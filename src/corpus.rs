@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Digest;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
@@ -941,11 +941,48 @@ fn export_leaf_artifacts(
     let export_root = output_dir.join(IR_DIR_CORPUS_EXPORTED_ARTIFACTS_DIR);
     fs::create_dir_all(&export_root)
         .with_context(|| format!("creating export root: {}", export_root.display()))?;
+    let done_sample_ids: BTreeSet<&str> = sample_records
+        .iter()
+        .filter(|sample| sample.status == "done")
+        .map(|sample| sample.sample_id.as_str())
+        .collect();
+    for entry in fs::read_dir(&export_root)
+        .with_context(|| format!("reading export root: {}", export_root.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("reading export entry in {}", export_root.display()))?;
+        if !entry
+            .file_type()
+            .with_context(|| format!("reading file type for {}", entry.path().display()))?
+            .is_dir()
+        {
+            continue;
+        }
+        let entry_name = entry.file_name();
+        let entry_name = entry_name.to_string_lossy();
+        if done_sample_ids.contains(entry_name.as_ref()) {
+            continue;
+        }
+        fs::remove_dir_all(entry.path()).with_context(|| {
+            format!(
+                "removing stale sample export dir: {}",
+                entry.path().display()
+            )
+        })?;
+    }
     for sample in sample_records {
+        let sample_dir = export_root.join(&sample.sample_id);
+        if sample_dir.exists() {
+            fs::remove_dir_all(&sample_dir).with_context(|| {
+                format!(
+                    "removing stale sample export dir before refresh: {}",
+                    sample_dir.display()
+                )
+            })?;
+        }
         if sample.status != "done" {
             continue;
         }
-        let sample_dir = export_root.join(&sample.sample_id);
         fs::create_dir_all(&sample_dir)
             .with_context(|| format!("creating sample export dir: {}", sample_dir.display()))?;
         copy_artifact_if_present(
@@ -1228,6 +1265,61 @@ mod tests {
                 .resolve_artifact_ref_path(&provenance.output_artifact)
                 .exists()
         );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn export_leaf_artifacts_prunes_stale_sample_dirs() {
+        let root = make_temp_dir("export-prune");
+        let store = ArtifactStore::new_with_sled(root.join("store"), root.join("artifacts.sled"));
+        store.ensure_layout().expect("ensure store layout");
+        let export_root = root.join(IR_DIR_CORPUS_EXPORTED_ARTIFACTS_DIR);
+        let stale_removed = export_root.join("removed-sample");
+        let stale_pending = export_root.join("pending-sample");
+        fs::create_dir_all(&stale_removed).expect("create removed sample dir");
+        fs::create_dir_all(&stale_pending).expect("create pending sample dir");
+        fs::write(stale_removed.join("stale.txt"), "stale")
+            .expect("write removed sample stale file");
+        fs::write(stale_pending.join("stale.txt"), "stale")
+            .expect("write pending sample stale file");
+
+        let pending_sample = IrDirCorpusSampleRecord {
+            sample_id: "pending-sample".to_string(),
+            logical_name: "pending.ir".to_string(),
+            source_relpath: "pending.ir".to_string(),
+            source_sha256: "sha".to_string(),
+            top_fn_policy: "explicit".to_string(),
+            top_fn_name: "foo".to_string(),
+            fraig: false,
+            dso_version: "v0.39.0".to_string(),
+            driver_crate_version: "0.34.0".to_string(),
+            stats_driver_crate_version: "0.39.0".to_string(),
+            yosys_script: "flows/yosys_to_aig.ys".to_string(),
+            yosys_script_sha256: "scriptsha".to_string(),
+            preset: recipe_preset_label(CorpusRecipePreset::G8rVsYabcAigDiff).to_string(),
+            import_ir_action_id: "import".to_string(),
+            import_ir_status: "done".to_string(),
+            g8r_aig_action_id: "g8r".to_string(),
+            g8r_aig_status: "pending".to_string(),
+            g8r_stats_action_id: "g8rstats".to_string(),
+            g8r_stats_status: "pending".to_string(),
+            combo_verilog_action_id: "combo".to_string(),
+            combo_verilog_status: "pending".to_string(),
+            yosys_abc_aig_action_id: "yosysaig".to_string(),
+            yosys_abc_aig_status: "pending".to_string(),
+            yosys_abc_stats_action_id: "yosysstats".to_string(),
+            yosys_abc_stats_status: "pending".to_string(),
+            aig_stat_diff_action_id: "diff".to_string(),
+            aig_stat_diff_status: "pending".to_string(),
+            status: "pending".to_string(),
+            error: None,
+        };
+
+        export_leaf_artifacts(&store, &root, &[pending_sample]).expect("export leaf artifacts");
+
+        assert!(!stale_removed.exists());
+        assert!(!stale_pending.exists());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
