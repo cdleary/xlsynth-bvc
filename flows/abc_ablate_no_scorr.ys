@@ -1,0 +1,5 @@
+proc
+opt
+techmap
+abc -g AND -script "+strash;&get -n;&fraig -x;&put;dc2;dretime;strash;&get -n;&dch -f;&nf;&put"
+clean

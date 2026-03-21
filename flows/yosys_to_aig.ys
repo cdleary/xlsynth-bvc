@@ -1,0 +1,8 @@
+# Commands executed after the wrapper has loaded the Verilog and optional top.
+# Keep this focused on optimization / mapping / ABC options.
+
+proc
+opt
+techmap
+abc -g AND
+clean

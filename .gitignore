@@ -1,0 +1,13 @@
+/target
+/bvc-artifacts/.staging/
+/bvc-artifacts/.materialized-actions/
+/bvc-artifacts/queue/
+/bvc-artifacts/driver-release-cache/
+/bvc-artifacts/failed-action-records/
+/bvc-artifacts/logs/
+/bvc-artifacts-sled/
+/bvc-artifacts/*.sled/
+/indices/
+/.sled/
+/*.sled/
+/snapshot/
