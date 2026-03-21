@@ -116,6 +116,16 @@ cargo run --bin xlsynth_bvc -- \
   --driver-version 0.34.0
 ```
 
+The enqueue workflow is intentionally explicit:
+
+1. The first `run-ir-dir-corpus` invocation seeds `OUTPUT_DIR/.bvc/`, imports local IR roots,
+   expands the fixed recipe, enqueues missing downstream actions, and writes initial
+   `manifest.json` / `samples.jsonl` / `joined/*` exports with current statuses.
+2. `drain-queue` runs against `OUTPUT_DIR/.bvc/` using the normal worker command.
+3. Rerun the same `run-ir-dir-corpus` command with the same input/output/config tuple to refresh
+   the public exports from the now-completed action graph. There is no separate `--refresh-only`
+   flag yet; rerunning the command is the refresh mechanism.
+
 Drain the internal queue with the normal worker command:
 
 ```bash
@@ -124,9 +134,6 @@ cargo run --bin xlsynth_bvc -- \
   --artifacts-via-sled /tmp/mcmc-ir-g8r-vs-yabc/.bvc/artifacts.sled \
   drain-queue --worker-id corpus-a --lease-seconds 1800
 ```
-
-Then rerun the same corpus command to refresh `manifest.json`, `samples.jsonl`, `joined/*.csv`,
-`joined/*.jsonl`, and `artifacts/<sample_id>/...` from the now-completed action graph.
 
 Inline run mode:
 
@@ -148,7 +155,16 @@ Current CLI notes:
 
 - `--recipe-preset g8r-vs-yabc-aig-diff` is the implemented preset.
 - `--top-fn-policy` supports `infer-single-package`, `explicit`, and `from-filename`.
+- `infer-single-package` expects exactly one unambiguous top function in each IR file. For
+  multi-function packages, use `explicit` or `from-filename`.
 - `--yosys-script` defaults to `flows/yosys_to_aig.ys`.
+- `sample_id` is stable for a fixed corpus relpath and currently uses
+  `<sanitized_basename>-<sha256(normalized_source_relpath)[0:12]>`; content identity remains
+  separately visible as `source_sha256`.
+- `manifest.json` and `samples.jsonl` expose the exact `dso_version`, driver crate versions,
+  `fraig` mode, top-fn policy/result, and yosys script path plus sha256.
+- `joined/*.csv` and `joined/*.jsonl` include source relpath/sha256, top-fn metadata, both branch
+  action IDs, node/depth metrics, `g8r_product`, `yosys_abc_product`, and `g8r_product_loss`.
 - The internal workspace paths are emitted in the command summary JSON so normal `drain-queue`,
   `show-provenance`, and `resolve` commands can target the same output-dir-local store.
 

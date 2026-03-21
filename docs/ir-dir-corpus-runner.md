@@ -125,6 +125,19 @@ and docs, but `yabc` is a reasonable shorthand in CLI preset names and output fi
 
 ## Queue-Backed Workflow
 
+The enqueue workflow is deliberately explicit:
+
+1. first `run-ir-dir-corpus --execution-mode enqueue` seeds the self-contained workspace, imports
+   local IR roots, expands the fixed recipe, enqueues missing actions, and writes initial exports
+   with current statuses
+2. `drain-queue` targets `OUTPUT_DIR/.bvc/` using the normal worker command
+3. rerunning the same `run-ir-dir-corpus` command with the same input/output/config tuple refreshes
+   `manifest.json`, `samples.jsonl`, `summary.json`, `joined/*`, and copied leaf artifacts from the
+   completed action graph
+
+There is no separate `--refresh-only` command yet. Rerunning the corpus command is the refresh
+mechanism.
+
 Initial submission:
 
 ```bash
@@ -147,8 +160,8 @@ cargo run --bin xlsynth_bvc -- \
   drain-queue --worker-id corpus-a --lease-seconds 1800
 ```
 
-Then rerun the same `run-ir-dir-corpus` command to refresh the public exports from the completed
-workspace state. The command is idempotent for a stable input/output/config tuple.
+The corpus command is idempotent for a stable input/output/config tuple, so the rerun refresh step
+does not invent a second store model or a separate export path.
 
 ## Inline Workflow
 
@@ -170,13 +183,24 @@ cargo run --bin xlsynth_bvc -- \
 
 `manifest.json` stores command configuration, workspace paths, runtimes, and one sample row per IR.
 
+The top-level manifest also makes two corpus-specific semantics explicit:
+
+- `refresh_semantics = rerun_same_command_refreshes_exports`
+- `sample_id_scheme = basename-plus-normalized-source-relpath-sha256-12-v1`
+
 Each sample row includes:
 
 - `sample_id`
 - `logical_name`
 - `source_relpath`
 - `source_sha256`
+- `top_fn_policy`
 - `top_fn_name`
+- `fraig`
+- exact `dso_version`
+- exact driver crate versions for both the main driver flow and stats flow
+- `yosys_script` path
+- `yosys_script_sha256`
 - `preset`
 - all action IDs in the fixed recipe
 - per-action status strings
@@ -188,12 +212,38 @@ workspace paths needed to target the same store with normal queue/provenance com
 
 The joined diff tables denormalize:
 
+- `source_relpath`
+- `source_sha256`
+- `top_fn_policy`
+- `top_fn_name`
+- both branch action IDs plus the import and diff action IDs
 - `g8r_and_nodes`
 - `g8r_depth`
+- `g8r_product`
 - `yosys_abc_and_nodes`
 - `yosys_abc_depth`
+- `yosys_abc_product`
+- `g8r_product_loss`
 - `delta_and_nodes_yosys_minus_g8r`
 - `delta_depth_yosys_minus_g8r`
+
+This is meant to make the public joined tables practical for science/analysis use without forcing
+the caller to reopen internal action provenance just to recover the basic run configuration.
+
+## Sample Identity
+
+`sample_id` is intentionally path-stable, not content-addressed.
+
+Current rule:
+
+- sanitize the sample basename
+- append the first 12 hex characters of `sha256(normalized_source_relpath)`
+
+That means:
+
+- rerunning the same corpus layout produces the same `sample_id`
+- changing file contents without changing relative path keeps the same `sample_id`
+- content identity is still visible as `source_sha256`
 
 ## Top Function Policy
 
@@ -201,11 +251,13 @@ Batch import needs one consistent answer to "what is the top function for this I
 
 Implemented policies:
 
-- `infer_single_package`: parse the IR package and require exactly one function/proc candidate
+- `infer_single_package`: parse the IR package and require exactly one unambiguous top
+  function/proc candidate
 - `from_filename`: strip extension and use basename
 - `explicit`: use one shared `--top-fn-name`
 
 The resolved `top_fn_name` is persisted in both the import action and the sample manifest.
+`infer_single_package` is useful for narrow corpora but not for general multi-function packages.
 
 ## Execution Modes
 

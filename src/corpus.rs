@@ -23,7 +23,7 @@ use crate::service::{
 };
 use crate::store::ArtifactStore;
 
-const IR_DIR_CORPUS_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const IR_DIR_CORPUS_MANIFEST_SCHEMA_VERSION: u32 = 2;
 const IR_DIR_CORPUS_MANIFEST_FILENAME: &str = "manifest.json";
 const IR_DIR_CORPUS_SAMPLES_FILENAME: &str = "samples.jsonl";
 const IR_DIR_CORPUS_SUMMARY_FILENAME: &str = "summary.json";
@@ -39,6 +39,8 @@ const COMBO_VERILOG_RELPATH: &str = "payload/result.v";
 const YOSYS_ABC_AIG_RELPATH: &str = "payload/result.aig";
 const YOSYS_ABC_STATS_RELPATH: &str = "payload/stats.json";
 const AIG_STAT_DIFF_RELPATH: &str = "payload/aig_stat_diff.json";
+const IR_DIR_CORPUS_REFRESH_SEMANTICS: &str = "rerun_same_command_refreshes_exports";
+const IR_DIR_CORPUS_SAMPLE_ID_SCHEME: &str = "basename-plus-normalized-source-relpath-sha256-12-v1";
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunIrDirCorpusSummary {
@@ -54,6 +56,8 @@ pub(crate) struct RunIrDirCorpusSummary {
     pub(crate) joined_csv_path: String,
     pub(crate) recipe_preset: String,
     pub(crate) execution_mode: String,
+    pub(crate) refresh_semantics: String,
+    pub(crate) sample_id_scheme: String,
     pub(crate) sample_count: usize,
     pub(crate) completed_samples: usize,
     pub(crate) enqueued_actions: usize,
@@ -72,6 +76,8 @@ struct IrDirCorpusManifest {
     workspace_artifacts_via_sled: String,
     recipe_preset: String,
     execution_mode: String,
+    refresh_semantics: String,
+    sample_id_scheme: String,
     top_fn_policy: String,
     top_fn_name: Option<String>,
     fraig: bool,
@@ -80,6 +86,7 @@ struct IrDirCorpusManifest {
     stats_runtime: DriverRuntimeSpec,
     yosys_runtime: YosysRuntimeSpec,
     yosys_script: String,
+    yosys_script_sha256: String,
     samples: Vec<IrDirCorpusSampleRecord>,
 }
 
@@ -89,7 +96,14 @@ struct IrDirCorpusSampleRecord {
     logical_name: String,
     source_relpath: String,
     source_sha256: String,
+    top_fn_policy: String,
     top_fn_name: String,
+    fraig: bool,
+    dso_version: String,
+    driver_crate_version: String,
+    stats_driver_crate_version: String,
+    yosys_script: String,
+    yosys_script_sha256: String,
     preset: String,
     import_ir_action_id: String,
     import_ir_status: String,
@@ -118,6 +132,8 @@ struct IrDirCorpusSummaryFile {
     workspace_artifacts_via_sled: String,
     recipe_preset: String,
     execution_mode: String,
+    refresh_semantics: String,
+    sample_id_scheme: String,
     total_samples: usize,
     completed_samples: usize,
     status_counts: BTreeMap<String, usize>,
@@ -130,7 +146,15 @@ struct IrDirCorpusJoinedRow {
     sample_id: String,
     logical_name: String,
     source_relpath: String,
+    source_sha256: String,
+    top_fn_policy: String,
     top_fn_name: String,
+    fraig: bool,
+    dso_version: String,
+    driver_crate_version: String,
+    stats_driver_crate_version: String,
+    yosys_script: String,
+    yosys_script_sha256: String,
     import_ir_action_id: String,
     g8r_aig_action_id: String,
     g8r_stats_action_id: String,
@@ -140,8 +164,11 @@ struct IrDirCorpusJoinedRow {
     aig_stat_diff_action_id: String,
     g8r_and_nodes: Option<f64>,
     g8r_depth: Option<f64>,
+    g8r_product: Option<f64>,
     yosys_abc_and_nodes: Option<f64>,
     yosys_abc_depth: Option<f64>,
+    yosys_abc_product: Option<f64>,
+    g8r_product_loss: Option<f64>,
     delta_and_nodes_yosys_minus_g8r: Option<f64>,
     delta_depth_yosys_minus_g8r: Option<f64>,
 }
@@ -262,7 +289,18 @@ pub(crate) fn run_ir_dir_corpus(
                     .ok();
             }
         }
-        sample_records.push(build_sample_record(&store, sample, &plan, &run_errors));
+        sample_records.push(build_sample_record(
+            &store,
+            sample,
+            &plan,
+            &run_errors,
+            top_fn_policy,
+            fraig,
+            version,
+            &driver_runtime,
+            &stats_runtime,
+            &yosys_script_ref,
+        ));
     }
 
     let joined_rows = build_joined_rows(&store, &sample_records)?;
@@ -278,6 +316,8 @@ pub(crate) fn run_ir_dir_corpus(
         workspace_artifacts_via_sled: workspace_artifacts_via_sled.display().to_string(),
         recipe_preset: recipe_preset_label(recipe_preset).to_string(),
         execution_mode: execution_mode_label(execution_mode).to_string(),
+        refresh_semantics: refresh_semantics_label().to_string(),
+        sample_id_scheme: sample_id_scheme_label().to_string(),
         top_fn_policy: top_fn_policy_label(top_fn_policy).to_string(),
         top_fn_name: top_fn_name.map(ToOwned::to_owned),
         fraig,
@@ -286,6 +326,7 @@ pub(crate) fn run_ir_dir_corpus(
         stats_runtime: stats_runtime.clone(),
         yosys_runtime: yosys_runtime.clone(),
         yosys_script: yosys_script_ref.path.clone(),
+        yosys_script_sha256: yosys_script_ref.sha256.clone(),
         samples: sample_records.clone(),
     };
     let status_counts = count_statuses(&sample_records);
@@ -297,6 +338,8 @@ pub(crate) fn run_ir_dir_corpus(
         workspace_artifacts_via_sled: workspace_artifacts_via_sled.display().to_string(),
         recipe_preset: recipe_preset_label(recipe_preset).to_string(),
         execution_mode: execution_mode_label(execution_mode).to_string(),
+        refresh_semantics: refresh_semantics_label().to_string(),
+        sample_id_scheme: sample_id_scheme_label().to_string(),
         total_samples: sample_records.len(),
         completed_samples: sample_records
             .iter()
@@ -344,6 +387,8 @@ pub(crate) fn run_ir_dir_corpus(
         joined_csv_path: joined_csv_path.display().to_string(),
         recipe_preset: recipe_preset_label(recipe_preset).to_string(),
         execution_mode: execution_mode_label(execution_mode).to_string(),
+        refresh_semantics: refresh_semantics_label().to_string(),
+        sample_id_scheme: sample_id_scheme_label().to_string(),
         sample_count: sample_records.len(),
         completed_samples: summary_file.completed_samples,
         enqueued_actions: counters.enqueued_actions,
@@ -410,7 +455,14 @@ fn resolve_top_fn_name(
     explicit_top_fn_name: Option<&str>,
 ) -> Result<String> {
     match policy {
-        CorpusTopFnPolicy::InferSinglePackage => infer_ir_top_function(source_path),
+        CorpusTopFnPolicy::InferSinglePackage => infer_ir_top_function(source_path).with_context(
+            || {
+                format!(
+                    "infer-single-package expects one unambiguous top function in {}; use --top-fn-policy explicit or from-filename for multi-function corpora",
+                    source_path.display()
+                )
+            },
+        ),
         CorpusTopFnPolicy::Explicit => Ok(explicit_top_fn_name
             .ok_or_else(|| anyhow!("--top-fn-name is required for explicit top-fn policy"))?
             .to_string()),
@@ -662,6 +714,12 @@ fn build_sample_record(
     sample: &CorpusSampleSpec,
     plan: &CorpusActionPlan,
     run_errors: &BTreeMap<String, String>,
+    top_fn_policy: CorpusTopFnPolicy,
+    fraig: bool,
+    dso_version: &str,
+    driver_runtime: &DriverRuntimeSpec,
+    stats_runtime: &DriverRuntimeSpec,
+    yosys_script_ref: &crate::model::ScriptRef,
 ) -> IrDirCorpusSampleRecord {
     let import_ir_status = action_status_label(store, &plan.import_ir_action_id);
     let g8r_aig_status = action_status_label(store, &plan.g8r_aig_action_id);
@@ -698,7 +756,14 @@ fn build_sample_record(
         logical_name: sample.logical_name.clone(),
         source_relpath: sample.source_relpath.clone(),
         source_sha256: sample.source_sha256.clone(),
+        top_fn_policy: top_fn_policy_label(top_fn_policy).to_string(),
         top_fn_name: sample.top_fn_name.clone(),
+        fraig,
+        dso_version: dso_version.to_string(),
+        driver_crate_version: driver_runtime.driver_version.clone(),
+        stats_driver_crate_version: stats_runtime.driver_version.clone(),
+        yosys_script: yosys_script_ref.path.clone(),
+        yosys_script_sha256: yosys_script_ref.sha256.clone(),
         preset: recipe_preset_label(CorpusRecipePreset::G8rVsYabcAigDiff).to_string(),
         import_ir_action_id: plan.import_ir_action_id.clone(),
         import_ir_status,
@@ -794,11 +859,27 @@ fn build_joined_rows(
             .get("yosys_abc_stats")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        let g8r_and_nodes = stats_metric(&g8r_stats, "and_nodes")
+            .or_else(|| stats_metric(&g8r_stats, "live_nodes"));
+        let g8r_depth = stats_metric(&g8r_stats, "depth");
+        let g8r_product = product_metric(g8r_and_nodes, g8r_depth);
+        let yosys_abc_and_nodes = stats_metric(&yosys_stats, "and_nodes")
+            .or_else(|| stats_metric(&yosys_stats, "live_nodes"));
+        let yosys_abc_depth = stats_metric(&yosys_stats, "depth");
+        let yosys_abc_product = product_metric(yosys_abc_and_nodes, yosys_abc_depth);
         rows.push(IrDirCorpusJoinedRow {
             sample_id: sample.sample_id.clone(),
             logical_name: sample.logical_name.clone(),
             source_relpath: sample.source_relpath.clone(),
+            source_sha256: sample.source_sha256.clone(),
+            top_fn_policy: sample.top_fn_policy.clone(),
             top_fn_name: sample.top_fn_name.clone(),
+            fraig: sample.fraig,
+            dso_version: sample.dso_version.clone(),
+            driver_crate_version: sample.driver_crate_version.clone(),
+            stats_driver_crate_version: sample.stats_driver_crate_version.clone(),
+            yosys_script: sample.yosys_script.clone(),
+            yosys_script_sha256: sample.yosys_script_sha256.clone(),
             import_ir_action_id: sample.import_ir_action_id.clone(),
             g8r_aig_action_id: sample.g8r_aig_action_id.clone(),
             g8r_stats_action_id: sample.g8r_stats_action_id.clone(),
@@ -806,12 +887,16 @@ fn build_joined_rows(
             yosys_abc_aig_action_id: sample.yosys_abc_aig_action_id.clone(),
             yosys_abc_stats_action_id: sample.yosys_abc_stats_action_id.clone(),
             aig_stat_diff_action_id: sample.aig_stat_diff_action_id.clone(),
-            g8r_and_nodes: stats_metric(&g8r_stats, "and_nodes")
-                .or_else(|| stats_metric(&g8r_stats, "live_nodes")),
-            g8r_depth: stats_metric(&g8r_stats, "depth"),
-            yosys_abc_and_nodes: stats_metric(&yosys_stats, "and_nodes")
-                .or_else(|| stats_metric(&yosys_stats, "live_nodes")),
-            yosys_abc_depth: stats_metric(&yosys_stats, "depth"),
+            g8r_and_nodes,
+            g8r_depth,
+            g8r_product,
+            yosys_abc_and_nodes,
+            yosys_abc_depth,
+            yosys_abc_product,
+            g8r_product_loss: match (g8r_product, yosys_abc_product) {
+                (Some(g8r), Some(yosys)) => Some(g8r - yosys),
+                _ => None,
+            },
             delta_and_nodes_yosys_minus_g8r: diff_numeric_delta(&diff_json, "and_nodes")
                 .or_else(|| diff_numeric_delta(&diff_json, "live_nodes")),
             delta_depth_yosys_minus_g8r: diff_numeric_delta(&diff_json, "depth"),
@@ -842,6 +927,10 @@ fn diff_numeric_delta(value: &serde_json::Value, metric: &str) -> Option<f64> {
         };
     }
     None
+}
+
+fn product_metric(and_nodes: Option<f64>, depth: Option<f64>) -> Option<f64> {
+    Some(and_nodes? * depth?)
 }
 
 fn export_leaf_artifacts(
@@ -967,14 +1056,22 @@ fn write_joined_jsonl(path: &Path, rows: &[IrDirCorpusJoinedRow]) -> Result<()> 
 fn write_joined_csv(path: &Path, rows: &[IrDirCorpusJoinedRow]) -> Result<()> {
     let mut text = String::new();
     text.push_str(
-        "sample_id,logical_name,source_relpath,top_fn_name,import_ir_action_id,g8r_aig_action_id,g8r_stats_action_id,combo_verilog_action_id,yosys_abc_aig_action_id,yosys_abc_stats_action_id,aig_stat_diff_action_id,g8r_and_nodes,g8r_depth,yosys_abc_and_nodes,yosys_abc_depth,delta_and_nodes_yosys_minus_g8r,delta_depth_yosys_minus_g8r\n",
+        "sample_id,logical_name,source_relpath,source_sha256,top_fn_policy,top_fn_name,fraig,dso_version,driver_crate_version,stats_driver_crate_version,yosys_script,yosys_script_sha256,import_ir_action_id,g8r_aig_action_id,g8r_stats_action_id,combo_verilog_action_id,yosys_abc_aig_action_id,yosys_abc_stats_action_id,aig_stat_diff_action_id,g8r_and_nodes,g8r_depth,g8r_product,yosys_abc_and_nodes,yosys_abc_depth,yosys_abc_product,g8r_product_loss,delta_and_nodes_yosys_minus_g8r,delta_depth_yosys_minus_g8r\n",
     );
     for row in rows {
         let fields = [
             csv_escape(&row.sample_id),
             csv_escape(&row.logical_name),
             csv_escape(&row.source_relpath),
+            csv_escape(&row.source_sha256),
+            csv_escape(&row.top_fn_policy),
             csv_escape(&row.top_fn_name),
+            csv_escape(&row.fraig.to_string()),
+            csv_escape(&row.dso_version),
+            csv_escape(&row.driver_crate_version),
+            csv_escape(&row.stats_driver_crate_version),
+            csv_escape(&row.yosys_script),
+            csv_escape(&row.yosys_script_sha256),
             csv_escape(&row.import_ir_action_id),
             csv_escape(&row.g8r_aig_action_id),
             csv_escape(&row.g8r_stats_action_id),
@@ -984,8 +1081,11 @@ fn write_joined_csv(path: &Path, rows: &[IrDirCorpusJoinedRow]) -> Result<()> {
             csv_escape(&row.aig_stat_diff_action_id),
             csv_escape(&optional_f64(row.g8r_and_nodes)),
             csv_escape(&optional_f64(row.g8r_depth)),
+            csv_escape(&optional_f64(row.g8r_product)),
             csv_escape(&optional_f64(row.yosys_abc_and_nodes)),
             csv_escape(&optional_f64(row.yosys_abc_depth)),
+            csv_escape(&optional_f64(row.yosys_abc_product)),
+            csv_escape(&optional_f64(row.g8r_product_loss)),
             csv_escape(&optional_f64(row.delta_and_nodes_yosys_minus_g8r)),
             csv_escape(&optional_f64(row.delta_depth_yosys_minus_g8r)),
         ];
@@ -1036,6 +1136,14 @@ fn top_fn_policy_label(policy: CorpusTopFnPolicy) -> &'static str {
     }
 }
 
+fn refresh_semantics_label() -> &'static str {
+    IR_DIR_CORPUS_REFRESH_SEMANTICS
+}
+
+fn sample_id_scheme_label() -> &'static str {
+    IR_DIR_CORPUS_SAMPLE_ID_SCHEME
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,6 +1171,17 @@ mod tests {
             super::top_fn_name_from_filename(path).expect("derive top fn"),
             "example"
         );
+    }
+
+    #[test]
+    fn sample_id_is_relpath_stable_and_content_independent() {
+        let lhs = super::sample_id_for_relpath("dir/sample.opt.ir");
+        let rhs = super::sample_id_for_relpath("dir/sample.opt.ir");
+        let other = super::sample_id_for_relpath("other-dir/sample.opt.ir");
+
+        assert_eq!(lhs, rhs);
+        assert_ne!(lhs, other);
+        assert!(lhs.starts_with("sample-"));
     }
 
     #[test]
