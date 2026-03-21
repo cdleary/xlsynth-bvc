@@ -48,6 +48,7 @@ Each action is represented as a typed `ActionSpec` and hashed to an `action_id`:
 
 Current action types:
 
+1. `ImportIrPackageFile(source_sha256, top_fn_name?) -> IrPackageFile`
 1. `DownloadAndExtractXlsynthReleaseStdlibTarball(dso:vX.Y.Z) -> DslxFileSubtree`
 1. `DownloadAndExtractXlsynthSourceSubtree(dso:vX.Y.Z, subtree=xls/modules/add_dual_path) -> DslxFileSubtree`
 1. `DriverDslxFnToIr(dslx_subtree_ref, dslx_file, dslx_fn_name, dso:vX.Y.Z, crate:vA.B.C) -> IrPackageFile`
@@ -198,8 +199,9 @@ The built-in `discover-releases` command does this polling directly and supports
 ## CLI Overview
 
 - `run ...` executes one action immediately (cached by action ID).
-- `--artifacts-via-sled <path>` is required and points at the sled-backed artifact store. Queue state is transient filesystem state under `bvc-artifacts/queue`, durable failed-action history is in sled (`failed_by_action`), and provenance/payload bytes are persisted in sled and materialized on demand under `bvc-artifacts/.materialized-actions/`.
+- `--artifacts-via-sled <path>` is required for the normal store-targeting commands and points at the sled-backed artifact store. `run-ir-dir-corpus` is the exception: it manages its own self-contained store under `OUTPUT_DIR/.bvc/` and does not require the flag for the initial corpus submission/refresh command itself.
 - In CLI text output/prose we still label versions explicitly as `crate:...` or `dso:...`; command flags themselves accept raw values (for example `--version v0.35.0`, `--driver-version 0.31.0`).
+- `run-ir-dir-corpus --input-dir ... --output-dir ... --execution-mode enqueue|run --recipe-preset g8r-vs-yabc-aig-diff` imports local `.ir` files into an output-dir-local workspace, expands the fixed recipe into normal actions, and writes `manifest.json`, `samples.jsonl`, `summary.json`, joined diff tables, and copied leaf artifacts.
 - For driver-backed `run` commands, `--version` is the DSO release (`dso:vX.Y.Z`) and `--driver-version` is the crate release (`crate:vA.B.C`).
 - `run download-source-subtree --version vX.Y.Z --subtree xls/modules/add_dual_path` downloads the tagged `xlsynth/xlsynth` source archive and extracts only that subtree.
 - `run ir-to-delay-info --ir-action-id ... [--top-fn-name ...] [--delay-model asap7] --version vX.Y.Z` computes textual delay info for an IR package.
@@ -275,6 +277,7 @@ Sort keys:
 
 - `ir2g8r --aiger-out` is used for AIG output in the current implementation.
 - Delay info currently executes the release `delay_info_main` binary directly; `xlsynth-driver ir2delayinfo` is not used until implemented upstream.
+- External IR corpus ingestion now has an initial batch layer via `ImportIrPackageFile` plus `run-ir-dir-corpus`; see `docs/ir-dir-corpus-runner.md` for the implemented output-dir-local workflow and follow-up ideas.
 - Consider optional global CAS blobs for dedup across action payloads.
 - As of March 14, 2026, the queue uses stage-bumped descendant priorities plus capped same-priority G8r micro-batching to improve "time to first comparison point" for new crate versions such as `crate:v0.39.0`. If snapshot views still lag after long drains, the next follow-up should be ready-aware batch suppression and/or priority-banded pending shards so sparse high-value leaf work is discovered faster than the current rotating pending scan.
 

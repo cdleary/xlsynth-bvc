@@ -3,6 +3,7 @@
 Hermetic, reproducible action execution for xlsynth artifact pipelines.
 
 See `docs/hermetic-action-design.md` for the architecture.
+See `docs/ir-dir-corpus-runner.md` for the batch `IR directory -> recipe preset -> output bundle` runner.
 
 Artifacts are stored in sharded CAS-style paths, e.g.:
 
@@ -91,6 +92,65 @@ cargo run --bin xlsynth_bvc -- discover-releases --after v0.37.0
 # Drain queue with lease-based worker claiming
 cargo run --bin xlsynth_bvc -- drain-queue --worker-id worker-a --lease-seconds 1800
 ```
+
+## IR Dir Corpus Runner
+
+`run-ir-dir-corpus` is the simple "command line build system with action enqueue" entrypoint for
+local IR corpora. It does not require global `--artifacts-via-sled`; instead it creates a
+self-contained workspace under `OUTPUT_DIR/.bvc/` and writes public manifests/exports directly into
+`OUTPUT_DIR/`.
+
+Enqueue mode:
+
+```bash
+# Seed a self-contained queue-backed workspace under /tmp/mcmc-ir-g8r-vs-yabc/.
+# This writes manifest.json, samples.jsonl, summary.json, joined/*, and OUTPUT_DIR/.bvc/*
+cargo run --bin xlsynth_bvc -- \
+  run-ir-dir-corpus \
+  --input-dir /tmp/mcmc-ir \
+  --output-dir /tmp/mcmc-ir-g8r-vs-yabc \
+  --execution-mode enqueue \
+  --recipe-preset g8r-vs-yabc-aig-diff \
+  --top-fn-policy infer-single-package \
+  --version v0.39.0 \
+  --driver-version 0.34.0
+```
+
+Drain the internal queue with the normal worker command:
+
+```bash
+cargo run --bin xlsynth_bvc -- \
+  --store-dir /tmp/mcmc-ir-g8r-vs-yabc/.bvc/bvc-artifacts \
+  --artifacts-via-sled /tmp/mcmc-ir-g8r-vs-yabc/.bvc/artifacts.sled \
+  drain-queue --worker-id corpus-a --lease-seconds 1800
+```
+
+Then rerun the same corpus command to refresh `manifest.json`, `samples.jsonl`, `joined/*.csv`,
+`joined/*.jsonl`, and `artifacts/<sample_id>/...` from the now-completed action graph.
+
+Inline run mode:
+
+```bash
+# Execute the fixed recipe immediately instead of using the queue
+cargo run --bin xlsynth_bvc -- \
+  run-ir-dir-corpus \
+  --input-dir /tmp/mcmc-ir \
+  --output-dir /tmp/mcmc-ir-inline \
+  --execution-mode run \
+  --recipe-preset g8r-vs-yabc-aig-diff \
+  --top-fn-policy explicit \
+  --top-fn-name foo \
+  --version v0.39.0 \
+  --driver-version 0.34.0
+```
+
+Current CLI notes:
+
+- `--recipe-preset g8r-vs-yabc-aig-diff` is the implemented preset.
+- `--top-fn-policy` supports `infer-single-package`, `explicit`, and `from-filename`.
+- `--yosys-script` defaults to `flows/yosys_to_aig.ys`.
+- The internal workspace paths are emitted in the command summary JSON so normal `drain-queue`,
+  `show-provenance`, and `resolve` commands can target the same output-dir-local store.
 
 `drain-queue` now records failed actions under `queue/failed/` and recursively
 cancels queued downstream dependents under `queue/canceled/` based on action
@@ -336,6 +396,11 @@ For legacy `driver_ir_to_g8r_aig` producers (`crate < v0.24.0`) that emit
 `ir-to-delay-info` emits `payload/delay_info.textproto` by running `delay_info_main --proto_out`
 and decoding `xls.DelayInfoProto` using schema files cached during setup from the
 matching `xlsynth/xlsynth` release tag.
+
+For `run-ir-dir-corpus`, imported local IR roots live inside the output-dir-local workspace and are
+represented as `ImportIrPackageFile(source_sha256, top_fn_name?) -> IrPackageFile`.
+These roots are intentionally local/workspace-scoped seeds for corpus execution rather than durable
+repo-global canonical roots.
 
 ## Suggested Next Actions
 

@@ -571,7 +571,8 @@ pub(crate) fn action_scheduler_priority(action: &ActionSpec) -> u8 {
         ActionSpec::DriverIrToDelayInfo { .. } => 9,
         ActionSpec::DriverIrToOpt { .. } => 10,
         ActionSpec::DriverDslxFnToIr { .. } => 11,
-        ActionSpec::DownloadAndExtractXlsynthSourceSubtree { .. } => 12,
+        ActionSpec::ImportIrPackageFile { .. }
+        | ActionSpec::DownloadAndExtractXlsynthSourceSubtree { .. } => 12,
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. } => {
             LOWEST_ACTION_SCHEDULER_PRIORITY
         }
@@ -801,7 +802,8 @@ pub(crate) fn write_failed_action_record(
 
 pub(crate) fn action_dependency_role_action_ids(action: &ActionSpec) -> Vec<(&'static str, &str)> {
     match action {
-        ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. }
+        ActionSpec::ImportIrPackageFile { .. }
+        | ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. }
         | ActionSpec::DownloadAndExtractXlsynthSourceSubtree { .. } => Vec::new(),
         ActionSpec::DriverDslxFnToIr {
             dslx_subtree_action_id,
