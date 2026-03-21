@@ -231,6 +231,7 @@ pub(crate) fn prepare_queue_runtime_environment(
 
     for action in actions {
         match action {
+            ActionSpec::ImportIrPackageFile { .. } => {}
             ActionSpec::DriverDslxFnToIr {
                 version, runtime, ..
             }

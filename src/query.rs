@@ -2948,6 +2948,7 @@ pub(crate) fn maybe_upsert_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_index_for_c
 
 pub(crate) fn action_kind_short_label(action: &ActionSpec) -> &'static str {
     match action {
+        ActionSpec::ImportIrPackageFile { .. } => "import-ir",
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. } => "stdlib",
         ActionSpec::DownloadAndExtractXlsynthSourceSubtree { .. } => "src-subtree",
         ActionSpec::DriverDslxFnToIr { .. } => "dslx2ir",
@@ -2977,6 +2978,15 @@ pub(crate) fn script_ref_short_label(script_ref: &ScriptRef) -> String {
 
 pub(crate) fn action_graph_node_label(action: &ActionSpec) -> String {
     match action {
+        ActionSpec::ImportIrPackageFile {
+            top_fn_name: Some(top),
+            ..
+        } => {
+            format!("import-ir\n{}", top)
+        }
+        ActionSpec::ImportIrPackageFile {
+            top_fn_name: None, ..
+        } => action_kind_short_label(action).to_string(),
         ActionSpec::DriverDslxFnToIr { dslx_fn_name, .. } => {
             format!("dslx2ir\n{}", dslx_fn_name)
         }
@@ -6848,6 +6858,7 @@ fn build_related_action_rows(
 
 pub(crate) fn action_dso_version(action: &ActionSpec) -> Option<&str> {
     match action {
+        ActionSpec::ImportIrPackageFile { .. } => None,
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { version, .. }
         | ActionSpec::DownloadAndExtractXlsynthSourceSubtree { version, .. }
         | ActionSpec::DriverDslxFnToIr { version, .. }
@@ -6867,6 +6878,7 @@ pub(crate) fn action_dso_version(action: &ActionSpec) -> Option<&str> {
 
 pub(crate) fn action_driver_version(action: &ActionSpec) -> Option<&str> {
     match action {
+        ActionSpec::ImportIrPackageFile { .. } => None,
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             discovery_runtime, ..
         }
@@ -7126,6 +7138,7 @@ pub(crate) fn classify_crate_version_inference_miss(
 
 pub(crate) fn action_kind_label(action: &ActionSpec) -> &'static str {
     match action {
+        ActionSpec::ImportIrPackageFile { .. } => "import_ir_package_file",
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. } => {
             "download_and_extract_xlsynth_release_stdlib_tarball"
         }
@@ -7149,6 +7162,14 @@ pub(crate) fn action_kind_label(action: &ActionSpec) -> &'static str {
 
 pub(crate) fn action_subject(action: &ActionSpec) -> String {
     match action {
+        ActionSpec::ImportIrPackageFile {
+            source_sha256,
+            top_fn_name,
+        } => format!(
+            "sha256={} top={}",
+            short_id(source_sha256),
+            top_fn_name.as_deref().unwrap_or("<auto>")
+        ),
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { version, .. } => {
             format!("download-stdlib {}", version)
         }

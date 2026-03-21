@@ -56,6 +56,11 @@ pub(crate) fn execute_action(
     let repo_root = std::env::current_dir().context("getting current directory")?;
 
     let outcome = match &action {
+        ActionSpec::ImportIrPackageFile { .. } => {
+            bail!(
+                "import_ir_package_file actions are created by `run-ir-dir-corpus` and cannot be executed directly"
+            );
+        }
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version,
             discovery_runtime,

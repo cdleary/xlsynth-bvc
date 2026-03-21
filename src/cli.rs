@@ -9,7 +9,7 @@ pub struct Cli {
     pub(crate) store_dir: PathBuf,
 
     #[arg(long, value_name = "PATH")]
-    pub(crate) artifacts_via_sled: PathBuf,
+    pub(crate) artifacts_via_sled: Option<PathBuf>,
 
     #[command(subcommand)]
     pub(crate) command: TopCommand,
@@ -17,6 +17,32 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    RunIrDirCorpus {
+        #[arg(long, value_name = "DIR")]
+        input_dir: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        output_dir: PathBuf,
+        #[arg(long, value_enum, default_value_t = CorpusRecipePreset::G8rVsYabcAigDiff)]
+        recipe_preset: CorpusRecipePreset,
+        #[arg(long, value_enum, default_value_t = CorpusExecutionMode::Enqueue)]
+        execution_mode: CorpusExecutionMode,
+        #[arg(long, value_enum, default_value_t = CorpusTopFnPolicy::InferSinglePackage)]
+        top_fn_policy: CorpusTopFnPolicy,
+        #[arg(long)]
+        top_fn_name: Option<String>,
+        #[arg(long, default_value_t = false)]
+        fraig: bool,
+        #[arg(long)]
+        version: String,
+        #[arg(long, default_value = crate::DEFAULT_YOSYS_FLOW_SCRIPT)]
+        yosys_script: String,
+        #[arg(long, default_value_t = crate::DEFAULT_QUEUE_PRIORITY)]
+        priority: i32,
+        #[command(flatten)]
+        driver: DriverCli,
+        #[command(flatten)]
+        yosys: YosysCli,
+    },
     Run {
         #[command(subcommand)]
         action: RunAction,
@@ -227,6 +253,24 @@ impl ExplicitBool {
     pub fn as_bool(self) -> bool {
         matches!(self, Self::True)
     }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CorpusRecipePreset {
+    G8rVsYabcAigDiff,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CorpusExecutionMode {
+    Enqueue,
+    Run,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CorpusTopFnPolicy {
+    InferSinglePackage,
+    Explicit,
+    FromFilename,
 }
 
 #[derive(Debug, Subcommand)]

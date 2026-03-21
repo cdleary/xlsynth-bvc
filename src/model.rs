@@ -58,6 +58,11 @@ pub(crate) struct ScriptRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub(crate) enum ActionSpec {
+    ImportIrPackageFile {
+        source_sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        top_fn_name: Option<String>,
+    },
     DownloadAndExtractXlsynthReleaseStdlibTarball {
         version: String,
         discovery_runtime: Option<DriverRuntimeSpec>,
@@ -174,7 +179,20 @@ pub(crate) fn action_batch_key(action: &ActionSpec) -> Option<ActionBatchKey> {
             fraig: *fraig,
             lowering_mode: lowering_mode.clone(),
         }),
-        _ => None,
+        ActionSpec::ImportIrPackageFile { .. }
+        | ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. }
+        | ActionSpec::DownloadAndExtractXlsynthSourceSubtree { .. }
+        | ActionSpec::DriverDslxFnToIr { .. }
+        | ActionSpec::DriverIrToOpt { .. }
+        | ActionSpec::DriverIrToDelayInfo { .. }
+        | ActionSpec::DriverIrEquiv { .. }
+        | ActionSpec::DriverIrAigEquiv { .. }
+        | ActionSpec::IrFnToCombinationalVerilog { .. }
+        | ActionSpec::IrFnToKBoolConeCorpus { .. }
+        | ActionSpec::ComboVerilogToYosysAbcAig { .. }
+        | ActionSpec::AigToYosysAbcAig { .. }
+        | ActionSpec::DriverAigToStats { .. }
+        | ActionSpec::AigStatDiff { .. } => None,
     }
 }
 

@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicU64;
 
 mod app;
 mod cli;
+mod corpus;
 mod executor;
 mod model;
 mod query;
@@ -172,7 +173,11 @@ pub(crate) fn default_k_bool_cone_max_ir_ops_for_k(k: u32) -> Option<u64> {
 }
 
 impl DriverCli {
-    fn into_runtime(self, repo_root: &Path, xlsynth_version: &str) -> Result<DriverRuntimeSpec> {
+    pub(crate) fn into_runtime(
+        self,
+        repo_root: &Path,
+        xlsynth_version: &str,
+    ) -> Result<DriverRuntimeSpec> {
         let resolved_driver_version =
             resolve_driver_version(repo_root, self.driver_version.as_deref(), xlsynth_version)?;
         let docker_image = self
@@ -190,7 +195,7 @@ impl DriverCli {
 }
 
 impl YosysCli {
-    fn into_runtime(self) -> YosysRuntimeSpec {
+    pub(crate) fn into_runtime(self) -> YosysRuntimeSpec {
         YosysRuntimeSpec {
             docker_image: self.yosys_docker_image,
             dockerfile: self.yosys_dockerfile.to_string_lossy().to_string(),

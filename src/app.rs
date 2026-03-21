@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::DELAY_INFO_OUTPUT_FORMAT_TEXTPROTO_V1;
 use crate::cli::{Cli, RunAction, TopCommand};
+use crate::corpus::run_ir_dir_corpus;
 use crate::driver_ir_aig_equiv_enabled;
 use crate::executor::{
     build_k_bool_cone_corpus_suggested_actions_for_entries, build_opt_ir_aig_equiv_suggestions,
@@ -120,6 +121,48 @@ pub(crate) fn run() -> Result<()> {
         artifacts_via_sled,
         command,
     } = Cli::parse();
+    let repo_root = std::env::current_dir().context("getting current directory")?;
+    if let TopCommand::RunIrDirCorpus {
+        input_dir,
+        output_dir,
+        recipe_preset,
+        execution_mode,
+        top_fn_policy,
+        top_fn_name,
+        fraig,
+        version,
+        yosys_script,
+        priority,
+        driver,
+        yosys,
+    } = command
+    {
+        let summary = run_ir_dir_corpus(
+            &repo_root,
+            &input_dir,
+            &output_dir,
+            recipe_preset,
+            execution_mode,
+            top_fn_policy,
+            top_fn_name.as_deref(),
+            fraig,
+            &version,
+            &yosys_script,
+            priority,
+            driver,
+            yosys,
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary).expect("serializing run-ir-dir-corpus summary")
+        );
+        return Ok(());
+    }
+    let artifacts_via_sled = artifacts_via_sled.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--artifacts-via-sled is required for all commands except `run-ir-dir-corpus`"
+        )
+    })?;
     if let TopCommand::AnalyzeSledSpace { top, sample } = &command {
         let summary = analyze_sled_space(&artifacts_via_sled, *top, *sample)?;
         println!(
@@ -183,7 +226,6 @@ pub(crate) fn run() -> Result<()> {
         );
         return Ok(());
     }
-    let repo_root = std::env::current_dir().context("getting current directory")?;
     if let TopCommand::VerifyStaticSnapshot { snapshot_dir } = &command {
         let summary = verify_static_snapshot(snapshot_dir)?;
         println!(
@@ -573,6 +615,9 @@ pub(crate) fn run() -> Result<()> {
             let provenance = store.load_provenance(&action_id)?;
             let path = store.resolve_artifact_ref_path(&provenance.output_artifact);
             println!("{}", path.display());
+        }
+        TopCommand::RunIrDirCorpus { .. } => {
+            unreachable!("run-ir-dir-corpus handled before shared store initialization")
         }
     }
 
