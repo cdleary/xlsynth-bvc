@@ -34,8 +34,8 @@ pub enum TopCommand {
         fraig: bool,
         #[arg(long)]
         version: String,
-        #[arg(long, default_value = crate::DEFAULT_YOSYS_FLOW_SCRIPT)]
-        yosys_script: String,
+        #[arg(long)]
+        yosys_script: Option<String>,
         #[arg(long, default_value_t = crate::DEFAULT_QUEUE_PRIORITY)]
         priority: i32,
         #[command(flatten)]
@@ -290,6 +290,7 @@ impl ExplicitBool {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CorpusRecipePreset {
     G8rVsYabcAigDiff,
+    G8rVsYabcNoFraigAigDiff,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

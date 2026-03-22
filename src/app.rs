@@ -148,7 +148,7 @@ pub(crate) fn run() -> Result<()> {
             top_fn_name.as_deref(),
             fraig,
             &version,
-            &yosys_script,
+            yosys_script.as_deref(),
             priority,
             driver,
             yosys,

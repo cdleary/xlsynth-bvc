@@ -116,6 +116,21 @@ cargo run --bin xlsynth_bvc -- \
   --driver-version 0.34.0
 ```
 
+No-fraig ABC ablation on a directory of `.ir` files:
+
+```bash
+# Same corpus runner shape, but compare g8r against yosys/abc using flows/abc_ablate_no_fraig.ys
+cargo run --bin xlsynth_bvc -- \
+  run-ir-dir-corpus \
+  --input-dir /tmp/mcmc-ir \
+  --output-dir /tmp/mcmc-ir-g8r-vs-yabc-no-fraig \
+  --execution-mode enqueue \
+  --recipe-preset g8r-vs-yabc-no-fraig-aig-diff \
+  --top-fn-policy infer-single-package \
+  --version v0.39.0 \
+  --driver-version 0.34.0
+```
+
 The enqueue workflow is intentionally explicit:
 
 1. The first `run-ir-dir-corpus` invocation seeds `OUTPUT_DIR/.bvc/`, imports local IR roots,
@@ -179,11 +194,15 @@ cargo run --bin xlsynth_bvc -- \
 
 Current CLI notes:
 
-- `--recipe-preset g8r-vs-yabc-aig-diff` is the implemented preset.
+- Implemented presets:
+  `g8r-vs-yabc-aig-diff` and `g8r-vs-yabc-no-fraig-aig-diff`.
 - `--top-fn-policy` supports `infer-single-package`, `explicit`, and `from-filename`.
 - `infer-single-package` expects exactly one unambiguous top function in each IR file. For
   multi-function packages, use `explicit` or `from-filename`.
-- `--yosys-script` defaults to `flows/yosys_to_aig.ys`.
+- Each preset has a fixed canonical Yosys script. `--yosys-script` may be omitted, but if you pass
+  it explicitly it must match the selected preset:
+  `flows/yosys_to_aig.ys` for `g8r-vs-yabc-aig-diff`,
+  `flows/abc_ablate_no_fraig.ys` for `g8r-vs-yabc-no-fraig-aig-diff`.
 - `sample_id` is stable for a fixed corpus relpath and currently uses
   `<sanitized_basename>-<sha256(normalized_source_relpath)[0:12]>`; content identity remains
   separately visible as `source_sha256`.
