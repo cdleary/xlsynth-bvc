@@ -2118,6 +2118,12 @@ mod tests {
             .collect()
     }
 
+    fn read_summary_json(output_dir: &Path) -> serde_json::Value {
+        let summary_path = output_dir.join(IR_DIR_CORPUS_SUMMARY_FILENAME);
+        let summary_text = fs::read_to_string(&summary_path).expect("read summary");
+        serde_json::from_str(&summary_text).expect("parse summary")
+    }
+
     fn seed_done_sample(
         store: &ArtifactStore,
         sample: &CorpusSampleSpec,
@@ -2564,6 +2570,170 @@ mod tests {
         assert_eq!(
             refreshed_failed_sample.error.as_deref(),
             Some("synthetic run failure")
+        );
+
+        fs::remove_dir_all(root).expect("cleanup fixture");
+    }
+
+    #[test]
+    fn refresh_ir_dir_corpus_status_prefers_live_state_over_stale_run_failure_manifest() {
+        let fixture = make_status_fixture();
+        let done_at = Utc::now() - ChronoDuration::minutes(4);
+        seed_done_sample(
+            &fixture.store,
+            &fixture.samples[0],
+            &fixture.plans[0],
+            done_at,
+        );
+        stage_provenance_record(
+            &fixture.store,
+            fixture.plans[1].import_action.clone(),
+            ArtifactRef {
+                action_id: fixture.plans[1].import_ir_action_id.clone(),
+                artifact_type: ArtifactType::IrPackageFile,
+                relpath: IMPORTED_IR_RELPATH.to_string(),
+            },
+            done_at,
+            json!({
+                "source_sha256": fixture.samples[1].source_sha256,
+                "ir_top": fixture.samples[1].top_fn_name,
+            }),
+            vec![(
+                IMPORTED_IR_RELPATH.to_string(),
+                b"package pending\n".to_vec(),
+            )],
+        );
+        enqueue_action_with_priority(&fixture.store, fixture.plans[1].g8r_aig_action.clone(), 0)
+            .expect("enqueue pending sample action");
+        let output_dir = fixture.output_dir.clone();
+        let root = fixture.root.clone();
+        let done_sample_id = fixture.samples[0].sample_id.clone();
+        let pending_sample_id = fixture.samples[1].sample_id.clone();
+        let mut manifest = read_status_manifest(&output_dir);
+        manifest.execution_mode = execution_mode_label(CorpusExecutionMode::Run).to_string();
+        for sample_id in [&done_sample_id, &pending_sample_id] {
+            let sample = manifest
+                .samples
+                .iter_mut()
+                .find(|sample| sample.sample_id == *sample_id)
+                .expect("find stale failed sample in manifest");
+            sample.status = "failed".to_string();
+            sample.error = Some("stale run failure".to_string());
+            sample.g8r_aig_status = "missing".to_string();
+            sample.g8r_stats_status = "missing".to_string();
+            sample.combo_verilog_status = "missing".to_string();
+            sample.yosys_abc_aig_status = "missing".to_string();
+            sample.yosys_abc_stats_status = "missing".to_string();
+            sample.aig_stat_diff_status = "missing".to_string();
+        }
+        write_status_manifest(&output_dir, &manifest);
+        drop(fixture.store);
+
+        let report = refresh_ir_dir_corpus_status(&output_dir, 1800, 10).expect("refresh status");
+        assert_eq!(report.sample_counts.get("done"), Some(&1));
+        assert_eq!(report.sample_counts.get("pending"), Some(&1));
+        assert_eq!(report.sample_counts.get("failed"), Some(&0));
+        assert!(report.failed_sample_examples.is_empty());
+
+        let refreshed_manifest = read_status_manifest(&output_dir);
+        let refreshed_done_sample = refreshed_manifest
+            .samples
+            .iter()
+            .find(|sample| sample.sample_id == done_sample_id)
+            .expect("find done sample in refreshed manifest");
+        assert_eq!(refreshed_done_sample.status, "done");
+        assert_eq!(refreshed_done_sample.error, None);
+        let refreshed_pending_sample = refreshed_manifest
+            .samples
+            .iter()
+            .find(|sample| sample.sample_id == pending_sample_id)
+            .expect("find pending sample in refreshed manifest");
+        assert_eq!(refreshed_pending_sample.status, "pending");
+        assert_eq!(refreshed_pending_sample.error, None);
+
+        let refreshed_samples = read_samples_jsonl(&output_dir);
+        let refreshed_done_sample = refreshed_samples
+            .iter()
+            .find(|sample| sample.sample_id == done_sample_id)
+            .expect("find done sample in refreshed samples jsonl");
+        assert_eq!(refreshed_done_sample.status, "done");
+        assert_eq!(refreshed_done_sample.error, None);
+        let refreshed_pending_sample = refreshed_samples
+            .iter()
+            .find(|sample| sample.sample_id == pending_sample_id)
+            .expect("find pending sample in refreshed samples jsonl");
+        assert_eq!(refreshed_pending_sample.status, "pending");
+        assert_eq!(refreshed_pending_sample.error, None);
+
+        fs::remove_dir_all(root).expect("cleanup fixture");
+    }
+
+    #[test]
+    fn refresh_ir_dir_corpus_status_rewrites_workspace_paths_under_output_dir() {
+        let fixture = make_status_fixture();
+        let output_dir = fixture.output_dir.clone();
+        let root = fixture.root.clone();
+        let workspace_dir = output_dir.join(IR_DIR_CORPUS_INTERNAL_DIR);
+        let workspace_store_dir = workspace_dir.join(IR_DIR_CORPUS_INTERNAL_STORE_DIR);
+        let workspace_artifacts_via_sled = workspace_dir.join(IR_DIR_CORPUS_INTERNAL_SLED_FILENAME);
+        let mut manifest = read_status_manifest(&output_dir);
+        manifest.workspace_dir = Path::new("out")
+            .join(IR_DIR_CORPUS_INTERNAL_DIR)
+            .display()
+            .to_string();
+        manifest.workspace_store_dir = Path::new("out")
+            .join(IR_DIR_CORPUS_INTERNAL_DIR)
+            .join(IR_DIR_CORPUS_INTERNAL_STORE_DIR)
+            .display()
+            .to_string();
+        manifest.workspace_artifacts_via_sled = Path::new("out")
+            .join(IR_DIR_CORPUS_INTERNAL_DIR)
+            .join(IR_DIR_CORPUS_INTERNAL_SLED_FILENAME)
+            .display()
+            .to_string();
+        write_status_manifest(&output_dir, &manifest);
+        drop(fixture.store);
+
+        let report = refresh_ir_dir_corpus_status(&output_dir, 1800, 10).expect("refresh status");
+        assert_eq!(
+            report.workspace_store_dir,
+            workspace_store_dir.display().to_string()
+        );
+        assert_eq!(
+            report.workspace_artifacts_via_sled,
+            workspace_artifacts_via_sled.display().to_string()
+        );
+
+        let refreshed_manifest = read_status_manifest(&output_dir);
+        assert_eq!(
+            refreshed_manifest.workspace_dir,
+            workspace_dir.display().to_string()
+        );
+        assert_eq!(
+            refreshed_manifest.workspace_store_dir,
+            workspace_store_dir.display().to_string()
+        );
+        assert_eq!(
+            refreshed_manifest.workspace_artifacts_via_sled,
+            workspace_artifacts_via_sled.display().to_string()
+        );
+
+        let refreshed_summary = read_summary_json(&output_dir);
+        assert_eq!(
+            refreshed_summary.get("output_dir").and_then(|v| v.as_str()),
+            Some(output_dir.display().to_string().as_str())
+        );
+        assert_eq!(
+            refreshed_summary
+                .get("workspace_store_dir")
+                .and_then(|v| v.as_str()),
+            Some(workspace_store_dir.display().to_string().as_str())
+        );
+        assert_eq!(
+            refreshed_summary
+                .get("workspace_artifacts_via_sled")
+                .and_then(|v| v.as_str()),
+            Some(workspace_artifacts_via_sled.display().to_string().as_str())
         );
 
         fs::remove_dir_all(root).expect("cleanup fixture");
