@@ -727,6 +727,56 @@ fn materialized_action_dir_path(store_root: &Path, action_id: &str) -> PathBuf {
     shard_dir(&store_root.join(".materialized-actions"), action_id).join(action_id)
 }
 
+fn failed_action_record_path(store_root: &Path, action_id: &str) -> PathBuf {
+    shard_dir(&store_root.join("failed-action-records"), action_id)
+        .join(action_id)
+        .join("failed.json")
+}
+
+fn legacy_queue_failed_action_record_path(store_root: &Path, action_id: &str) -> PathBuf {
+    queue_json_path(store_root, "failed", action_id)
+}
+
+fn load_failed_action_record_from_path(path: &Path) -> Result<Option<QueueFailed>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading failed action record path: {}", path.display()))?;
+    let record: QueueFailed = serde_json::from_str(&text)
+        .with_context(|| format!("parsing failed action record path: {}", path.display()))?;
+    Ok(Some(record))
+}
+
+fn load_failed_action_record_from_disk(
+    store_root: &Path,
+    action_id: &str,
+) -> Result<Option<QueueFailed>> {
+    for path in [
+        failed_action_record_path(store_root, action_id),
+        legacy_queue_failed_action_record_path(store_root, action_id),
+    ] {
+        if let Some(record) = load_failed_action_record_from_path(&path)? {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
+}
+
+fn write_failed_action_record_to_disk(store_root: &Path, failed: &QueueFailed) -> Result<()> {
+    let path = failed_action_record_path(store_root, &failed.action_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("creating failed action record parent: {}", parent.display())
+        })?;
+    }
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(failed).context("serializing failed action record mirror")?,
+    )
+    .with_context(|| format!("writing failed action record mirror: {}", path.display()))
+}
+
 fn remove_file_if_exists(path: &Path, dry_run: bool) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
@@ -1491,7 +1541,12 @@ impl ArtifactBackend for SledArtifactBackend {
             .join("provenance.json")
     }
 
-    fn failed_action_record_exists(&self, _store_root: &Path, action_id: &str) -> bool {
+    fn failed_action_record_exists(&self, store_root: &Path, action_id: &str) -> bool {
+        if failed_action_record_path(store_root, action_id).exists()
+            || legacy_queue_failed_action_record_path(store_root, action_id).exists()
+        {
+            return true;
+        }
         let db = match self.open_db() {
             Ok(db) => db,
             Err(_) => return false,
@@ -1505,9 +1560,12 @@ impl ArtifactBackend for SledArtifactBackend {
 
     fn load_failed_action_record(
         &self,
-        _store_root: &Path,
+        store_root: &Path,
         action_id: &str,
     ) -> Result<Option<QueueFailed>> {
+        if let Some(record) = load_failed_action_record_from_disk(store_root, action_id)? {
+            return Ok(Some(record));
+        }
         let db = self.open_db()?;
         let tree = db
             .open_tree(Self::TREE_FAILED_BY_ACTION)
@@ -1523,7 +1581,7 @@ impl ArtifactBackend for SledArtifactBackend {
         Ok(None)
     }
 
-    fn write_failed_action_record(&self, _store_root: &Path, failed: &QueueFailed) -> Result<()> {
+    fn write_failed_action_record(&self, store_root: &Path, failed: &QueueFailed) -> Result<()> {
         let db = self.open_db()?;
         let tree = db
             .open_tree(Self::TREE_FAILED_BY_ACTION)
@@ -1534,10 +1592,11 @@ impl ArtifactBackend for SledArtifactBackend {
             .context("writing failed action record row to sled")?;
         db.flush()
             .context("flushing sled artifact database after failed record write")?;
+        write_failed_action_record_to_disk(store_root, failed)?;
         Ok(())
     }
 
-    fn delete_failed_action_record(&self, _store_root: &Path, action_id: &str) -> Result<bool> {
+    fn delete_failed_action_record(&self, store_root: &Path, action_id: &str) -> Result<bool> {
         let db = self.open_db()?;
         let tree = db
             .open_tree(Self::TREE_FAILED_BY_ACTION)
@@ -1549,6 +1608,14 @@ impl ArtifactBackend for SledArtifactBackend {
             .is_some()
         {
             deleted = true;
+        }
+        for path in [
+            failed_action_record_path(store_root, action_id),
+            legacy_queue_failed_action_record_path(store_root, action_id),
+        ] {
+            if remove_file_if_exists(&path, false)? {
+                deleted = true;
+            }
         }
         if deleted {
             db.flush()

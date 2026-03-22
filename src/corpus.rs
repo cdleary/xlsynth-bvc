@@ -14,8 +14,8 @@ use crate::model::{
     ActionSpec, ArtifactRef, ArtifactType, DriverRuntimeSpec, Provenance, YosysRuntimeSpec,
 };
 use crate::queue::{
-    enqueue_action_with_priority, load_queue_canceled_record, load_queue_failed_record,
-    queue_state_for_action, suggested_action_queue_priority,
+    enqueue_action_with_priority, load_queue_canceled_record, load_queue_done_record,
+    load_queue_failed_record, queue_state_for_action, suggested_action_queue_priority,
 };
 use crate::runtime::resolve_driver_runtime_for_aig_stats;
 use crate::service::{
@@ -241,6 +241,12 @@ struct CorpusActionPlan {
 struct ExecutionCounters {
     enqueued_actions: usize,
     executed_actions: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CorpusStatusQueryMode {
+    LiveStore,
+    QueueFilesOnly,
 }
 
 pub(crate) fn run_ir_dir_corpus(
@@ -489,17 +495,22 @@ fn build_ir_dir_corpus_status_report(
         workspace_store_dir.clone(),
         workspace_artifacts_via_sled.clone(),
     );
-    store.ensure_layout()?;
-    if let Err(err) = store.load_failed_action_records() {
-        let err_text = format!("{:#}", err);
-        if err_text.contains("could not acquire lock") {
-            bail!(
-                "corpus workspace sled db is locked by another process: {} (stop the active worker/service first, then retry)",
-                workspace_store_dir.display()
-            );
+    let status_query_mode = match store.load_failed_action_records() {
+        Ok(_) => CorpusStatusQueryMode::LiveStore,
+        Err(err) => {
+            if is_sled_lock_error(&err) {
+                if refresh_public_outputs {
+                    bail!(
+                        "corpus workspace sled db is locked by another process: {} (stop the active worker/service first, then retry)",
+                        workspace_store_dir.display()
+                    );
+                }
+                CorpusStatusQueryMode::QueueFilesOnly
+            } else {
+                return Err(err);
+            }
         }
-        return Err(err);
-    }
+    };
 
     let top_fn_policy = parse_top_fn_policy_label(&manifest.top_fn_policy)?;
     let yosys_script_ref = crate::model::ScriptRef {
@@ -523,40 +534,53 @@ fn build_ir_dir_corpus_status_report(
             &manifest.yosys_runtime,
             &yosys_script_ref,
         )?;
-        let mut sample_record = build_sample_record(
-            &store,
-            sample,
-            &plan,
-            &run_errors,
-            top_fn_policy,
-            manifest.fraig,
-            &manifest.dso_version,
-            &manifest.driver_runtime,
-            &manifest.stats_runtime,
-            &yosys_script_ref,
-        );
+        let mut sample_record = match status_query_mode {
+            CorpusStatusQueryMode::LiveStore => build_sample_record(
+                &store,
+                sample,
+                &plan,
+                &run_errors,
+                top_fn_policy,
+                manifest.fraig,
+                &manifest.dso_version,
+                &manifest.driver_runtime,
+                &manifest.stats_runtime,
+                &yosys_script_ref,
+            ),
+            CorpusStatusQueryMode::QueueFilesOnly => build_sample_record_from_queue_state(
+                &store,
+                sample,
+                persisted_sample,
+                &plan,
+                top_fn_policy,
+                manifest.fraig,
+                &manifest.dso_version,
+                &manifest.driver_runtime,
+                &manifest.stats_runtime,
+                &yosys_script_ref,
+            ),
+        };
         preserve_persisted_run_failure(
             &manifest.execution_mode,
             persisted_sample,
             &mut sample_record,
         );
-        sample_records.push(sample_record);
-        for action_id in corpus_plan_action_ids(&plan) {
+        for (action_id, status) in corpus_sample_action_statuses(&sample_record) {
             if !unique_action_ids.insert(action_id.to_string()) {
                 continue;
             }
-            let status = action_status_key(&store, action_id);
             *action_counts
                 .get_mut(status)
                 .expect("known corpus action status key") += 1;
             if status == "done" {
-                let created_utc = store
-                    .load_provenance(action_id)
-                    .with_context(|| format!("loading action provenance for {}", action_id))?
-                    .created_utc;
-                action_completion_times.push(created_utc);
+                if let Some(completed_utc) =
+                    action_completion_utc(&store, action_id, status_query_mode)?
+                {
+                    action_completion_times.push(completed_utc);
+                }
             }
         }
+        sample_records.push(sample_record);
     }
     action_counts.insert("planned_unique".to_string(), unique_action_ids.len());
 
@@ -569,7 +593,8 @@ fn build_ir_dir_corpus_status_report(
     ensure_sample_count_key(&mut sample_counts, "missing");
 
     let now = Utc::now();
-    let sample_completion_times = collect_sample_completion_times(&store, &sample_records)?;
+    let sample_completion_times =
+        collect_sample_completion_times(&store, &sample_records, status_query_mode)?;
     let sample_rate =
         completion_rate_per_hour(&sample_completion_times, now, throughput_window_seconds);
     let action_rate =
@@ -684,7 +709,7 @@ fn build_ir_dir_corpus_status_report(
         eta_scope: "running_plus_pending_samples".to_string(),
         eta_seconds,
         eta_human: eta_seconds.map(format_eta_seconds),
-        ready_output_counts: ready_output_counts(&store, &sample_records),
+        ready_output_counts: ready_output_counts(&sample_records),
         public_outputs_present,
         exported_sample_dirs_on_disk: exported_sample_dirs_on_disk(output_dir)?,
         failed_sample_examples: failed_sample_examples_for(&sample_records, failed_sample_examples),
@@ -747,32 +772,6 @@ fn parse_top_fn_policy_label(label: &str) -> Result<CorpusTopFnPolicy> {
     }
 }
 
-fn corpus_plan_action_ids(plan: &CorpusActionPlan) -> [&str; 7] {
-    [
-        &plan.import_ir_action_id,
-        &plan.g8r_aig_action_id,
-        &plan.g8r_stats_action_id,
-        &plan.combo_verilog_action_id,
-        &plan.yosys_abc_aig_action_id,
-        &plan.yosys_abc_stats_action_id,
-        &plan.aig_stat_diff_action_id,
-    ]
-}
-
-fn action_status_key(store: &ArtifactStore, action_id: &str) -> &'static str {
-    if store.action_exists(action_id) {
-        return "done";
-    }
-    match queue_state_for_action(store, action_id) {
-        crate::queue::QueueState::Pending => "pending",
-        crate::queue::QueueState::Running { .. } => "running",
-        crate::queue::QueueState::Done => "done_missing_artifact",
-        crate::queue::QueueState::Failed => "failed",
-        crate::queue::QueueState::Canceled => "canceled",
-        crate::queue::QueueState::None => "missing",
-    }
-}
-
 fn empty_action_counts() -> BTreeMap<String, usize> {
     [
         "planned_unique",
@@ -799,25 +798,44 @@ fn joined_output_path(output_dir: &Path, recipe_preset: &str, extension: &str) -
         .join(format!("{}.{}", recipe_preset, extension))
 }
 
+fn is_sled_lock_error(err: &anyhow::Error) -> bool {
+    format!("{:#}", err).contains("could not acquire lock")
+}
+
+fn action_completion_utc(
+    store: &ArtifactStore,
+    action_id: &str,
+    status_query_mode: CorpusStatusQueryMode,
+) -> Result<Option<DateTime<Utc>>> {
+    if let Some(done) = load_queue_done_record(store, action_id)? {
+        return Ok(Some(done.completed_utc));
+    }
+    if status_query_mode == CorpusStatusQueryMode::QueueFilesOnly {
+        return Ok(None);
+    }
+    Ok(Some(
+        store
+            .load_provenance(action_id)
+            .with_context(|| format!("loading action provenance for {}", action_id))?
+            .created_utc,
+    ))
+}
+
 fn collect_sample_completion_times(
     store: &ArtifactStore,
     sample_records: &[IrDirCorpusSampleRecord],
+    status_query_mode: CorpusStatusQueryMode,
 ) -> Result<Vec<DateTime<Utc>>> {
     let mut out = Vec::new();
     for sample in sample_records {
         if sample.status != "done" {
             continue;
         }
-        let created_utc = store
-            .load_provenance(&sample.aig_stat_diff_action_id)
-            .with_context(|| {
-                format!(
-                    "loading aig-stat-diff provenance for completed sample {}",
-                    sample.sample_id
-                )
-            })?
-            .created_utc;
-        out.push(created_utc);
+        if let Some(completed_utc) =
+            action_completion_utc(store, &sample.aig_stat_diff_action_id, status_query_mode)?
+        {
+            out.push(completed_utc);
+        }
     }
     Ok(out)
 }
@@ -908,10 +926,7 @@ fn format_eta_seconds(total_seconds: i64) -> String {
     parts.join("")
 }
 
-fn ready_output_counts(
-    store: &ArtifactStore,
-    sample_records: &[IrDirCorpusSampleRecord],
-) -> BTreeMap<String, usize> {
+fn ready_output_counts(sample_records: &[IrDirCorpusSampleRecord]) -> BTreeMap<String, usize> {
     let mut counts: BTreeMap<String, usize> = [
         "input_ir",
         "g8r_aig",
@@ -927,71 +942,26 @@ fn ready_output_counts(
 
     for sample in sample_records {
         let checks = [
-            (
-                "input_ir",
-                ArtifactRef {
-                    action_id: sample.import_ir_action_id.clone(),
-                    artifact_type: ArtifactType::IrPackageFile,
-                    relpath: IMPORTED_IR_RELPATH.to_string(),
-                },
-            ),
-            (
-                "g8r_aig",
-                ArtifactRef {
-                    action_id: sample.g8r_aig_action_id.clone(),
-                    artifact_type: ArtifactType::AigFile,
-                    relpath: G8R_AIG_RELPATH.to_string(),
-                },
-            ),
-            (
-                "g8r_stats",
-                ArtifactRef {
-                    action_id: sample.g8r_stats_action_id.clone(),
-                    artifact_type: ArtifactType::AigStatsFile,
-                    relpath: G8R_STATS_RELPATH.to_string(),
-                },
-            ),
-            (
-                "combo_verilog",
-                ArtifactRef {
-                    action_id: sample.combo_verilog_action_id.clone(),
-                    artifact_type: ArtifactType::VerilogFile,
-                    relpath: COMBO_VERILOG_RELPATH.to_string(),
-                },
-            ),
-            (
-                "yosys_abc_aig",
-                ArtifactRef {
-                    action_id: sample.yosys_abc_aig_action_id.clone(),
-                    artifact_type: ArtifactType::AigFile,
-                    relpath: YOSYS_ABC_AIG_RELPATH.to_string(),
-                },
-            ),
-            (
-                "yosys_abc_stats",
-                ArtifactRef {
-                    action_id: sample.yosys_abc_stats_action_id.clone(),
-                    artifact_type: ArtifactType::AigStatsFile,
-                    relpath: YOSYS_ABC_STATS_RELPATH.to_string(),
-                },
-            ),
-            (
-                "aig_stat_diff",
-                ArtifactRef {
-                    action_id: sample.aig_stat_diff_action_id.clone(),
-                    artifact_type: ArtifactType::AigStatDiffFile,
-                    relpath: AIG_STAT_DIFF_RELPATH.to_string(),
-                },
-            ),
+            ("input_ir", sample.import_ir_status.as_str()),
+            ("g8r_aig", sample.g8r_aig_status.as_str()),
+            ("g8r_stats", sample.g8r_stats_status.as_str()),
+            ("combo_verilog", sample.combo_verilog_status.as_str()),
+            ("yosys_abc_aig", sample.yosys_abc_aig_status.as_str()),
+            ("yosys_abc_stats", sample.yosys_abc_stats_status.as_str()),
+            ("aig_stat_diff", sample.aig_stat_diff_status.as_str()),
         ];
-        for (key, artifact_ref) in checks {
-            if store.resolve_artifact_ref_path(&artifact_ref).exists() {
+        for (key, status) in checks {
+            if status_has_ready_output(status) {
                 *counts.get_mut(key).expect("known ready output key") += 1;
             }
         }
     }
 
     counts
+}
+
+fn status_has_ready_output(status: &str) -> bool {
+    matches!(status, "done" | "done_missing_artifact")
 }
 
 fn public_outputs_present(
@@ -1397,6 +1367,134 @@ fn build_sample_record(
                 .map(|s| summarize_error(s))
         });
 
+    build_sample_record_with_statuses(
+        sample,
+        plan,
+        top_fn_policy,
+        fraig,
+        dso_version,
+        driver_runtime,
+        stats_runtime,
+        yosys_script_ref,
+        import_ir_status,
+        g8r_aig_status,
+        g8r_stats_status,
+        combo_verilog_status,
+        yosys_abc_aig_status,
+        yosys_abc_stats_status,
+        aig_stat_diff_status,
+        terminal_error,
+    )
+}
+
+fn build_sample_record_from_queue_state(
+    store: &ArtifactStore,
+    sample: &CorpusSampleSpec,
+    persisted_sample: &IrDirCorpusSampleRecord,
+    plan: &CorpusActionPlan,
+    top_fn_policy: CorpusTopFnPolicy,
+    fraig: bool,
+    dso_version: &str,
+    driver_runtime: &DriverRuntimeSpec,
+    stats_runtime: &DriverRuntimeSpec,
+    yosys_script_ref: &crate::model::ScriptRef,
+) -> IrDirCorpusSampleRecord {
+    let import_ir_status = queue_or_persisted_action_status_label(
+        store,
+        &plan.import_ir_action_id,
+        &persisted_sample.import_ir_status,
+    );
+    let g8r_aig_status = queue_or_persisted_action_status_label(
+        store,
+        &plan.g8r_aig_action_id,
+        &persisted_sample.g8r_aig_status,
+    );
+    let g8r_stats_status = queue_or_persisted_action_status_label(
+        store,
+        &plan.g8r_stats_action_id,
+        &persisted_sample.g8r_stats_status,
+    );
+    let combo_verilog_status = queue_or_persisted_action_status_label(
+        store,
+        &plan.combo_verilog_action_id,
+        &persisted_sample.combo_verilog_status,
+    );
+    let yosys_abc_aig_status = queue_or_persisted_action_status_label(
+        store,
+        &plan.yosys_abc_aig_action_id,
+        &persisted_sample.yosys_abc_aig_status,
+    );
+    let yosys_abc_stats_status = queue_or_persisted_action_status_label(
+        store,
+        &plan.yosys_abc_stats_action_id,
+        &persisted_sample.yosys_abc_stats_status,
+    );
+    let aig_stat_diff_status = queue_or_persisted_action_status_label(
+        store,
+        &plan.aig_stat_diff_action_id,
+        &persisted_sample.aig_stat_diff_status,
+    );
+
+    let statuses = [
+        aig_stat_diff_status.as_str(),
+        yosys_abc_stats_status.as_str(),
+        yosys_abc_aig_status.as_str(),
+        g8r_stats_status.as_str(),
+        g8r_aig_status.as_str(),
+        combo_verilog_status.as_str(),
+    ];
+    let terminal_error = action_error_summary(store, &plan.aig_stat_diff_action_id)
+        .or_else(|| action_error_summary(store, &plan.yosys_abc_stats_action_id))
+        .or_else(|| action_error_summary(store, &plan.yosys_abc_aig_action_id))
+        .or_else(|| action_error_summary(store, &plan.combo_verilog_action_id))
+        .or_else(|| action_error_summary(store, &plan.g8r_stats_action_id))
+        .or_else(|| action_error_summary(store, &plan.g8r_aig_action_id))
+        .or_else(|| {
+            if summarize_sample_status(&statuses, false) == "failed" {
+                persisted_sample.error.clone()
+            } else {
+                None
+            }
+        });
+
+    build_sample_record_with_statuses(
+        sample,
+        plan,
+        top_fn_policy,
+        fraig,
+        dso_version,
+        driver_runtime,
+        stats_runtime,
+        yosys_script_ref,
+        import_ir_status,
+        g8r_aig_status,
+        g8r_stats_status,
+        combo_verilog_status,
+        yosys_abc_aig_status,
+        yosys_abc_stats_status,
+        aig_stat_diff_status,
+        terminal_error,
+    )
+}
+
+fn build_sample_record_with_statuses(
+    sample: &CorpusSampleSpec,
+    plan: &CorpusActionPlan,
+    top_fn_policy: CorpusTopFnPolicy,
+    fraig: bool,
+    dso_version: &str,
+    driver_runtime: &DriverRuntimeSpec,
+    stats_runtime: &DriverRuntimeSpec,
+    yosys_script_ref: &crate::model::ScriptRef,
+    import_ir_status: String,
+    g8r_aig_status: String,
+    g8r_stats_status: String,
+    combo_verilog_status: String,
+    yosys_abc_aig_status: String,
+    yosys_abc_stats_status: String,
+    aig_stat_diff_status: String,
+    terminal_error: Option<String>,
+) -> IrDirCorpusSampleRecord {
     let statuses = [
         aig_stat_diff_status.as_str(),
         yosys_abc_stats_status.as_str(),
@@ -1438,6 +1536,45 @@ fn build_sample_record(
         status: overall_status,
         error: terminal_error,
     }
+}
+
+fn queue_or_persisted_action_status_label(
+    store: &ArtifactStore,
+    action_id: &str,
+    persisted_status: &str,
+) -> String {
+    match queue_state_for_action(store, action_id) {
+        crate::queue::QueueState::Pending => "pending".to_string(),
+        crate::queue::QueueState::Running { .. } => "running".to_string(),
+        crate::queue::QueueState::Done => "done".to_string(),
+        crate::queue::QueueState::Failed => "failed".to_string(),
+        crate::queue::QueueState::Canceled => "canceled".to_string(),
+        crate::queue::QueueState::None => persisted_status.to_string(),
+    }
+}
+
+fn corpus_sample_action_statuses(sample: &IrDirCorpusSampleRecord) -> [(&str, &str); 7] {
+    [
+        (&sample.import_ir_action_id, &sample.import_ir_status),
+        (&sample.g8r_aig_action_id, &sample.g8r_aig_status),
+        (&sample.g8r_stats_action_id, &sample.g8r_stats_status),
+        (
+            &sample.combo_verilog_action_id,
+            &sample.combo_verilog_status,
+        ),
+        (
+            &sample.yosys_abc_aig_action_id,
+            &sample.yosys_abc_aig_status,
+        ),
+        (
+            &sample.yosys_abc_stats_action_id,
+            &sample.yosys_abc_stats_status,
+        ),
+        (
+            &sample.aig_stat_diff_action_id,
+            &sample.aig_stat_diff_status,
+        ),
+    ]
 }
 
 fn action_status_label(store: &ArtifactStore, action_id: &str) -> String {
@@ -2452,6 +2589,107 @@ mod tests {
             Some(&false)
         );
 
+        fs::remove_dir_all(root).expect("cleanup fixture");
+    }
+
+    #[test]
+    fn show_ir_dir_corpus_progress_does_not_materialize_ready_outputs() {
+        let fixture = make_status_fixture();
+        let done_at = Utc::now() - ChronoDuration::minutes(5);
+        seed_done_sample(
+            &fixture.store,
+            &fixture.samples[0],
+            &fixture.plans[0],
+            done_at,
+        );
+        let output_dir = fixture.output_dir.clone();
+        let root = fixture.root.clone();
+        let materialized_actions_root = fixture.store.artifacts_dir();
+        let materialized_before = WalkDir::new(&materialized_actions_root)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.depth() > 0)
+            .count();
+        assert_eq!(materialized_before, 0);
+        drop(fixture.store);
+
+        let report = show_ir_dir_corpus_progress(&output_dir, 1800, 10).expect("show progress");
+        assert_eq!(report.ready_output_counts.get("input_ir"), Some(&1));
+        assert_eq!(report.ready_output_counts.get("g8r_aig"), Some(&1));
+        assert_eq!(report.ready_output_counts.get("aig_stat_diff"), Some(&1));
+
+        let materialized_after = WalkDir::new(&materialized_actions_root)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.depth() > 0)
+            .count();
+        assert_eq!(materialized_after, 0);
+
+        fs::remove_dir_all(root).expect("cleanup fixture");
+    }
+
+    #[test]
+    fn show_ir_dir_corpus_progress_succeeds_while_sled_db_is_locked() {
+        let fixture = make_status_fixture();
+        let done_at = Utc::now() - ChronoDuration::minutes(5);
+        stage_provenance_record(
+            &fixture.store,
+            fixture.plans[1].import_action.clone(),
+            ArtifactRef {
+                action_id: fixture.plans[1].import_ir_action_id.clone(),
+                artifact_type: ArtifactType::IrPackageFile,
+                relpath: IMPORTED_IR_RELPATH.to_string(),
+            },
+            done_at,
+            json!({
+                "source_sha256": fixture.samples[1].source_sha256,
+                "ir_top": fixture.samples[1].top_fn_name,
+            }),
+            vec![(
+                IMPORTED_IR_RELPATH.to_string(),
+                b"package pending\n".to_vec(),
+            )],
+        );
+        enqueue_action_with_priority(&fixture.store, fixture.plans[1].g8r_aig_action.clone(), 0)
+            .expect("enqueue pending sample action");
+        fixture
+            .store
+            .write_failed_action_record(&crate::model::QueueFailed {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: fixture.plans[2].g8r_aig_action_id.clone(),
+                enqueued_utc: done_at,
+                failed_utc: done_at,
+                failed_by: "test".to_string(),
+                action: fixture.plans[2].g8r_aig_action.clone(),
+                error: "synthetic failure while locked".to_string(),
+            })
+            .expect("write failed action record");
+        let output_dir = fixture.output_dir.clone();
+        let root = fixture.root.clone();
+        let failed_sample_id = fixture.samples[2].sample_id.clone();
+        let lock_err = sled::Config::new()
+            .path(
+                output_dir
+                    .join(IR_DIR_CORPUS_INTERNAL_DIR)
+                    .join(IR_DIR_CORPUS_INTERNAL_SLED_FILENAME),
+            )
+            .open()
+            .expect_err("second sled open should hit the exclusive lock");
+        assert!(lock_err.to_string().contains("could not acquire lock"));
+
+        let report =
+            show_ir_dir_corpus_progress(&output_dir, 1800, 10).expect("show progress while locked");
+        assert_eq!(report.sample_counts.get("pending"), Some(&2));
+        assert_eq!(report.sample_counts.get("failed"), Some(&1));
+        assert_eq!(report.sample_counts.get("missing"), Some(&0));
+        assert_eq!(report.failed_sample_examples.len(), 1);
+        assert_eq!(report.failed_sample_examples[0].sample_id, failed_sample_id);
+        assert_eq!(
+            report.failed_sample_examples[0].error,
+            "synthetic failure while locked"
+        );
+
+        drop(fixture.store);
         fs::remove_dir_all(root).expect("cleanup fixture");
     }
 
