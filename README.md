@@ -121,10 +121,11 @@ The enqueue workflow is intentionally explicit:
 1. The first `run-ir-dir-corpus` invocation seeds `OUTPUT_DIR/.bvc/`, imports local IR roots,
    expands the fixed recipe, enqueues missing downstream actions, and writes initial
    `manifest.json` / `samples.jsonl` / `joined/*` exports with current statuses.
-2. `drain-queue` runs against `OUTPUT_DIR/.bvc/` using the normal worker command.
-3. Rerun the same `run-ir-dir-corpus` command with the same input/output/config tuple to refresh
-   the public exports from the now-completed action graph. There is no separate `--refresh-only`
-   flag yet; rerunning the command is the refresh mechanism.
+2. `drain-queue` or `run-workers` runs against `OUTPUT_DIR/.bvc/` using the normal queue worker
+   commands.
+3. `refresh-corpus-status --output-dir OUTPUT_DIR` rewrites the public exports from the current
+   workspace state. Rerunning the same `run-ir-dir-corpus` command still works as a full
+   refresh/reconcile path when you want to re-read inputs and re-enqueue anything missing.
 
 Drain the internal queue with the normal worker command:
 
@@ -133,6 +134,31 @@ cargo run --bin xlsynth_bvc -- \
   --store-dir /tmp/mcmc-ir-g8r-vs-yabc/.bvc/bvc-artifacts \
   --artifacts-via-sled /tmp/mcmc-ir-g8r-vs-yabc/.bvc/artifacts.sled \
   drain-queue --worker-id corpus-a --lease-seconds 1800
+```
+
+Or drain it with multiple local workers without `serve-web`:
+
+```bash
+cargo run --bin xlsynth_bvc -- \
+  --store-dir /tmp/mcmc-ir-g8r-vs-yabc/.bvc/bvc-artifacts \
+  --artifacts-via-sled /tmp/mcmc-ir-g8r-vs-yabc/.bvc/artifacts.sled \
+  run-workers --workers 8
+```
+
+Inspect live corpus progress from the workspace state:
+
+```bash
+cargo run --bin xlsynth_bvc -- \
+  show-corpus-progress \
+  --output-dir /tmp/mcmc-ir-g8r-vs-yabc
+```
+
+Refresh the public report/export files without rerunning the full corpus command:
+
+```bash
+cargo run --bin xlsynth_bvc -- \
+  refresh-corpus-status \
+  --output-dir /tmp/mcmc-ir-g8r-vs-yabc
 ```
 
 Inline run mode:

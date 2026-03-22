@@ -12,13 +12,14 @@ use std::time::{Duration, Instant};
 
 use crate::DELAY_INFO_OUTPUT_FORMAT_TEXTPROTO_V1;
 use crate::cli::{Cli, RunAction, TopCommand};
-use crate::corpus::run_ir_dir_corpus;
+use crate::corpus::{refresh_ir_dir_corpus_status, run_ir_dir_corpus, show_ir_dir_corpus_progress};
 use crate::driver_ir_aig_equiv_enabled;
 use crate::executor::{
     build_k_bool_cone_corpus_suggested_actions_for_entries, build_opt_ir_aig_equiv_suggestions,
     compute_action_id, execute_action, execute_action_batch, resolve_driver_ir_aig_equiv_supported,
 };
 use crate::model::*;
+use crate::ops::run_workers;
 use crate::query::{enqueue_processing_for_crate_version, rebuild_web_indices};
 use crate::queue::*;
 use crate::queue_only_previous_loss_k_cones_enabled;
@@ -158,9 +159,44 @@ pub(crate) fn run() -> Result<()> {
         );
         return Ok(());
     }
+    if let TopCommand::ShowCorpusProgress {
+        output_dir,
+        throughput_window_seconds,
+        failed_sample_examples,
+    } = &command
+    {
+        let report = show_ir_dir_corpus_progress(
+            output_dir,
+            *throughput_window_seconds,
+            *failed_sample_examples,
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("serializing show-corpus-progress report")
+        );
+        return Ok(());
+    }
+    if let TopCommand::RefreshCorpusStatus {
+        output_dir,
+        throughput_window_seconds,
+        failed_sample_examples,
+    } = &command
+    {
+        let report = refresh_ir_dir_corpus_status(
+            output_dir,
+            *throughput_window_seconds,
+            *failed_sample_examples,
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .expect("serializing refresh-corpus-status report")
+        );
+        return Ok(());
+    }
     let artifacts_via_sled = artifacts_via_sled.ok_or_else(|| {
         anyhow::anyhow!(
-            "--artifacts-via-sled is required for all commands except `run-ir-dir-corpus`"
+            "--artifacts-via-sled is required for all commands except `run-ir-dir-corpus`, `show-corpus-progress`, and `refresh-corpus-status`"
         )
     })?;
     if let TopCommand::AnalyzeSledSpace { top, sample } = &command {
@@ -308,6 +344,32 @@ pub(crate) fn run() -> Result<()> {
                 None,
             )?;
             println!("{}", drained);
+        }
+        TopCommand::RunWorkers {
+            workers,
+            worker_id,
+            lease_seconds,
+            poll_millis,
+            batch_size,
+            exit_when_idle,
+            no_reclaim_expired,
+        } => {
+            let worker_id = worker_id.unwrap_or_else(default_worker_id);
+            let summary = run_workers(
+                Arc::new(store),
+                repo_root.clone(),
+                workers,
+                &worker_id,
+                lease_seconds,
+                Duration::from_millis(poll_millis),
+                batch_size,
+                !no_reclaim_expired,
+                exit_when_idle,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary).expect("serializing run-workers summary")
+            );
         }
         TopCommand::ServeWeb {
             bind,
@@ -618,6 +680,12 @@ pub(crate) fn run() -> Result<()> {
         }
         TopCommand::RunIrDirCorpus { .. } => {
             unreachable!("run-ir-dir-corpus handled before shared store initialization")
+        }
+        TopCommand::ShowCorpusProgress { .. } => {
+            unreachable!("show-corpus-progress handled before shared store initialization")
+        }
+        TopCommand::RefreshCorpusStatus { .. } => {
+            unreachable!("refresh-corpus-status handled before shared store initialization")
         }
     }
 
