@@ -13,6 +13,7 @@ mod cli;
 mod corpus;
 mod executor;
 mod model;
+mod ops;
 mod query;
 mod queue;
 mod runtime;

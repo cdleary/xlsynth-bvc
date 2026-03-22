@@ -69,6 +69,38 @@ pub enum TopCommand {
         #[arg(long)]
         no_reclaim_expired: bool,
     },
+    RunWorkers {
+        #[arg(long, default_value_t = crate::runtime::default_web_runner_workers())]
+        workers: usize,
+        #[arg(long)]
+        worker_id: Option<String>,
+        #[arg(long, default_value_t = crate::DEFAULT_QUEUE_LEASE_SECONDS)]
+        lease_seconds: i64,
+        #[arg(long, default_value_t = crate::DEFAULT_WEB_RUNNER_POLL_MILLIS)]
+        poll_millis: u64,
+        #[arg(long, default_value_t = crate::DEFAULT_WEB_RUNNER_DRAIN_BATCH_SIZE)]
+        batch_size: usize,
+        #[arg(long)]
+        exit_when_idle: bool,
+        #[arg(long)]
+        no_reclaim_expired: bool,
+    },
+    ShowCorpusProgress {
+        #[arg(long, value_name = "DIR")]
+        output_dir: PathBuf,
+        #[arg(long, default_value_t = 1800)]
+        throughput_window_seconds: i64,
+        #[arg(long, default_value_t = 10)]
+        failed_sample_examples: usize,
+    },
+    RefreshCorpusStatus {
+        #[arg(long, value_name = "DIR")]
+        output_dir: PathBuf,
+        #[arg(long, default_value_t = 1800)]
+        throughput_window_seconds: i64,
+        #[arg(long, default_value_t = 10)]
+        failed_sample_examples: usize,
+    },
     ServeWeb {
         #[arg(long, default_value = crate::DEFAULT_WEB_BIND)]
         bind: String,
