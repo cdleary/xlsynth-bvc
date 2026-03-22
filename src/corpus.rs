@@ -2693,6 +2693,8 @@ mod tests {
         drop(fixture.store);
         fs::remove_dir_all(root).expect("cleanup fixture");
     }
+
+    #[test]
     fn show_ir_dir_corpus_progress_uses_output_dir_workspace_paths() {
         let fixture = make_status_fixture();
         let output_dir = fixture.output_dir.clone();
