@@ -2261,6 +2261,7 @@ mod tests {
         let summary_text = fs::read_to_string(&summary_path).expect("read summary");
         serde_json::from_str(&summary_text).expect("parse summary")
     }
+
     fn seed_done_sample(
         store: &ArtifactStore,
         sample: &CorpusSampleSpec,
@@ -2974,6 +2975,8 @@ mod tests {
 
         fs::remove_dir_all(root).expect("cleanup fixture");
     }
+
+    #[test]
     fn refresh_ir_dir_corpus_status_rewrites_public_outputs_from_live_state() {
         let fixture = make_status_fixture();
         let done_at = Utc::now() - ChronoDuration::minutes(3);
