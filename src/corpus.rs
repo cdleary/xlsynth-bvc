@@ -42,6 +42,12 @@ const AIG_STAT_DIFF_RELPATH: &str = "payload/aig_stat_diff.json";
 const IR_DIR_CORPUS_REFRESH_SEMANTICS: &str = "rerun_same_command_refreshes_exports";
 const IR_DIR_CORPUS_SAMPLE_ID_SCHEME: &str = "basename-plus-normalized-source-relpath-sha256-12-v1";
 
+#[derive(Debug, Clone, Copy)]
+struct CorpusRecipePresetSpec {
+    label: &'static str,
+    yosys_script: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunIrDirCorpusSummary {
     pub(crate) output_dir: String,
@@ -259,7 +265,7 @@ pub(crate) fn run_ir_dir_corpus(
     top_fn_name: Option<&str>,
     fraig: bool,
     version: &str,
-    yosys_script: &str,
+    yosys_script: Option<&str>,
     priority: i32,
     driver: DriverCli,
     yosys: YosysCli,
@@ -295,6 +301,8 @@ pub(crate) fn run_ir_dir_corpus(
     let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &driver_runtime)
         .unwrap_or_else(|_| driver_runtime.clone());
     let yosys_runtime = yosys.into_runtime();
+    let recipe_preset_name = recipe_preset_label(recipe_preset);
+    let yosys_script = resolve_recipe_preset_yosys_script(recipe_preset, yosys_script)?;
     let yosys_script_ref = make_script_ref(repo_root, yosys_script)?;
     let samples = discover_corpus_samples(input_dir, output_dir, top_fn_policy, top_fn_name)?;
     if samples.is_empty() {
@@ -335,6 +343,7 @@ pub(crate) fn run_ir_dir_corpus(
             sample,
             &plan,
             &run_errors,
+            recipe_preset_name,
             top_fn_policy,
             fraig,
             version,
@@ -355,7 +364,7 @@ pub(crate) fn run_ir_dir_corpus(
         workspace_dir: workspace_dir.display().to_string(),
         workspace_store_dir: workspace_store_dir.display().to_string(),
         workspace_artifacts_via_sled: workspace_artifacts_via_sled.display().to_string(),
-        recipe_preset: recipe_preset_label(recipe_preset).to_string(),
+        recipe_preset: recipe_preset_name.to_string(),
         execution_mode: execution_mode_label(execution_mode).to_string(),
         refresh_semantics: refresh_semantics_label().to_string(),
         sample_id_scheme: sample_id_scheme_label().to_string(),
@@ -377,7 +386,7 @@ pub(crate) fn run_ir_dir_corpus(
         output_dir: output_dir.display().to_string(),
         workspace_store_dir: workspace_store_dir.display().to_string(),
         workspace_artifacts_via_sled: workspace_artifacts_via_sled.display().to_string(),
-        recipe_preset: recipe_preset_label(recipe_preset).to_string(),
+        recipe_preset: recipe_preset_name.to_string(),
         execution_mode: execution_mode_label(execution_mode).to_string(),
         refresh_semantics: refresh_semantics_label().to_string(),
         sample_id_scheme: sample_id_scheme_label().to_string(),
@@ -397,9 +406,8 @@ pub(crate) fn run_ir_dir_corpus(
     let joined_dir = output_dir.join(IR_DIR_CORPUS_JOINED_DIR);
     fs::create_dir_all(&joined_dir)
         .with_context(|| format!("creating joined dir: {}", joined_dir.display()))?;
-    let joined_jsonl_path =
-        joined_dir.join(format!("{}.jsonl", recipe_preset_label(recipe_preset)));
-    let joined_csv_path = joined_dir.join(format!("{}.csv", recipe_preset_label(recipe_preset)));
+    let joined_jsonl_path = joined_dir.join(format!("{}.jsonl", recipe_preset_name));
+    let joined_csv_path = joined_dir.join(format!("{}.csv", recipe_preset_name));
 
     fs::write(
         &manifest_path,
@@ -426,7 +434,7 @@ pub(crate) fn run_ir_dir_corpus(
         summary_path: summary_path.display().to_string(),
         joined_jsonl_path: joined_jsonl_path.display().to_string(),
         joined_csv_path: joined_csv_path.display().to_string(),
-        recipe_preset: recipe_preset_label(recipe_preset).to_string(),
+        recipe_preset: recipe_preset_name.to_string(),
         execution_mode: execution_mode_label(execution_mode).to_string(),
         refresh_semantics: refresh_semantics_label().to_string(),
         sample_id_scheme: sample_id_scheme_label().to_string(),
@@ -540,6 +548,7 @@ fn build_ir_dir_corpus_status_report(
                 sample,
                 &plan,
                 &run_errors,
+                &manifest.recipe_preset,
                 top_fn_policy,
                 manifest.fraig,
                 &manifest.dso_version,
@@ -552,6 +561,7 @@ fn build_ir_dir_corpus_status_report(
                 sample,
                 persisted_sample,
                 &plan,
+                &manifest.recipe_preset,
                 top_fn_policy,
                 manifest.fraig,
                 &manifest.dso_version,
@@ -1340,6 +1350,7 @@ fn build_sample_record(
     sample: &CorpusSampleSpec,
     plan: &CorpusActionPlan,
     run_errors: &BTreeMap<String, String>,
+    recipe_preset: &str,
     top_fn_policy: CorpusTopFnPolicy,
     fraig: bool,
     dso_version: &str,
@@ -1370,6 +1381,7 @@ fn build_sample_record(
     build_sample_record_with_statuses(
         sample,
         plan,
+        recipe_preset,
         top_fn_policy,
         fraig,
         dso_version,
@@ -1392,6 +1404,7 @@ fn build_sample_record_from_queue_state(
     sample: &CorpusSampleSpec,
     persisted_sample: &IrDirCorpusSampleRecord,
     plan: &CorpusActionPlan,
+    recipe_preset: &str,
     top_fn_policy: CorpusTopFnPolicy,
     fraig: bool,
     dso_version: &str,
@@ -1460,6 +1473,7 @@ fn build_sample_record_from_queue_state(
     build_sample_record_with_statuses(
         sample,
         plan,
+        recipe_preset,
         top_fn_policy,
         fraig,
         dso_version,
@@ -1480,6 +1494,7 @@ fn build_sample_record_from_queue_state(
 fn build_sample_record_with_statuses(
     sample: &CorpusSampleSpec,
     plan: &CorpusActionPlan,
+    recipe_preset: &str,
     top_fn_policy: CorpusTopFnPolicy,
     fraig: bool,
     dso_version: &str,
@@ -1518,7 +1533,7 @@ fn build_sample_record_with_statuses(
         stats_driver_crate_version: stats_runtime.driver_version.clone(),
         yosys_script: yosys_script_ref.path.clone(),
         yosys_script_sha256: yosys_script_ref.sha256.clone(),
-        preset: recipe_preset_label(CorpusRecipePreset::G8rVsYabcAigDiff).to_string(),
+        preset: recipe_preset.to_string(),
         import_ir_action_id: plan.import_ir_action_id.clone(),
         import_ir_status,
         g8r_aig_action_id: plan.g8r_aig_action_id.clone(),
@@ -1946,9 +1961,46 @@ fn count_statuses(samples: &[IrDirCorpusSampleRecord]) -> BTreeMap<String, usize
 }
 
 fn recipe_preset_label(recipe_preset: CorpusRecipePreset) -> &'static str {
+    recipe_preset_spec(recipe_preset).label
+}
+
+fn recipe_preset_spec(recipe_preset: CorpusRecipePreset) -> CorpusRecipePresetSpec {
     match recipe_preset {
-        CorpusRecipePreset::G8rVsYabcAigDiff => "g8r-vs-yabc-aig-diff",
+        CorpusRecipePreset::G8rVsYabcAigDiff => CorpusRecipePresetSpec {
+            label: "g8r-vs-yabc-aig-diff",
+            yosys_script: "flows/yosys_to_aig.ys",
+        },
+        CorpusRecipePreset::G8rVsYabcNoFraigAigDiff => CorpusRecipePresetSpec {
+            label: "g8r-vs-yabc-no-fraig-aig-diff",
+            yosys_script: "flows/abc_ablate_no_fraig.ys",
+        },
     }
+}
+
+fn normalize_script_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim()
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_string()
+}
+
+fn resolve_recipe_preset_yosys_script(
+    recipe_preset: CorpusRecipePreset,
+    yosys_script: Option<&str>,
+) -> Result<&'static str> {
+    let spec = recipe_preset_spec(recipe_preset);
+    if let Some(requested) = yosys_script {
+        if normalize_script_path(requested) != normalize_script_path(spec.yosys_script) {
+            bail!(
+                "recipe preset `{}` requires --yosys-script={} but got {}",
+                spec.label,
+                spec.yosys_script,
+                requested
+            );
+        }
+    }
+    Ok(spec.yosys_script)
 }
 
 fn execution_mode_label(execution_mode: CorpusExecutionMode) -> &'static str {
@@ -2021,6 +2073,52 @@ mod tests {
             path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
             sha256: "a".repeat(64),
         }
+    }
+
+    fn sample_driver_cli() -> DriverCli {
+        DriverCli {
+            driver_version: Some("0.34.0".to_string()),
+            release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
+            dockerfile: PathBuf::from(crate::DEFAULT_DOCKERFILE),
+            docker_image: None,
+        }
+    }
+
+    fn sample_yosys_cli() -> YosysCli {
+        YosysCli {
+            yosys_dockerfile: PathBuf::from(crate::DEFAULT_YOSYS_DOCKERFILE),
+            yosys_docker_image: crate::DEFAULT_YOSYS_DOCKER_IMAGE.to_string(),
+        }
+    }
+
+    fn run_enqueue_corpus_for_recipe(
+        recipe_preset: CorpusRecipePreset,
+        yosys_script: Option<&str>,
+    ) -> (PathBuf, PathBuf, RunIrDirCorpusSummary) {
+        let root = make_temp_dir("run-ir-dir-corpus");
+        let input_dir = root.join("input");
+        let output_dir = root.join("out");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+        fs::write(input_dir.join("foo.ir"), "package foo\n").expect("write sample ir");
+
+        let summary = run_ir_dir_corpus(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &input_dir,
+            &output_dir,
+            recipe_preset,
+            CorpusExecutionMode::Enqueue,
+            CorpusTopFnPolicy::FromFilename,
+            None,
+            false,
+            "v0.39.0",
+            yosys_script,
+            crate::DEFAULT_QUEUE_PRIORITY,
+            sample_driver_cli(),
+            sample_yosys_cli(),
+        )
+        .expect("run ir dir corpus");
+
+        (root, output_dir, summary)
     }
 
     fn stage_provenance_record(
@@ -2505,6 +2603,82 @@ mod tests {
     }
 
     #[test]
+    fn run_ir_dir_corpus_no_fraig_preset_uses_canonical_script_and_metadata() {
+        let (root, output_dir, summary) =
+            run_enqueue_corpus_for_recipe(CorpusRecipePreset::G8rVsYabcNoFraigAigDiff, None);
+        let manifest = read_status_manifest(&output_dir);
+        let samples = read_samples_jsonl(&output_dir);
+        let summary_json = read_summary_json(&output_dir);
+        let preset = recipe_preset_label(CorpusRecipePreset::G8rVsYabcNoFraigAigDiff);
+        let expected_script_ref = make_script_ref(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            "flows/abc_ablate_no_fraig.ys",
+        )
+        .expect("make no-fraig script ref");
+        let expected_joined_jsonl = output_dir
+            .join(IR_DIR_CORPUS_JOINED_DIR)
+            .join(format!("{}.jsonl", preset));
+        let expected_joined_csv = output_dir
+            .join(IR_DIR_CORPUS_JOINED_DIR)
+            .join(format!("{}.csv", preset));
+
+        assert_eq!(summary.recipe_preset, preset);
+        assert_eq!(
+            summary.joined_jsonl_path,
+            expected_joined_jsonl.display().to_string()
+        );
+        assert_eq!(
+            summary.joined_csv_path,
+            expected_joined_csv.display().to_string()
+        );
+        assert_eq!(manifest.recipe_preset, preset);
+        assert_eq!(manifest.yosys_script, expected_script_ref.path);
+        assert_eq!(manifest.yosys_script_sha256, expected_script_ref.sha256);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].preset, preset);
+        assert_eq!(samples[0].yosys_script, "flows/abc_ablate_no_fraig.ys");
+        assert_eq!(samples[0].yosys_script_sha256, manifest.yosys_script_sha256);
+        assert_eq!(summary_json["recipe_preset"].as_str(), Some(preset));
+        assert!(expected_joined_jsonl.exists());
+        assert!(expected_joined_csv.exists());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn run_ir_dir_corpus_rejects_mismatched_yosys_script_for_no_fraig_preset() {
+        let root = make_temp_dir("run-ir-dir-corpus-mismatch");
+        let input_dir = root.join("input");
+        let output_dir = root.join("out");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+        fs::write(input_dir.join("foo.ir"), "package foo\n").expect("write sample ir");
+
+        let err = run_ir_dir_corpus(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &input_dir,
+            &output_dir,
+            CorpusRecipePreset::G8rVsYabcNoFraigAigDiff,
+            CorpusExecutionMode::Enqueue,
+            CorpusTopFnPolicy::FromFilename,
+            None,
+            false,
+            "v0.39.0",
+            Some("flows/yosys_to_aig.ys"),
+            crate::DEFAULT_QUEUE_PRIORITY,
+            sample_driver_cli(),
+            sample_yosys_cli(),
+        )
+        .expect_err("mismatched yosys script should fail");
+        let err_text = format!("{:#}", err);
+
+        assert!(err_text.contains("g8r-vs-yabc-no-fraig-aig-diff"));
+        assert!(err_text.contains("flows/abc_ablate_no_fraig.ys"));
+        assert!(err_text.contains("flows/yosys_to_aig.ys"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn show_ir_dir_corpus_progress_reports_live_counts_eta_and_failures() {
         let fixture = make_status_fixture();
         let done_at = Utc::now() - ChronoDuration::minutes(5);
@@ -2904,6 +3078,61 @@ mod tests {
         assert_eq!(refreshed_pending_sample.error, None);
 
         fs::remove_dir_all(root).expect("cleanup fixture");
+    }
+
+    #[test]
+    fn refresh_ir_dir_corpus_status_preserves_no_fraig_preset_metadata() {
+        let (root, output_dir, _) = run_enqueue_corpus_for_recipe(
+            CorpusRecipePreset::G8rVsYabcNoFraigAigDiff,
+            Some("./flows/abc_ablate_no_fraig.ys"),
+        );
+        let report = refresh_ir_dir_corpus_status(&output_dir, 1800, 10).expect("refresh status");
+        let manifest = read_status_manifest(&output_dir);
+        let samples = read_samples_jsonl(&output_dir);
+        let summary_json = read_summary_json(&output_dir);
+        let preset = recipe_preset_label(CorpusRecipePreset::G8rVsYabcNoFraigAigDiff);
+        let expected_script_ref = make_script_ref(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            "flows/abc_ablate_no_fraig.ys",
+        )
+        .expect("make no-fraig script ref");
+        let expected_joined_jsonl = output_dir
+            .join(IR_DIR_CORPUS_JOINED_DIR)
+            .join(format!("{}.jsonl", preset));
+        let expected_joined_csv = output_dir
+            .join(IR_DIR_CORPUS_JOINED_DIR)
+            .join(format!("{}.csv", preset));
+
+        assert_eq!(
+            report.joined_jsonl_path,
+            expected_joined_jsonl.display().to_string()
+        );
+        assert_eq!(
+            report.joined_csv_path,
+            expected_joined_csv.display().to_string()
+        );
+        assert_eq!(manifest.recipe_preset, preset);
+        assert_eq!(manifest.yosys_script, expected_script_ref.path);
+        assert_eq!(manifest.yosys_script_sha256, expected_script_ref.sha256);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].preset, preset);
+        assert_eq!(samples[0].yosys_script, "flows/abc_ablate_no_fraig.ys");
+        assert_eq!(samples[0].yosys_script_sha256, manifest.yosys_script_sha256);
+        assert_eq!(summary_json["recipe_preset"].as_str(), Some(preset));
+        assert!(
+            !output_dir
+                .join(IR_DIR_CORPUS_JOINED_DIR)
+                .join("g8r-vs-yabc-aig-diff.jsonl")
+                .exists()
+        );
+        assert!(
+            !output_dir
+                .join(IR_DIR_CORPUS_JOINED_DIR)
+                .join("g8r-vs-yabc-aig-diff.csv")
+                .exists()
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]

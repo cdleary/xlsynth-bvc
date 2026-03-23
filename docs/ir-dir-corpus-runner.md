@@ -38,13 +38,14 @@ Current supported flags:
 - `--input-dir <dir>`
 - `--output-dir <dir>`
 - `--execution-mode enqueue|run`
-- `--recipe-preset g8r-vs-yabc-aig-diff`
+- `--recipe-preset g8r-vs-yabc-aig-diff|g8r-vs-yabc-no-fraig-aig-diff`
 - `--top-fn-policy infer-single-package|explicit|from-filename`
 - `--top-fn-name <name>` when policy is `explicit`
 - `--fraig`
 - `--version <dso:vX.Y.Z input via existing --version flag>`
 - `--driver-version <crate:vA.B.C input via existing --driver-version flag>`
-- `--yosys-script <path>` defaulting to `flows/yosys_to_aig.ys`
+- `--yosys-script <path>` when explicitly provided must match the selected preset's canonical
+  script
 - `--priority <n>` when enqueueing
 
 It recursively scans `INPUT_DIR` for files ending in `.ir`.
@@ -64,6 +65,8 @@ Public outputs are written directly into `OUTPUT_DIR/`:
 - `summary.json`
 - `joined/g8r-vs-yabc-aig-diff.csv`
 - `joined/g8r-vs-yabc-aig-diff.jsonl`
+- `joined/g8r-vs-yabc-no-fraig-aig-diff.csv`
+- `joined/g8r-vs-yabc-no-fraig-aig-diff.jsonl`
 - `artifacts/<sample_id>/...` for copied leaf outputs when available
 
 The summary JSON includes the exact `--store-dir` and `--artifacts-via-sled` paths for the
@@ -106,9 +109,10 @@ This is intentionally a seed/import action, not a dockerized transform.
 
 ## Implemented Preset
 
-Current preset:
+Current presets:
 
 - `g8r-vs-yabc-aig-diff`
+- `g8r-vs-yabc-no-fraig-aig-diff`
 
 Expansion per sample:
 
@@ -120,8 +124,28 @@ Expansion per sample:
 1. `DriverAigToStats`
 1. `AigStatDiff`
 
+The two presets intentionally use the same action graph shape and differ only in the Yosys/ABC
+script used by `ComboVerilogToYosysAbcAig`:
+
+- `g8r-vs-yabc-aig-diff` uses `flows/yosys_to_aig.ys`
+- `g8r-vs-yabc-no-fraig-aig-diff` uses `flows/abc_ablate_no_fraig.ys`
+
 For symmetry with the rest of the repo, the preset should write `yosys/abc` in data keys
 and docs, but `yabc` is a reasonable shorthand in CLI preset names and output filenames.
+
+Example no-fraig run on a directory of `.ir` files:
+
+```bash
+cargo run --bin xlsynth_bvc -- \
+  run-ir-dir-corpus \
+  --input-dir /tmp/mcmc-ir \
+  --output-dir /tmp/mcmc-ir-g8r-vs-yabc-no-fraig \
+  --execution-mode enqueue \
+  --recipe-preset g8r-vs-yabc-no-fraig-aig-diff \
+  --top-fn-policy infer-single-package \
+  --version v0.39.0 \
+  --driver-version 0.34.0
+```
 
 ## Queue-Backed Workflow
 
