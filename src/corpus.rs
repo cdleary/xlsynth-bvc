@@ -503,7 +503,6 @@ fn build_ir_dir_corpus_status_report(
         workspace_store_dir.clone(),
         workspace_artifacts_via_sled.clone(),
     );
-    store.ensure_layout()?;
     let status_query_mode = match store.load_failed_action_records() {
         Ok(_) => CorpusStatusQueryMode::LiveStore,
         Err(err) => {
