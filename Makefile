@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 SHELL := /usr/bin/env bash
 
 .PHONY: help test \

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 
 pub(crate) fn normalized_structural_hash(value: &str) -> Option<String> {

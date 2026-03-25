@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use reqwest::blocking::Client;

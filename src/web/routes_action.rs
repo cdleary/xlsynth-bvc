@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::types::*;
 use anyhow::{Context, Result, bail};
 use axum::{
