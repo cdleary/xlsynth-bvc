@@ -48,7 +48,7 @@ const DEFAULT_RELEASE_PLATFORM: &str = "ubuntu2004";
 const DEFAULT_DOCKERFILE: &str = "docker/xlsynth-driver.Dockerfile";
 const DEFAULT_DOCKER_IMAGE_PREFIX: &str = "xlsynth-bvc-driver";
 const DEFAULT_YOSYS_DOCKERFILE: &str = "docker/yosys-abc.Dockerfile";
-const DEFAULT_YOSYS_DOCKER_IMAGE: &str = "xlsynth-bvc-yosys-abc:ubuntu24.04";
+const DEFAULT_YOSYS_DOCKER_IMAGE: &str = "xlsynth-bvc-yosys-abc:ubuntu24.04-py";
 const DEFAULT_YOSYS_FLOW_SCRIPT: &str = "flows/yosys_to_aig.ys";
 const DEFAULT_QUEUE_LEASE_SECONDS: i64 = 900;
 const DEFAULT_QUEUE_PRIORITY: i32 = 0;
@@ -104,6 +104,7 @@ const LEGACY_G8R_STATS_RELPATH: &str = "payload/result.g8r_stats.json";
 const BVC_ENABLE_DRIVER_IR_AIG_EQUIV_ENV: &str = "BVC_ENABLE_DRIVER_IR_AIG_EQUIV";
 const BVC_ENABLE_INCREMENTAL_IR_CORPUS_UPSERT_ENV: &str = "BVC_ENABLE_INCREMENTAL_IR_CORPUS_UPSERT";
 const BVC_QUEUE_ONLY_PREVIOUS_LOSS_K_CONES_ENV: &str = "BVC_QUEUE_ONLY_PREVIOUS_LOSS_K_CONES";
+const BVC_DISABLE_AUTO_SUGGESTED_ENQUEUE_ENV: &str = "BVC_DISABLE_AUTO_SUGGESTED_ENQUEUE";
 const DASHBOARD_FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="10" fill="#070b12"/><rect x="12" y="14" width="40" height="30" rx="4" fill="#0f1f35" stroke="#35f2b3" stroke-width="2"/><path d="M22 22l8 7-8 7" fill="none" stroke="#35f2b3" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><rect x="34" y="34" width="10" height="3" rx="1.5" fill="#5ec9ff"/><circle cx="18" cy="50" r="2" fill="#35f2b3"/><circle cx="25" cy="50" r="2" fill="#5ec9ff"/><circle cx="32" cy="50" r="2" fill="#35f2b3"/></svg>"##;
 const DRIVER_TOOLS_SETUP_FROM_CACHE_SNIPPET: &str = r#"
 cache_dir="/cache/${XLSYNTH_VERSION}/${XLSYNTH_PLATFORM}"
@@ -147,6 +148,17 @@ pub(crate) fn driver_ir_aig_equiv_enabled() -> bool {
 
 pub(crate) fn queue_only_previous_loss_k_cones_enabled() -> bool {
     std::env::var(BVC_QUEUE_ONLY_PREVIOUS_LOSS_K_CONES_ENV)
+        .ok()
+        .map(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn auto_suggested_enqueue_enabled() -> bool {
+    !std::env::var(BVC_DISABLE_AUTO_SUGGESTED_ENQUEUE_ENV)
         .ok()
         .map(|raw| match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => true,

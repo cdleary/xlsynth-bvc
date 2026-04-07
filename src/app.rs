@@ -977,14 +977,16 @@ pub(crate) fn drain_queue(
                                     err
                                 );
                             }
-                            if let Err(err) = enqueue_suggested_actions(
-                                store,
-                                repo_root,
-                                running.action_id(),
-                                false,
-                                1,
-                                running.priority(),
-                            ) {
+                            if crate::auto_suggested_enqueue_enabled()
+                                && let Err(err) = enqueue_suggested_actions(
+                                    store,
+                                    repo_root,
+                                    running.action_id(),
+                                    false,
+                                    1,
+                                    running.priority(),
+                                )
+                            {
                                 eprintln!(
                                     "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
                                     running.action_id(),
@@ -1030,14 +1032,16 @@ pub(crate) fn drain_queue(
                                 err
                             );
                         }
-                        if let Err(err) = enqueue_suggested_actions(
-                            store,
-                            repo_root,
-                            running_batch[0].action_id(),
-                            false,
-                            1,
-                            running_batch[0].priority(),
-                        ) {
+                        if crate::auto_suggested_enqueue_enabled()
+                            && let Err(err) = enqueue_suggested_actions(
+                                store,
+                                repo_root,
+                                running_batch[0].action_id(),
+                                false,
+                                1,
+                                running_batch[0].priority(),
+                            )
+                        {
                             eprintln!(
                                 "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
                                 running_batch[0].action_id(),

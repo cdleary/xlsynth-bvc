@@ -13,7 +13,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};

@@ -1,1 +1,10 @@
-repos: []
+# SPDX-License-Identifier: Apache-2.0
+
+repos:
+  - repo: local
+    hooks:
+      - id: spdx-headers
+        name: SPDX headers
+        entry: python3 scripts/check_spdx_headers.py
+        language: system
+        pass_filenames: false

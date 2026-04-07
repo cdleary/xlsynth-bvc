@@ -308,7 +308,7 @@ test -s /scratch/structural_hash.json
             DockerMount::read_write(&scratch_dir, "/scratch")?,
             driver_cache_mount(store)?,
         ];
-        let run_trace = run_docker_script(
+        let run_trace = execute_persistent_runner_script(
             &runtime_for_hash.docker_image,
             &mounts,
             &env,

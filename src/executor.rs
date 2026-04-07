@@ -1033,7 +1033,7 @@ test -f /scratch/dslx_list_fns_errors.jsonl
             DockerMount::read_write(&scratch_dir, "/scratch")?,
             driver_cache_mount(store)?,
         ];
-        let run_trace = run_docker_script(
+        let run_trace = execute_persistent_runner_script(
             &discovery_runtime.docker_image,
             &mounts,
             &env,
@@ -1402,7 +1402,8 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml dslx2ir \
         driver_cache_mount(store)?,
     ];
 
-    let run_trace = run_docker_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace =
+        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
     commands.push(run_trace);
 
     let ir_output_path = payload_dir.join("package.ir");
@@ -1695,8 +1696,13 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir2opt /inputs/input.ir -
             driver_cache_mount(store)?,
         ];
 
-        let run_trace =
-            run_docker_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+        let run_trace = execute_persistent_runner_script(
+            &runtime.docker_image,
+            &mounts,
+            &env,
+            &script,
+            action_id,
+        )?;
         commands.push(run_trace);
     }
 
@@ -2065,7 +2071,8 @@ test -s /outputs/delay_info.textproto
         driver_cache_mount(store)?,
     ];
 
-    let run_trace = run_docker_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace =
+        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
     commands.push(run_trace);
 
     Ok(ActionOutcome {
@@ -2149,7 +2156,8 @@ test -s /outputs/ir_equiv.json
         DockerMount::read_write(payload_dir, "/outputs")?,
         driver_cache_mount(store)?,
     ];
-    let run_trace = run_docker_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace =
+        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
     commands.push(run_trace);
 
     let output_artifact = ArtifactRef {
@@ -2207,53 +2215,10 @@ pub(crate) fn probe_driver_subcommand_support(
     store: &ArtifactStore,
     repo_root: &Path,
     runtime: &DriverRuntimeSpec,
-    version: &str,
+    _version: &str,
     subcommand: &str,
 ) -> Result<bool> {
-    let scratch = make_temp_work_dir("driver-subcommand-probe")?;
-    let outputs_dir = scratch.join("outputs");
-    fs::create_dir_all(&outputs_dir).with_context(|| {
-        format!(
-            "creating subcommand probe outputs: {}",
-            outputs_dir.display()
-        )
-    })?;
-    let result = (|| -> Result<bool> {
-        let effective_version = effective_xlsynth_version_for_runtime(repo_root, version, runtime);
-        let script = driver_script(
-            r#"
-if xlsynth-driver --help | grep -Eq "^[[:space:]]+${DRIVER_SUBCOMMAND}[[:space:]]"; then
-  printf "true\n" > /outputs/supported.txt
-else
-  printf "false\n" > /outputs/supported.txt
-fi
-"#,
-        );
-        let mut env = BTreeMap::new();
-        env.insert("XLSYNTH_VERSION".to_string(), effective_version);
-        env.insert(
-            "XLSYNTH_PLATFORM".to_string(),
-            runtime.release_platform.to_string(),
-        );
-        env.insert("DRIVER_SUBCOMMAND".to_string(), subcommand.to_string());
-        let mounts = vec![
-            DockerMount::read_write(&outputs_dir, "/outputs")?,
-            driver_cache_mount(store)?,
-        ];
-        run_docker_script(
-            &runtime.docker_image,
-            &mounts,
-            &env,
-            &script,
-            "driver-subcommand-probe",
-        )?;
-        let supported_path = outputs_dir.join("supported.txt");
-        let text = fs::read_to_string(&supported_path)
-            .with_context(|| format!("reading probe output: {}", supported_path.display()))?;
-        Ok(text.trim().eq_ignore_ascii_case("true"))
-    })();
-    fs::remove_dir_all(&scratch).ok();
-    result
+    driver_runner_supports_subcommand(store, repo_root, runtime, subcommand)
 }
 
 pub(crate) fn driver_subcommand_help_has_token_cached(
@@ -2291,55 +2256,11 @@ pub(crate) fn probe_driver_subcommand_help_token(
     store: &ArtifactStore,
     repo_root: &Path,
     runtime: &DriverRuntimeSpec,
-    version: &str,
+    _version: &str,
     subcommand: &str,
     token: &str,
 ) -> Result<bool> {
-    let scratch = make_temp_work_dir("driver-help-token-probe")?;
-    let outputs_dir = scratch.join("outputs");
-    fs::create_dir_all(&outputs_dir).with_context(|| {
-        format!(
-            "creating help-token probe outputs: {}",
-            outputs_dir.display()
-        )
-    })?;
-    let result = (|| -> Result<bool> {
-        let effective_version = effective_xlsynth_version_for_runtime(repo_root, version, runtime);
-        let script = driver_script(
-            r#"
-if xlsynth-driver "${DRIVER_SUBCOMMAND}" --help 2>/dev/null | grep -Fq -- "${DRIVER_HELP_TOKEN}"; then
-  printf "true\n" > /outputs/supported.txt
-else
-  printf "false\n" > /outputs/supported.txt
-fi
-"#,
-        );
-        let mut env = BTreeMap::new();
-        env.insert("XLSYNTH_VERSION".to_string(), effective_version);
-        env.insert(
-            "XLSYNTH_PLATFORM".to_string(),
-            runtime.release_platform.to_string(),
-        );
-        env.insert("DRIVER_SUBCOMMAND".to_string(), subcommand.to_string());
-        env.insert("DRIVER_HELP_TOKEN".to_string(), token.to_string());
-        let mounts = vec![
-            DockerMount::read_write(&outputs_dir, "/outputs")?,
-            driver_cache_mount(store)?,
-        ];
-        run_docker_script(
-            &runtime.docker_image,
-            &mounts,
-            &env,
-            &script,
-            "driver-help-token-probe",
-        )?;
-        let supported_path = outputs_dir.join("supported.txt");
-        let text = fs::read_to_string(&supported_path)
-            .with_context(|| format!("reading probe output: {}", supported_path.display()))?;
-        Ok(text.trim().eq_ignore_ascii_case("true"))
-    })();
-    fs::remove_dir_all(&scratch).ok();
-    result
+    driver_runner_subcommand_help_has_token(store, repo_root, runtime, subcommand, token)
 }
 
 fn effective_xlsynth_version_for_runtime(
@@ -2432,7 +2353,8 @@ test -s /outputs/ir_aig_equiv.json
         DockerMount::read_write(payload_dir, "/outputs")?,
         driver_cache_mount(store)?,
     ];
-    let run_trace = run_docker_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace =
+        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
     commands.push(run_trace);
 
     let output_artifact = ArtifactRef {
@@ -2924,7 +2846,7 @@ fn run_driver_ir_to_g8r_batch_runnable(
             DockerMount::read_write(&batch_root, "/batch")?,
             driver_cache_mount(store)?,
         ];
-        let run_trace = run_docker_script(
+        let run_trace = execute_persistent_runner_script(
             &runtime.docker_image,
             &mounts,
             &env,
@@ -3310,7 +3232,8 @@ xlsynth-driver ir2g8r ${G8R_EXTRA_FLAGS} /inputs/input.ir --fraig="${FRAIG}" --a
         driver_cache_mount(store)?,
     ];
 
-    let run_trace = run_docker_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace =
+        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
     commands.push(run_trace);
 
     Ok(ActionOutcome {
@@ -3524,8 +3447,9 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir2combo /inputs/input.ir
         driver_cache_mount(store)?,
     ];
 
-    let run_trace =
-        (|| run_docker_script(&runtime.docker_image, &mounts, &env, &script, action_id))();
+    let run_trace = (|| {
+        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)
+    })();
     if let Some(dir) = rewrite_work_dir {
         fs::remove_dir_all(&dir).ok();
     }
@@ -4321,7 +4245,8 @@ test -f /outputs/raw/manifest.jsonl
         DockerMount::read_write(&raw_output_dir, "/outputs/raw")?,
         driver_cache_mount(store)?,
     ];
-    let run_trace = run_docker_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace =
+        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
     commands.push(run_trace);
 
     let manifest = build_k_bool_cone_corpus_outputs(
@@ -4520,7 +4445,8 @@ test -s /outputs/result.aig
         DockerMount::read_write(payload_dir, "/outputs")?,
     ];
 
-    let run_trace = run_docker_script(&runtime.docker_image, &mounts, &env, script, action_id)?;
+    let run_trace =
+        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, script, action_id)?;
     commands.push(run_trace);
 
     let output_artifact = ArtifactRef {
@@ -4606,7 +4532,8 @@ test -s /outputs/result.aig
         DockerMount::read_write(payload_dir, "/outputs")?,
     ];
     let env = BTreeMap::new();
-    let run_trace = run_docker_script(&runtime.docker_image, &mounts, &env, script, action_id)?;
+    let run_trace =
+        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, script, action_id)?;
     commands.push(run_trace);
 
     let output_artifact = ArtifactRef {
@@ -4759,7 +4686,7 @@ test -s /outputs/stats.raw.json
                 DockerMount::read_write(payload_dir, "/outputs")?,
                 driver_cache_mount(store)?,
             ];
-            let run_trace = run_docker_script(
+            let run_trace = execute_persistent_runner_script(
                 &legacy_ctx.runtime.docker_image,
                 &mounts,
                 &env,
@@ -4810,8 +4737,13 @@ test -s /outputs/stats.json
             DockerMount::read_write(payload_dir, "/outputs")?,
             driver_cache_mount(store)?,
         ];
-        let run_trace =
-            run_docker_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+        let run_trace = execute_persistent_runner_script(
+            &runtime.docker_image,
+            &mounts,
+            &env,
+            &script,
+            action_id,
+        )?;
         commands.push(run_trace);
         details.insert("aig_stats_mode".to_string(), json!("aiger_aig_stats"));
     }
