@@ -1245,6 +1245,7 @@ fn entity_map_to_points(
         .collect()
 }
 
+#[allow(dead_code)]
 fn entity_points_to_map(
     points: &[IrFnCorpusEntityPoint],
 ) -> BTreeMap<(String, String), StdlibAigStatsPoint> {
@@ -1256,6 +1257,7 @@ fn entity_points_to_map(
     map
 }
 
+#[allow(dead_code)]
 fn paired_entity_maps_from_dataset(
     dataset: &StdlibG8rVsYosysDataset,
 ) -> (
@@ -1340,6 +1342,7 @@ fn build_ir_fn_corpus_dataset_from_entity_maps(
     ir_node_count_by_structural_hash: Option<&BTreeMap<String, u64>>,
     ir_node_count_by_source_ir_action_and_top: Option<&BTreeMap<String, BTreeMap<String, u64>>>,
     unique_ir_node_count_by_source_ir_action: Option<&BTreeMap<String, u64>>,
+    allow_artifact_ir_node_count_fallback: bool,
     seed_ir_node_count_cache: Option<BTreeMap<(String, Option<String>), u64>>,
 ) -> StdlibG8rVsYosysDataset {
     let paired_entity_count = g8r_by_entity
@@ -1375,20 +1378,28 @@ fn build_ir_fn_corpus_dataset_from_entity_maps(
                 )
             })
             .or_else(|| {
-                resolve_ir_node_count_cached(
-                    store,
-                    &g8r.ir_action_id,
-                    g8r.ir_top.as_deref(),
-                    &mut ir_node_count_cache,
-                )
+                if allow_artifact_ir_node_count_fallback {
+                    resolve_ir_node_count_cached(
+                        store,
+                        &g8r.ir_action_id,
+                        g8r.ir_top.as_deref(),
+                        &mut ir_node_count_cache,
+                    )
+                } else {
+                    None
+                }
             })
             .or_else(|| {
-                resolve_ir_node_count_cached(
-                    store,
-                    &yosys.ir_action_id,
-                    yosys.ir_top.as_deref(),
-                    &mut ir_node_count_cache,
-                )
+                if allow_artifact_ir_node_count_fallback {
+                    resolve_ir_node_count_cached(
+                        store,
+                        &yosys.ir_action_id,
+                        yosys.ir_top.as_deref(),
+                        &mut ir_node_count_cache,
+                    )
+                } else {
+                    None
+                }
             })
             .unwrap_or(0);
         let g8r_product = g8r.and_nodes * g8r.depth;
@@ -1440,6 +1451,7 @@ fn build_ir_fn_corpus_dataset_from_entity_maps(
     }
 }
 
+#[allow(dead_code)]
 fn load_ir_fn_corpus_incremental_delta_rows(
     store: &ArtifactStore,
     index_key: &str,
@@ -1462,6 +1474,7 @@ fn load_ir_fn_corpus_incremental_delta_rows(
     Ok(out)
 }
 
+#[allow(dead_code)]
 fn build_ir_fn_corpus_state_from_incremental_deltas(
     store: &ArtifactStore,
     deltas: &[IrFnCorpusIncrementalDeltaRow],
@@ -1492,6 +1505,7 @@ fn build_ir_fn_corpus_state_from_incremental_deltas(
         None,
         None,
         None,
+        false,
         None,
     );
     Some(IrFnCorpusG8rVsYosysIndexState {
@@ -1611,6 +1625,7 @@ pub(crate) struct WebIndicesRebuildSummary {
     pub(crate) ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc: IrFnCorpusG8rVsYosysIndexSummary,
 }
 
+#[allow(dead_code)]
 fn load_ir_fn_corpus_index_state(
     store: &ArtifactStore,
     index_key: &str,
@@ -1694,29 +1709,55 @@ fn load_ir_fn_corpus_index_state(
             None,
             None,
             None,
+            false,
             Some(seed_ir_node_count_cache),
         );
     }
     Ok(state)
 }
 
-fn load_ir_fn_corpus_g8r_vs_yosys_index_state(
+fn load_ir_fn_corpus_dataset_snapshot_index(
     store: &ArtifactStore,
-) -> Result<Option<IrFnCorpusG8rVsYosysIndexState>> {
-    load_ir_fn_corpus_index_state(
-        store,
-        WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
-        WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
-    )
+    index_key: &str,
+    expected_schema_version: u32,
+) -> Result<Option<StdlibG8rVsYosysDataset>> {
+    let location = store.web_index_location(index_key);
+    let Some(bytes) = store
+        .load_web_index_bytes(index_key)
+        .with_context(|| format!("reading ir-fn-corpus web index: {}", location))?
+    else {
+        info!("query ir-fn-corpus web index miss location={}", location);
+        return Ok(None);
+    };
+    let index_file: IrFnCorpusG8rVsYosysIndexFile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing ir-fn-corpus web index: {}", location))?;
+    if index_file.schema_version != expected_schema_version {
+        info!(
+            "query ir-fn-corpus web index schema mismatch location={} expected={} got={}",
+            location, expected_schema_version, index_file.schema_version
+        );
+        return Ok(None);
+    }
+    // Keep dataset-only web routes responsive: incremental rows are folded into
+    // this compact snapshot by the explicit web-index rebuild path.
+    info!(
+        "query ir-fn-corpus dataset web index hit location={} generated_utc={} samples={}",
+        location,
+        index_file.generated_utc,
+        index_file.dataset.samples.len()
+    );
+    Ok(Some(index_file.dataset))
 }
 
-fn load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_index_state(
+#[allow(dead_code)]
+fn load_ir_fn_corpus_dataset_index(
     store: &ArtifactStore,
-) -> Result<Option<IrFnCorpusG8rVsYosysIndexState>> {
-    load_ir_fn_corpus_index_state(
-        store,
-        WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
-        WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
+    index_key: &str,
+    expected_schema_version: u32,
+) -> Result<Option<StdlibG8rVsYosysDataset>> {
+    Ok(
+        load_ir_fn_corpus_index_state(store, index_key, expected_schema_version)?
+            .map(|state| state.dataset),
     )
 }
 
@@ -1808,18 +1849,45 @@ fn write_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_index_state(
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn load_ir_fn_corpus_g8r_vs_yosys_dataset_index(
     store: &ArtifactStore,
 ) -> Result<Option<StdlibG8rVsYosysDataset>> {
-    Ok(load_ir_fn_corpus_g8r_vs_yosys_index_state(store)?.map(|state| state.dataset))
+    load_ir_fn_corpus_dataset_index(
+        store,
+        WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+        WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+    )
 }
 
+pub(crate) fn load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index(
+    store: &ArtifactStore,
+) -> Result<Option<StdlibG8rVsYosysDataset>> {
+    load_ir_fn_corpus_dataset_snapshot_index(
+        store,
+        WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+        WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+    )
+}
+
+#[allow(dead_code)]
 pub(crate) fn load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(
     store: &ArtifactStore,
 ) -> Result<Option<StdlibG8rVsYosysDataset>> {
-    Ok(
-        load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_index_state(store)?
-            .map(|state| state.dataset),
+    load_ir_fn_corpus_dataset_index(
+        store,
+        WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
+        WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
+    )
+}
+
+pub(crate) fn load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_index(
+    store: &ArtifactStore,
+) -> Result<Option<StdlibG8rVsYosysDataset>> {
+    load_ir_fn_corpus_dataset_snapshot_index(
+        store,
+        WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
+        WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
     )
 }
 
@@ -2286,6 +2354,7 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
         Some(&ir_node_count_by_structural_hash),
         None,
         None,
+        false,
         None,
     );
     info!(
@@ -2535,6 +2604,7 @@ fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed(
         Some(&ir_node_count_by_structural_hash),
         Some(&ir_node_count_by_source_ir_action_and_top),
         Some(&unique_ir_node_count_by_source_ir_action),
+        false,
         seed_ir_node_count_cache,
     );
     info!(
@@ -2961,6 +3031,7 @@ pub(crate) fn action_kind_short_label(action: &ActionSpec) -> &'static str {
         ActionSpec::DriverIrToG8rAig { .. } => "ir2g8r",
         ActionSpec::IrFnToCombinationalVerilog { .. } => "ir2combo",
         ActionSpec::IrFnToKBoolConeCorpus { .. } => "ir2kcone",
+        ActionSpec::IrFnToMffcCorpus { .. } => "ir2mffc",
         ActionSpec::ComboVerilogToYosysAbcAig { .. } => "yosys-abc",
         ActionSpec::AigToYosysAbcAig { .. } => "aig2abc",
         ActionSpec::DriverAigToStats { .. } => "aig-stats",
@@ -3075,6 +3146,20 @@ pub(crate) fn action_graph_node_label(action: &ActionSpec) -> String {
                 .map(|v| format!("k={k},ops<={v}"))
                 .unwrap_or_else(|| format!("k={k}"));
             format!("ir2kcone({})", cfg)
+        }
+        ActionSpec::IrFnToMffcCorpus {
+            top_fn_name: Some(top),
+            min_internal_non_literal,
+            ..
+        } => {
+            format!("ir2mffc(min={})\n{}", min_internal_non_literal, top)
+        }
+        ActionSpec::IrFnToMffcCorpus {
+            top_fn_name: None,
+            min_internal_non_literal,
+            ..
+        } => {
+            format!("ir2mffc(min={})", min_internal_non_literal)
         }
         ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_top_module_name: Some(top),
@@ -6871,6 +6956,7 @@ pub(crate) fn action_dso_version(action: &ActionSpec) -> Option<&str> {
         | ActionSpec::DriverIrToG8rAig { version, .. }
         | ActionSpec::IrFnToCombinationalVerilog { version, .. }
         | ActionSpec::IrFnToKBoolConeCorpus { version, .. }
+        | ActionSpec::IrFnToMffcCorpus { version, .. }
         | ActionSpec::DriverAigToStats { version, .. } => Some(version.as_str()),
         ActionSpec::ComboVerilogToYosysAbcAig { .. }
         | ActionSpec::AigToYosysAbcAig { .. }
@@ -6897,6 +6983,7 @@ pub(crate) fn action_driver_version(action: &ActionSpec) -> Option<&str> {
         | ActionSpec::DriverIrToG8rAig { runtime, .. }
         | ActionSpec::IrFnToCombinationalVerilog { runtime, .. }
         | ActionSpec::IrFnToKBoolConeCorpus { runtime, .. }
+        | ActionSpec::IrFnToMffcCorpus { runtime, .. }
         | ActionSpec::DriverAigToStats { runtime, .. } => Some(runtime.driver_version.as_str()),
         ActionSpec::ComboVerilogToYosysAbcAig { .. }
         | ActionSpec::AigToYosysAbcAig { .. }
@@ -7155,6 +7242,7 @@ pub(crate) fn action_kind_label(action: &ActionSpec) -> &'static str {
         ActionSpec::DriverIrToG8rAig { .. } => "driver_ir_to_g8r_aig",
         ActionSpec::IrFnToCombinationalVerilog { .. } => "ir_fn_to_combinational_verilog",
         ActionSpec::IrFnToKBoolConeCorpus { .. } => "ir_fn_to_k_bool_cone_corpus",
+        ActionSpec::IrFnToMffcCorpus { .. } => "ir_fn_to_mffc_corpus",
         ActionSpec::ComboVerilogToYosysAbcAig { .. } => "combo_verilog_to_yosys_abc_aig",
         ActionSpec::AigToYosysAbcAig { .. } => "aig_to_yosys_abc_aig",
         ActionSpec::DriverAigToStats { .. } => "driver_aig_to_stats",
@@ -7266,6 +7354,25 @@ pub(crate) fn action_subject(action: &ActionSpec) -> String {
             top_fn_name.as_deref().unwrap_or("<auto>"),
             k,
             max_ir_ops
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        ),
+        ActionSpec::IrFnToMffcCorpus {
+            ir_action_id,
+            top_fn_name,
+            max_mffcs,
+            min_internal_non_literal,
+            max_frontier_non_literal,
+            ..
+        } => format!(
+            "ir={} top={} max_mffcs={} min_internal={} max_frontier={}",
+            short_id(ir_action_id),
+            top_fn_name.as_deref().unwrap_or("<auto>"),
+            max_mffcs
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            min_internal_non_literal,
+            max_frontier_non_literal
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "<none>".to_string())
         ),
@@ -8611,6 +8718,7 @@ mod tests {
             None,
             Some(&ir_node_count_by_source_ir_action_and_top),
             None,
+            true,
             None,
         );
 

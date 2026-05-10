@@ -13,10 +13,12 @@ use crate::DEFAULT_STDLIB_FN_TIMELINE_ROUTE;
 use crate::app;
 use crate::query::{
     build_stdlib_file_action_graph_dataset, build_stdlib_g8r_vs_yosys_dataset,
-    build_unprocessed_version_rows, load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index,
-    load_ir_fn_corpus_g8r_vs_yosys_dataset_index, load_stdlib_fn_version_timeline_dataset_index,
-    load_stdlib_fns_trend_dataset_index, load_stdlib_g8r_vs_yosys_dataset_index,
-    load_versions_cards_index, parse_stdlib_fn_route_selector,
+    build_unprocessed_version_rows,
+    load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_index,
+    load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index,
+    load_stdlib_fn_version_timeline_dataset_index, load_stdlib_fns_trend_dataset_index,
+    load_stdlib_g8r_vs_yosys_dataset_index, load_versions_cards_index,
+    parse_stdlib_fn_route_selector,
     rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index,
     rebuild_ir_fn_corpus_g8r_vs_yosys_dataset_index,
     rebuild_stdlib_fn_version_timeline_dataset_index, rebuild_stdlib_fns_trend_dataset_index,
@@ -532,7 +534,8 @@ pub(crate) fn serve_web_ui(
             }
             let corpus_started = Instant::now();
             match prewarm_cache.get_or_compute_ir_fn_corpus_g8r_vs_yosys_dataset(|| {
-                if let Some(indexed) = load_ir_fn_corpus_g8r_vs_yosys_dataset_index(&prewarm_store)?
+                if let Some(indexed) =
+                    load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index(&prewarm_store)?
                 {
                     return Ok(indexed);
                 }
@@ -544,11 +547,13 @@ pub(crate) fn serve_web_ui(
                     "web cache prewarm ir-fn-corpus rebuilt index samples={} versions={}",
                     summary.sample_count, summary.crate_versions
                 );
-                load_ir_fn_corpus_g8r_vs_yosys_dataset_index(&prewarm_store)?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "ir-fn-corpus index rebuild completed but index remained unavailable"
-                    )
-                })
+                load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index(&prewarm_store)?.ok_or_else(
+                    || {
+                        anyhow::anyhow!(
+                            "ir-fn-corpus index rebuild completed but index remained unavailable"
+                        )
+                    },
+                )
             }) {
                 Ok(dataset) => info!(
                     "web cache prewarm ir-fn-corpus g8r-vs-yosys samples={} elapsed_ms={}",
@@ -564,7 +569,7 @@ pub(crate) fn serve_web_ui(
             match prewarm_cache
                 .get_or_compute_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset(|| {
                     if let Some(indexed) =
-                        load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(
+                        load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_index(
                             &prewarm_store,
                         )?
                     {
@@ -578,7 +583,7 @@ pub(crate) fn serve_web_ui(
                         "web cache prewarm ir-fn frontend-compare rebuilt index samples={} versions={}",
                         summary.sample_count, summary.crate_versions
                     );
-                    load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(&prewarm_store)?
+                    load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_index(&prewarm_store)?
                         .ok_or_else(|| {
                             anyhow::anyhow!(
                                 "ir-fn frontend-compare index rebuild completed but index remained unavailable"

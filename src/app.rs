@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde_json::json;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::{
@@ -12,7 +12,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use crate::DELAY_INFO_OUTPUT_FORMAT_TEXTPROTO_V1;
+use crate::{
+    DELAY_INFO_OUTPUT_FORMAT_TEXTPROTO_V1, INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY,
+    VERSION_COMPAT_PATH,
+};
 use crate::cli::{Cli, RunAction, TopCommand};
 use crate::corpus::{refresh_ir_dir_corpus_status, run_ir_dir_corpus, show_ir_dir_corpus_progress};
 use crate::driver_ir_aig_equiv_enabled;
@@ -22,7 +25,11 @@ use crate::executor::{
 };
 use crate::model::*;
 use crate::ops::run_workers;
-use crate::query::{enqueue_processing_for_crate_version, rebuild_web_indices};
+use crate::query::{
+    enqueue_processing_for_crate_version,
+    action_kind_label, rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index,
+    rebuild_web_indices,
+};
 use crate::queue::*;
 use crate::queue_only_previous_loss_k_cones_enabled;
 use crate::runtime::*;
@@ -487,6 +494,27 @@ pub(crate) fn run() -> Result<()> {
                     .expect("serializing rebuild web indices summary")
             );
         }
+        TopCommand::RebuildIrFnG8rAbcVsCodegenYosysAbcIndex => {
+            let summary =
+                rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(&store, &repo_root)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary).expect(
+                    "serializing rebuild IR fn g8r-ABC vs codegen-Yosys/ABC index summary"
+                )
+            );
+        }
+        TopCommand::PromoteMffcDerivedPending {
+            base_priority,
+            dry_run,
+        } => {
+            let summary = promote_mffc_derived_pending_actions(&store, base_priority, dry_run)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing promote MFFC-derived pending summary")
+            );
+        }
         TopCommand::BuildStaticSnapshot {
             out_dir,
             overwrite,
@@ -564,6 +592,30 @@ pub(crate) fn run() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&summary)
                     .expect("serializing enqueue structural opt ir k-bool-cone summary")
+            );
+        }
+        TopCommand::EnqueueStructuralOptIrMffcs {
+            crate_version,
+            max_mffcs,
+            min_internal_non_literal,
+            max_frontier_non_literal,
+            priority,
+            dry_run,
+        } => {
+            let summary = enqueue_structural_opt_ir_mffc_actions(
+                &store,
+                &repo_root,
+                &crate_version,
+                max_mffcs,
+                min_internal_non_literal,
+                max_frontier_non_literal,
+                priority,
+                dry_run,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing enqueue structural opt ir MFFC summary")
             );
         }
         TopCommand::BackfillKBoolConeSuggestions { enqueue, dry_run } => {
@@ -815,6 +867,23 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
             top_fn_name,
             k,
             max_ir_ops: max_ir_ops.or_else(|| crate::default_k_bool_cone_max_ir_ops_for_k(k)),
+            runtime: driver.into_runtime(repo_root, &version)?,
+            version,
+        }),
+        RunAction::IrToMffcCorpus {
+            ir_action_id,
+            top_fn_name,
+            max_mffcs,
+            min_internal_non_literal,
+            max_frontier_non_literal,
+            version,
+            driver,
+        } => Ok(ActionSpec::IrFnToMffcCorpus {
+            ir_action_id,
+            top_fn_name,
+            max_mffcs,
+            min_internal_non_literal,
+            max_frontier_non_literal,
             runtime: driver.into_runtime(repo_root, &version)?,
             version,
         }),
@@ -2117,12 +2186,16 @@ pub(crate) fn backfill_opt_ir_frontend_compare_suggestions(
     let mut already_failed_count = 0_usize;
     let mut already_canceled_count = 0_usize;
     let mut deduped_candidate_action_ids = HashSet::new();
+    let mut downstream_counts = TargetedSuggestionEnqueueCounts::default();
 
     store.for_each_provenance(|provenance| {
-        let (version, runtime) = match &provenance.action {
+        let (top_fn_name, version, runtime) = match &provenance.action {
             ActionSpec::DriverIrToOpt {
-                version, runtime, ..
-            } => (version.clone(), runtime.clone()),
+                top_fn_name,
+                version,
+                runtime,
+                ..
+            } => (top_fn_name.clone(), version.clone(), runtime.clone()),
             _ => return Ok(std::ops::ControlFlow::Continue(())),
         };
         scanned_opt_actions += 1;
@@ -2136,26 +2209,47 @@ pub(crate) fn backfill_opt_ir_frontend_compare_suggestions(
         }
         scoped_opt_actions += 1;
 
-        let candidate_action = ActionSpec::DriverIrToG8rAig {
+        let g8r_action = ActionSpec::DriverIrToG8rAig {
             ir_action_id: provenance.action_id.clone(),
             top_fn_name: None,
             fraig: false,
             lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+            version: version.clone(),
+            runtime: runtime.clone(),
+        };
+        let g8r_action_id = compute_action_id(&g8r_action)?;
+        let combo_top_fn_name = provenance
+            .details
+            .get("ir_top")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or(top_fn_name);
+        let combo_action = ActionSpec::IrFnToCombinationalVerilog {
+            ir_action_id: provenance.action_id.clone(),
+            top_fn_name: combo_top_fn_name,
+            use_system_verilog: false,
             version,
             runtime,
         };
-        let candidate_action_id = compute_action_id(&candidate_action)?;
-        let candidate = SuggestedAction {
+        let combo_action_id = compute_action_id(&combo_action)?;
+        let candidates = [
+            SuggestedAction {
             reason: "Run frontend-isolated g8r+ABC path (fraig=false, no prep rewrite)".to_string(),
-            action_id: candidate_action_id.clone(),
-            action: candidate_action,
-        };
-        total_candidate_suggestions += 1;
+                action_id: g8r_action_id,
+                action: g8r_action,
+            },
+            SuggestedAction {
+                reason: "Run codegen+Yosys/ABC path for frontend comparison".to_string(),
+                action_id: combo_action_id,
+                action: combo_action,
+            },
+        ];
+        total_candidate_suggestions += candidates.len();
 
         let mut updated = provenance.clone();
         let before_len = updated.suggested_next_actions.len();
         updated.suggested_next_actions.retain(|suggested| {
-            !matches!(
+            let is_target_g8r = matches!(
                 &suggested.action,
                 ActionSpec::DriverIrToG8rAig {
                     ir_action_id,
@@ -2165,17 +2259,28 @@ pub(crate) fn backfill_opt_ir_frontend_compare_suggestions(
                 } if ir_action_id == &provenance.action_id
                     && !fraig
                     && *lowering_mode == G8rLoweringMode::FrontendNoPrepRewrite
-            )
+            );
+            let is_target_combo = matches!(
+                &suggested.action,
+                ActionSpec::IrFnToCombinationalVerilog {
+                    ir_action_id,
+                    use_system_verilog,
+                    ..
+                } if ir_action_id == &provenance.action_id && !use_system_verilog
+            );
+            !(is_target_g8r || is_target_combo)
         });
         let removed = before_len.saturating_sub(updated.suggested_next_actions.len());
-        let exists = updated
-            .suggested_next_actions
-            .iter()
-            .any(|suggested| suggested.action_id == candidate_action_id);
         let mut added = 0_usize;
-        if !exists {
-            updated.suggested_next_actions.push(candidate.clone());
-            added = 1;
+        for candidate in &candidates {
+            let exists = updated
+                .suggested_next_actions
+                .iter()
+                .any(|suggested| suggested.action_id == candidate.action_id);
+            if !exists {
+                updated.suggested_next_actions.push(candidate.clone());
+                added += 1;
+            }
         }
         if removed > 0 || added > 0 {
             updated_provenance_count += 1;
@@ -2186,11 +2291,22 @@ pub(crate) fn backfill_opt_ir_frontend_compare_suggestions(
             }
         }
 
-        if enqueue && deduped_candidate_action_ids.insert(candidate_action_id.clone()) {
-            if store.action_exists(&candidate_action_id) {
+        for candidate in candidates {
+            if !enqueue || !deduped_candidate_action_ids.insert(candidate.action_id.clone()) {
+                continue;
+            }
+            if store.action_exists(&candidate.action_id) {
                 already_done_count += 1;
+                if enqueue {
+                    downstream_counts += enqueue_completed_action_suggestions_with_priority(
+                        store,
+                        &candidate.action_id,
+                        priority,
+                        dry_run,
+                    )?;
+                }
             } else {
-                match queue_state_for_action(store, &candidate_action_id) {
+                match queue_state_for_action(store, &candidate.action_id) {
                     QueueState::Pending => {
                         already_pending_count += 1;
                         if !dry_run {
@@ -2202,7 +2318,17 @@ pub(crate) fn backfill_opt_ir_frontend_compare_suggestions(
                         }
                     }
                     QueueState::Running { .. } => already_running_count += 1,
-                    QueueState::Done => already_done_count += 1,
+                    QueueState::Done => {
+                        already_done_count += 1;
+                        if enqueue {
+                            downstream_counts += enqueue_completed_action_suggestions_with_priority(
+                                store,
+                                &candidate.action_id,
+                                priority,
+                                dry_run,
+                            )?;
+                        }
+                    }
                     QueueState::Failed => already_failed_count += 1,
                     QueueState::Canceled => already_canceled_count += 1,
                     QueueState::None => {
@@ -2238,7 +2364,335 @@ pub(crate) fn backfill_opt_ir_frontend_compare_suggestions(
         "already_pending_count": already_pending_count,
         "already_running_count": already_running_count,
         "already_failed_count": already_failed_count,
-        "already_canceled_count": already_canceled_count
+        "already_canceled_count": already_canceled_count,
+        "downstream_suggestions_scanned": downstream_counts.scanned,
+        "downstream_enqueued_count": downstream_counts.enqueued,
+        "downstream_promoted_pending_count": downstream_counts.promoted_pending,
+        "downstream_already_done_count": downstream_counts.already_done,
+        "downstream_already_running_count": downstream_counts.already_running,
+        "downstream_already_failed_count": downstream_counts.already_failed,
+        "downstream_already_canceled_count": downstream_counts.already_canceled,
+        "downstream_skipped_blocked_count": downstream_counts.skipped_blocked,
+        "downstream_load_error_count": downstream_counts.load_error
+    }))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TargetedSuggestionEnqueueCounts {
+    scanned: usize,
+    enqueued: usize,
+    promoted_pending: usize,
+    already_done: usize,
+    already_running: usize,
+    already_failed: usize,
+    already_canceled: usize,
+    skipped_blocked: usize,
+    load_error: usize,
+}
+
+impl std::ops::AddAssign for TargetedSuggestionEnqueueCounts {
+    fn add_assign(&mut self, rhs: Self) {
+        self.scanned += rhs.scanned;
+        self.enqueued += rhs.enqueued;
+        self.promoted_pending += rhs.promoted_pending;
+        self.already_done += rhs.already_done;
+        self.already_running += rhs.already_running;
+        self.already_failed += rhs.already_failed;
+        self.already_canceled += rhs.already_canceled;
+        self.skipped_blocked += rhs.skipped_blocked;
+        self.load_error += rhs.load_error;
+    }
+}
+
+fn enqueue_completed_action_suggestions_with_priority(
+    store: &ArtifactStore,
+    root_action_id: &str,
+    priority: i32,
+    dry_run: bool,
+) -> Result<TargetedSuggestionEnqueueCounts> {
+    let mut counts = TargetedSuggestionEnqueueCounts::default();
+    let mut stack = vec![root_action_id.to_string()];
+    let mut visited_completed = HashSet::new();
+    let mut visited_suggestions = HashSet::new();
+
+    while let Some(action_id) = stack.pop() {
+        if !visited_completed.insert(action_id.clone()) {
+            continue;
+        }
+        let provenance = match store.load_provenance(&action_id) {
+            Ok(provenance) => provenance,
+            Err(_) => {
+                counts.load_error += 1;
+                continue;
+            }
+        };
+        for suggested in provenance.suggested_next_actions {
+            counts.scanned += 1;
+            let action = suggested.action;
+            let suggested_action_id = compute_action_id(&action)?;
+            if !visited_suggestions.insert(suggested_action_id.clone()) {
+                continue;
+            }
+            if store.action_exists(&suggested_action_id) {
+                counts.already_done += 1;
+                stack.push(suggested_action_id);
+                continue;
+            }
+            match queue_state_for_action(store, &suggested_action_id) {
+                QueueState::Pending => {
+                    if !dry_run {
+                        enqueue_action_with_priority(store, action, priority)?;
+                    }
+                    counts.promoted_pending += 1;
+                }
+                QueueState::Running { .. } => counts.already_running += 1,
+                QueueState::Done => {
+                    counts.already_done += 1;
+                    stack.push(suggested_action_id);
+                }
+                QueueState::Failed => counts.already_failed += 1,
+                QueueState::Canceled => counts.already_canceled += 1,
+                QueueState::None => match classify_action_readiness(store, &action)? {
+                    ActionReadiness::Blocked { .. } => counts.skipped_blocked += 1,
+                    ActionReadiness::Ready | ActionReadiness::NotReady => {
+                        if !dry_run {
+                            enqueue_action_with_priority(store, action, priority)?;
+                        }
+                        counts.enqueued += 1;
+                    }
+                },
+            }
+        }
+    }
+
+    Ok(counts)
+}
+
+fn enqueue_structural_opt_ir_mffc_actions(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    requested_crate_version: &str,
+    max_mffcs: Option<u64>,
+    min_internal_non_literal: u64,
+    max_frontier_non_literal: Option<u64>,
+    priority: i32,
+    dry_run: bool,
+) -> Result<serde_json::Value> {
+    let compat = load_version_compat_map(repo_root)?;
+    let crate_version = normalize_tag_version(requested_crate_version).to_string();
+    let entry = compat.get(&crate_version).ok_or_else(|| {
+        anyhow::anyhow!(
+            "crate version `v{}` not found in {}",
+            crate_version,
+            VERSION_COMPAT_PATH
+        )
+    })?;
+    let dso_version = if entry.xlsynth_release_version.starts_with('v') {
+        entry.xlsynth_release_version.clone()
+    } else {
+        format!("v{}", entry.xlsynth_release_version)
+    };
+    let target_runtime =
+        explicit_driver_runtime_for_crate_version(repo_root, &crate_version, &dso_version)?;
+
+    let mut scanned_opt_actions = 0_usize;
+    let mut scoped_opt_actions = 0_usize;
+    let mut skipped_missing_ir_top = 0_usize;
+    let mut skipped_existing_structural_hash = 0_usize;
+    let mut representatives: BTreeMap<String, (String, String)> = BTreeMap::new();
+
+    store.for_each_provenance(|provenance| {
+        let ActionSpec::DriverIrToOpt {
+            top_fn_name,
+            runtime,
+            ..
+        } = &provenance.action
+        else {
+            return Ok(std::ops::ControlFlow::Continue(()));
+        };
+        scanned_opt_actions += 1;
+        if normalize_tag_version(&runtime.driver_version) != crate_version {
+            return Ok(std::ops::ControlFlow::Continue(()));
+        }
+        scoped_opt_actions += 1;
+
+        let Some(ir_top) = provenance
+            .details
+            .get("ir_top")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| top_fn_name.clone())
+        else {
+            skipped_missing_ir_top += 1;
+            return Ok(std::ops::ControlFlow::Continue(()));
+        };
+
+        let structural_key = provenance
+            .details
+            .get(INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| provenance.action_id.clone());
+        if representatives
+            .insert(structural_key, (provenance.action_id.clone(), ir_top))
+            .is_some()
+        {
+            skipped_existing_structural_hash += 1;
+        }
+
+        Ok(std::ops::ControlFlow::Continue(()))
+    })?;
+
+    let mut enqueued_count = 0_usize;
+    let mut already_done_count = 0_usize;
+    let mut already_pending_count = 0_usize;
+    let mut already_running_count = 0_usize;
+    let mut already_failed_count = 0_usize;
+    let mut already_canceled_count = 0_usize;
+    let mut enqueued_samples = Vec::new();
+
+    for (structural_key, (opt_ir_action_id, ir_top)) in representatives {
+        let action = ActionSpec::IrFnToMffcCorpus {
+            ir_action_id: opt_ir_action_id.clone(),
+            top_fn_name: Some(ir_top.clone()),
+            max_mffcs,
+            min_internal_non_literal,
+            max_frontier_non_literal,
+            version: dso_version.clone(),
+            runtime: target_runtime.clone(),
+        };
+        let action_id = compute_action_id(&action)?;
+        if store.action_exists(&action_id) {
+            already_done_count += 1;
+            continue;
+        }
+        match queue_state_for_action(store, &action_id) {
+            QueueState::Pending => {
+                already_pending_count += 1;
+                if !dry_run {
+                    enqueue_action_with_priority(store, action, priority)?;
+                }
+            }
+            QueueState::Running { .. } => already_running_count += 1,
+            QueueState::Done => already_done_count += 1,
+            QueueState::Failed => already_failed_count += 1,
+            QueueState::Canceled => already_canceled_count += 1,
+            QueueState::None => {
+                if !dry_run {
+                    enqueue_action_with_priority(store, action, priority)?;
+                }
+                enqueued_count += 1;
+                if enqueued_samples.len() < 32 {
+                    enqueued_samples.push(json!({
+                        "structural_key": structural_key,
+                        "opt_ir_action_id": opt_ir_action_id,
+                        "ir_top": ir_top,
+                        "action_id": action_id,
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "dry_run": dry_run,
+        "crate_version": format!("v{}", crate_version),
+        "dso_version": dso_version,
+        "priority": priority,
+        "max_mffcs": max_mffcs,
+        "min_internal_non_literal": min_internal_non_literal,
+        "max_frontier_non_literal": max_frontier_non_literal,
+        "scanned_opt_actions": scanned_opt_actions,
+        "scoped_opt_actions": scoped_opt_actions,
+        "unique_representatives": scoped_opt_actions
+            .saturating_sub(skipped_existing_structural_hash),
+        "skipped_missing_ir_top": skipped_missing_ir_top,
+        "skipped_existing_structural_hash": skipped_existing_structural_hash,
+        "enqueued_count": enqueued_count,
+        "already_done_count": already_done_count,
+        "already_pending_count": already_pending_count,
+        "already_running_count": already_running_count,
+        "already_failed_count": already_failed_count,
+        "already_canceled_count": already_canceled_count,
+        "enqueued_samples": enqueued_samples,
+    }))
+}
+
+fn is_mffc_named_action(action: &ActionSpec) -> bool {
+    match action {
+        ActionSpec::DriverIrToG8rAig {
+            top_fn_name: Some(top_fn_name),
+            ..
+        }
+        | ActionSpec::IrFnToCombinationalVerilog {
+            top_fn_name: Some(top_fn_name),
+            ..
+        }
+        | ActionSpec::ComboVerilogToYosysAbcAig {
+            verilog_top_module_name: Some(top_fn_name),
+            ..
+        } => top_fn_name.starts_with("__mffc_"),
+        _ => false,
+    }
+}
+
+fn promote_mffc_derived_pending_actions(
+    store: &ArtifactStore,
+    base_priority: i32,
+    dry_run: bool,
+) -> Result<serde_json::Value> {
+    let mut scanned_pending = 0_usize;
+    let mut mffc_pending = 0_usize;
+    let mut promoted_count = 0_usize;
+    let mut already_high_enough_count = 0_usize;
+    let mut promoted_samples = Vec::new();
+
+    let mut pending_paths = list_queue_files(&store.queue_pending_dir())?;
+    pending_paths.sort();
+    for pending_path in pending_paths {
+        let text = match fs::read_to_string(&pending_path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("reading pending queue record: {}", pending_path.display())
+                });
+            }
+        };
+        let (action_id, _enqueued_utc, priority, action) =
+            parse_queue_work_item(&text, &pending_path)?;
+        scanned_pending += 1;
+        if !is_mffc_named_action(&action) {
+            continue;
+        }
+        mffc_pending += 1;
+        let target_priority = suggested_action_queue_priority(base_priority, &action);
+        if priority >= target_priority {
+            already_high_enough_count += 1;
+            continue;
+        }
+        if !dry_run {
+            enqueue_action_with_priority(store, action.clone(), target_priority)?;
+        }
+        promoted_count += 1;
+        if promoted_samples.len() < 32 {
+            promoted_samples.push(json!({
+                "action_id": action_id,
+                "old_priority": priority,
+                "new_priority": target_priority,
+                "action_kind": action_kind_label(&action),
+            }));
+        }
+    }
+
+    Ok(json!({
+        "dry_run": dry_run,
+        "base_priority": base_priority,
+        "scanned_pending": scanned_pending,
+        "mffc_pending": mffc_pending,
+        "promoted_count": promoted_count,
+        "already_high_enough_count": already_high_enough_count,
+        "promoted_samples": promoted_samples,
     }))
 }
 

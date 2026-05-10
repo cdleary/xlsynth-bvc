@@ -26,8 +26,8 @@ use crate::{
     ACTION_SCHEMA_VERSION, DEFAULT_YOSYS_FLOW_SCRIPT, DELAY_INFO_OUTPUT_FORMAT_TEXTPROTO_V1,
     DSLX_PATH_LIST_SEPARATOR, INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY, LEGACY_G8R_STATS_RELPATH,
     OUTPUT_IR_OP_COUNT_DETAILS_KEY, XLSYNTH_SOURCE_ARCHIVE_URL_PREFIX,
-    default_k_bool_cone_max_ir_ops_for_k, driver_ir_aig_equiv_enabled,
-    incremental_ir_corpus_upsert_enabled,
+    default_k_bool_cone_max_ir_ops_for_k, default_mffc_min_internal_non_literal,
+    driver_ir_aig_equiv_enabled, incremental_ir_corpus_upsert_enabled,
 };
 
 type DriverSubcommandSupportCacheKey = (String, String, String, String);
@@ -223,6 +223,27 @@ pub(crate) fn execute_action(
             top_fn_name.as_deref(),
             *k,
             *max_ir_ops,
+            version,
+            runtime,
+            &payload_dir,
+        )?,
+        ActionSpec::IrFnToMffcCorpus {
+            ir_action_id,
+            top_fn_name,
+            max_mffcs,
+            min_internal_non_literal,
+            max_frontier_non_literal,
+            version,
+            runtime,
+        } => run_ir_fn_to_mffc_corpus_action(
+            store,
+            &repo_root,
+            &action_id,
+            ir_action_id,
+            top_fn_name.as_deref(),
+            *max_mffcs,
+            *min_internal_non_literal,
+            *max_frontier_non_literal,
             version,
             runtime,
             &payload_dir,
@@ -1727,10 +1748,10 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir2opt /inputs/input.ir -
             None
         }
     };
-    let k_bool_cone_max_ir_ops = default_k_bool_cone_max_ir_ops_for_k(3);
+    let mffc_min_internal_non_literal = default_mffc_min_internal_non_literal();
     details.insert(
-        "k_bool_cone_max_output_ir_ops".to_string(),
-        json!(k_bool_cone_max_ir_ops),
+        "mffc_min_internal_non_literal".to_string(),
+        json!(mffc_min_internal_non_literal),
     );
     let mut output_ir_structural_hash = reused_output_ir_structural_hash;
     if output_ir_structural_hash.is_none() {
@@ -1767,41 +1788,36 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir2opt /inputs/input.ir -
         next_combo,
     ];
     suggested_next_actions.extend(opt_ir_aig_equiv_suggestions);
-    let mut k_bool_cone_reason = "missing_structural_hash";
-    let mut k_bool_cone_eligible = false;
+    let mut mffc_reason = "missing_structural_hash";
+    let mut mffc_eligible = false;
     if !reused_payload {
         if let Some(hash) = output_ir_structural_hash.as_deref() {
             if is_first_opt_action_for_output_structural_hash(store, action_id, hash)? {
-                k_bool_cone_reason = "eligible";
-                k_bool_cone_eligible = true;
+                mffc_reason = "eligible";
+                mffc_eligible = true;
             } else {
-                k_bool_cone_reason = "not_first_structural_owner";
+                mffc_reason = "not_first_structural_owner";
             }
         }
     } else {
-        k_bool_cone_reason = "semantic_cache_hit";
+        mffc_reason = "semantic_cache_hit";
     }
-    details.insert(
-        "k_bool_cone_suggestion_eligible".to_string(),
-        json!(k_bool_cone_eligible),
-    );
-    details.insert(
-        "k_bool_cone_suggestion_reason".to_string(),
-        json!(k_bool_cone_reason),
-    );
-    if k_bool_cone_eligible {
-        let next_k_bool_cones = build_suggestion(
-            "Extract k=3 bool-cone corpus from structurally unique optimized IR and keep cones with <=16 IR ops",
-            ActionSpec::IrFnToKBoolConeCorpus {
+    details.insert("mffc_suggestion_eligible".to_string(), json!(mffc_eligible));
+    details.insert("mffc_suggestion_reason".to_string(), json!(mffc_reason));
+    if mffc_eligible {
+        let next_mffcs = build_suggestion(
+            "Extract ranked MFFC corpus from structurally unique optimized IR",
+            ActionSpec::IrFnToMffcCorpus {
                 ir_action_id: action_id.to_string(),
                 top_fn_name: Some(ir_top.clone()),
-                k: 3,
-                max_ir_ops: k_bool_cone_max_ir_ops,
+                max_mffcs: None,
+                min_internal_non_literal: mffc_min_internal_non_literal,
+                max_frontier_non_literal: None,
                 version: version.to_string(),
                 runtime: runtime.clone(),
             },
         )?;
-        suggested_next_actions.push(next_k_bool_cones);
+        suggested_next_actions.push(next_mffcs);
     }
 
     Ok(ActionOutcome {
@@ -3488,6 +3504,27 @@ pub(crate) fn load_raw_bool_cone_manifest_lines(
     Ok(rows)
 }
 
+pub(crate) fn load_raw_mffc_manifest_lines(path: &Path) -> Result<Vec<RawMffcManifestLine>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading ir-fn-mffcs manifest jsonl: {}", path.display()))?;
+    let mut rows = Vec::new();
+    for (line_no, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let row: RawMffcManifestLine = serde_json::from_str(trimmed).with_context(|| {
+            format!(
+                "parsing ir-fn-mffcs manifest row {} from {}",
+                line_no + 1,
+                path.display()
+            )
+        })?;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 pub(crate) fn extract_single_ir_fn_block_with_name(
     ir_text: &str,
     new_fn_name: &str,
@@ -4042,6 +4079,174 @@ pub(crate) fn build_k_bool_cone_corpus_outputs(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn build_mffc_corpus_outputs(
+    raw_output_dir: &Path,
+    output_ir_path: &Path,
+    output_manifest_path: &Path,
+    source_ir_action_id: &str,
+    source_ir_top: &str,
+    max_mffcs: Option<u64>,
+    min_internal_non_literal: u64,
+    max_frontier_non_literal: Option<u64>,
+) -> Result<MffcCorpusManifest> {
+    let manifest_jsonl_path = raw_output_dir.join("manifest.jsonl");
+    let raw_rows = load_raw_mffc_manifest_lines(&manifest_jsonl_path)?;
+
+    #[derive(Debug, Clone)]
+    struct TempEntry {
+        source_index: usize,
+        structural_hash: String,
+        fn_name: String,
+        fn_block: String,
+        ir_fn_signature: Option<String>,
+        ir_op_count: Option<u64>,
+        rank: u64,
+        root_node_index: u64,
+        root_text_id: u64,
+        frontier_leaf_indices: Vec<u64>,
+        frontier_non_literal_count: u64,
+        internal_non_literal_count: u64,
+        included_node_count: u64,
+        score_numerator: u64,
+        score_denominator: u64,
+    }
+
+    let mut by_hash: BTreeMap<String, TempEntry> = BTreeMap::new();
+    for (index, row) in raw_rows.iter().enumerate() {
+        let Some(structural_hash) = normalized_structural_hash(&row.sha256) else {
+            bail!(
+                "invalid ir-fn-mffcs manifest sha256 at row {}: {}",
+                index + 1,
+                row.sha256
+            );
+        };
+        if by_hash.contains_key(&structural_hash) {
+            continue;
+        }
+        let mffc_ir_path = raw_output_dir.join(format!("{structural_hash}.ir"));
+        if !mffc_ir_path.exists() {
+            bail!(
+                "manifest referenced missing MFFC IR file: {}",
+                mffc_ir_path.display()
+            );
+        }
+        let mffc_ir_text = fs::read_to_string(&mffc_ir_path)
+            .with_context(|| format!("reading MFFC IR file: {}", mffc_ir_path.display()))?;
+        let fn_name = format!("__mffc_{}", &structural_hash[..16]);
+        let fn_block =
+            extract_single_ir_fn_block_with_name(&mffc_ir_text, &fn_name).with_context(|| {
+                format!(
+                    "extracting function block from MFFC IR: {}",
+                    mffc_ir_path.display()
+                )
+            })?;
+        let ir_fn_signature = parse_ir_function_signature(&fn_block, &fn_name);
+        let ir_op_count = parse_ir_fn_node_count_by_name(&fn_block, &fn_name);
+        let duplicate_ids = find_duplicate_ir_text_ids(&fn_block);
+        if !duplicate_ids.is_empty() {
+            bail!(
+                "invalid ir-fn-mffcs output for `{}` from {}: duplicate text ids {:?}",
+                fn_name,
+                mffc_ir_path.display(),
+                duplicate_ids
+            );
+        }
+        by_hash.insert(
+            structural_hash.clone(),
+            TempEntry {
+                source_index: index,
+                structural_hash,
+                fn_name,
+                fn_block,
+                ir_fn_signature,
+                ir_op_count,
+                rank: row.rank,
+                root_node_index: row.root_node_index,
+                root_text_id: row.root_text_id,
+                frontier_leaf_indices: row.frontier_leaf_indices.clone(),
+                frontier_non_literal_count: row.frontier_non_literal_count,
+                internal_non_literal_count: row.internal_non_literal_count,
+                included_node_count: row.included_node_count,
+                score_numerator: row.score_numerator,
+                score_denominator: row.score_denominator,
+            },
+        );
+    }
+
+    let mut package_text = "package mffcs\n\n".to_string();
+    let mut next_id_offset = 0u64;
+    for entry in by_hash.values() {
+        let rewritten_fn_block = rewrite_ir_text_ids_with_offset(&entry.fn_block, next_id_offset)
+            .and_then(|text| rewrite_ir_node_name_suffixes_with_offset(&text, next_id_offset))
+            .with_context(|| {
+                format!(
+                    "rewriting text ids and node-name suffixes with offset {} for function `{}`",
+                    next_id_offset, entry.fn_name
+                )
+            })?;
+        package_text.push_str(&rewritten_fn_block);
+        package_text.push_str("\n\n");
+        let max_id = max_ir_text_id(&entry.fn_block);
+        next_id_offset = next_id_offset.saturating_add(max_id.saturating_add(1));
+    }
+    fs::write(output_ir_path, &package_text).with_context(|| {
+        format!(
+            "writing merged MFFC IR package: {}",
+            output_ir_path.display()
+        )
+    })?;
+
+    let output_ir_relpath = format!(
+        "payload/{}",
+        output_ir_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("mffcs.ir")
+    );
+
+    let mut entries = Vec::new();
+    for entry in by_hash.values() {
+        entries.push(MffcCorpusEntry {
+            structural_hash: entry.structural_hash.clone(),
+            fn_name: entry.fn_name.clone(),
+            source_index: entry.source_index,
+            rank: entry.rank,
+            root_node_index: entry.root_node_index,
+            root_text_id: entry.root_text_id,
+            frontier_leaf_indices: entry.frontier_leaf_indices.clone(),
+            frontier_non_literal_count: entry.frontier_non_literal_count,
+            internal_non_literal_count: entry.internal_non_literal_count,
+            included_node_count: entry.included_node_count,
+            score_numerator: entry.score_numerator,
+            score_denominator: entry.score_denominator,
+            ir_fn_signature: entry.ir_fn_signature.clone(),
+            ir_op_count: entry.ir_op_count,
+        });
+    }
+    entries.sort_by(|a, b| {
+        a.structural_hash
+            .cmp(&b.structural_hash)
+            .then(a.fn_name.cmp(&b.fn_name))
+    });
+
+    let manifest = MffcCorpusManifest {
+        schema_version: 1,
+        source_ir_action_id: source_ir_action_id.to_string(),
+        source_ir_top: source_ir_top.to_string(),
+        max_mffcs,
+        min_internal_non_literal,
+        max_frontier_non_literal,
+        total_manifest_rows: raw_rows.len(),
+        emitted_mffc_files: entries.len(),
+        deduped_unique_mffcs: entries.len(),
+        output_ir_relpath,
+        entries,
+    };
+    write_json_pretty_file(output_manifest_path, &manifest)?;
+    Ok(manifest)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_ir_fn_to_k_bool_cone_corpus_action(
     store: &ArtifactStore,
     repo_root: &Path,
@@ -4375,6 +4580,227 @@ pub(crate) fn build_k_bool_cone_corpus_suggested_actions_for_entries(
         };
         if let Ok(next) = build_suggestion(
             "Convert k-bool-cone IR function to combinational Verilog with IrFnToCombinationalVerilog",
+            combo,
+        ) && seen_action_ids.insert(next.action_id.clone())
+        {
+            suggested.push(next);
+        }
+    }
+    suggested
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_ir_fn_to_mffc_corpus_action(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    action_id: &str,
+    ir_action_id: &str,
+    top_fn_name: Option<&str>,
+    max_mffcs: Option<u64>,
+    min_internal_non_literal: u64,
+    max_frontier_non_literal: Option<u64>,
+    version: &str,
+    runtime: &DriverRuntimeSpec,
+    payload_dir: &Path,
+) -> Result<ActionOutcome> {
+    let dep = load_dependency_of_type(store, ir_action_id, ArtifactType::IrPackageFile)?;
+    let ir_input_path = store.resolve_artifact_ref_path(&dep);
+    if !ir_input_path.exists() {
+        bail!("input IR path does not exist: {}", ir_input_path.display());
+    }
+
+    let ir_top = match top_fn_name {
+        Some(top) => top.to_string(),
+        None => infer_ir_top_function(&ir_input_path)?,
+    };
+    let min_internal_non_literal = if min_internal_non_literal == 0 {
+        default_mffc_min_internal_non_literal()
+    } else {
+        min_internal_non_literal
+    };
+
+    let output_ir_relpath = "payload/mffcs.ir".to_string();
+    let output_manifest_relpath = "payload/mffcs_manifest.json".to_string();
+    let output_ir_path = payload_dir.join("mffcs.ir");
+    let output_manifest_path = payload_dir.join("mffcs_manifest.json");
+    let output_artifact = ArtifactRef {
+        action_id: action_id.to_string(),
+        artifact_type: ArtifactType::IrPackageFile,
+        relpath: output_ir_relpath.clone(),
+    };
+
+    let mut commands = Vec::new();
+    ensure_driver_runtime_prepared(store, repo_root, version, runtime, &mut commands)?;
+
+    let mut details = serde_json::Map::new();
+    details.insert("driver_runtime".to_string(), json!(runtime));
+    details.insert("xlsynth_version".to_string(), json!(version));
+    insert_driver_version_labels(&mut details, version, runtime);
+    details.insert("ir_top".to_string(), json!(ir_top.clone()));
+    details.insert("max_mffcs".to_string(), json!(max_mffcs));
+    details.insert(
+        "min_internal_non_literal".to_string(),
+        json!(min_internal_non_literal),
+    );
+    details.insert(
+        "max_frontier_non_literal".to_string(),
+        json!(max_frontier_non_literal),
+    );
+    details.insert("driver_subcommand".to_string(), json!("ir-fn-mffcs"));
+    details.insert(
+        "output_ir_relpath".to_string(),
+        json!(output_ir_relpath.clone()),
+    );
+    details.insert(
+        "output_manifest_relpath".to_string(),
+        json!(output_manifest_relpath.clone()),
+    );
+
+    let raw_output_dir = payload_dir.join("mffcs_raw");
+    fs::create_dir_all(&raw_output_dir).with_context(|| {
+        format!(
+            "creating raw MFFC output directory: {}",
+            raw_output_dir.display()
+        )
+    })?;
+    let script = driver_script(
+        r#"
+cat > /tmp/xlsynth-toolchain.toml <<'TOML'
+[toolchain]
+tool_path = "/tmp/xlsynth-release"
+TOML
+mkdir -p /outputs/raw
+xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir-fn-mffcs \
+  --top "${IR_TOP}" \
+  --output_dir /outputs/raw \
+  --manifest_jsonl /outputs/raw/manifest.jsonl \
+  --max_mffcs "${MAX_MFFCS}" \
+  --min_internal_non_literal "${MIN_INTERNAL_NON_LITERAL}" \
+  --max_frontier_non_literal "${MAX_FRONTIER_NON_LITERAL}" \
+  /inputs/input.ir
+test -f /outputs/raw/manifest.jsonl
+"#,
+    );
+    let mut env = BTreeMap::new();
+    env.insert("XLSYNTH_VERSION".to_string(), version.to_string());
+    env.insert(
+        "XLSYNTH_PLATFORM".to_string(),
+        runtime.release_platform.to_string(),
+    );
+    env.insert("IR_TOP".to_string(), ir_top.clone());
+    env.insert("MAX_MFFCS".to_string(), max_mffcs.unwrap_or(0).to_string());
+    env.insert(
+        "MIN_INTERNAL_NON_LITERAL".to_string(),
+        min_internal_non_literal.to_string(),
+    );
+    env.insert(
+        "MAX_FRONTIER_NON_LITERAL".to_string(),
+        max_frontier_non_literal.unwrap_or(0).to_string(),
+    );
+
+    let mounts = vec![
+        DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
+        DockerMount::read_write(&raw_output_dir, "/outputs/raw")?,
+        driver_cache_mount(store)?,
+    ];
+    let run_trace =
+        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    commands.push(run_trace);
+
+    let manifest = build_mffc_corpus_outputs(
+        &raw_output_dir,
+        &output_ir_path,
+        &output_manifest_path,
+        ir_action_id,
+        &ir_top,
+        max_mffcs,
+        min_internal_non_literal,
+        max_frontier_non_literal,
+    )?;
+    details.insert(
+        "total_manifest_rows".to_string(),
+        json!(manifest.total_manifest_rows),
+    );
+    details.insert(
+        "emitted_mffc_files".to_string(),
+        json!(manifest.emitted_mffc_files),
+    );
+    details.insert(
+        "deduped_unique_mffcs".to_string(),
+        json!(manifest.deduped_unique_mffcs),
+    );
+    details.insert(
+        "mffc_entry_count".to_string(),
+        json!(manifest.entries.len()),
+    );
+    let suggested_next_actions =
+        build_mffc_corpus_suggested_actions(action_id, &manifest, version, runtime);
+    details.insert(
+        "suggested_actions".to_string(),
+        json!(suggested_next_actions.len()),
+    );
+
+    fs::remove_dir_all(&raw_output_dir).ok();
+
+    Ok(ActionOutcome {
+        dependencies: vec![dep],
+        output_artifact,
+        commands,
+        details: serde_json::Value::Object(details),
+        suggested_next_actions,
+    })
+}
+
+pub(crate) fn build_mffc_corpus_suggested_actions(
+    action_id: &str,
+    manifest: &MffcCorpusManifest,
+    version: &str,
+    runtime: &DriverRuntimeSpec,
+) -> Vec<SuggestedAction> {
+    let mut suggested = Vec::new();
+    let mut seen_action_ids = HashSet::new();
+    for entry in &manifest.entries {
+        let top = Some(entry.fn_name.clone());
+        let g8r = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: action_id.to_string(),
+            top_fn_name: top.clone(),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::Default,
+            version: version.to_string(),
+            runtime: runtime.clone(),
+        };
+        if let Ok(next) = build_suggestion(
+            "Convert MFFC IR function to AIG with DriverIrToG8rAig (fraig=false)",
+            g8r,
+        ) && seen_action_ids.insert(next.action_id.clone())
+        {
+            suggested.push(next);
+        }
+        let frontend_g8r = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: action_id.to_string(),
+            top_fn_name: top.clone(),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+            version: version.to_string(),
+            runtime: runtime.clone(),
+        };
+        if let Ok(next) = build_suggestion(
+            "Convert MFFC IR function to AIG with DriverIrToG8rAig (frontend_no_prep_rewrite)",
+            frontend_g8r,
+        ) && seen_action_ids.insert(next.action_id.clone())
+        {
+            suggested.push(next);
+        }
+
+        let combo = ActionSpec::IrFnToCombinationalVerilog {
+            ir_action_id: action_id.to_string(),
+            top_fn_name: top,
+            use_system_verilog: false,
+            version: version.to_string(),
+            runtime: runtime.clone(),
+        };
+        if let Ok(next) = build_suggestion(
+            "Convert MFFC IR function to combinational Verilog with IrFnToCombinationalVerilog",
             combo,
         ) && seen_action_ids.insert(next.action_id.clone())
         {
@@ -5369,6 +5795,85 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
                     use_system_verilog: false,
                     ..
                 } if top_fn_name.as_deref() == Some("__k3_cone_bbbbbbbbbbbbbbbb")
+            )
+        }));
+    }
+
+    #[test]
+    fn build_mffc_corpus_suggested_actions_builds_g8r_frontend_and_combo_per_entry() {
+        let manifest = MffcCorpusManifest {
+            schema_version: 1,
+            source_ir_action_id: "a".repeat(64),
+            source_ir_top: "__top".to_string(),
+            max_mffcs: None,
+            min_internal_non_literal: 4,
+            max_frontier_non_literal: None,
+            total_manifest_rows: 1,
+            emitted_mffc_files: 1,
+            deduped_unique_mffcs: 1,
+            output_ir_relpath: "payload/mffcs.ir".to_string(),
+            entries: vec![MffcCorpusEntry {
+                structural_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                fn_name: "__mffc_aaaaaaaaaaaaaaaa".to_string(),
+                source_index: 0,
+                rank: 0,
+                root_node_index: 12,
+                root_text_id: 34,
+                frontier_leaf_indices: vec![1, 2],
+                frontier_non_literal_count: 2,
+                internal_non_literal_count: 8,
+                included_node_count: 10,
+                score_numerator: 64,
+                score_denominator: 3,
+                ir_fn_signature: None,
+                ir_op_count: None,
+            }],
+        };
+        let runtime = DriverRuntimeSpec {
+            driver_version: "0.46.0".to_string(),
+            release_platform: "ubuntu2004".to_string(),
+            docker_image: "xlsynth-bvc-driver:0.46.0".to_string(),
+            dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+        };
+
+        let suggestions = build_mffc_corpus_suggested_actions(
+            "f1a545045a06d81c95bd6d70447918805d408b02d4f262b73cf625a4e5feb4ac",
+            &manifest,
+            "v0.45.0",
+            &runtime,
+        );
+        assert_eq!(suggestions.len(), 3);
+        assert!(suggestions.iter().any(|s| {
+            matches!(
+                s.action,
+                ActionSpec::DriverIrToG8rAig {
+                    ref top_fn_name,
+                    fraig: false,
+                    lowering_mode: G8rLoweringMode::Default,
+                    ..
+                } if top_fn_name.as_deref() == Some("__mffc_aaaaaaaaaaaaaaaa")
+            )
+        }));
+        assert!(suggestions.iter().any(|s| {
+            matches!(
+                s.action,
+                ActionSpec::DriverIrToG8rAig {
+                    ref top_fn_name,
+                    fraig: false,
+                    lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+                    ..
+                } if top_fn_name.as_deref() == Some("__mffc_aaaaaaaaaaaaaaaa")
+            )
+        }));
+        assert!(suggestions.iter().any(|s| {
+            matches!(
+                s.action,
+                ActionSpec::IrFnToCombinationalVerilog {
+                    ref top_fn_name,
+                    use_system_verilog: false,
+                    ..
+                } if top_fn_name.as_deref() == Some("__mffc_aaaaaaaaaaaaaaaa")
             )
         }));
     }

@@ -2308,8 +2308,21 @@ pub(super) fn render_stdlib_g8r_vs_yosys_html(
     let zero_display_note = format!(
         "For the log/log levels and nodes plots, zero values are displayed as <code>1</code> so those samples remain visible ({lhs_label} vs {rhs_label})."
     );
+    let server_scoped_samples = scope == G8rVsYosysViewScope::IrFnCorpusG8rAbcVsCodegenYosysAbc
+        && selected_crate_version.is_some();
+    let scoped_samples: Vec<&crate::view::StdlibG8rVsYosysSample> = if server_scoped_samples {
+        let selected_crate_version =
+            selected_crate_version.expect("checked selected crate version");
+        dataset
+            .samples
+            .iter()
+            .filter(|sample| sample.crate_version == selected_crate_version)
+            .collect()
+    } else {
+        dataset.samples.iter().collect()
+    };
     let samples_json =
-        serde_json::to_string(&dataset.samples).expect("serializing g8r-vs-yosys samples");
+        serde_json::to_string(&scoped_samples).expect("serializing g8r-vs-yosys samples");
     let selected_crate_json =
         serde_json::to_string(&selected_crate_version).expect("serializing selected crate version");
     let scope_label = selected_crate_version
@@ -2507,6 +2520,12 @@ pub(super) fn render_stdlib_g8r_vs_yosys_html(
     } else {
         "false"
     });
+    html.push_str(";\nconst serverScopedSamples = ");
+    html.push_str(if server_scoped_samples {
+        "true"
+    } else {
+        "false"
+    });
     html.push_str(";\nlet lossesOnly = ");
     html.push_str(if losses_only { "true" } else { "false" });
     html.push_str(";\nconst viewScopePath = ");
@@ -2673,6 +2692,27 @@ function syncUrlQueryState() {
   }
   const query = url.searchParams.toString();
   history.replaceState(null, '', viewScopePath + (query ? '?' + query : ''));
+}
+
+function navigateToCurrentFilterState() {
+  const url = new URL(window.location.origin + viewScopePath);
+  if (allowFraigToggle) {
+    url.searchParams.set('fraig', fraig ? 'true' : 'false');
+  }
+  if (sliderEl) {
+    url.searchParams.set('max_ir_nodes', String(Number(sliderEl.value)));
+  }
+  const crateVersion = crateSelectEl ? (crateSelectEl.value || '') : (selectedCrateVersion || '');
+  if (crateVersion) {
+    url.searchParams.set('crate_version', crateVersion);
+  }
+  const nextLossesOnly = lossesOnlySelectEl
+    ? lossesOnlySelectEl.value === 'losses_only'
+    : lossesOnly;
+  if (nextLossesOnly) {
+    url.searchParams.set('losses_only', 'true');
+  }
+  window.location.assign(url.toString());
 }
 
 async function showSampleDetails(sample, sourcePlotId) {
@@ -3273,7 +3313,13 @@ if (sliderEl) {
   sliderEl.addEventListener('input', updateFilteredViews);
 }
 if (crateSelectEl) {
-  crateSelectEl.addEventListener('change', updateFilteredViews);
+  crateSelectEl.addEventListener('change', () => {
+    if (serverScopedSamples) {
+      navigateToCurrentFilterState();
+      return;
+    }
+    updateFilteredViews();
+  });
 }
 if (lossesOnlySelectEl) {
   lossesOnlySelectEl.addEventListener('change', updateFilteredViews);

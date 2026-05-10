@@ -12,26 +12,44 @@ use axum::{
 };
 use chrono::Utc;
 use log::info;
-use std::time::Instant;
+use std::{collections::BTreeSet, path::Path, time::Instant};
 
 use crate::query::{
     build_ir_fn_corpus_k3_loss_by_version_dataset, build_ir_fn_corpus_structural_coverage,
     build_ir_fn_corpus_structural_member_views, clamp_ir_node_limit,
     ensure_ir_fn_corpus_structural_archive, html_escape,
     ir_fn_corpus_structural_archive_download_filename, is_valid_action_id_for_route,
-    load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index,
-    load_ir_fn_corpus_g8r_vs_yosys_dataset_index, load_ir_fn_corpus_structural_group,
+    load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_index,
+    load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index, load_ir_fn_corpus_structural_group,
     load_ir_fn_corpus_structural_manifest, lookup_ir_fn_corpus_by_fn_name,
     rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index,
     rebuild_ir_fn_corpus_g8r_vs_yosys_dataset_index,
 };
-use crate::versioning::normalize_tag_version;
-use crate::view::G8rVsYosysViewScope;
+use crate::versioning::{
+    cmp_dotted_numeric_version, load_version_compat_map, normalize_tag_version,
+};
+use crate::view::{G8rVsYosysViewScope, StdlibG8rVsYosysDataset};
 use crate::web::render::{
     inject_server_timing_badge, render_ir_fn_corpus_k3_losses_vs_crate_version_html,
     render_ir_fn_corpus_structural_group_html, render_ir_fn_corpus_structural_html,
     render_stdlib_g8r_vs_yosys_html,
 };
+
+fn with_known_crate_versions_for_selector(
+    dataset: &StdlibG8rVsYosysDataset,
+    repo_root: &Path,
+) -> StdlibG8rVsYosysDataset {
+    let Ok(compat) = load_version_compat_map(repo_root) else {
+        return dataset.clone();
+    };
+    let mut versions: BTreeSet<String> = dataset.available_crate_versions.iter().cloned().collect();
+    versions.extend(compat.keys().map(|v| normalize_tag_version(v).to_string()));
+    let mut available_crate_versions: Vec<String> = versions.into_iter().collect();
+    available_crate_versions.sort_by(|a, b| cmp_dotted_numeric_version(a, b));
+    let mut out = dataset.clone();
+    out.available_crate_versions = available_crate_versions;
+    out
+}
 
 pub(super) async fn web_ir_fn_corpus_g8r_vs_yosys_abc_redirect() -> Redirect {
     Redirect::temporary("/ir-fn-corpus-g8r-vs-yosys-abc/")
@@ -75,7 +93,7 @@ pub(super) async fn web_ir_fn_corpus_structural(
     match tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         let manifest = load_ir_fn_corpus_structural_manifest(&store).ok();
-        let coverage = load_ir_fn_corpus_g8r_vs_yosys_dataset_index(&store)
+        let coverage = load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index(&store)
             .ok()
             .flatten()
             .map(|dataset| build_ir_fn_corpus_structural_coverage(&dataset))
@@ -328,7 +346,7 @@ pub(super) async fn web_ir_fn_corpus_g8r_vs_yosys_abc(
         let _permit = permit;
         let started = Instant::now();
         let dataset = cache.get_or_compute_ir_fn_corpus_g8r_vs_yosys_dataset(|| {
-            if let Some(indexed) = load_ir_fn_corpus_g8r_vs_yosys_dataset_index(&store)? {
+            if let Some(indexed) = load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index(&store)? {
                 return Ok(indexed);
             }
             if snapshot_mode {
@@ -341,13 +359,15 @@ pub(super) async fn web_ir_fn_corpus_g8r_vs_yosys_abc(
                 "web /ir-fn-corpus-g8r-vs-yosys-abc rebuilt index samples={} versions={}",
                 summary.sample_count, summary.crate_versions
             );
-            load_ir_fn_corpus_g8r_vs_yosys_dataset_index(&store)?.ok_or_else(|| {
+            load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index(&store)?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "ir-fn-corpus index rebuild completed but index remained unavailable"
                 )
             })
         })?;
         let after_build = Instant::now();
+        let sampled_crate_versions = dataset.available_crate_versions.clone();
+        let dataset = with_known_crate_versions_for_selector(&dataset, &repo_root);
         let max_ir_nodes = clamp_ir_node_limit(
             requested_max_ir_nodes,
             dataset.min_ir_nodes,
@@ -355,7 +375,7 @@ pub(super) async fn web_ir_fn_corpus_g8r_vs_yosys_abc(
         );
         let selected_crate_version = requested_crate_version
             .filter(|v| dataset.available_crate_versions.binary_search(v).is_ok())
-            .or_else(|| dataset.available_crate_versions.last().cloned());
+            .or_else(|| sampled_crate_versions.last().cloned());
         let html = render_stdlib_g8r_vs_yosys_html(
             &dataset,
             max_ir_nodes,
@@ -446,7 +466,7 @@ pub(super) async fn web_ir_fn_corpus_k3_losses_vs_crate_version(
         let _permit = permit;
         let started = Instant::now();
         let dataset = cache.get_or_compute_ir_fn_corpus_g8r_vs_yosys_dataset(|| {
-            if let Some(indexed) = load_ir_fn_corpus_g8r_vs_yosys_dataset_index(&store)? {
+            if let Some(indexed) = load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index(&store)? {
                 return Ok(indexed);
             }
             if snapshot_mode {
@@ -459,7 +479,7 @@ pub(super) async fn web_ir_fn_corpus_k3_losses_vs_crate_version(
                 "web /ir-fn-corpus-k3-losses-vs-crate-version rebuilt index samples={} versions={}",
                 summary.sample_count, summary.crate_versions
             );
-            load_ir_fn_corpus_g8r_vs_yosys_dataset_index(&store)?.ok_or_else(|| {
+            load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index(&store)?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "ir-fn-corpus index rebuild completed but index remained unavailable"
                 )
@@ -555,7 +575,7 @@ pub(super) async fn web_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc(
         let dataset = cache.get_or_compute_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset(
             || {
                 if let Some(indexed) =
-                    load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(&store)?
+                    load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_index(&store)?
                 {
                     return Ok(indexed);
                 }
@@ -571,7 +591,7 @@ pub(super) async fn web_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc(
                     "web /ir-fn-g8r-abc-vs-codegen-yosys-abc rebuilt index samples={} versions={}",
                     summary.sample_count, summary.crate_versions
                 );
-                load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(&store)?.ok_or_else(
+                load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_index(&store)?.ok_or_else(
                     || {
                         anyhow::anyhow!(
                             "ir-fn-corpus frontend-compare index rebuild completed but index remained unavailable"
@@ -581,6 +601,8 @@ pub(super) async fn web_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc(
             },
         )?;
         let after_build = Instant::now();
+        let sampled_crate_versions = dataset.available_crate_versions.clone();
+        let dataset = with_known_crate_versions_for_selector(&dataset, &repo_root);
         let max_ir_nodes = clamp_ir_node_limit(
             requested_max_ir_nodes,
             dataset.min_ir_nodes,
@@ -588,7 +610,7 @@ pub(super) async fn web_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc(
         );
         let selected_crate_version = requested_crate_version
             .filter(|v| dataset.available_crate_versions.binary_search(v).is_ok())
-            .or_else(|| dataset.available_crate_versions.last().cloned());
+            .or_else(|| sampled_crate_versions.last().cloned());
         let html = render_stdlib_g8r_vs_yosys_html(
             &dataset,
             max_ir_nodes,

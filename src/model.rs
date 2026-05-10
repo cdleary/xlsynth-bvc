@@ -134,6 +134,17 @@ pub(crate) enum ActionSpec {
         version: String,
         runtime: DriverRuntimeSpec,
     },
+    IrFnToMffcCorpus {
+        ir_action_id: String,
+        top_fn_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_mffcs: Option<u64>,
+        min_internal_non_literal: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_frontier_non_literal: Option<u64>,
+        version: String,
+        runtime: DriverRuntimeSpec,
+    },
     ComboVerilogToYosysAbcAig {
         verilog_action_id: String,
         verilog_top_module_name: Option<String>,
@@ -191,6 +202,7 @@ pub(crate) fn action_batch_key(action: &ActionSpec) -> Option<ActionBatchKey> {
         | ActionSpec::DriverIrAigEquiv { .. }
         | ActionSpec::IrFnToCombinationalVerilog { .. }
         | ActionSpec::IrFnToKBoolConeCorpus { .. }
+        | ActionSpec::IrFnToMffcCorpus { .. }
         | ActionSpec::ComboVerilogToYosysAbcAig { .. }
         | ActionSpec::AigToYosysAbcAig { .. }
         | ActionSpec::DriverAigToStats { .. }
@@ -738,6 +750,59 @@ pub(crate) struct RawBoolConeManifestLine {
     pub(crate) frontier_leaf_indices: Vec<u64>,
     pub(crate) frontier_non_literal_count: u64,
     pub(crate) included_node_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MffcCorpusManifest {
+    pub(crate) schema_version: u32,
+    pub(crate) source_ir_action_id: String,
+    pub(crate) source_ir_top: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_mffcs: Option<u64>,
+    pub(crate) min_internal_non_literal: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_frontier_non_literal: Option<u64>,
+    pub(crate) total_manifest_rows: usize,
+    pub(crate) emitted_mffc_files: usize,
+    pub(crate) deduped_unique_mffcs: usize,
+    pub(crate) output_ir_relpath: String,
+    pub(crate) entries: Vec<MffcCorpusEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MffcCorpusEntry {
+    pub(crate) structural_hash: String,
+    pub(crate) fn_name: String,
+    pub(crate) source_index: usize,
+    pub(crate) rank: u64,
+    pub(crate) root_node_index: u64,
+    pub(crate) root_text_id: u64,
+    #[serde(default)]
+    pub(crate) frontier_leaf_indices: Vec<u64>,
+    pub(crate) frontier_non_literal_count: u64,
+    pub(crate) internal_non_literal_count: u64,
+    pub(crate) included_node_count: u64,
+    pub(crate) score_numerator: u64,
+    pub(crate) score_denominator: u64,
+    #[serde(default)]
+    pub(crate) ir_fn_signature: Option<String>,
+    #[serde(default)]
+    pub(crate) ir_op_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct RawMffcManifestLine {
+    pub(crate) sha256: String,
+    pub(crate) rank: u64,
+    pub(crate) root_node_index: u64,
+    pub(crate) root_text_id: u64,
+    #[serde(default)]
+    pub(crate) frontier_leaf_indices: Vec<u64>,
+    pub(crate) frontier_non_literal_count: u64,
+    pub(crate) internal_non_literal_count: u64,
+    pub(crate) included_node_count: u64,
+    pub(crate) score_numerator: u64,
+    pub(crate) score_denominator: u64,
 }
 
 #[derive(Debug)]

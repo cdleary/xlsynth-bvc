@@ -257,6 +257,9 @@ pub(crate) fn prepare_queue_runtime_environment(
             }
             | ActionSpec::IrFnToKBoolConeCorpus {
                 version, runtime, ..
+            }
+            | ActionSpec::IrFnToMffcCorpus {
+                version, runtime, ..
             } => {
                 driver_releases.insert((version, runtime.release_platform.clone()));
                 driver_runtimes.insert(runtime);
@@ -836,7 +839,9 @@ fn prepare_mount_request(
     mount_index: usize,
     mount: &DockerMount,
 ) -> Result<(PersistentRunnerMountRequest, Option<ExternalWriteback>)> {
-    if let Some(source_path) = store_container_path(store_root, &mount.host_path) {
+    if mount.read_only
+        && let Some(source_path) = store_container_path(store_root, &mount.host_path)
+    {
         return Ok((
             PersistentRunnerMountRequest {
                 source_path,
@@ -1763,6 +1768,7 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
             ActionSpec::DriverIrToG8rAig { .. } => "driver_ir_to_g8r_aig",
             ActionSpec::IrFnToCombinationalVerilog { .. } => "ir_fn_to_combinational_verilog",
             ActionSpec::IrFnToKBoolConeCorpus { .. } => "ir_fn_to_k_bool_cone_corpus",
+            ActionSpec::IrFnToMffcCorpus { .. } => "ir_fn_to_mffc_corpus",
             ActionSpec::ComboVerilogToYosysAbcAig { .. } => "combo_verilog_to_yosys_abc_aig",
             ActionSpec::AigToYosysAbcAig { .. } => "aig_to_yosys_abc_aig",
             ActionSpec::DriverAigToStats { .. } => "driver_aig_to_stats",

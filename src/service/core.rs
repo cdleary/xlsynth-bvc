@@ -778,7 +778,8 @@ pub(crate) fn resolve_dslx_origin_action_context_from_ir_action(
                 }));
             }
             ActionSpec::DriverIrToOpt { ir_action_id, .. }
-            | ActionSpec::IrFnToKBoolConeCorpus { ir_action_id, .. } => {
+            | ActionSpec::IrFnToKBoolConeCorpus { ir_action_id, .. }
+            | ActionSpec::IrFnToMffcCorpus { ir_action_id, .. } => {
                 current = ir_action_id;
             }
             _ => return Ok(None),

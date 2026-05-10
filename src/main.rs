@@ -126,6 +126,7 @@ export LD_LIBRARY_PATH="/tmp/xlsynth-release:${LD_LIBRARY_PATH:-}"
 const INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY: &str = "input_ir_fn_structural_hash";
 const OUTPUT_IR_OP_COUNT_DETAILS_KEY: &str = "output_ir_op_count";
 const DEFAULT_K_BOOL_CONE_MAX_IR_OPS: u64 = 16;
+const DEFAULT_MFFC_MIN_INTERNAL_NON_LITERAL: u64 = 4;
 const DELAY_INFO_OUTPUT_FORMAT_TEXTPROTO_V1: &str = "textproto_v1";
 const DSLX_LIST_FNS_LEGACY_SOURCE_DRIVER_MAX: &str = "0.29.0";
 const XLSYNTH_SOURCE_ARCHIVE_URL_PREFIX: &str =
@@ -185,6 +186,10 @@ pub(crate) fn default_k_bool_cone_max_ir_ops_for_k(k: u32) -> Option<u64> {
     } else {
         None
     }
+}
+
+pub(crate) fn default_mffc_min_internal_non_literal() -> u64 {
+    DEFAULT_MFFC_MIN_INTERNAL_NON_LITERAL
 }
 
 impl DriverCli {

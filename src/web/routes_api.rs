@@ -13,8 +13,8 @@ use std::time::Instant;
 use crate::model::{ActionSpec, CommandTrace};
 use crate::query::{
     build_associated_ir_view, filter_ir_fn_corpus_g8r_vs_yosys_samples,
-    load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index,
-    load_ir_fn_corpus_g8r_vs_yosys_dataset_index,
+    load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_index,
+    load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index,
     rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index,
     rebuild_ir_fn_corpus_g8r_vs_yosys_dataset_index,
 };
@@ -486,7 +486,9 @@ pub(super) async fn web_jsonrpc(
             match tokio::task::spawn_blocking(move || {
                 let started = Instant::now();
                 let dataset = cache.get_or_compute_ir_fn_corpus_g8r_vs_yosys_dataset(|| {
-                    if let Some(indexed) = load_ir_fn_corpus_g8r_vs_yosys_dataset_index(&store)? {
+                    if let Some(indexed) =
+                        load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index(&store)?
+                    {
                         return Ok(indexed);
                     }
                     let summary = rebuild_ir_fn_corpus_g8r_vs_yosys_dataset_index(&store, &repo_root)?;
@@ -494,7 +496,7 @@ pub(super) async fn web_jsonrpc(
                         "web /api/jsonrpc rebuilt ir-fn-corpus g8r-vs-yosys index samples={} versions={}",
                         summary.sample_count, summary.crate_versions
                     );
-                    load_ir_fn_corpus_g8r_vs_yosys_dataset_index(&store)?.ok_or_else(|| {
+                    load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index(&store)?.ok_or_else(|| {
                         anyhow::anyhow!(
                             "ir-fn-corpus index rebuild completed but index remained unavailable"
                         )
@@ -619,7 +621,9 @@ pub(super) async fn web_jsonrpc(
                 let dataset = cache.get_or_compute_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset(
                     || {
                         if let Some(indexed) =
-                            load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(&store)?
+                            load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_index(
+                                &store,
+                            )?
                         {
                             return Ok(indexed);
                         }
@@ -631,7 +635,9 @@ pub(super) async fn web_jsonrpc(
                             "web /api/jsonrpc rebuilt ir-fn-corpus g8r+abc-vs-codegen+yosys index samples={} versions={}",
                             summary.sample_count, summary.crate_versions
                         );
-                        load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(&store)?
+                        load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_index(
+                            &store,
+                        )?
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "ir-fn-corpus g8r+abc-vs-codegen+yosys index rebuild completed but index remained unavailable"
@@ -791,7 +797,7 @@ pub(super) async fn web_jsonrpc(
                     cache.get_or_compute_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset(
                         || {
                             if let Some(indexed) =
-                                load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(
+                                load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_index(
                                     &store,
                                 )?
                             {
@@ -800,7 +806,9 @@ pub(super) async fn web_jsonrpc(
                             rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(
                                 &store, &repo_root,
                             )?;
-                            load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(&store)?
+                            load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_index(
+                                &store,
+                            )?
                                 .ok_or_else(|| {
                                     anyhow::anyhow!(
                                         "frontend compare index rebuild completed but index remained unavailable"
@@ -820,12 +828,12 @@ pub(super) async fn web_jsonrpc(
                     let dataset_default = cache.get_or_compute_ir_fn_corpus_g8r_vs_yosys_dataset(
                         || {
                             if let Some(indexed) =
-                                load_ir_fn_corpus_g8r_vs_yosys_dataset_index(&store)?
+                                load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index(&store)?
                             {
                                 return Ok(indexed);
                             }
                             rebuild_ir_fn_corpus_g8r_vs_yosys_dataset_index(&store, &repo_root)?;
-                            load_ir_fn_corpus_g8r_vs_yosys_dataset_index(&store)?.ok_or_else(
+                            load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index(&store)?.ok_or_else(
                                 || {
                                     anyhow::anyhow!(
                                         "ir-fn-corpus g8r-vs-yosys index rebuild completed but index remained unavailable"

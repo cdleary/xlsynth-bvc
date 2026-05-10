@@ -161,6 +161,13 @@ pub enum TopCommand {
     },
     CheckIrFnCorpusStructuralFreshness,
     RebuildWebIndices,
+    RebuildIrFnG8rAbcVsCodegenYosysAbcIndex,
+    PromoteMffcDerivedPending {
+        #[arg(long, default_value_t = crate::DEFAULT_QUEUE_PRIORITY)]
+        base_priority: i32,
+        #[arg(long)]
+        dry_run: bool,
+    },
     BuildStaticSnapshot {
         #[arg(long, value_name = "DIR")]
         out_dir: PathBuf,
@@ -222,6 +229,20 @@ pub enum TopCommand {
         only_previous_losses: bool,
         #[arg(long)]
         recompute_missing_hashes: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    EnqueueStructuralOptIrMffcs {
+        #[arg(long)]
+        crate_version: String,
+        #[arg(long)]
+        max_mffcs: Option<u64>,
+        #[arg(long, default_value_t = crate::default_mffc_min_internal_non_literal())]
+        min_internal_non_literal: u64,
+        #[arg(long)]
+        max_frontier_non_literal: Option<u64>,
+        #[arg(long, default_value_t = crate::DEFAULT_QUEUE_PRIORITY)]
+        priority: i32,
         #[arg(long)]
         dry_run: bool,
     },
@@ -411,6 +432,22 @@ pub enum RunAction {
         k: u32,
         #[arg(long)]
         max_ir_ops: Option<u64>,
+        #[arg(long)]
+        version: String,
+        #[command(flatten)]
+        driver: DriverCli,
+    },
+    IrToMffcCorpus {
+        #[arg(long)]
+        ir_action_id: String,
+        #[arg(long)]
+        top_fn_name: Option<String>,
+        #[arg(long)]
+        max_mffcs: Option<u64>,
+        #[arg(long, default_value_t = crate::default_mffc_min_internal_non_literal())]
+        min_internal_non_literal: u64,
+        #[arg(long)]
+        max_frontier_non_literal: Option<u64>,
         #[arg(long)]
         version: String,
         #[command(flatten)]

@@ -566,13 +566,18 @@ pub(crate) fn action_scheduler_priority(action: &ActionSpec) -> u8 {
         ActionSpec::AigToYosysAbcAig { .. } => 2,
         ActionSpec::ComboVerilogToYosysAbcAig { .. } => 3,
         ActionSpec::DriverIrToG8rAig { .. } => 4,
+        ActionSpec::IrFnToCombinationalVerilog {
+            top_fn_name: Some(top_fn_name),
+            ..
+        } if top_fn_name.starts_with("__mffc_") => 3,
         ActionSpec::IrFnToCombinationalVerilog { .. } => 5,
-        ActionSpec::IrFnToKBoolConeCorpus { .. } => 6,
-        ActionSpec::DriverIrAigEquiv { .. } => 7,
-        ActionSpec::DriverIrEquiv { .. } => 8,
+        ActionSpec::DriverIrAigEquiv { .. } => 6,
+        ActionSpec::DriverIrToOpt { .. } => 7,
+        ActionSpec::DriverDslxFnToIr { .. } => 8,
         ActionSpec::DriverIrToDelayInfo { .. } => 9,
-        ActionSpec::DriverIrToOpt { .. } => 10,
-        ActionSpec::DriverDslxFnToIr { .. } => 11,
+        ActionSpec::DriverIrEquiv { .. } => 10,
+        ActionSpec::IrFnToMffcCorpus { .. } => 11,
+        ActionSpec::IrFnToKBoolConeCorpus { .. } => 12,
         ActionSpec::ImportIrPackageFile { .. }
         | ActionSpec::DownloadAndExtractXlsynthSourceSubtree { .. } => 12,
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. } => {
@@ -839,7 +844,8 @@ pub(crate) fn action_dependency_role_action_ids(action: &ActionSpec) -> Vec<(&'s
         ActionSpec::IrFnToCombinationalVerilog { ir_action_id, .. } => {
             vec![("ir_action_id", ir_action_id.as_str())]
         }
-        ActionSpec::IrFnToKBoolConeCorpus { ir_action_id, .. } => {
+        ActionSpec::IrFnToKBoolConeCorpus { ir_action_id, .. }
+        | ActionSpec::IrFnToMffcCorpus { ir_action_id, .. } => {
             vec![("ir_action_id", ir_action_id.as_str())]
         }
         ActionSpec::ComboVerilogToYosysAbcAig {
@@ -1854,8 +1860,8 @@ mod tests {
         assert!(action_scheduler_priority(&stats) < action_scheduler_priority(&yabc));
         assert!(action_scheduler_priority(&yabc) < action_scheduler_priority(&combo));
         assert!(action_scheduler_priority(&combo) < action_scheduler_priority(&ir_aig_equiv));
-        assert!(action_scheduler_priority(&ir_aig_equiv) < action_scheduler_priority(&ir_equiv));
-        assert!(action_scheduler_priority(&ir_equiv) < action_scheduler_priority(&opt));
+        assert!(action_scheduler_priority(&ir_aig_equiv) < action_scheduler_priority(&opt));
+        assert!(action_scheduler_priority(&opt) < action_scheduler_priority(&ir_equiv));
         assert!(action_scheduler_priority(&combo) < action_scheduler_priority(&opt));
     }
 
