@@ -1785,6 +1785,7 @@ mod tests {
         YosysRuntimeSpec {
             docker_image: image,
             dockerfile: "testdata/persistent_runners/fake-yosys.Dockerfile".to_string(),
+            upstream_commit: None,
         }
     }
 

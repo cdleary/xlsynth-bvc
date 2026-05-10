@@ -17,6 +17,8 @@ pub(crate) struct DriverRuntimeSpec {
 pub(crate) struct YosysRuntimeSpec {
     pub(crate) docker_image: String,
     pub(crate) dockerfile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) upstream_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]

@@ -510,4 +510,6 @@ pub struct YosysCli {
     pub(crate) yosys_dockerfile: PathBuf,
     #[arg(long, default_value = crate::DEFAULT_YOSYS_DOCKER_IMAGE)]
     pub(crate) yosys_docker_image: String,
+    #[arg(long, default_value = crate::DEFAULT_YOSYS_UPSTREAM_COMMIT)]
+    pub(crate) yosys_upstream_commit: Option<String>,
 }

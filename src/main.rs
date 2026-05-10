@@ -48,7 +48,8 @@ const DEFAULT_RELEASE_PLATFORM: &str = "ubuntu2004";
 const DEFAULT_DOCKERFILE: &str = "docker/xlsynth-driver.Dockerfile";
 const DEFAULT_DOCKER_IMAGE_PREFIX: &str = "xlsynth-bvc-driver";
 const DEFAULT_YOSYS_DOCKERFILE: &str = "docker/yosys-abc.Dockerfile";
-const DEFAULT_YOSYS_DOCKER_IMAGE: &str = "xlsynth-bvc-yosys-abc:ubuntu24.04-py";
+const DEFAULT_YOSYS_DOCKER_IMAGE: &str = "xlsynth-bvc-yosys-abc:yosys-1f023432-py";
+const DEFAULT_YOSYS_UPSTREAM_COMMIT: &str = "1f023432681c159885f0b834a2e0717e67c4c115";
 const DEFAULT_YOSYS_FLOW_SCRIPT: &str = "flows/yosys_to_aig.ys";
 const DEFAULT_QUEUE_LEASE_SECONDS: i64 = 900;
 const DEFAULT_QUEUE_PRIORITY: i32 = 0;
@@ -219,6 +220,7 @@ impl YosysCli {
         YosysRuntimeSpec {
             docker_image: self.yosys_docker_image,
             dockerfile: self.yosys_dockerfile.to_string_lossy().to_string(),
+            upstream_commit: self.yosys_upstream_commit,
         }
     }
 }

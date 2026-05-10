@@ -12,10 +12,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use crate::{
-    DELAY_INFO_OUTPUT_FORMAT_TEXTPROTO_V1, INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY,
-    VERSION_COMPAT_PATH,
-};
 use crate::cli::{Cli, RunAction, TopCommand};
 use crate::corpus::{refresh_ir_dir_corpus_status, run_ir_dir_corpus, show_ir_dir_corpus_progress};
 use crate::driver_ir_aig_equiv_enabled;
@@ -26,9 +22,8 @@ use crate::executor::{
 use crate::model::*;
 use crate::ops::run_workers;
 use crate::query::{
-    enqueue_processing_for_crate_version,
-    action_kind_label, rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index,
-    rebuild_web_indices,
+    action_kind_label, enqueue_processing_for_crate_version,
+    rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index, rebuild_web_indices,
 };
 use crate::queue::*;
 use crate::queue_only_previous_loss_k_cones_enabled;
@@ -42,6 +37,10 @@ use crate::store::{
 };
 use crate::versioning::*;
 use crate::web::{self, types::WebRunnerConfig};
+use crate::{
+    DELAY_INFO_OUTPUT_FORMAT_TEXTPROTO_V1, INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY,
+    VERSION_COMPAT_PATH,
+};
 
 const DEFAULT_QUEUE_RUNTIME_PREPARE_MIN_INTERVAL_SECS: u64 = 30;
 const MAX_COMPATIBLE_BATCH_SIZE: usize = 4;
@@ -495,13 +494,13 @@ pub(crate) fn run() -> Result<()> {
             );
         }
         TopCommand::RebuildIrFnG8rAbcVsCodegenYosysAbcIndex => {
-            let summary =
-                rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(&store, &repo_root)?;
+            let summary = rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(
+                &store, &repo_root,
+            )?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&summary).expect(
-                    "serializing rebuild IR fn g8r-ABC vs codegen-Yosys/ABC index summary"
-                )
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing rebuild IR fn g8r-ABC vs codegen-Yosys/ABC index summary")
             );
         }
         TopCommand::PromoteMffcDerivedPending {
@@ -2234,7 +2233,8 @@ pub(crate) fn backfill_opt_ir_frontend_compare_suggestions(
         let combo_action_id = compute_action_id(&combo_action)?;
         let candidates = [
             SuggestedAction {
-            reason: "Run frontend-isolated g8r+ABC path (fraig=false, no prep rewrite)".to_string(),
+                reason: "Run frontend-isolated g8r+ABC path (fraig=false, no prep rewrite)"
+                    .to_string(),
                 action_id: g8r_action_id,
                 action: g8r_action,
             },
@@ -2321,12 +2321,13 @@ pub(crate) fn backfill_opt_ir_frontend_compare_suggestions(
                     QueueState::Done => {
                         already_done_count += 1;
                         if enqueue {
-                            downstream_counts += enqueue_completed_action_suggestions_with_priority(
-                                store,
-                                &candidate.action_id,
-                                priority,
-                                dry_run,
-                            )?;
+                            downstream_counts +=
+                                enqueue_completed_action_suggestions_with_priority(
+                                    store,
+                                    &candidate.action_id,
+                                    priority,
+                                    dry_run,
+                                )?;
                         }
                     }
                     QueueState::Failed => already_failed_count += 1,

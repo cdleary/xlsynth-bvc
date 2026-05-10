@@ -1808,6 +1808,7 @@ mod tests {
         let yosys_runtime = crate::model::YosysRuntimeSpec {
             docker_image: "xlsynth-bvc-yosys:latest".to_string(),
             dockerfile: "docker/yosys-abc.Dockerfile".to_string(),
+            upstream_commit: None,
         };
         let diff = ActionSpec::AigStatDiff {
             opt_ir_action_id: "a".repeat(64),

@@ -2067,6 +2067,7 @@ mod tests {
         YosysRuntimeSpec {
             docker_image: crate::DEFAULT_YOSYS_DOCKER_IMAGE.to_string(),
             dockerfile: crate::DEFAULT_YOSYS_DOCKERFILE.to_string(),
+            upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
         }
     }
 
@@ -2090,6 +2091,7 @@ mod tests {
         YosysCli {
             yosys_dockerfile: PathBuf::from(crate::DEFAULT_YOSYS_DOCKERFILE),
             yosys_docker_image: crate::DEFAULT_YOSYS_DOCKER_IMAGE.to_string(),
+            yosys_upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
         }
     }
 

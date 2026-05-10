@@ -4905,6 +4905,7 @@ test -s /outputs/result.aig
         commands,
         details: json!({
             "yosys_runtime": runtime,
+            "yosys_upstream_commit": runtime.upstream_commit.as_deref(),
             "verilog_top_module_name": verilog_top_module_name,
             "yosys_script_ref": yosys_script_ref,
             "flow": "yosys_script_to_aiger",
@@ -4992,6 +4993,7 @@ test -s /outputs/result.aig
         commands,
         details: json!({
             "yosys_runtime": runtime,
+            "yosys_upstream_commit": runtime.upstream_commit.as_deref(),
             "yosys_script_ref": yosys_script_ref,
             "flow": "aiger_script_to_aiger",
         }),
