@@ -462,6 +462,12 @@ const PERSISTENT_RUNNER_ROOT_DIR: &str = "persistent-runners";
 const PERSISTENT_RUNNER_RUNNERS_DIR: &str = "runners";
 const PERSISTENT_RUNNER_REQUEST_TIMEOUT_GRACE_SECS: u64 = 15;
 const PERSISTENT_RUNNER_HEARTBEAT_STALE_SECS: u64 = 15;
+const PERSISTENT_RUNNER_POOL_SIZE_ENV: &str = "XLSYNTH_BVC_PERSISTENT_RUNNER_POOL_SIZE";
+const PERSISTENT_RUNNER_DRIVER_POOL_SIZE_ENV: &str =
+    "XLSYNTH_BVC_DRIVER_PERSISTENT_RUNNER_POOL_SIZE";
+const PERSISTENT_RUNNER_YOSYS_POOL_SIZE_ENV: &str = "XLSYNTH_BVC_YOSYS_PERSISTENT_RUNNER_POOL_SIZE";
+const PERSISTENT_RUNNER_IDLE_TTL_SECS_ENV: &str = "XLSYNTH_BVC_PERSISTENT_RUNNER_IDLE_TTL_SECS";
+const PERSISTENT_RUNNER_DEFAULT_IDLE_TTL_SECS: u64 = 15 * 60;
 const PERSISTENT_RUNNER_WORKER_SCRIPT: &str = "scripts/persistent_runner_worker.py";
 static PERSISTENT_RUNNER_START_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
@@ -577,6 +583,33 @@ struct PersistentRunnerCapabilities {
     driver_help_tokens: BTreeMap<String, BTreeMap<String, bool>>,
 }
 
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct PersistentRunnerHeartbeat {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    current_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedPersistentRunner {
+    runner_key: String,
+    runner_instance_id: String,
+    container_name: String,
+    paths: PersistentRunnerPaths,
+}
+
+#[derive(Debug, Clone)]
+struct PersistentRunnerSlotStatus {
+    slot: usize,
+    runner_key: String,
+    container_name: String,
+    paths: PersistentRunnerPaths,
+    running: bool,
+    depth: usize,
+    idle: bool,
+}
+
 #[derive(Debug)]
 struct ExternalWriteback {
     host_path: PathBuf,
@@ -617,8 +650,54 @@ fn persistent_runner_container_name(image: &str, runner_key: &str) -> String {
     format!("xlsynth-bvc-pr-{}-{}", image_hint, runner_key)
 }
 
+fn persistent_runner_slot_key(base_runner_key: &str, pool_size: usize, slot: usize) -> String {
+    if pool_size <= 1 {
+        base_runner_key.to_string()
+    } else {
+        format!("{base_runner_key}-s{slot:02}")
+    }
+}
+
 fn persistent_runner_instance_id(runner_key: &str) -> String {
     format!("instance-{}", runner_key)
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn persistent_runner_pool_size(image: &str) -> usize {
+    let image_lower = image.to_ascii_lowercase();
+    let image_default = if image_lower.contains("yosys") {
+        std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 8))
+            .unwrap_or(8)
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 4))
+            .unwrap_or(4)
+    };
+    let family_override = if image_lower.contains("yosys") {
+        env_usize(PERSISTENT_RUNNER_YOSYS_POOL_SIZE_ENV)
+    } else {
+        env_usize(PERSISTENT_RUNNER_DRIVER_POOL_SIZE_ENV)
+    };
+    family_override
+        .or_else(|| env_usize(PERSISTENT_RUNNER_POOL_SIZE_ENV))
+        .unwrap_or(image_default)
+        .clamp(1, 64)
+}
+
+fn persistent_runner_idle_ttl_secs() -> u64 {
+    env_u64(PERSISTENT_RUNNER_IDLE_TTL_SECS_ENV).unwrap_or(PERSISTENT_RUNNER_DEFAULT_IDLE_TTL_SECS)
 }
 
 fn store_root_container_path() -> &'static str {
@@ -694,7 +773,9 @@ fn load_driver_runner_capabilities(
     runtime: &DriverRuntimeSpec,
 ) -> Result<PersistentRunnerCapabilities> {
     ensure_driver_image(repo_root, runtime)?;
-    let runner_key = persistent_runner_key(&runtime.docker_image, &store.root);
+    let base_runner_key = persistent_runner_key(&runtime.docker_image, &store.root);
+    let pool_size = persistent_runner_pool_size(&runtime.docker_image);
+    let runner_key = persistent_runner_slot_key(&base_runner_key, pool_size, 0);
     let container_name = persistent_runner_container_name(&runtime.docker_image, &runner_key);
     let runner_paths = PersistentRunnerPaths::new(&store.root, &runner_key);
     ensure_persistent_runner_started(
@@ -945,6 +1026,68 @@ fn docker_container_is_running(container_name: &str) -> Result<bool> {
     Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
 }
 
+fn count_json_files(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for entry in
+        fs::read_dir(path).with_context(|| format!("reading runner dir: {}", path.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading runner entry: {}", path.display()))?;
+        let entry_path = entry.path();
+        if entry_path.is_file() && entry_path.extension().and_then(|s| s.to_str()) == Some("json") {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn persistent_runner_depth(paths: &PersistentRunnerPaths) -> Result<usize> {
+    Ok(count_json_files(&paths.inbox_dir)? + count_json_files(&paths.processing_dir)?)
+}
+
+fn read_persistent_runner_heartbeat(
+    paths: &PersistentRunnerPaths,
+) -> Result<Option<PersistentRunnerHeartbeat>> {
+    if !paths.heartbeat_path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&paths.heartbeat_path).with_context(|| {
+        format!(
+            "reading runner heartbeat: {}",
+            paths.heartbeat_path.display()
+        )
+    })?;
+    serde_json::from_str::<PersistentRunnerHeartbeat>(&text)
+        .map(Some)
+        .with_context(|| {
+            format!(
+                "parsing runner heartbeat: {}",
+                paths.heartbeat_path.display()
+            )
+        })
+}
+
+fn persistent_runner_is_idle(paths: &PersistentRunnerPaths) -> Result<bool> {
+    if persistent_runner_depth(paths)? != 0 {
+        return Ok(false);
+    }
+    let Some(heartbeat) = read_persistent_runner_heartbeat(paths)? else {
+        return Ok(false);
+    };
+    Ok(heartbeat.state == "idle" && heartbeat.current_request_id.is_none())
+}
+
+fn persistent_runner_heartbeat_age_secs(paths: &PersistentRunnerPaths) -> Option<u64> {
+    let metadata = fs::metadata(&paths.heartbeat_path).ok()?;
+    let modified = metadata.modified().ok()?;
+    std::time::SystemTime::now()
+        .duration_since(modified)
+        .ok()
+        .map(|age| age.as_secs())
+}
+
 fn cleanup_persistent_runner_container(container_name: &str) -> Result<()> {
     let output = Command::new("docker")
         .args(["rm", "-f", container_name])
@@ -973,6 +1116,24 @@ fn ensure_persistent_runner_started(
     let _guard = persistent_runner_start_lock()
         .lock()
         .map_err(|_| anyhow!("persistent runner start lock poisoned"))?;
+    ensure_persistent_runner_started_locked(
+        repo_root,
+        store_root,
+        image,
+        runner_key,
+        container_name,
+        runner_paths,
+    )
+}
+
+fn ensure_persistent_runner_started_locked(
+    repo_root: &Path,
+    store_root: &Path,
+    image: &str,
+    runner_key: &str,
+    container_name: &str,
+    runner_paths: &PersistentRunnerPaths,
+) -> Result<()> {
     if docker_container_is_running(container_name)? {
         return Ok(());
     }
@@ -1090,6 +1251,119 @@ fn ensure_persistent_runner_started(
     );
 }
 
+fn persistent_runner_slot_status(
+    store_root: &Path,
+    image: &str,
+    base_runner_key: &str,
+    pool_size: usize,
+    slot: usize,
+) -> Result<PersistentRunnerSlotStatus> {
+    let runner_key = persistent_runner_slot_key(base_runner_key, pool_size, slot);
+    let container_name = persistent_runner_container_name(image, &runner_key);
+    let paths = PersistentRunnerPaths::new(store_root, &runner_key);
+    let running = docker_container_is_running(&container_name)?;
+    let depth = if running {
+        persistent_runner_depth(&paths)?
+    } else {
+        0
+    };
+    let idle = running && persistent_runner_is_idle(&paths)?;
+    Ok(PersistentRunnerSlotStatus {
+        slot,
+        runner_key,
+        container_name,
+        paths,
+        running,
+        depth,
+        idle,
+    })
+}
+
+fn cleanup_idle_persistent_runner_pool_slots(
+    store_root: &Path,
+    image: &str,
+    base_runner_key: &str,
+    pool_size: usize,
+) -> Result<()> {
+    if pool_size <= 1 {
+        return Ok(());
+    }
+    let ttl_secs = persistent_runner_idle_ttl_secs();
+    if ttl_secs == 0 {
+        return Ok(());
+    }
+    for slot in 1..pool_size {
+        let status =
+            persistent_runner_slot_status(store_root, image, base_runner_key, pool_size, slot)?;
+        if !status.running || !status.idle {
+            continue;
+        }
+        if persistent_runner_heartbeat_age_secs(&status.paths).unwrap_or(0) < ttl_secs {
+            continue;
+        }
+        cleanup_persistent_runner_container(&status.container_name).ok();
+    }
+    Ok(())
+}
+
+fn select_persistent_runner_locked(
+    repo_root: &Path,
+    store_root: &Path,
+    image: &str,
+) -> Result<SelectedPersistentRunner> {
+    let base_runner_key = persistent_runner_key(image, store_root);
+    let pool_size = persistent_runner_pool_size(image);
+    cleanup_idle_persistent_runner_pool_slots(store_root, image, &base_runner_key, pool_size)?;
+
+    let mut statuses = Vec::with_capacity(pool_size);
+    for slot in 0..pool_size {
+        statuses.push(persistent_runner_slot_status(
+            store_root,
+            image,
+            &base_runner_key,
+            pool_size,
+            slot,
+        )?);
+    }
+
+    if let Some(status) = statuses.iter().find(|status| status.idle) {
+        return Ok(SelectedPersistentRunner {
+            runner_key: status.runner_key.clone(),
+            runner_instance_id: persistent_runner_instance_id(&status.runner_key),
+            container_name: status.container_name.clone(),
+            paths: status.paths.clone(),
+        });
+    }
+
+    if let Some(status) = statuses.iter().find(|status| !status.running) {
+        ensure_persistent_runner_started_locked(
+            repo_root,
+            store_root,
+            image,
+            &status.runner_key,
+            &status.container_name,
+            &status.paths,
+        )?;
+        return Ok(SelectedPersistentRunner {
+            runner_key: status.runner_key.clone(),
+            runner_instance_id: persistent_runner_instance_id(&status.runner_key),
+            container_name: status.container_name.clone(),
+            paths: status.paths.clone(),
+        });
+    }
+
+    let status = statuses
+        .iter()
+        .min_by_key(|status| (status.depth, status.slot))
+        .ok_or_else(|| anyhow!("persistent runner pool has no slots"))?;
+    Ok(SelectedPersistentRunner {
+        runner_key: status.runner_key.clone(),
+        runner_instance_id: persistent_runner_instance_id(&status.runner_key),
+        container_name: status.container_name.clone(),
+        paths: status.paths.clone(),
+    })
+}
+
 pub(crate) fn execute_persistent_runner_script(
     image: &str,
     mounts: &[DockerMount],
@@ -1099,87 +1373,86 @@ pub(crate) fn execute_persistent_runner_script(
 ) -> Result<CommandTrace> {
     let repo_root = std::env::current_dir().context("getting current directory")?;
     let store_root = infer_store_root_from_mounts(mounts)?;
-    let runner_key = persistent_runner_key(image, &store_root);
-    let container_name = persistent_runner_container_name(image, &runner_key);
-    let runner_paths = PersistentRunnerPaths::new(&store_root, &runner_key);
-    ensure_persistent_runner_started(
-        &repo_root,
-        &store_root,
-        image,
-        &runner_key,
-        &container_name,
-        &runner_paths,
-    )?;
-
     let request_seq = DOCKER_RUN_NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
     let request_id = format!("req-{}-{}", std::process::id(), request_seq);
-    let job_root = runner_paths.jobs_dir.join(&request_id);
-    fs::create_dir_all(&job_root)
-        .with_context(|| format!("creating persistent runner job dir: {}", job_root.display()))?;
-    let mut request_mounts = Vec::with_capacity(mounts.len());
-    let mut writebacks = Vec::new();
-    for (index, mount) in mounts.iter().enumerate() {
-        let (request_mount, writeback) =
-            prepare_mount_request(&store_root, &runner_paths, &request_id, index, mount)?;
-        request_mounts.push(request_mount);
-        if let Some(writeback) = writeback {
-            writebacks.push(writeback);
+
+    let (runner, result_path, command_argv, writebacks) = {
+        let _guard = persistent_runner_start_lock()
+            .lock()
+            .map_err(|_| anyhow!("persistent runner start lock poisoned"))?;
+        let runner = select_persistent_runner_locked(&repo_root, &store_root, image)?;
+        let job_root = runner.paths.jobs_dir.join(&request_id);
+        fs::create_dir_all(&job_root).with_context(|| {
+            format!("creating persistent runner job dir: {}", job_root.display())
+        })?;
+        let mut request_mounts = Vec::with_capacity(mounts.len());
+        let mut writebacks = Vec::new();
+        for (index, mount) in mounts.iter().enumerate() {
+            let (request_mount, writeback) =
+                prepare_mount_request(&store_root, &runner.paths, &request_id, index, mount)?;
+            request_mounts.push(request_mount);
+            if let Some(writeback) = writeback {
+                writebacks.push(writeback);
+            }
         }
-    }
 
-    let instance_id = persistent_runner_instance_id(&runner_key);
-    let request = PersistentRunnerRequest {
-        schema_version: PERSISTENT_RUNNER_SCHEMA_VERSION,
-        request_id: request_id.clone(),
-        runner_key: runner_key.clone(),
-        runner_instance_id: instance_id,
-        container_name: container_name.clone(),
-        image: image.to_string(),
-        job_root: store_container_path(&store_root, &job_root)
-            .ok_or_else(|| anyhow!("unable to translate job root path {}", job_root.display()))?,
-        heartbeat_path: store_container_path(&store_root, &runner_paths.heartbeat_path)
-            .ok_or_else(|| {
-                anyhow!(
-                    "unable to translate runner heartbeat path {}",
-                    runner_paths.heartbeat_path.display()
-                )
+        let request = PersistentRunnerRequest {
+            schema_version: PERSISTENT_RUNNER_SCHEMA_VERSION,
+            request_id: request_id.clone(),
+            runner_key: runner.runner_key.clone(),
+            runner_instance_id: runner.runner_instance_id.clone(),
+            container_name: runner.container_name.clone(),
+            image: image.to_string(),
+            job_root: store_container_path(&store_root, &job_root).ok_or_else(|| {
+                anyhow!("unable to translate job root path {}", job_root.display())
             })?,
-        timeout_secs: DEFAULT_ACTION_TIMEOUT_SECONDS,
-        env: env.clone(),
-        script: script.to_string(),
-        mounts: request_mounts,
-    };
-    let request_json =
-        serde_json::to_string_pretty(&request).context("serializing persistent runner request")?;
-    let request_path = job_root.join("request.json");
-    fs::write(&request_path, &request_json)
-        .with_context(|| format!("writing request file: {}", request_path.display()))?;
-    let inbox_path = runner_paths.inbox_dir.join(format!("{request_id}.json"));
-    let inbox_tmp = runner_paths
-        .inbox_dir
-        .join(format!(".{request_id}.tmp-{}", std::process::id()));
-    fs::write(&inbox_tmp, &request_json)
-        .with_context(|| format!("writing request inbox temp file: {}", inbox_tmp.display()))?;
-    fs::rename(&inbox_tmp, &inbox_path).with_context(|| {
-        format!(
-            "publishing request into runner inbox: {} -> {}",
-            inbox_tmp.display(),
-            inbox_path.display()
-        )
-    })?;
+            heartbeat_path: store_container_path(&store_root, &runner.paths.heartbeat_path)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "unable to translate runner heartbeat path {}",
+                        runner.paths.heartbeat_path.display()
+                    )
+                })?,
+            timeout_secs: DEFAULT_ACTION_TIMEOUT_SECONDS,
+            env: env.clone(),
+            script: script.to_string(),
+            mounts: request_mounts,
+        };
+        let request_json = serde_json::to_string_pretty(&request)
+            .context("serializing persistent runner request")?;
+        let request_path = job_root.join("request.json");
+        fs::write(&request_path, &request_json)
+            .with_context(|| format!("writing request file: {}", request_path.display()))?;
+        let inbox_path = runner.paths.inbox_dir.join(format!("{request_id}.json"));
+        let inbox_tmp = runner
+            .paths
+            .inbox_dir
+            .join(format!(".{request_id}.tmp-{}", std::process::id()));
+        fs::write(&inbox_tmp, &request_json)
+            .with_context(|| format!("writing request inbox temp file: {}", inbox_tmp.display()))?;
+        fs::rename(&inbox_tmp, &inbox_path).with_context(|| {
+            format!(
+                "publishing request into runner inbox: {} -> {}",
+                inbox_tmp.display(),
+                inbox_path.display()
+            )
+        })?;
 
-    let result_path = runner_paths.results_dir.join(format!("{request_id}.json"));
-    let command_argv = vec![
-        "persistent-runner".to_string(),
-        "--image".to_string(),
-        image.to_string(),
-        "--container".to_string(),
-        container_name.clone(),
-        "--request-id".to_string(),
-        request_id.clone(),
-        "--run-hint".to_string(),
-        run_hint.to_string(),
-    ];
+        let result_path = runner.paths.results_dir.join(format!("{request_id}.json"));
+        let command_argv = vec![
+            "persistent-runner".to_string(),
+            "--image".to_string(),
+            image.to_string(),
+            "--container".to_string(),
+            runner.container_name.clone(),
+            "--request-id".to_string(),
+            request_id.clone(),
+            "--run-hint".to_string(),
+            run_hint.to_string(),
+        ];
+        (runner, result_path, command_argv, writebacks)
+    };
+
     let deadline = Instant::now()
         + Duration::from_secs(
             DEFAULT_ACTION_TIMEOUT_SECONDS + PERSISTENT_RUNNER_REQUEST_TIMEOUT_GRACE_SECS,
@@ -1193,32 +1466,32 @@ pub(crate) fn execute_persistent_runner_script(
                 format!("parsing runner result file: {}", result_path.display())
             })?;
         }
-        if !docker_container_is_running(&container_name)? {
+        if !docker_container_is_running(&runner.container_name)? {
             bail!(
                 "persistent runner container exited before producing result (container={} request_id={})",
-                container_name,
+                runner.container_name,
                 request_id
             );
         }
-        if let Ok(metadata) = fs::metadata(&runner_paths.heartbeat_path)
+        if let Ok(metadata) = fs::metadata(&runner.paths.heartbeat_path)
             && let Ok(modified) = metadata.modified()
             && let Ok(age) = std::time::SystemTime::now().duration_since(modified)
             && age.as_secs() > PERSISTENT_RUNNER_HEARTBEAT_STALE_SECS
         {
-            let cleanup_summary = cleanup_timed_out_container(&container_name);
+            let cleanup_summary = cleanup_timed_out_container(&runner.container_name);
             bail!(
                 "persistent runner heartbeat stale for request {} (container={}) cleanup: {}",
                 request_id,
-                container_name,
+                runner.container_name,
                 cleanup_summary
             );
         }
         if Instant::now() >= deadline {
-            let cleanup_summary = cleanup_timed_out_container(&container_name);
+            let cleanup_summary = cleanup_timed_out_container(&runner.container_name);
             bail!(
                 "TIMEOUT({}) waiting for persistent runner result (container={} request_id={}) cleanup: {}",
                 DEFAULT_ACTION_TIMEOUT_SECONDS,
-                container_name,
+                runner.container_name,
                 request_id,
                 cleanup_summary
             );
@@ -1270,8 +1543,8 @@ pub(crate) fn execute_persistent_runner_script(
     }
 
     fs::remove_file(&result_path).ok();
-    fs::remove_file(runner_paths.archive_dir.join(format!("{request_id}.json"))).ok();
-    remove_path_if_exists(&job_root).ok();
+    fs::remove_file(runner.paths.archive_dir.join(format!("{request_id}.json"))).ok();
+    remove_path_if_exists(&runner.paths.jobs_dir.join(&request_id)).ok();
 
     Ok(CommandTrace {
         argv: command_argv,
