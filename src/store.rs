@@ -987,6 +987,190 @@ fn build_reverse_dependency_edges(
     Ok(reverse_edges)
 }
 
+pub(crate) fn prune_sled_actions_by_ids(
+    store_root: &Path,
+    db_path: &Path,
+    action_ids: &[String],
+    include_downstream: bool,
+    dry_run: bool,
+) -> Result<SledPruneActionsByRelpathSizeSummary> {
+    const PRUNE_CACHE_CAPACITY_BYTES: u64 = 16 * 1024 * 1024;
+    let started = Instant::now();
+    let seed_action_ids = action_ids.iter().cloned().collect::<BTreeSet<_>>();
+    eprintln!("prune-sled-actions: opening {}", db_path.display());
+    let db = match sled::Config::new()
+        .path(db_path)
+        .cache_capacity(PRUNE_CACHE_CAPACITY_BYTES)
+        .open()
+    {
+        Ok(db) => db,
+        Err(err) => {
+            let err_text = err.to_string();
+            if err_text.contains("could not acquire lock") {
+                bail!(
+                    "opening sled db for prune: {} (database lock is held by another process; stop the service first)",
+                    db_path.display()
+                );
+            }
+            return Err(err)
+                .with_context(|| format!("opening sled db for prune: {}", db_path.display()));
+        }
+    };
+    let provenance_tree = db
+        .open_tree(SledArtifactBackend::TREE_PROVENANCE_BY_ACTION)
+        .context("opening provenance_by_action tree for action-id prune")?;
+    let file_tree = db
+        .open_tree(SledArtifactBackend::TREE_ACTION_FILE_BYTES)
+        .context("opening action_file_bytes tree for action-id prune")?;
+    let failed_tree = db
+        .open_tree(SledArtifactBackend::TREE_FAILED_BY_ACTION)
+        .context("opening failed_by_action tree for action-id prune")?;
+
+    let reverse_edges = if include_downstream {
+        build_reverse_dependency_edges(store_root, &provenance_tree, &failed_tree)?
+    } else {
+        HashMap::new()
+    };
+    let mut action_ids_to_prune: BTreeSet<String> = seed_action_ids.clone();
+    if include_downstream {
+        let mut queue: VecDeque<String> = seed_action_ids.iter().cloned().collect();
+        while let Some(action_id) = queue.pop_front() {
+            let Some(children) = reverse_edges.get(&action_id) else {
+                continue;
+            };
+            for child in children {
+                if action_ids_to_prune.insert(child.clone()) {
+                    queue.push_back(child.clone());
+                }
+            }
+        }
+    }
+    let downstream_action_count = action_ids_to_prune
+        .len()
+        .saturating_sub(seed_action_ids.len()) as u64;
+
+    let mut deleted_provenance_rows = 0_u64;
+    let mut deleted_action_file_rows = 0_u64;
+    let mut deleted_action_file_key_bytes = 0_u64;
+    let mut deleted_action_file_stored_value_bytes = 0_u64;
+    let mut deleted_action_file_decoded_value_bytes = 0_u64;
+    let mut deleted_queue_pending_files = 0_u64;
+    let mut deleted_queue_running_files = 0_u64;
+    let mut deleted_queue_done_files = 0_u64;
+    let mut deleted_queue_failed_files = 0_u64;
+    let mut deleted_queue_canceled_files = 0_u64;
+    let mut deleted_failed_action_record_files = 0_u64;
+    let mut deleted_materialized_action_dirs = 0_u64;
+
+    for action_id in &action_ids_to_prune {
+        if provenance_tree
+            .get(action_id.as_bytes())
+            .with_context(|| format!("reading provenance row before delete for {}", action_id))?
+            .is_some()
+        {
+            deleted_provenance_rows += 1;
+            if !dry_run {
+                provenance_tree
+                    .remove(action_id.as_bytes())
+                    .with_context(|| format!("deleting provenance row for {}", action_id))?;
+            }
+        }
+
+        let prefix = SledArtifactBackend::action_files_prefix(action_id);
+        let mut keys = Vec::new();
+        for row in file_tree.scan_prefix(prefix.as_slice()) {
+            let (key, value) = row.with_context(|| {
+                format!(
+                    "iterating action_file rows for delete action_id={}",
+                    action_id
+                )
+            })?;
+            deleted_action_file_rows += 1;
+            deleted_action_file_key_bytes += key.len() as u64;
+            deleted_action_file_stored_value_bytes += value.len() as u64;
+            deleted_action_file_decoded_value_bytes += value.len() as u64;
+            keys.push(key);
+        }
+        if !dry_run {
+            for key in keys {
+                file_tree.remove(key).with_context(|| {
+                    format!("deleting action_file row for action_id={}", action_id)
+                })?;
+            }
+        }
+
+        if remove_file_if_exists(&queue_json_path(store_root, "pending", action_id), dry_run)? {
+            deleted_queue_pending_files += 1;
+        }
+        if remove_file_if_exists(&queue_json_path(store_root, "running", action_id), dry_run)? {
+            deleted_queue_running_files += 1;
+        }
+        if remove_file_if_exists(&queue_json_path(store_root, "done", action_id), dry_run)? {
+            deleted_queue_done_files += 1;
+        }
+        if remove_file_if_exists(&queue_json_path(store_root, "failed", action_id), dry_run)? {
+            deleted_queue_failed_files += 1;
+        }
+        if remove_file_if_exists(&queue_json_path(store_root, "canceled", action_id), dry_run)? {
+            deleted_queue_canceled_files += 1;
+        }
+        if failed_tree
+            .get(action_id.as_bytes())
+            .with_context(|| {
+                format!(
+                    "reading failed_by_action row before delete for {}",
+                    action_id
+                )
+            })?
+            .is_some()
+        {
+            deleted_failed_action_record_files += 1;
+            if !dry_run {
+                failed_tree
+                    .remove(action_id.as_bytes())
+                    .with_context(|| format!("deleting failed_by_action row for {}", action_id))?;
+            }
+        }
+        if remove_dir_if_exists(
+            &materialized_action_dir_path(store_root, action_id),
+            dry_run,
+        )? {
+            deleted_materialized_action_dirs += 1;
+        }
+    }
+
+    if !dry_run {
+        db.flush()
+            .context("flushing sled db after action-id prune")?;
+    }
+
+    Ok(SledPruneActionsByRelpathSizeSummary {
+        db_path: db_path.display().to_string(),
+        store_root: store_root.display().to_string(),
+        relpath: "action-id".to_string(),
+        min_bytes: 0,
+        include_downstream,
+        dry_run,
+        seed_action_count: seed_action_ids.len() as u64,
+        downstream_action_count,
+        total_action_count: action_ids_to_prune.len() as u64,
+        seed_action_ids_sample: seed_action_ids.into_iter().take(25).collect(),
+        deleted_provenance_rows,
+        deleted_action_file_rows,
+        deleted_action_file_key_bytes,
+        deleted_action_file_stored_value_bytes,
+        deleted_action_file_decoded_value_bytes,
+        deleted_queue_pending_files,
+        deleted_queue_running_files,
+        deleted_queue_done_files,
+        deleted_queue_failed_files,
+        deleted_queue_canceled_files,
+        deleted_failed_action_record_files,
+        deleted_materialized_action_dirs,
+        elapsed_secs: started.elapsed().as_secs_f64(),
+    })
+}
+
 pub(crate) fn prune_sled_actions_by_relpath_size(
     store_root: &Path,
     db_path: &Path,

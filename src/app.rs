@@ -33,7 +33,7 @@ use crate::sled_space::analyze_sled_space;
 use crate::snapshot::{BuildStaticSnapshotOptions, build_static_snapshot, verify_static_snapshot};
 use crate::store::{
     ArtifactStore, backfill_sled_action_file_compression, compact_sled_db,
-    ingest_legacy_failed_records, prune_sled_actions_by_relpath_size,
+    ingest_legacy_failed_records, prune_sled_actions_by_ids, prune_sled_actions_by_relpath_size,
 };
 use crate::versioning::*;
 use crate::web::{self, types::WebRunnerConfig};
@@ -267,6 +267,26 @@ pub(crate) fn run() -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&summary)
                 .expect("serializing sled relpath-size prune summary")
+        );
+        return Ok(());
+    }
+    if let TopCommand::PruneSledActions {
+        action_ids,
+        dry_run,
+        no_downstream,
+    } = &command
+    {
+        let summary = prune_sled_actions_by_ids(
+            &store_dir,
+            &artifacts_via_sled,
+            action_ids,
+            !*no_downstream,
+            *dry_run,
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .expect("serializing sled action-id prune summary")
         );
         return Ok(());
     }
@@ -550,6 +570,9 @@ pub(crate) fn run() -> Result<()> {
         }
         TopCommand::PruneSledActionsByRelpathSize { .. } => {
             unreachable!("prune-sled-actions-by-relpath-size handled before store initialization")
+        }
+        TopCommand::PruneSledActions { .. } => {
+            unreachable!("prune-sled-actions handled before store initialization")
         }
         TopCommand::EnqueueStructuralOptIrG8r {
             crate_version,

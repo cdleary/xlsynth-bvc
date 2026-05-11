@@ -210,6 +210,14 @@ pub enum TopCommand {
         #[arg(long)]
         no_downstream: bool,
     },
+    PruneSledActions {
+        #[arg(long = "action-id", required = true)]
+        action_ids: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        no_downstream: bool,
+    },
     EnqueueStructuralOptIrG8r {
         #[arg(long)]
         crate_version: String,
