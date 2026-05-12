@@ -1371,6 +1371,24 @@ pub(crate) fn execute_persistent_runner_script(
     script: &str,
     run_hint: &str,
 ) -> Result<CommandTrace> {
+    execute_persistent_runner_script_with_timeout(
+        image,
+        mounts,
+        env,
+        script,
+        run_hint,
+        DEFAULT_ACTION_TIMEOUT_SECONDS,
+    )
+}
+
+pub(crate) fn execute_persistent_runner_script_with_timeout(
+    image: &str,
+    mounts: &[DockerMount],
+    env: &BTreeMap<String, String>,
+    script: &str,
+    run_hint: &str,
+    timeout_secs: u64,
+) -> Result<CommandTrace> {
     let repo_root = std::env::current_dir().context("getting current directory")?;
     let store_root = infer_store_root_from_mounts(mounts)?;
     let request_seq = DOCKER_RUN_NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1413,7 +1431,7 @@ pub(crate) fn execute_persistent_runner_script(
                         runner.paths.heartbeat_path.display()
                     )
                 })?,
-            timeout_secs: DEFAULT_ACTION_TIMEOUT_SECONDS,
+            timeout_secs,
             env: env.clone(),
             script: script.to_string(),
             mounts: request_mounts,
@@ -1454,9 +1472,7 @@ pub(crate) fn execute_persistent_runner_script(
     };
 
     let deadline = Instant::now()
-        + Duration::from_secs(
-            DEFAULT_ACTION_TIMEOUT_SECONDS + PERSISTENT_RUNNER_REQUEST_TIMEOUT_GRACE_SECS,
-        );
+        + Duration::from_secs(timeout_secs + PERSISTENT_RUNNER_REQUEST_TIMEOUT_GRACE_SECS);
     let result = loop {
         if result_path.exists() {
             let text = fs::read_to_string(&result_path).with_context(|| {
@@ -1490,7 +1506,7 @@ pub(crate) fn execute_persistent_runner_script(
             let cleanup_summary = cleanup_timed_out_container(&runner.container_name);
             bail!(
                 "TIMEOUT({}) waiting for persistent runner result (container={} request_id={}) cleanup: {}",
-                DEFAULT_ACTION_TIMEOUT_SECONDS,
+                timeout_secs,
                 runner.container_name,
                 request_id,
                 cleanup_summary

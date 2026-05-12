@@ -276,6 +276,16 @@ pub enum TopCommand {
         #[arg(long)]
         crate_version: Option<String>,
     },
+    EnqueueIrFnG8rAbcVsCodegenYosysAbcGaps {
+        #[arg(long)]
+        crate_version: String,
+        #[arg(long, default_value_t = crate::DEFAULT_QUEUE_PRIORITY)]
+        priority: i32,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        dry_run: bool,
+    },
     RepairQueue {
         #[arg(long)]
         apply: bool,

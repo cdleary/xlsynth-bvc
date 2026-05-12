@@ -1056,6 +1056,120 @@ pub(crate) fn load_ir_fn_corpus_entity_maps(
     ))
 }
 
+fn generated_entry_ir_node_count(
+    ir_op_count: Option<u64>,
+    included_node_count: u64,
+) -> Option<u64> {
+    ir_op_count
+        .or(Some(included_node_count))
+        .filter(|count| *count > 0)
+}
+
+fn load_generated_ir_node_count_maps(
+    store: &ArtifactStore,
+    provenances: &[Provenance],
+) -> (
+    BTreeMap<String, BTreeMap<String, u64>>,
+    BTreeMap<String, u64>,
+) {
+    let mut by_ir_action_and_top: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut by_structural_hash: BTreeMap<String, u64> = BTreeMap::new();
+
+    for provenance in provenances {
+        match &provenance.action {
+            ActionSpec::IrFnToKBoolConeCorpus { .. } => {
+                let manifest_relpath = provenance
+                    .details
+                    .get("output_manifest_relpath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("payload/k_bool_cones_k3_manifest.json");
+                let manifest_ref = ArtifactRef {
+                    action_id: provenance.action_id.clone(),
+                    artifact_type: ArtifactType::IrPackageFile,
+                    relpath: manifest_relpath.to_string(),
+                };
+                let manifest_path = store.resolve_artifact_ref_path(&manifest_ref);
+                let Ok(text) = fs::read_to_string(&manifest_path) else {
+                    continue;
+                };
+                let Ok(manifest) = serde_json::from_str::<KBoolConeCorpusManifest>(&text) else {
+                    warn!(
+                        "query skipping malformed k-bool-cone manifest action_id={} path={}",
+                        provenance.action_id,
+                        manifest_path.display()
+                    );
+                    continue;
+                };
+                for entry in manifest.entries {
+                    let Some(ir_node_count) =
+                        generated_entry_ir_node_count(entry.ir_op_count, entry.included_node_count)
+                    else {
+                        continue;
+                    };
+                    by_ir_action_and_top
+                        .entry(provenance.action_id.clone())
+                        .or_default()
+                        .entry(entry.fn_name)
+                        .or_insert(ir_node_count);
+                    if let Some(structural_hash) =
+                        normalize_structural_hash_hex(&entry.structural_hash)
+                    {
+                        by_structural_hash
+                            .entry(structural_hash)
+                            .or_insert(ir_node_count);
+                    }
+                }
+            }
+            ActionSpec::IrFnToMffcCorpus { .. } => {
+                let manifest_relpath = provenance
+                    .details
+                    .get("output_manifest_relpath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("payload/mffcs_manifest.json");
+                let manifest_ref = ArtifactRef {
+                    action_id: provenance.action_id.clone(),
+                    artifact_type: ArtifactType::IrPackageFile,
+                    relpath: manifest_relpath.to_string(),
+                };
+                let manifest_path = store.resolve_artifact_ref_path(&manifest_ref);
+                let Ok(text) = fs::read_to_string(&manifest_path) else {
+                    continue;
+                };
+                let Ok(manifest) = serde_json::from_str::<MffcCorpusManifest>(&text) else {
+                    warn!(
+                        "query skipping malformed MFFC manifest action_id={} path={}",
+                        provenance.action_id,
+                        manifest_path.display()
+                    );
+                    continue;
+                };
+                for entry in manifest.entries {
+                    let Some(ir_node_count) =
+                        generated_entry_ir_node_count(entry.ir_op_count, entry.included_node_count)
+                    else {
+                        continue;
+                    };
+                    by_ir_action_and_top
+                        .entry(provenance.action_id.clone())
+                        .or_default()
+                        .entry(entry.fn_name)
+                        .or_insert(ir_node_count);
+                    if let Some(structural_hash) =
+                        normalize_structural_hash_hex(&entry.structural_hash)
+                    {
+                        by_structural_hash
+                            .entry(structural_hash)
+                            .or_insert(ir_node_count);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (by_ir_action_and_top, by_structural_hash)
+}
+
 pub(crate) fn resolve_ir_corpus_structural_hash_for_source(
     structural_hash_by_ir_action_and_top: &BTreeMap<(String, String), String>,
     unique_structural_hash_by_ir_action: &BTreeMap<String, String>,
@@ -1164,10 +1278,10 @@ struct StdlibFnTimelineIndexFile {
 }
 
 #[derive(Debug, Clone)]
-struct IrFnCorpusG8rVsYosysIndexState {
-    dataset: StdlibG8rVsYosysDataset,
-    g8r_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint>,
-    yosys_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint>,
+pub(crate) struct IrFnCorpusG8rVsYosysIndexState {
+    pub(crate) dataset: StdlibG8rVsYosysDataset,
+    pub(crate) g8r_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint>,
+    pub(crate) yosys_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -1335,6 +1449,27 @@ fn resolve_ir_node_count_from_source_maps(
     unique_ir_node_count_by_source_ir_action.and_then(|counts| counts.get(ir_action_id).copied())
 }
 
+fn structural_hash_from_generated_ir_top_prefix(
+    label_by_structural_hash: &BTreeMap<String, String>,
+    ir_top: Option<&str>,
+) -> Option<String> {
+    let top = ir_top?;
+    let prefix = top
+        .strip_prefix("__k3_cone_")
+        .or_else(|| top.strip_prefix("__mffc_"))?;
+    if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut matches = label_by_structural_hash
+        .keys()
+        .filter(|hash| hash.starts_with(prefix));
+    let first = matches.next()?.clone();
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
 fn build_ir_fn_corpus_dataset_from_entity_maps(
     store: &ArtifactStore,
     g8r_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
@@ -1498,11 +1633,18 @@ fn build_ir_fn_corpus_state_from_incremental_deltas(
             }
         }
     }
+    let mut ir_node_count_by_structural_hash = load_ir_fn_corpus_entity_maps(store)
+        .map(|(_, _, _, counts, _, _)| counts)
+        .unwrap_or_default();
+    if let Ok(provenances) = store.list_provenances_shared() {
+        let (_, generated_counts) = load_generated_ir_node_count_maps(store, provenances.as_ref());
+        ir_node_count_by_structural_hash.extend(generated_counts);
+    }
     let dataset = build_ir_fn_corpus_dataset_from_entity_maps(
         store,
         &g8r_by_entity,
         &yosys_by_entity,
-        None,
+        Some(&ir_node_count_by_structural_hash),
         None,
         None,
         false,
@@ -2193,10 +2335,13 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
         structural_hash_by_ir_action_and_top,
         unique_structural_hash_by_ir_action,
         label_by_structural_hash,
-        ir_node_count_by_structural_hash,
+        mut ir_node_count_by_structural_hash,
         _ir_node_count_by_source_ir_action_and_top,
         _unique_ir_node_count_by_source_ir_action,
     ) = load_ir_fn_corpus_entity_maps(store)?;
+    let (_, generated_ir_node_count_by_structural_hash) =
+        load_generated_ir_node_count_maps(store, provenances.as_ref());
+    ir_node_count_by_structural_hash.extend(generated_ir_node_count_by_structural_hash);
 
     let mut g8r_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
     let mut yosys_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
@@ -2467,7 +2612,7 @@ fn extract_ir_fn_corpus_g8r_abc_vs_codegen_source_context(
     }
 }
 
-fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed(
+pub(crate) fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed(
     store: &ArtifactStore,
     _repo_root: &Path,
     seed_ir_node_count_cache: Option<BTreeMap<(String, Option<String>), u64>>,
@@ -2480,10 +2625,19 @@ fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed(
         structural_hash_by_ir_action_and_top,
         unique_structural_hash_by_ir_action,
         label_by_structural_hash,
-        ir_node_count_by_structural_hash,
-        ir_node_count_by_source_ir_action_and_top,
+        mut ir_node_count_by_structural_hash,
+        mut ir_node_count_by_source_ir_action_and_top,
         unique_ir_node_count_by_source_ir_action,
     ) = load_ir_fn_corpus_entity_maps(store)?;
+    let (generated_ir_node_count_by_action_and_top, generated_ir_node_count_by_structural_hash) =
+        load_generated_ir_node_count_maps(store, provenances.as_ref());
+    ir_node_count_by_structural_hash.extend(generated_ir_node_count_by_structural_hash);
+    for (action_id, by_top) in generated_ir_node_count_by_action_and_top {
+        ir_node_count_by_source_ir_action_and_top
+            .entry(action_id)
+            .or_default()
+            .extend(by_top);
+    }
 
     let mut g8r_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
     let mut yosys_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
@@ -2546,14 +2700,19 @@ fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed(
             continue;
         };
 
-        let structural_hash = structural_hash_hint.or_else(|| {
-            resolve_ir_corpus_structural_hash_for_source(
-                &structural_hash_by_ir_action_and_top,
-                &unique_structural_hash_by_ir_action,
-                &source_ctx.ir_action_id,
+        let structural_hash = resolve_ir_corpus_structural_hash_for_source(
+            &structural_hash_by_ir_action_and_top,
+            &unique_structural_hash_by_ir_action,
+            &source_ctx.ir_action_id,
+            source_ctx.ir_top.as_deref(),
+        )
+        .or_else(|| {
+            structural_hash_from_generated_ir_top_prefix(
+                &label_by_structural_hash,
                 source_ctx.ir_top.as_deref(),
             )
-        });
+        })
+        .or(structural_hash_hint);
         let Some(structural_hash) = structural_hash else {
             continue;
         };
@@ -2604,7 +2763,7 @@ fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed(
         Some(&ir_node_count_by_structural_hash),
         Some(&ir_node_count_by_source_ir_action_and_top),
         Some(&unique_ir_node_count_by_source_ir_action),
-        false,
+        true,
         seed_ir_node_count_cache,
     );
     info!(
@@ -2725,16 +2884,24 @@ fn compute_ir_fn_corpus_stats_upsert_point(
             _ => return Ok(None),
         };
 
-    if structural_hash.is_none() {
-        let (structural_hash_by_ir_action_and_top, unique_structural_hash_by_ir_action, _, _, _, _) =
-            load_ir_fn_corpus_entity_maps(store)?;
-        structural_hash = resolve_ir_corpus_structural_hash_for_source(
-            &structural_hash_by_ir_action_and_top,
-            &unique_structural_hash_by_ir_action,
-            &ir_action_id,
-            ir_top.as_deref(),
-        );
-    }
+    let (
+        structural_hash_by_ir_action_and_top,
+        unique_structural_hash_by_ir_action,
+        label_by_structural_hash,
+        _,
+        _,
+        _,
+    ) = load_ir_fn_corpus_entity_maps(store)?;
+    structural_hash = resolve_ir_corpus_structural_hash_for_source(
+        &structural_hash_by_ir_action_and_top,
+        &unique_structural_hash_by_ir_action,
+        &ir_action_id,
+        ir_top.as_deref(),
+    )
+    .or_else(|| {
+        structural_hash_from_generated_ir_top_prefix(&label_by_structural_hash, ir_top.as_deref())
+    })
+    .or(structural_hash);
     let Some(structural_hash) = structural_hash else {
         return Ok(None);
     };
@@ -2930,16 +3097,24 @@ fn compute_ir_fn_corpus_g8r_abc_vs_codegen_stats_upsert_point(
             _ => return Ok(None),
         };
 
-    if structural_hash.is_none() {
-        let (structural_hash_by_ir_action_and_top, unique_structural_hash_by_ir_action, _, _, _, _) =
-            load_ir_fn_corpus_entity_maps(store)?;
-        structural_hash = resolve_ir_corpus_structural_hash_for_source(
-            &structural_hash_by_ir_action_and_top,
-            &unique_structural_hash_by_ir_action,
-            &ir_action_id,
-            ir_top.as_deref(),
-        );
-    }
+    let (
+        structural_hash_by_ir_action_and_top,
+        unique_structural_hash_by_ir_action,
+        label_by_structural_hash,
+        _,
+        _,
+        _,
+    ) = load_ir_fn_corpus_entity_maps(store)?;
+    structural_hash = resolve_ir_corpus_structural_hash_for_source(
+        &structural_hash_by_ir_action_and_top,
+        &unique_structural_hash_by_ir_action,
+        &ir_action_id,
+        ir_top.as_deref(),
+    )
+    .or_else(|| {
+        structural_hash_from_generated_ir_top_prefix(&label_by_structural_hash, ir_top.as_deref())
+    })
+    .or(structural_hash);
     let Some(structural_hash) = structural_hash else {
         return Ok(None);
     };
@@ -7600,6 +7775,81 @@ mod tests {
             fs::create_dir_all(parent).expect("create artifact parent");
         }
         fs::write(path, content).expect("overwrite test artifact");
+    }
+
+    #[test]
+    fn load_generated_ir_node_count_maps_uses_mffc_manifest_counts() {
+        let (store, root) = make_test_store("generated-ir-node-count-mffc");
+        let runtime = test_runtime();
+        let action_id = "a".repeat(64);
+        let source_ir_action_id = "b".repeat(64);
+        let structural_hash = "c".repeat(64);
+        let fn_name = format!("__mffc_{}", &structural_hash[..16]);
+        materialize_test_provenance(
+            &store,
+            &action_id,
+            ActionSpec::IrFnToMffcCorpus {
+                ir_action_id: source_ir_action_id.clone(),
+                top_fn_name: Some("__source".to_string()),
+                max_mffcs: None,
+                min_internal_non_literal: 4,
+                max_frontier_non_literal: None,
+                version: "0.35.0".to_string(),
+                runtime,
+            },
+            ArtifactType::IrPackageFile,
+            "payload/mffcs.ir",
+        );
+        let manifest = MffcCorpusManifest {
+            schema_version: 1,
+            source_ir_action_id,
+            source_ir_top: "__source".to_string(),
+            max_mffcs: None,
+            min_internal_non_literal: 4,
+            max_frontier_non_literal: None,
+            total_manifest_rows: 1,
+            emitted_mffc_files: 1,
+            deduped_unique_mffcs: 1,
+            output_ir_relpath: "payload/mffcs.ir".to_string(),
+            entries: vec![MffcCorpusEntry {
+                structural_hash: structural_hash.clone(),
+                fn_name: fn_name.clone(),
+                source_index: 0,
+                rank: 0,
+                root_node_index: 7,
+                root_text_id: 7,
+                frontier_leaf_indices: vec![1, 2],
+                frontier_non_literal_count: 2,
+                internal_non_literal_count: 12,
+                included_node_count: 17,
+                score_numerator: 12,
+                score_denominator: 17,
+                ir_fn_signature: None,
+                ir_op_count: None,
+            }],
+        };
+        overwrite_test_artifact(
+            &store,
+            &action_id,
+            ArtifactType::IrPackageFile,
+            "payload/mffcs_manifest.json",
+            &serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        );
+
+        let provenances = store.list_provenances_shared().expect("list provenances");
+        let (by_action_top, by_structural_hash) =
+            load_generated_ir_node_count_maps(&store, provenances.as_ref());
+
+        assert_eq!(
+            by_action_top
+                .get(&action_id)
+                .and_then(|by_top| by_top.get(&fn_name))
+                .copied(),
+            Some(17)
+        );
+        assert_eq!(by_structural_hash.get(&structural_hash).copied(), Some(17));
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
     }
 
     fn synthetic_provenance(

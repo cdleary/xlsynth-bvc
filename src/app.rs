@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::{
@@ -22,7 +22,8 @@ use crate::executor::{
 use crate::model::*;
 use crate::ops::run_workers;
 use crate::query::{
-    action_kind_label, enqueue_processing_for_crate_version,
+    action_kind_label, build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed,
+    enqueue_processing_for_crate_version,
     rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index, rebuild_web_indices,
 };
 use crate::queue::*;
@@ -674,6 +675,26 @@ pub(crate) fn run() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&summary)
                     .expect("serializing backfill opt-IR frontend compare suggestions summary")
+            );
+        }
+        TopCommand::EnqueueIrFnG8rAbcVsCodegenYosysAbcGaps {
+            crate_version,
+            priority,
+            limit,
+            dry_run,
+        } => {
+            let summary = enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
+                &store,
+                &repo_root,
+                &crate_version,
+                priority,
+                limit,
+                dry_run,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing enqueue IR fn g8r-ABC vs codegen-Yosys/ABC gaps summary")
             );
         }
         TopCommand::RepairQueue {
@@ -2398,6 +2419,170 @@ pub(crate) fn backfill_opt_ir_frontend_compare_suggestions(
         "downstream_already_canceled_count": downstream_counts.already_canceled,
         "downstream_skipped_blocked_count": downstream_counts.skipped_blocked,
         "downstream_load_error_count": downstream_counts.load_error
+    }))
+}
+
+pub(crate) fn enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    requested_crate_version: &str,
+    priority: i32,
+    limit: Option<usize>,
+    dry_run: bool,
+) -> Result<serde_json::Value> {
+    let crate_version = normalize_tag_version(requested_crate_version).to_string();
+    let state = build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed(
+        store, repo_root, None,
+    )?;
+
+    let mut keys = BTreeSet::new();
+    for key @ (_, version) in state.g8r_by_entity.keys() {
+        if version == &crate_version {
+            keys.insert(key.clone());
+        }
+    }
+    for key @ (_, version) in state.yosys_by_entity.keys() {
+        if version == &crate_version {
+            keys.insert(key.clone());
+        }
+    }
+
+    let mut scoped_keys = 0_usize;
+    let mut already_paired = 0_usize;
+    let mut missing_g8r = 0_usize;
+    let mut missing_yosys = 0_usize;
+    let mut candidates_considered = 0_usize;
+    let mut enqueued_count = 0_usize;
+    let mut promoted_pending_count = 0_usize;
+    let mut already_done_count = 0_usize;
+    let mut already_running_count = 0_usize;
+    let mut already_failed_count = 0_usize;
+    let mut already_canceled_count = 0_usize;
+    let mut downstream_counts = TargetedSuggestionEnqueueCounts::default();
+    let mut samples = Vec::new();
+
+    for key in keys {
+        if limit
+            .map(|limit| candidates_considered >= limit)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        scoped_keys += 1;
+        let g8r = state.g8r_by_entity.get(&key);
+        let yosys = state.yosys_by_entity.get(&key);
+        let candidate = match (g8r, yosys) {
+            (Some(_), Some(_)) => {
+                already_paired += 1;
+                continue;
+            }
+            (Some(point), None) => {
+                missing_yosys += 1;
+                let runtime = DriverRuntimeSpec {
+                    driver_version: point.crate_version.clone(),
+                    release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
+                    docker_image: default_driver_image(&point.crate_version),
+                    dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+                };
+                ActionSpec::IrFnToCombinationalVerilog {
+                    ir_action_id: point.ir_action_id.clone(),
+                    top_fn_name: point.ir_top.clone(),
+                    use_system_verilog: false,
+                    version: format!("v{}", normalize_tag_version(&point.dso_version)),
+                    runtime,
+                }
+            }
+            (None, Some(point)) => {
+                missing_g8r += 1;
+                let runtime = DriverRuntimeSpec {
+                    driver_version: point.crate_version.clone(),
+                    release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
+                    docker_image: default_driver_image(&point.crate_version),
+                    dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+                };
+                ActionSpec::DriverIrToG8rAig {
+                    ir_action_id: point.ir_action_id.clone(),
+                    top_fn_name: point.ir_top.clone(),
+                    fraig: false,
+                    lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+                    version: format!("v{}", normalize_tag_version(&point.dso_version)),
+                    runtime,
+                }
+            }
+            (None, None) => continue,
+        };
+
+        candidates_considered += 1;
+        let action_id = compute_action_id(&candidate)?;
+        let queue_state = queue_state_for_action(store, &action_id);
+        match queue_state {
+            QueueState::Pending => {
+                if !dry_run {
+                    enqueue_action_with_priority(store, candidate.clone(), priority)?;
+                }
+                promoted_pending_count += 1;
+            }
+            QueueState::Running { .. } => already_running_count += 1,
+            QueueState::Done => {
+                already_done_count += 1;
+                downstream_counts += enqueue_completed_action_suggestions_with_priority(
+                    store, &action_id, priority, dry_run,
+                )?;
+            }
+            QueueState::Failed => already_failed_count += 1,
+            QueueState::Canceled => already_canceled_count += 1,
+            QueueState::None => {
+                if store.action_exists(&action_id) {
+                    already_done_count += 1;
+                    downstream_counts += enqueue_completed_action_suggestions_with_priority(
+                        store, &action_id, priority, dry_run,
+                    )?;
+                } else {
+                    if !dry_run {
+                        enqueue_action_with_priority(store, candidate.clone(), priority)?;
+                    }
+                    enqueued_count += 1;
+                }
+            }
+        }
+        if samples.len() < 32 {
+            samples.push(json!({
+                "structural_hash": key.0,
+                "crate_version": key.1,
+                "missing_side": if g8r.is_none() { "g8r_abc" } else { "codegen_yosys_abc" },
+                "candidate_action_id": action_id,
+                "candidate_action_kind": action_kind_label(&candidate),
+                "queue_state": queue_state.as_label(),
+            }));
+        }
+    }
+
+    Ok(json!({
+        "dry_run": dry_run,
+        "crate_version": crate_version,
+        "priority": priority,
+        "limit": limit,
+        "scoped_keys": scoped_keys,
+        "already_paired": already_paired,
+        "missing_g8r_count": missing_g8r,
+        "missing_yosys_count": missing_yosys,
+        "candidates_considered": candidates_considered,
+        "enqueued_count": enqueued_count,
+        "promoted_pending_count": promoted_pending_count,
+        "already_done_count": already_done_count,
+        "already_running_count": already_running_count,
+        "already_failed_count": already_failed_count,
+        "already_canceled_count": already_canceled_count,
+        "downstream_suggestions_scanned": downstream_counts.scanned,
+        "downstream_enqueued_count": downstream_counts.enqueued,
+        "downstream_promoted_pending_count": downstream_counts.promoted_pending,
+        "downstream_already_done_count": downstream_counts.already_done,
+        "downstream_already_running_count": downstream_counts.already_running,
+        "downstream_already_failed_count": downstream_counts.already_failed,
+        "downstream_already_canceled_count": downstream_counts.already_canceled,
+        "downstream_skipped_blocked_count": downstream_counts.skipped_blocked,
+        "downstream_load_error_count": downstream_counts.load_error,
+        "samples": samples
     }))
 }
 

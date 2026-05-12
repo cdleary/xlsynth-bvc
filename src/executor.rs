@@ -38,6 +38,7 @@ type DriverSubcommandHelpTokenCacheKey = (String, String, String, String, String
 static DRIVER_SUBCOMMAND_HELP_TOKEN_CACHE: OnceLock<
     Mutex<BTreeMap<DriverSubcommandHelpTokenCacheKey, bool>>,
 > = OnceLock::new();
+const DRIVER_IR_EQUIV_TIMEOUT_SECONDS: u64 = 30;
 
 pub(crate) fn execute_action(
     store: &ArtifactStore,
@@ -2172,8 +2173,14 @@ test -s /outputs/ir_equiv.json
         DockerMount::read_write(payload_dir, "/outputs")?,
         driver_cache_mount(store)?,
     ];
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace = execute_persistent_runner_script_with_timeout(
+        &runtime.docker_image,
+        &mounts,
+        &env,
+        &script,
+        action_id,
+        DRIVER_IR_EQUIV_TIMEOUT_SECONDS,
+    )?;
     commands.push(run_trace);
 
     let output_artifact = ArtifactRef {
@@ -2193,6 +2200,7 @@ test -s /outputs/ir_equiv.json
             "dso_version_label": version_label("dso", version),
             "ir_top": ir_top,
             "driver_subcommand": "ir-equiv",
+            "timeout_secs": DRIVER_IR_EQUIV_TIMEOUT_SECONDS,
         }),
         suggested_next_actions: Vec::new(),
     })
@@ -2369,8 +2377,14 @@ test -s /outputs/ir_aig_equiv.json
         DockerMount::read_write(payload_dir, "/outputs")?,
         driver_cache_mount(store)?,
     ];
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace = execute_persistent_runner_script_with_timeout(
+        &runtime.docker_image,
+        &mounts,
+        &env,
+        &script,
+        action_id,
+        DRIVER_IR_EQUIV_TIMEOUT_SECONDS,
+    )?;
     commands.push(run_trace);
 
     let output_artifact = ArtifactRef {
@@ -2391,6 +2405,7 @@ test -s /outputs/ir_aig_equiv.json
             "ir_top": ir_top,
             "driver_subcommand": "aig2ir+ir-equiv",
             "driver_ir_aig_equiv_mode": "aig2ir_then_ir_equiv",
+            "timeout_secs": DRIVER_IR_EQUIV_TIMEOUT_SECONDS,
         }),
         suggested_next_actions: Vec::new(),
     })
