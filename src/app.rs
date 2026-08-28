@@ -598,6 +598,7 @@ pub(crate) fn run() -> Result<()> {
         TopCommand::EnqueueStructuralOptIrKBoolCones {
             crate_version,
             k,
+            priority,
             only_previous_losses,
             recompute_missing_hashes,
             dry_run,
@@ -607,6 +608,7 @@ pub(crate) fn run() -> Result<()> {
                 &repo_root,
                 &crate_version,
                 k,
+                priority,
                 only_previous_losses,
                 recompute_missing_hashes,
                 dry_run,

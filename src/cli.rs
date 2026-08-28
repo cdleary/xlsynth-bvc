@@ -233,6 +233,8 @@ pub enum TopCommand {
         crate_version: String,
         #[arg(long, default_value_t = 3)]
         k: u32,
+        #[arg(long, default_value_t = crate::DEFAULT_QUEUE_PRIORITY)]
+        priority: i32,
         #[arg(long)]
         only_previous_losses: bool,
         #[arg(long)]

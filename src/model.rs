@@ -493,6 +493,7 @@ pub(crate) struct EnqueueStructuralOptIrKBoolConeSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_ir_ops: Option<u64>,
     pub(crate) dry_run: bool,
+    pub(crate) priority: i32,
     pub(crate) only_previous_losses: bool,
     pub(crate) recompute_missing_hashes: bool,
     pub(crate) total_actions_scanned: usize,
@@ -516,6 +517,7 @@ pub(crate) struct EnqueueStructuralOptIrKBoolConeSummary {
     pub(crate) existing_running_count: usize,
     pub(crate) existing_failed_count: usize,
     pub(crate) existing_canceled_count: usize,
+    pub(crate) promoted_pending_count: usize,
     pub(crate) already_done_action_id_count: usize,
     pub(crate) already_pending_action_id_count: usize,
     pub(crate) already_running_action_id_count: usize,

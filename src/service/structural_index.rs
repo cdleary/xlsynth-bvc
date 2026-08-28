@@ -1587,6 +1587,7 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
     repo_root: &Path,
     requested_crate_version: &str,
     k: u32,
+    priority: i32,
     only_previous_losses: bool,
     recompute_missing_hashes: bool,
     dry_run: bool,
@@ -1743,6 +1744,7 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
     }
 
     let mut existing_by_hash: BTreeMap<String, StructuralHashCoverageRecord> = BTreeMap::new();
+    let mut promoted_pending_count = 0_usize;
     for provenance in &provenances {
         if let Some(structural_hash) = structural_hash_for_matching_target_k_bool_action(
             &provenance.action,
@@ -1766,7 +1768,7 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
     for path in pending_paths {
         let text = fs::read_to_string(&path)
             .with_context(|| format!("reading pending queue record: {}", path.display()))?;
-        let (_action_id, _, _, action) = parse_queue_work_item(&text, &path)?;
+        let (_action_id, _, queue_priority, action) = parse_queue_work_item(&text, &path)?;
         if let Some(structural_hash) = structural_hash_for_matching_target_k_bool_action(
             &action,
             None,
@@ -1781,6 +1783,12 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
                 structural_hash,
                 StructuralHashCoverageState::Pending,
             );
+            if queue_priority < priority {
+                promoted_pending_count += 1;
+                if !dry_run {
+                    enqueue_action_with_priority(store, action, priority)?;
+                }
+            }
         }
     }
 
@@ -1893,6 +1901,9 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
         match queue_state_for_action(store, &action_id) {
             QueueState::Pending => {
                 already_pending_action_id_count += 1;
+                if !dry_run {
+                    enqueue_action_with_priority(store, action, priority)?;
+                }
                 continue;
             }
             QueueState::Running { .. } => {
@@ -1915,7 +1926,7 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
         }
 
         if !dry_run {
-            enqueue_action(store, action)?;
+            enqueue_action_with_priority(store, action, priority)?;
         }
         enqueued_count += 1;
         if enqueued_samples.len() < 32 {
@@ -1934,6 +1945,7 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
         k,
         max_ir_ops: target_max_ir_ops,
         dry_run,
+        priority,
         only_previous_losses,
         recompute_missing_hashes,
         total_actions_scanned,
@@ -1957,6 +1969,7 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
         existing_running_count,
         existing_failed_count,
         existing_canceled_count,
+        promoted_pending_count,
         already_done_action_id_count,
         already_pending_action_id_count,
         already_running_action_id_count,
