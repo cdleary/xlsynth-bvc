@@ -33,7 +33,7 @@ use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
-pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 3;
+pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 4;
 pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.pb";
 pub(crate) const STATIC_SNAPSHOT_WEB_INDEX_DIR: &str = "web_index";
 
@@ -1166,7 +1166,7 @@ mod tests {
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("ensure layout");
         store
-            .write_web_index_bytes("versions-summary.v1.json", br#"{"cards":[]}"#)
+            .write_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME, br#"{"cards":[]}"#)
             .expect("write web index");
         store
             .write_web_index_bytes(
@@ -1216,7 +1216,7 @@ mod tests {
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("ensure layout");
         store
-            .write_web_index_bytes("versions-summary.v1.json", br#"{"cards":[]}"#)
+            .write_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME, br#"{"cards":[]}"#)
             .expect("write web index");
 
         let out_dir = root.join("snapshot-out");
@@ -1231,7 +1231,9 @@ mod tests {
         )
         .expect("build snapshot");
 
-        let tampered_path = out_dir.join("web_index").join("versions-summary.v1.json");
+        let tampered_path = out_dir
+            .join("web_index")
+            .join(WEB_VERSIONS_SUMMARY_INDEX_FILENAME);
         fs::write(&tampered_path, b"tampered").expect("tamper file");
         let err = verify_static_snapshot(&out_dir).expect_err("verify should fail");
         assert!(
@@ -1294,7 +1296,7 @@ mod tests {
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("ensure layout");
         store
-            .write_web_index_bytes("versions-summary.v1.json", br#"{"cards":[]}"#)
+            .write_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME, br#"{"cards":[]}"#)
             .expect("write versions index");
         store
             .write_web_index_bytes(
@@ -1320,7 +1322,7 @@ mod tests {
         assert_eq!(manifest.dataset_files.len(), 1);
         assert_eq!(
             manifest.dataset_files[0].index_key,
-            "versions-summary.v1.json"
+            WEB_VERSIONS_SUMMARY_INDEX_FILENAME
         );
         assert!(
             !out_dir

@@ -1224,8 +1224,8 @@ mod tests {
     use super::*;
     use crate::campaign::finalize_campaign_run;
     use crate::executor::compute_action_id;
-    use crate::model::{ArtifactRef, ArtifactType, Provenance};
-    use crate::query::canonical_root_actions_for_crate_version;
+    use crate::model::{ActionSpec, ArtifactRef, ArtifactType, Provenance, QueueFailed};
+    use crate::query::{canonical_root_actions_for_crate_version, rebuild_versions_cards_index};
     use crate::snapshot::{BuildStaticSnapshotOptions, build_static_snapshot};
     use crate::store::ArtifactStore;
     use crate::versioning::{load_version_compat_map, resolve_xlsynth_version_for_driver};
@@ -1265,7 +1265,10 @@ mod tests {
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("store layout");
         store
-            .write_web_index_bytes("versions-summary.v1.json", br#"{"cards":[]}"#)
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                br#"{"cards":[]}"#,
+            )
             .expect("write dataset");
         let snapshot_dir = root.join("snapshot");
         build_static_snapshot(
@@ -1298,12 +1301,104 @@ mod tests {
     }
 
     #[test]
+    fn public_site_never_contains_private_executor_error_text() {
+        let root = temp_root();
+        let store = ArtifactStore::new(root.join("store"));
+        store.ensure_layout().expect("store layout");
+        let repo_root = std::env::current_dir().expect("current dir");
+        let crate_version = load_version_compat_map(&repo_root)
+            .expect("compat map")
+            .into_keys()
+            .next()
+            .expect("known crate version");
+        let dso_version = resolve_xlsynth_version_for_driver(&repo_root, &crate_version)
+            .expect("resolve DSO version");
+        let action =
+            canonical_root_actions_for_crate_version(&repo_root, &crate_version, &dso_version)
+                .expect("canonical roots")
+                .into_iter()
+                .find(|action| {
+                    matches!(
+                        action,
+                        ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. }
+                    )
+                })
+                .expect("stdlib root action");
+        let action_id = compute_action_id(&action).expect("action id");
+        let private_path = root.join("private-build/worker.log").display().to_string();
+        let private_token = "BVC_TEST_CREDENTIAL=do-not-publish";
+        let now = Utc::now();
+        store
+            .write_failed_action_record(&QueueFailed {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id,
+                enqueued_utc: now,
+                failed_utc: now,
+                failed_by: "test-worker".to_string(),
+                action,
+                error: format!("executor failed at {private_path}; {private_token}"),
+            })
+            .expect("write private failure");
+        rebuild_versions_cards_index(&store, &repo_root).expect("build public versions index");
+
+        let snapshot_dir = root.join("snapshot");
+        build_static_snapshot(
+            &store,
+            &repo_root,
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+        let versions_json = fs::read_to_string(
+            snapshot_dir
+                .join("web_index")
+                .join(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME),
+        )
+        .expect("read public versions dataset");
+        assert!(versions_json.contains("\"failure_class\":\"failed\""));
+        assert!(!versions_json.contains(&private_path));
+        assert!(!versions_json.contains(private_token));
+
+        let site_dir = root.join("site");
+        build_static_site(&BuildStaticSiteOptions {
+            snapshot_dir,
+            out_dir: site_dir.clone(),
+            base_url: "/xlsynth-bvc/".into(),
+            overwrite: false,
+        })
+        .expect("build site");
+        verify_static_site(&site_dir).expect("verify site");
+        for entry in WalkDir::new(&site_dir) {
+            let entry = entry.expect("walk public site");
+            if !entry.file_type().is_file()
+                || !matches!(
+                    entry.path().extension().and_then(|value| value.to_str()),
+                    Some("json" | "html")
+                )
+            {
+                continue;
+            }
+            let text = fs::read_to_string(entry.path()).expect("read public text file");
+            assert!(!text.contains(&private_path), "{}", entry.path().display());
+            assert!(!text.contains(private_token), "{}", entry.path().display());
+        }
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn site_verifier_detects_tamper() {
         let root = temp_root();
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("store layout");
         store
-            .write_web_index_bytes("versions-summary.v1.json", br#"{"cards":[]}"#)
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                br#"{"cards":[]}"#,
+            )
             .expect("write dataset");
         let snapshot_dir = root.join("snapshot");
         build_static_snapshot(

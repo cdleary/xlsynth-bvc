@@ -493,7 +493,10 @@ mod tests {
         let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("layout");
         store
-            .write_web_index_bytes("versions-summary.v1.json", br#"{"cards":[]}"#)
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                br#"{"cards":[]}"#,
+            )
             .expect("write index");
         let snapshot_dir = root.join("snapshot");
         build_static_snapshot(

@@ -50,7 +50,23 @@ pub(crate) struct FailedActionRowView {
     pub(crate) action_kind: String,
     pub(crate) dso_version: Option<String>,
     pub(crate) subject: String,
-    pub(crate) error_summary: String,
+    pub(crate) failure_class: PublicFailureClass,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PublicFailureClass {
+    Timeout,
+    Failed,
+}
+
+impl PublicFailureClass {
+    pub(crate) fn as_label(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Default)]

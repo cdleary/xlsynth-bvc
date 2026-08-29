@@ -21,7 +21,7 @@ use crate::proto::{
 };
 use crate::query::{
     canonical_root_actions_for_crate_version, enqueue_processing_for_crate_version,
-    load_stdlib_g8r_vs_yosys_dataset_index, load_versions_cards_index,
+    is_timeout_error, load_stdlib_g8r_vs_yosys_dataset_index, load_versions_cards_index,
 };
 use crate::queue::{QueueState, load_queue_canceled_record, queue_state_for_action};
 use crate::runtime::explicit_driver_runtime_for_crate_version;
@@ -724,9 +724,14 @@ fn failure_error(store: &ArtifactStore, action_id: &str) -> Result<String> {
     Ok(store
         .load_failed_action_record(action_id)?
         .map(|failed| {
-            normalize_completion_error(&failed.error, "failed action error is unavailable")
+            if is_timeout_error(&failed.error) {
+                "timeout"
+            } else {
+                "failed"
+            }
         })
-        .unwrap_or_else(|| "failed action record is unavailable".to_string()))
+        .unwrap_or("failed")
+        .to_string())
 }
 
 fn evaluate_completion(
@@ -1431,5 +1436,38 @@ mod tests {
             "\\0oops\\0"
         );
         assert_eq!(normalize_completion_error(" \n\t", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn campaign_failed_samples_use_fixed_public_classes() {
+        let root = temp_path("private-failure");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "ab".repeat(32),
+            top_fn_name: Some("main".to_string()),
+        };
+        let action_id = compute_model_action_id_v2(&action)
+            .expect("action id")
+            .to_hex();
+        let now = Utc::now();
+        store
+            .write_failed_action_record(&crate::model::QueueFailed {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: action_id.clone(),
+                enqueued_utc: now,
+                failed_utc: now,
+                failed_by: "test-worker".to_string(),
+                action,
+                error: format!("private path {} token=do-not-publish", root.display()),
+            })
+            .expect("write failed action");
+        assert_eq!(
+            failure_error(&store, &action_id).expect("public class"),
+            "failed"
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
