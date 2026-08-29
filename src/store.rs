@@ -116,6 +116,17 @@ fn ensure_store_format_marker(store_root: &Path) -> Result<()> {
         }
         return Ok(());
     }
+    let mut entries = fs::read_dir(store_root)
+        .with_context(|| format!("listing unmarked store root: {}", store_root.display()))?;
+    if let Some(entry) = entries.next() {
+        let entry = entry
+            .with_context(|| format!("reading unmarked store entry in {}", store_root.display()))?;
+        bail!(
+            "refusing to initialize protobuf format marker in nonempty store {}; found {}; use a fresh empty store because legacy migration is intentionally unsupported",
+            store_root.display(),
+            entry.path().display()
+        );
+    }
     let marker = pb::StoreFormat {
         format_version: STORE_FORMAT_VERSION,
         format_name: STORE_FORMAT_NAME.to_string(),
@@ -2861,6 +2872,25 @@ mod tests {
             store.artifacts_sled_db_path(),
             root.join("artifacts.test.sled")
         );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn unmarked_nonempty_store_is_rejected() {
+        let root = make_test_root("xlsynth-bvc-store-unmarked-nonempty");
+        std::fs::create_dir_all(&root).expect("create test root");
+        std::fs::write(root.join("legacy.json"), "{}").expect("write legacy marker");
+        let store = ArtifactStore::new(root.clone());
+        let error = store
+            .ensure_layout()
+            .expect_err("unmarked nonempty store must fail closed");
+        assert!(error.to_string().contains("nonempty store"));
+        assert!(
+            error
+                .to_string()
+                .contains("legacy migration is intentionally unsupported")
+        );
+        assert!(!root.join(STORE_FORMAT_MARKER).exists());
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 

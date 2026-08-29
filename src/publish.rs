@@ -286,7 +286,8 @@ pub(crate) fn publish_static_site(
     };
 
     let catalog_relpath = format!("catalogs/{site_id}.pb");
-    let catalog = pb::PublishedSiteCatalog {
+    let catalog_path = publish_root.join(&catalog_relpath);
+    let mut catalog = pb::PublishedSiteCatalog {
         record_version: PUBLISHED_SITE_RECORD_VERSION,
         site_id: Some(site_id_digest.clone()),
         source_snapshot_id: site_manifest.source_snapshot_id.clone(),
@@ -297,9 +298,23 @@ pub(crate) fn publish_static_site(
         }),
         published_at: Some(timestamp_to_proto(&Utc::now())),
     };
-    validate_catalog(&catalog)?;
-    let catalog_bytes = catalog.encode_to_vec();
-    atomic_write(&publish_root.join(&catalog_relpath), &catalog_bytes)?;
+    if catalog_path.exists() {
+        let catalog_bytes = fs::read(&catalog_path)
+            .with_context(|| format!("reading immutable catalog: {}", catalog_path.display()))?;
+        let existing = pb::PublishedSiteCatalog::decode(catalog_bytes.as_slice())
+            .with_context(|| format!("decoding immutable catalog: {}", catalog_path.display()))?;
+        validate_catalog(&existing)?;
+        catalog.published_at = existing.published_at.clone();
+        if existing != catalog {
+            bail!(
+                "immutable published catalog conflicts with site identity at {}",
+                catalog_path.display()
+            );
+        }
+    } else {
+        validate_catalog(&catalog)?;
+        atomic_write(&catalog_path, &catalog.encode_to_vec())?;
+    }
     let pointer = pb::CurrentSitePointer {
         record_version: CURRENT_SITE_RECORD_VERSION,
         site_id: Some(site_id_digest),
@@ -449,9 +464,16 @@ mod tests {
         let publish_root = root.join("published");
         let first = publish_static_site(&site_dir, &publish_root).expect("first publish");
         assert!(!first.reused_immutable_site);
+        let catalog_path = publish_root.join(&first.catalog_relpath);
+        let first_catalog = fs::read(&catalog_path).expect("first catalog");
         let second = publish_static_site(&site_dir, &publish_root).expect("second publish");
         assert!(second.reused_immutable_site);
         assert_eq!(first.site_id, second.site_id);
+        assert_eq!(
+            fs::read(&catalog_path).expect("second catalog"),
+            first_catalog,
+            "republishing an immutable site must preserve catalog bytes"
+        );
         let verified = verify_published_site(&publish_root).expect("verify publication");
         assert_eq!(verified.site_id, first.site_id);
         drop(store);
@@ -467,6 +489,18 @@ mod tests {
                 .expect("immutable index");
         assert!(immutable_index.contains("name=\"bvc-site-root\" content=\"./\""));
         assert!(!immutable_index.contains("/xlsynth-bvc/assets/"));
+
+        let mut conflicting =
+            pb::PublishedSiteCatalog::decode(first_catalog.as_slice()).expect("decode catalog");
+        conflicting.base_url = "/conflicting/".to_string();
+        fs::write(&catalog_path, conflicting.encode_to_vec()).expect("write conflicting catalog");
+        let error = publish_static_site(&site_dir, &publish_root)
+            .expect_err("conflicting immutable catalog must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("immutable published catalog conflicts")
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 }
