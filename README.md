@@ -2,7 +2,8 @@
 
 Hermetic, reproducible action execution for xlsynth artifact pipelines.
 
-See `docs/hermetic-action-design.md` for the architecture.
+See `DESIGN.md` for repository-wide invariants and filesystem boundaries.
+See `docs/hermetic-action-design.md` for the action execution architecture.
 See `docs/batched-persistent-runners-plan.md` for the implemented persistent Docker runner design.
 See `docs/ir-dir-corpus-runner.md` for the batch `IR directory -> recipe preset -> output bundle` runner.
 

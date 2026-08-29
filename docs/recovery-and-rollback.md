@@ -24,11 +24,11 @@ requests.
 
 ## Store loss
 
-Back up the private protobuf store independently of the static output. Stop the
-coordinator/service, snapshot `STORE` and the sled database together, then
-restart. Restore both from the same backup generation. The static site is not a
-full private-store backup: operational provenance, queues, and non-allowlisted
-artifacts are intentionally excluded.
+Back up the private protobuf store independently of the static output. Stop all
+coordinator and worker processes, snapshot `STORE` and the sled database
+together, then restart. Restore both from the same backup generation. The
+static site is not a full private-store backup: operational provenance, queues,
+and non-allowlisted artifacts are intentionally excluded.
 
 If no store backup exists, initialize an empty directory and rerun campaigns
 from their declared roots. Do not import the pre-protobuf JSON store.

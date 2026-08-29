@@ -28,24 +28,44 @@ use no-cache or a short TTL.
 
 ## Fresh machine
 
-1. Create a dedicated unprivileged `xlsynth-bvc` user.
+1. Create a dedicated unprivileged runtime user.
 2. Install Docker and grant only the access required by the existing hermetic
    driver/Yosys images.
-3. Check out this repository at `/opt/xlsynth-bvc` and build with
+3. Check out this repository at `RESOURCE_ROOT` and build with
    `cargo build --release`.
-4. Create `/srv/xlsynth-bvc/{store,publication-work,public}` owned by the service
-   user. Do not copy the legacy JSON store; this deployment is protobuf-only.
-5. Copy `deploy/systemd/coordinator.env.example` to
-   `/etc/xlsynth-bvc/coordinator.env` and adjust paths/workers/base URL.
-6. Copy the service and timer into `/etc/systemd/system/`, run
-   `systemctl daemon-reload`, then enable the timer.
-7. Run two chosen historical versions manually with `coordinate-release`
-   before enabling unattended publication. The scheduled script refreshes the
-   compatibility map and processes the newest pending version by default.
+4. Make `RESOURCE_ROOT` readable but not writable by the runtime user. It is an
+   immutable application-resource bundle containing flow scripts, Dockerfiles,
+   vendored helpers, and the deployed compatibility map.
+5. Create `STORE`, `WORK`, and `PUBLIC` outside `RESOURCE_ROOT`, owned by the
+   runtime user. Do not copy the legacy JSON store; this deployment is
+   protobuf-only.
+6. From `RESOURCE_ROOT`, run two chosen historical versions manually with
+   `coordinate-release` before enabling unattended publication.
+7. Configure the operator's preferred scheduler or supervisor to invoke the
+   same command directly. Scheduling policy is deliberately outside this
+   repository.
 
-`scripts/run-release-coordinator.sh` is the scheduled entrypoint. Set
-`BVC_MAX_VERSIONS` to bound work per timer activation. The Rust-side file lock
-is authoritative, so overlapping timer/manual invocations fail cleanly.
+The runtime account needs read access to `RESOURCE_ROOT` and read-write access
+only to the configured store, sled database, work directory, publication root,
+and Docker resources. The Rust-side file lock is authoritative, so overlapping
+invocations for one store fail cleanly.
+
+Compatibility-map updates are out-of-band repository maintenance. A maintainer
+runs `scripts/sync-version-compat.sh`, reviews the source change, and deploys a
+new resource root. The coordinator never updates the checkout. If the deployed
+map lacks a requested crate version, the command fails and leaves all resources
+unchanged.
+
+To discover work without changing the resource root, a scheduler can run:
+
+```text
+xlsynth_bvc --store-dir STORE --artifacts-via-sled STORE/artifacts.sled \
+  list-pending-campaign-versions
+```
+
+It can then pass one selected version to the `coordinate-release` command shown
+above. Bound the number of versions in scheduler policy rather than a repository
+wrapper.
 
 ## Verification
 
