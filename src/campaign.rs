@@ -935,6 +935,56 @@ mod tests {
             .clone()
     }
 
+    #[cfg(unix)]
+    fn make_read_only_resource_root() -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_root = std::env::current_dir().expect("current dir");
+        let root = temp_path("read-only-resources");
+        let compat_path = root.join(crate::VERSION_COMPAT_PATH);
+        fs::create_dir_all(compat_path.parent().expect("compat parent"))
+            .expect("create resource directories");
+        fs::copy(source_root.join(crate::VERSION_COMPAT_PATH), &compat_path)
+            .expect("copy compatibility map");
+        fs::set_permissions(&compat_path, fs::Permissions::from_mode(0o444))
+            .expect("make compatibility map read-only");
+        let mut current = compat_path.parent();
+        while let Some(dir) = current {
+            if !dir.starts_with(&root) {
+                break;
+            }
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o555))
+                .expect("make resource directory read-only");
+            if dir == root {
+                break;
+            }
+            current = dir.parent();
+        }
+        root
+    }
+
+    #[cfg(unix)]
+    fn remove_read_only_resource_root(root: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let compat_path = root.join(crate::VERSION_COMPAT_PATH);
+        let mut current = compat_path.parent();
+        while let Some(dir) = current {
+            if !dir.starts_with(root) {
+                break;
+            }
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755))
+                .expect("restore resource directory permissions");
+            if dir == root {
+                break;
+            }
+            current = dir.parent();
+        }
+        fs::set_permissions(&compat_path, fs::Permissions::from_mode(0o644))
+            .expect("restore compatibility map permissions");
+        fs::remove_dir_all(root).expect("remove resource root");
+    }
+
     #[test]
     fn campaign_id_is_deterministic_and_semantic() {
         let campaign = load_default_campaign().expect("load campaign");
@@ -962,6 +1012,31 @@ mod tests {
         assert!(!Path::new(&first.manifest_path).exists());
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn planning_uses_a_read_only_resource_root_and_unknown_versions_fail_closed() {
+        let repo_root = make_read_only_resource_root();
+        let compat_path = repo_root.join(crate::VERSION_COMPAT_PATH);
+        let original_compat = fs::read(&compat_path).expect("read compatibility map");
+        let store_root = temp_path("read-only-store");
+        let store = ArtifactStore::new(store_root.clone());
+        store.ensure_layout().expect("layout");
+
+        let version = known_crate_version(&repo_root);
+        plan_campaign_run(&store, &repo_root, &version).expect("plan from read-only resources");
+        let error = plan_campaign_run(&store, &repo_root, "999.0.0")
+            .expect_err("unknown deployed version should fail");
+        assert!(error.to_string().contains("update it out of band"));
+        assert_eq!(
+            fs::read(&compat_path).expect("reread compatibility map"),
+            original_compat
+        );
+
+        drop(store);
+        fs::remove_dir_all(store_root).expect("remove store");
+        remove_read_only_resource_root(&repo_root);
     }
 
     #[test]
