@@ -6770,6 +6770,13 @@ pub(crate) fn maybe_refresh_dslx_root_for_suggestion_discovery(
     Ok(())
 }
 
+fn dslx_root_provenance_has_discovery_result(provenance: &Provenance) -> bool {
+    provenance
+        .details
+        .as_object()
+        .is_some_and(|details| details.contains_key("dslx_list_fns_discovery"))
+}
+
 pub(crate) fn dslx_root_provenance_needs_discovery_refresh(provenance: &Provenance) -> bool {
     if !matches!(
         provenance.action,
@@ -6778,10 +6785,8 @@ pub(crate) fn dslx_root_provenance_needs_discovery_refresh(provenance: &Provenan
     ) {
         return false;
     }
-    if provenance.suggested_next_actions.is_empty() {
-        return true;
-    }
-    false
+    provenance.suggested_next_actions.is_empty()
+        && !dslx_root_provenance_has_discovery_result(provenance)
 }
 
 pub(crate) fn ensure_dslx_root_has_suggested_actions(provenance: &Provenance) -> Result<()> {
@@ -6792,19 +6797,15 @@ pub(crate) fn ensure_dslx_root_has_suggested_actions(provenance: &Provenance) ->
     ) {
         return Ok(());
     }
-    if !provenance.suggested_next_actions.is_empty() {
+    if !provenance.suggested_next_actions.is_empty()
+        || dslx_root_provenance_has_discovery_result(provenance)
+    {
         return Ok(());
     }
     let detail = provenance
         .details
         .as_object()
-        .and_then(|o| o.get("dslx_list_fns_discovery").cloned())
-        .or_else(|| {
-            provenance
-                .details
-                .as_object()
-                .and_then(|o| o.get("dslx_list_fns_discovery_error").cloned())
-        })
+        .and_then(|o| o.get("dslx_list_fns_discovery_error").cloned())
         .unwrap_or_else(|| json!("dslx discovery produced zero suggestions"));
     bail!(
         "dslx discovery produced zero suggested actions for action {}: {}",
@@ -10099,5 +10100,34 @@ fn only(z: bits[1] id=1) -> bits[1] {
         assert!(missing.selected_file.is_none());
         assert_eq!(missing.series.len(), 2);
         assert_eq!(missing.total_points, 3);
+    }
+
+    #[test]
+    fn recorded_empty_dslx_discovery_is_terminal_and_reusable() {
+        let mut provenance = synthetic_provenance(
+            &"d".repeat(64),
+            ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
+                version: "0.5.0".to_string(),
+                subtree: "xls/modules/add_dual_path".to_string(),
+                discovery_runtime: Some(test_runtime()),
+            },
+            ArtifactType::DslxFileSubtree,
+        );
+        assert!(dslx_root_provenance_needs_discovery_refresh(&provenance));
+        assert!(ensure_dslx_root_has_suggested_actions(&provenance).is_err());
+
+        provenance.details = json!({
+            "dslx_list_fns_discovery": {
+                "concrete_functions": 0,
+                "suggested_actions": 0
+            }
+        });
+        assert!(!dslx_root_provenance_needs_discovery_refresh(&provenance));
+        ensure_dslx_root_has_suggested_actions(&provenance)
+            .expect("recorded empty discovery is a valid terminal result");
+
+        provenance.details = json!({"dslx_list_fns_discovery_error": "boom"});
+        assert!(dslx_root_provenance_needs_discovery_refresh(&provenance));
+        assert!(ensure_dslx_root_has_suggested_actions(&provenance).is_err());
     }
 }

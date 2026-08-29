@@ -18,6 +18,9 @@ use crate::proto::v1 as pb;
 use crate::proto::{timestamp_from_proto, timestamp_to_proto};
 use crate::publish::{publish_static_site, verify_published_site};
 use crate::query::rebuild_web_indices;
+use crate::service::{
+    check_ir_fn_corpus_structural_freshness, populate_ir_fn_corpus_structural_index,
+};
 use crate::site::{BuildStaticSiteOptions, build_static_site, verify_static_site};
 use crate::snapshot::{BuildStaticSnapshotOptions, build_static_snapshot, verify_static_snapshot};
 use crate::store::ArtifactStore;
@@ -296,6 +299,25 @@ fn stage_succeeded(state: &pb::CoordinatorState, stage: pb::CoordinatorStage) ->
     })
 }
 
+fn ensure_structural_index_current(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    work_dir: &Path,
+    workers: usize,
+) -> Result<String> {
+    let freshness = check_ir_fn_corpus_structural_freshness(store)?;
+    if freshness.up_to_date {
+        return Ok("reused current structural corpus index".to_string());
+    }
+
+    let summary =
+        populate_ir_fn_corpus_structural_index(store, repo_root, work_dir, false, workers)?;
+    Ok(format!(
+        "rebuilt structural corpus index actions={} hashes={}",
+        summary.indexed_actions, summary.distinct_structural_hashes
+    ))
+}
+
 pub(crate) fn coordinate_release(
     store: ArtifactStore,
     repo_root: &Path,
@@ -380,10 +402,19 @@ pub(crate) fn coordinate_release(
                     "reused previously verified web/publication datasets".to_string(),
                 ))
             } else {
+                let structural_index = ensure_structural_index_current(
+                    &store,
+                    repo_root,
+                    &options.work_dir,
+                    options.workers,
+                )?;
                 rebuild_web_indices(&store, repo_root)?;
                 Ok((
                     (),
-                    "rebuilt all declared web/publication datasets".to_string(),
+                    format!(
+                        "{}; rebuilt all declared web/publication datasets",
+                        structural_index
+                    ),
                 ))
             }
         },
@@ -568,5 +599,26 @@ mod tests {
             &state,
             pb::CoordinatorStage::SnapshotVerified
         ));
+    }
+
+    #[test]
+    fn structural_index_is_initialized_once_for_a_fresh_store() {
+        let root = temp_path("structural-index");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+
+        let first = ensure_structural_index_current(&store, &root, &root, 1)
+            .expect("initialize structural index");
+        assert!(first.starts_with("rebuilt structural corpus index"));
+        let freshness = check_ir_fn_corpus_structural_freshness(&store)
+            .expect("check initialized structural index");
+        assert!(freshness.up_to_date, "{:?}", freshness.stale_reasons);
+
+        let second = ensure_structural_index_current(&store, &root, &root, 1)
+            .expect("reuse structural index");
+        assert_eq!(second, "reused current structural corpus index");
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

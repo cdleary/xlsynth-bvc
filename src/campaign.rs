@@ -602,10 +602,22 @@ fn stdlib_dataset_contains_crate(
             .any(|sample| canonical_version_matches(&sample.crate_version, version))
 }
 
+fn normalize_completion_error(error: &str, fallback: &str) -> String {
+    let escaped = error.replace('\0', "\\0");
+    let trimmed = escaped.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn failure_error(store: &ArtifactStore, action_id: &str) -> Result<String> {
     Ok(store
         .load_failed_action_record(action_id)?
-        .map(|failed| failed.error)
+        .map(|failed| {
+            normalize_completion_error(&failed.error, "failed action error is unavailable")
+        })
         .unwrap_or_else(|| "failed action record is unavailable".to_string()))
 }
 
@@ -613,7 +625,9 @@ fn canceled_error(store: &ArtifactStore, action_id: &str) -> String {
     fs::read(store.canceled_queue_path(action_id))
         .ok()
         .and_then(|bytes| decode_queue_canceled(&bytes).ok())
-        .map(|record| record.reason)
+        .map(|record| {
+            normalize_completion_error(&record.reason, "canceled action reason is unavailable")
+        })
         .unwrap_or_else(|| "canceled action record is unavailable".to_string())
 }
 
@@ -1143,5 +1157,18 @@ mod tests {
         };
         assert!(stdlib_dataset_contains_crate(&dataset, "0.40.0"));
         assert!(!stdlib_dataset_contains_crate(&dataset, "0.41.0"));
+    }
+
+    #[test]
+    fn completion_errors_are_trimmed_and_nul_escaped() {
+        assert_eq!(
+            normalize_completion_error("  timed out\n", "fallback"),
+            "timed out"
+        );
+        assert_eq!(
+            normalize_completion_error("\0oops\0", "fallback"),
+            "\\0oops\\0"
+        );
+        assert_eq!(normalize_completion_error(" \n\t", "fallback"), "fallback");
     }
 }
