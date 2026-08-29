@@ -1592,7 +1592,7 @@ mod tests {
     }
 
     #[test]
-    fn finalized_campaign_is_rendered_as_verified_static_run_page() {
+    fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() {
         let root = temp_root();
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("store layout");
@@ -1689,7 +1689,19 @@ mod tests {
             .expect("comparison dataset");
         let finalized =
             finalize_campaign_run(&store, &repo_root, &crate_version).expect("finalize campaign");
-        assert_eq!(finalized.status, "complete");
+        assert_eq!(finalized.status, "degraded");
+        assert!(
+            finalized
+                .missing_outputs
+                .iter()
+                .any(|reason| reason.contains("stdlib enumeration is absent"))
+        );
+        assert!(
+            finalized
+                .missing_outputs
+                .iter()
+                .any(|reason| reason.contains("declared stdlib-root lineage"))
+        );
 
         let snapshot_dir = root.join("snapshot-with-run");
         build_static_snapshot(

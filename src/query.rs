@@ -6385,8 +6385,20 @@ pub(crate) fn stdlib_enumeration_status_from_provenance(
         .get("suggested_actions")
         .and_then(|v| v.as_u64())
         .unwrap_or(provenance.suggested_next_actions.len() as u64);
+    let suggestion_count_matches =
+        suggested_actions == provenance.suggested_next_actions.len() as u64;
+    if scanned_files == 0 {
+        return StdlibEnumerationStatusView {
+            state: StdlibEnumerationState::Failed,
+            reason: StdlibEnumerationReason::DiscoveryEmpty,
+            scanned_files,
+            failed_files,
+            concrete_functions,
+            suggested_actions,
+        };
+    }
     let all_files_failed = scanned_files > 0 && failed_files >= scanned_files;
-    let no_concrete_outputs = concrete_functions == 0 && suggested_actions == 0;
+    let no_concrete_outputs = concrete_functions == 0 || suggested_actions == 0;
     if all_files_failed || (failed_files > 0 && no_concrete_outputs) {
         return StdlibEnumerationStatusView {
             state: StdlibEnumerationState::Failed,
@@ -6397,7 +6409,7 @@ pub(crate) fn stdlib_enumeration_status_from_provenance(
             suggested_actions,
         };
     }
-    if failed_files > 0 || no_concrete_outputs {
+    if failed_files > 0 || no_concrete_outputs || !suggestion_count_matches {
         return StdlibEnumerationStatusView {
             state: StdlibEnumerationState::Partial,
             reason: StdlibEnumerationReason::DiscoveryCounts,

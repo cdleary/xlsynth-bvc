@@ -22,14 +22,18 @@ use crate::proto::{
 use crate::query::{
     canonical_root_actions_for_crate_version, enqueue_processing_for_crate_version,
     is_timeout_error, load_stdlib_g8r_vs_yosys_dataset_index, load_versions_cards_index,
+    stdlib_enumeration_status_from_provenance,
 };
-use crate::queue::{QueueState, load_queue_canceled_record, queue_state_for_action};
+use crate::queue::{
+    QueueState, action_dependency_action_ids, load_queue_canceled_record, queue_state_for_action,
+};
 use crate::runtime::explicit_driver_runtime_for_crate_version;
 use crate::store::ArtifactStore;
 use crate::versioning::{
     cmp_dotted_numeric_version, load_version_compat_map, normalize_tag_version,
     resolve_xlsynth_version_for_driver,
 };
+use crate::view::{StdlibEnumerationState, StdlibEnumerationStatusView, StdlibG8rVsYosysDataset};
 use crate::{
     WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME, WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
 };
@@ -729,28 +733,115 @@ fn add_missing_dataset_if(
     }
 }
 
+fn stdlib_enumeration_is_complete(status: &StdlibEnumerationStatusView) -> bool {
+    status.state == StdlibEnumerationState::Ok
+        && status.scanned_files > 0
+        && status.failed_files == 0
+        && status.concrete_functions > 0
+        && status.suggested_actions > 0
+}
+
 fn versions_summary_contains_crate(
     report: &crate::view::VersionCardsReport,
     version: &str,
 ) -> bool {
-    report
-        .cards
-        .iter()
-        .any(|card| canonical_version_matches(&card.crate_version, version))
+    report.cards.iter().any(|card| {
+        canonical_version_matches(&card.crate_version, version)
+            && stdlib_enumeration_is_complete(&card.stdlib_enumeration)
+    })
 }
 
-fn stdlib_dataset_contains_crate(
-    dataset: &crate::view::StdlibG8rVsYosysDataset,
-    version: &str,
-) -> bool {
+fn stdlib_dataset_contains_crate(dataset: &StdlibG8rVsYosysDataset, version: &str) -> bool {
     dataset
-        .available_crate_versions
+        .samples
         .iter()
-        .any(|candidate| canonical_version_matches(candidate, version))
-        || dataset
-            .samples
-            .iter()
-            .any(|sample| canonical_version_matches(&sample.crate_version, version))
+        .any(|sample| canonical_version_matches(&sample.crate_version, version))
+}
+
+fn action_descends_from_root<F>(
+    start_action_id: &str,
+    root_action_id: &str,
+    mut load_action: F,
+) -> Result<bool>
+where
+    F: FnMut(&str) -> Result<Option<ActionSpec>>,
+{
+    let mut visited = BTreeSet::new();
+    let mut queue = VecDeque::from([start_action_id.to_string()]);
+    while let Some(action_id) = queue.pop_front() {
+        if action_id == root_action_id {
+            return Ok(true);
+        }
+        if !visited.insert(action_id.clone()) {
+            continue;
+        }
+        let Some(action) = load_action(&action_id)? else {
+            continue;
+        };
+        for dependency in action_dependency_action_ids(&action) {
+            queue.push_back(dependency.to_string());
+        }
+    }
+    Ok(false)
+}
+
+fn stored_action_descends_from_root(
+    store: &ArtifactStore,
+    start_action_id: &str,
+    root_action_id: &str,
+) -> Result<bool> {
+    action_descends_from_root(start_action_id, root_action_id, |action_id| {
+        if !store.action_exists(action_id) {
+            return Ok(None);
+        }
+        Ok(Some(store.load_provenance(action_id)?.action))
+    })
+}
+
+fn stdlib_dataset_has_root_lineage(
+    store: &ArtifactStore,
+    dataset: &StdlibG8rVsYosysDataset,
+    version: &str,
+    root_action_id: &str,
+) -> Result<bool> {
+    let matching = dataset
+        .samples
+        .iter()
+        .filter(|sample| canonical_version_matches(&sample.crate_version, version))
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Ok(false);
+    }
+    for sample in matching {
+        for action_id in [
+            &sample.ir_action_id,
+            &sample.g8r_stats_action_id,
+            &sample.yosys_abc_stats_action_id,
+        ] {
+            if !stored_action_descends_from_root(store, action_id, root_action_id)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn stdlib_root_action_id(manifest: &pb::CampaignRunManifest) -> Result<Option<String>> {
+    let mut roots = Vec::new();
+    for root in &manifest.root_actions {
+        let action =
+            action_spec_from_proto(required(&root.action, "campaign_run.root_actions.action")?)?;
+        if matches!(
+            action,
+            ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. }
+        ) {
+            roots.push(action_id_from_root(root)?);
+        }
+    }
+    if roots.len() > 1 {
+        bail!("campaign run contains more than one stdlib root action");
+    }
+    Ok(roots.pop())
 }
 
 fn normalize_completion_error(error: &str, fallback: &str) -> String {
@@ -902,6 +993,13 @@ fn evaluate_completion(
     }
 
     let crate_version = &required(&manifest.crate_version, "campaign_run.crate_version")?.value;
+    let stdlib_root_action_id = stdlib_root_action_id(manifest)?;
+    let stdlib_enumeration_status = match stdlib_root_action_id.as_deref() {
+        Some(action_id) if store.action_exists(action_id) => Some(
+            stdlib_enumeration_status_from_provenance(&store.load_provenance(action_id)?),
+        ),
+        _ => None,
+    };
     for raw in &campaign.required_outputs {
         match pb::RequiredOutputKind::try_from(*raw)
             .context("campaign.required_outputs contains unknown value")?
@@ -920,16 +1018,49 @@ fn evaluate_completion(
                 );
             }
             pb::RequiredOutputKind::StdlibG8rVsYosysDataset => {
-                let present = load_stdlib_g8r_vs_yosys_dataset_index(store, false)?
+                let dataset = load_stdlib_g8r_vs_yosys_dataset_index(store, false)?;
+                let present = match (dataset.as_ref(), stdlib_root_action_id.as_deref()) {
+                    (Some(dataset), Some(root_action_id)) => {
+                        stdlib_dataset_contains_crate(dataset, crate_version)
+                            && stdlib_dataset_has_root_lineage(
+                                store,
+                                dataset,
+                                crate_version,
+                                root_action_id,
+                            )?
+                    }
+                    _ => false,
+                };
+                if !present {
+                    missing_outputs.push(pb::MissingOutput {
+                        kind: pb::RequiredOutputKind::StdlibG8rVsYosysDataset as i32,
+                        action_id: stdlib_root_action_id
+                            .as_deref()
+                            .map(|id| action_id_to_proto(id, "missing_output.action_id"))
+                            .transpose()?,
+                        reason: format!(
+                            "required dataset {} lacks non-empty crate samples with declared stdlib-root lineage for {}",
+                            WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
+                            crate_version
+                        ),
+                    });
+                }
+            }
+            pb::RequiredOutputKind::StdlibEnumeration => {
+                if !stdlib_enumeration_status
                     .as_ref()
-                    .is_some_and(|dataset| stdlib_dataset_contains_crate(dataset, crate_version));
-                add_missing_dataset_if(
-                    pb::RequiredOutputKind::StdlibG8rVsYosysDataset,
-                    WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
-                    crate_version,
-                    present,
-                    &mut missing_outputs,
-                );
+                    .is_some_and(stdlib_enumeration_is_complete)
+                {
+                    missing_outputs.push(pb::MissingOutput {
+                        kind: pb::RequiredOutputKind::StdlibEnumeration as i32,
+                        action_id: stdlib_root_action_id
+                            .as_deref()
+                            .map(|id| action_id_to_proto(id, "missing_output.action_id"))
+                            .transpose()?,
+                        reason: "stdlib enumeration is absent, partial, failed, or empty"
+                            .to_string(),
+                    });
+                }
             }
             pb::RequiredOutputKind::Unspecified => unreachable!("campaign validated"),
         }
@@ -1141,6 +1272,7 @@ mod tests {
         StdlibEnumerationStatusView, StdlibG8rVsYosysDataset, StdlibG8rVsYosysSample,
         VersionCardView, VersionCardsReport,
     };
+    use std::collections::BTreeMap;
 
     fn temp_path(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1460,7 +1592,7 @@ mod tests {
 
     #[test]
     fn completion_dataset_checks_use_exact_crate_fields() {
-        let versions = VersionCardsReport {
+        let mut versions = VersionCardsReport {
             cards: vec![VersionCardView {
                 crate_version: "0.40.0".to_string(),
                 crate_release_datetime: None,
@@ -1482,6 +1614,8 @@ mod tests {
         };
         assert!(versions_summary_contains_crate(&versions, "v0.40.0"));
         assert!(!versions_summary_contains_crate(&versions, "0.41.0"));
+        versions.cards[0].stdlib_enumeration.state = crate::view::StdlibEnumerationState::Partial;
+        assert!(!versions_summary_contains_crate(&versions, "0.40.0"));
 
         let dataset = StdlibG8rVsYosysDataset {
             fraig: false,
@@ -1511,6 +1645,57 @@ mod tests {
         };
         assert!(stdlib_dataset_contains_crate(&dataset, "0.40.0"));
         assert!(!stdlib_dataset_contains_crate(&dataset, "0.41.0"));
+        let mut advertised_but_empty = dataset.clone();
+        advertised_but_empty.samples.clear();
+        assert!(!stdlib_dataset_contains_crate(
+            &advertised_but_empty,
+            "0.40.0"
+        ));
+    }
+
+    #[test]
+    fn stdlib_completeness_requires_nonempty_success_and_declared_root_lineage() {
+        let complete = StdlibEnumerationStatusView {
+            state: crate::view::StdlibEnumerationState::Ok,
+            reason: crate::view::StdlibEnumerationReason::DiscoveryCounts,
+            scanned_files: 2,
+            failed_files: 0,
+            concrete_functions: 2,
+            suggested_actions: 2,
+        };
+        assert!(stdlib_enumeration_is_complete(&complete));
+        let mut empty = complete.clone();
+        empty.scanned_files = 0;
+        assert!(!stdlib_enumeration_is_complete(&empty));
+        let mut partial = complete;
+        partial.state = crate::view::StdlibEnumerationState::Partial;
+        assert!(!stdlib_enumeration_is_complete(&partial));
+
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "leaf".to_string(),
+            ActionSpec::AigStatDiff {
+                opt_ir_action_id: "middle".to_string(),
+                g8r_aig_stats_action_id: "unrelated".to_string(),
+                yosys_abc_aig_stats_action_id: "unrelated".to_string(),
+            },
+        );
+        actions.insert(
+            "middle".to_string(),
+            ActionSpec::AigStatDiff {
+                opt_ir_action_id: "root".to_string(),
+                g8r_aig_stats_action_id: "unrelated".to_string(),
+                yosys_abc_aig_stats_action_id: "unrelated".to_string(),
+            },
+        );
+        assert!(
+            action_descends_from_root("leaf", "root", |id| { Ok(actions.get(id).cloned()) })
+                .expect("lineage")
+        );
+        assert!(
+            !action_descends_from_root("leaf", "other-root", |id| { Ok(actions.get(id).cloned()) })
+                .expect("unrelated lineage")
+        );
     }
 
     #[test]

@@ -203,3 +203,17 @@ changing the data contract.
 
 See `docs/hermetic-action-design.md` for action execution details and
 `docs/build-machine-deployment.md` for the concrete filesystem contract.
+
+## Campaign completeness invariant
+
+A release campaign is complete only when its declared stdlib root has a
+successful, non-empty enumeration: at least one DSLX file was scanned, no file
+enumeration failed, and the root produced concrete functions and suggested
+actions. A versions card that merely names the crate version is not sufficient.
+
+The required stdlib comparison dataset must contain at least one sample for the
+run's exact crate version. Every sample's IR, g8r stats, and Yosys/ABC stats
+actions must have a transitive typed dependency path to the stdlib root action
+recorded in that campaign manifest. An advertised version with zero samples,
+samples from another root lineage, partial discovery, or empty discovery adds a
+typed missing output and prevents COMPLETE status.

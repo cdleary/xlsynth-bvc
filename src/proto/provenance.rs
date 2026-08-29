@@ -1369,6 +1369,21 @@ mod tests {
         let action_id = crate::proto::compute_model_action_id_v2(&action)
             .expect("action id")
             .to_hex();
+        let suggested_next_actions = (1_u8..=7)
+            .map(|value| {
+                let suggested_action = model::ActionSpec::ImportIrPackageFile {
+                    source_sha256: format!("{:064x}", value),
+                    top_fn_name: Some(format!("suggested_{value}")),
+                };
+                model::SuggestedAction {
+                    reason: "test discovery".to_string(),
+                    action_id: crate::proto::compute_model_action_id_v2(&suggested_action)
+                        .expect("suggested action id")
+                        .to_hex(),
+                    action: suggested_action,
+                }
+            })
+            .collect();
         model::Provenance {
             schema_version: PROVENANCE_RECORD_VERSION,
             action_id: action_id.clone(),
@@ -1383,7 +1398,7 @@ mod tests {
             output_files: Vec::new(),
             commands: Vec::new(),
             details,
-            suggested_next_actions: Vec::new(),
+            suggested_next_actions: suggested_next_actions,
         }
     }
 
