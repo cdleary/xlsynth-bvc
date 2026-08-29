@@ -33,7 +33,7 @@ use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
-pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 4;
+pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 5;
 pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.pb";
 pub(crate) const STATIC_SNAPSHOT_WEB_INDEX_DIR: &str = "web_index";
 
@@ -864,6 +864,8 @@ pub(crate) fn build_static_snapshot(
     let mut entries = store
         .list_web_index_entries_with_prefix("")
         .context("listing web index entries for static snapshot")?;
+    crate::service::validate_ir_fn_corpus_structural_index_closure(&entries)
+        .context("validating structural index closure before static snapshot")?;
     entries.retain(|(index_key, _)| {
         should_copy_snapshot_store_index(index_key, direct_heavy_indices_written)
     });
@@ -990,6 +992,7 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
     let mut declared_relpaths = std::collections::BTreeSet::new();
     let mut decoded_campaign_ids = std::collections::BTreeSet::new();
     let mut decoded_run_ids = std::collections::BTreeSet::new();
+    let mut structural_index_entries = Vec::new();
     declared_relpaths.insert(STATIC_SNAPSHOT_MANIFEST_FILENAME.to_string());
     for entry in &manifest.dataset_files {
         let expected_relpath = if entry.index_key.starts_with("runs/") {
@@ -1080,8 +1083,17 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
         } else if entry.index_key.starts_with("runs/") {
             bail!("unknown run publication file: {}", entry.index_key);
         }
+        if entry
+            .index_key
+            .starts_with(WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE)
+        {
+            structural_index_entries.push((entry.index_key.clone(), bytes));
+        }
         recomputed_total_bytes += actual_bytes;
     }
+
+    crate::service::validate_ir_fn_corpus_structural_index_closure(&structural_index_entries)
+        .context("validating structural index closure in static snapshot")?;
 
     if decoded_campaign_ids.into_iter().collect::<Vec<_>>() != manifest.campaign_ids
         || decoded_run_ids.into_iter().collect::<Vec<_>>() != manifest.run_ids
@@ -1168,10 +1180,33 @@ mod tests {
         store
             .write_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME, br#"{"cards":[]}"#)
             .expect("write web index");
+        let structural_manifest = crate::model::IrFnCorpusStructuralManifest {
+            schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
+            generated_utc: Utc::now(),
+            recompute_missing_hashes: false,
+            total_actions_scanned: 0,
+            total_driver_ir_to_opt_actions: 0,
+            total_ir_fn_to_k_bool_cone_corpus_actions: 0,
+            indexed_actions: 0,
+            indexed_k_bool_cone_members: 0,
+            distinct_structural_hashes: 0,
+            hash_from_dependency_hint_count: 0,
+            hash_recomputed_count: 0,
+            hash_hint_conflict_count: 0,
+            skipped_missing_output_count: 0,
+            skipped_missing_ir_top_count: 0,
+            skipped_missing_hash_hint_count: 0,
+            skipped_hash_error_count: 0,
+            skipped_k_bool_cone_manifest_errors: 0,
+            skipped_k_bool_cone_empty_count: 0,
+            source_action_set_sha256: Some("ab".repeat(32)),
+            groups: Vec::new(),
+        };
         store
             .write_web_index_bytes(
-                "ir-fn-corpus-structural.v1/manifest.json",
-                br#"{"source_action_set_sha256":"abababababababababababababababababababababababababababababababab"}"#,
+                WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY,
+                &serde_json::to_vec_pretty(&structural_manifest)
+                    .expect("serialize structural manifest"),
             )
             .expect("write structural manifest");
 
@@ -1331,6 +1366,65 @@ mod tests {
                 .exists(),
             "file action graph should be omitted from snapshot"
         );
+    }
+
+    #[test]
+    fn static_snapshot_rejects_incomplete_structural_index() {
+        let root = make_temp_dir("incomplete-structural-index");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("ensure layout");
+        let structural_hash = "c".repeat(64);
+        let manifest = crate::model::IrFnCorpusStructuralManifest {
+            schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
+            generated_utc: Utc::now(),
+            recompute_missing_hashes: false,
+            total_actions_scanned: 0,
+            total_driver_ir_to_opt_actions: 0,
+            total_ir_fn_to_k_bool_cone_corpus_actions: 0,
+            indexed_actions: 1,
+            indexed_k_bool_cone_members: 0,
+            distinct_structural_hashes: 1,
+            hash_from_dependency_hint_count: 1,
+            hash_recomputed_count: 0,
+            hash_hint_conflict_count: 0,
+            skipped_missing_output_count: 0,
+            skipped_missing_ir_top_count: 0,
+            skipped_missing_hash_hint_count: 0,
+            skipped_hash_error_count: 0,
+            skipped_k_bool_cone_manifest_errors: 0,
+            skipped_k_bool_cone_empty_count: 0,
+            source_action_set_sha256: Some("ab".repeat(32)),
+            groups: vec![crate::model::IrFnCorpusStructuralManifestGroup {
+                structural_hash: structural_hash.clone(),
+                member_count: 1,
+                relpath: crate::service::hash_group_relpath(&structural_hash),
+                content_sha256: "0".repeat(64),
+                ir_node_count: None,
+            }],
+        };
+        store
+            .write_web_index_bytes(
+                WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY,
+                &serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+            )
+            .expect("write structural manifest");
+
+        let error = build_static_snapshot(
+            &store,
+            &root,
+            &BuildStaticSnapshotOptions {
+                out_dir: root.join("snapshot-out"),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect_err("incomplete structural index must not be snapshotted");
+        assert!(
+            format!("{error:#}").contains("structural manifest group is missing"),
+            "unexpected error: {error:#}"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

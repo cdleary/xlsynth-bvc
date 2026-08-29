@@ -221,7 +221,7 @@ The built-in `discover-releases` command does this polling directly and supports
 - `ingest-legacy-failed-records [--dry-run] [--keep-legacy-files]` one-shot migration that ingests legacy filesystem failure records (`failed-action-records/` and `queue/failed/`) into sled `failed_by_action`; with defaults it prunes those legacy directories after successful parse.
 - `audit-suggested [--include-completed]` scans all completed actions and reports suggestion completion gaps.
 - `find-aig-stat-diffs --opt-ir-action-id <id>` answers whether any completed `AigStatDiff` joins exist for a given optimized IR action.
-- `populate-ir-fn-corpus-structural [--recompute-missing-hashes]` materializes a derived index of IR functions grouped by `ir-fn-structural-hash` into sled web-index keys (`ir-fn-corpus-structural.v1/...`), not filesystem files under the repo checkout.
+- `populate-ir-fn-corpus-structural [--recompute-missing-hashes]` materializes a derived index of IR functions grouped by `ir-fn-structural-hash` into sled web-index keys (`ir-fn-corpus-structural.v2/...`), not filesystem files under the repo checkout. The v2 manifest binds every group key to its exact JSON digest and member count.
 
 ## JSON-RPC API
 

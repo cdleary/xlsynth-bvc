@@ -68,10 +68,10 @@ const DEFAULT_STRUCTURAL_INDEX_MAX_THREADS: usize = 16;
 const DEFAULT_SUGGESTED_ENQUEUE_MAX_DEPTH: u32 = 32;
 const DEFAULT_STDLIB_FN_TIMELINE_ROUTE: &str = "/dslx-fns/float32.x:add";
 const DSLX_PATH_LIST_SEPARATOR: &str = ":";
-const IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION: u32 = 1;
-const WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE: &str = "ir-fn-corpus-structural.v1";
+const IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION: u32 = 2;
+const WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE: &str = "ir-fn-corpus-structural.v2";
 const WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY: &str =
-    "ir-fn-corpus-structural.v1/manifest.json";
+    "ir-fn-corpus-structural.v2/manifest.json";
 const WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME: &str = "ir-fn-corpus-g8r-vs-yosys-abc.v3.json";
 const WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION: u32 = 3;
 const WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME: &str =

@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(test)]
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
@@ -9649,11 +9651,9 @@ fn only(z: bits[1] id=1) -> bits[1] {
 
         let group_relpath = hash_group_relpath(&structural_hash);
         let group_key = ir_fn_corpus_structural_group_index_key(&structural_hash);
+        let group_bytes = serde_json::to_vec_pretty(&group).expect("serialize group");
         store
-            .write_web_index_bytes(
-                &group_key,
-                &serde_json::to_vec_pretty(&group).expect("serialize group"),
-            )
+            .write_web_index_bytes(&group_key, &group_bytes)
             .expect("write group key");
 
         let manifest = IrFnCorpusStructuralManifest {
@@ -9680,6 +9680,7 @@ fn only(z: bits[1] id=1) -> bits[1] {
                 structural_hash: structural_hash.clone(),
                 member_count: 1,
                 relpath: group_relpath,
+                content_sha256: format!("{:x}", Sha256::digest(&group_bytes)),
                 ir_node_count: Some(1),
             }],
         };
@@ -9777,11 +9778,9 @@ fn only(z: bits[1] id=1) -> bits[1] {
             }],
         };
         let group_key = ir_fn_corpus_structural_group_index_key(&structural_hash);
+        let group_bytes = serde_json::to_vec_pretty(&group).expect("serialize group");
         store
-            .write_web_index_bytes(
-                &group_key,
-                &serde_json::to_vec_pretty(&group).expect("serialize group"),
-            )
+            .write_web_index_bytes(&group_key, &group_bytes)
             .expect("write group key");
 
         let manifest = IrFnCorpusStructuralManifest {
@@ -9808,6 +9807,7 @@ fn only(z: bits[1] id=1) -> bits[1] {
                 structural_hash: structural_hash.clone(),
                 member_count: 1,
                 relpath: group_relpath,
+                content_sha256: format!("{:x}", Sha256::digest(&group_bytes)),
                 ir_node_count: Some(1),
             }],
         };

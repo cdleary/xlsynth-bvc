@@ -118,6 +118,14 @@ outputs are flushed before Indexed success is recorded. Reuse requires
 both fingerprints to match; new actions, provenance changes, missing outputs,
 and modified output bytes invalidate the checkpoint.
 
+The structural corpus index is a manifest-last generation. Its manifest lists
+the exact group key set and binds every group to its structural hash, canonical
+relative path, encoded-byte digest, member count, and node-count metadata.
+Freshness checks and static snapshot build/verification require exact
+manifest-to-group closure. A missing, extra, malformed, or concurrently partial
+generation is stale or fails closed rather than being checkpointed or
+published.
+
 ## Campaign work-policy invariant
 
 Release-campaign admission policy is canonical checked-in protobuf data and is

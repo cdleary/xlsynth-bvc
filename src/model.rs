@@ -603,6 +603,7 @@ pub(crate) struct IrFnCorpusStructuralManifestGroup {
     pub(crate) structural_hash: String,
     pub(crate) member_count: usize,
     pub(crate) relpath: String,
+    pub(crate) content_sha256: String,
     #[serde(default)]
     pub(crate) ir_node_count: Option<u64>,
 }
