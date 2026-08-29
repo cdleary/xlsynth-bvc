@@ -380,7 +380,6 @@ pub enum TopCommand {
         #[arg(long)]
         reenqueue_missing_suggested: bool,
     },
-    RefreshVersionCompat,
     DslxToMangledIrFnName {
         #[arg(long)]
         dslx_module_name: String,

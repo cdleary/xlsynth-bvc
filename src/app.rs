@@ -913,14 +913,6 @@ pub(crate) fn run() -> Result<()> {
             );
         }
 
-        TopCommand::RefreshVersionCompat => {
-            let summary = refresh_version_compat_json()?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&summary)
-                    .expect("serializing version compat refresh summary")
-            );
-        }
         TopCommand::DslxToMangledIrFnName {
             dslx_module_name,
             dslx_fn_name,

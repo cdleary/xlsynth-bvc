@@ -673,14 +673,6 @@ pub(crate) struct DiscoveredRelease {
     pub(crate) enqueued: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct RefreshVersionCompatSummary {
-    pub(crate) output_path: String,
-    pub(crate) source_url: String,
-    pub(crate) bytes: usize,
-    pub(crate) sha256: String,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct VersionCompatEntry {
     pub(crate) xlsynth_release_version: String,

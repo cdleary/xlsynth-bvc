@@ -140,8 +140,6 @@ const DSLX_LIST_FNS_LEGACY_SOURCE_DRIVER_MAX: &str = "0.29.0";
 const XLSYNTH_SOURCE_ARCHIVE_URL_PREFIX: &str =
     "https://github.com/xlsynth/xlsynth/archive/refs/tags";
 const MODULE_SUBTREE_ROOT_PATHS: &[&str] = &["xls/modules/add_dual_path"];
-const VERSION_COMPAT_MAIN_URL: &str =
-    "https://raw.githubusercontent.com/xlsynth/xlsynth-crate/main/generated_version_compat.json";
 static DOCKER_RUN_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn driver_ir_aig_equiv_enabled() -> bool {

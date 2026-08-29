@@ -289,15 +289,16 @@ cargo run --bin xlsynth_bvc -- discover-releases --after v0.37.0 --dry-run
 ## Compatibility Map Refresh
 
 ```bash
-# Refresh only the crate<->xlsynth compatibility JSON from upstream main
-cargo run --bin xlsynth_bvc -- refresh-version-compat
-
-# Equivalent script form (default: update if needed)
+# Maintainer operation: update the checked-in map if needed
 scripts/sync-version-compat.sh
 
 # CI/check mode: exit non-zero if out of date
 scripts/sync-version-compat.sh --check
 ```
+
+Compatibility-map refresh is reviewed, out-of-band repository maintenance. A
+running `xlsynth-bvc` process only reads the deployed map and never updates its
+checkout.
 
 ## IR Corpus Structural Index
 
