@@ -315,7 +315,8 @@ pub(crate) fn publish_static_site(
         validate_catalog(&catalog)?;
         atomic_write(&catalog_path, &catalog.encode_to_vec())?;
     }
-    let pointer = pb::CurrentSitePointer {
+    let pointer_path = publish_root.join(CURRENT_POINTER_PROTO);
+    let mut pointer = pb::CurrentSitePointer {
         record_version: CURRENT_SITE_RECORD_VERSION,
         site_id: Some(site_id_digest),
         catalog_relpath: Some(pb::NormalizedRelpath {
@@ -323,11 +324,29 @@ pub(crate) fn publish_static_site(
         }),
         updated_at: Some(timestamp_to_proto(&Utc::now())),
     };
+    if pointer_path.exists() {
+        let existing_bytes = fs::read(&pointer_path).with_context(|| {
+            format!(
+                "reading current protobuf pointer: {}",
+                pointer_path.display()
+            )
+        })?;
+        let existing =
+            pb::CurrentSitePointer::decode(existing_bytes.as_slice()).with_context(|| {
+                format!(
+                    "decoding current protobuf pointer: {}",
+                    pointer_path.display()
+                )
+            })?;
+        validate_pointer(&existing)?;
+        if existing.site_id == pointer.site_id
+            && existing.catalog_relpath == pointer.catalog_relpath
+        {
+            pointer.updated_at = existing.updated_at;
+        }
+    }
     validate_pointer(&pointer)?;
-    atomic_write(
-        &publish_root.join(CURRENT_POINTER_PROTO),
-        &pointer.encode_to_vec(),
-    )?;
+    atomic_write(&pointer_path, &pointer.encode_to_vec())?;
     let browser_pointer = BrowserCurrentPointer {
         schema_version: 1,
         site_id: site_id.clone(),
@@ -468,6 +487,8 @@ mod tests {
         assert!(!first.reused_immutable_site);
         let catalog_path = publish_root.join(&first.catalog_relpath);
         let first_catalog = fs::read(&catalog_path).expect("first catalog");
+        let first_pointer =
+            fs::read(publish_root.join(CURRENT_POINTER_PROTO)).expect("first current pointer");
 
         let first_snapshot_manifest =
             fs::read(snapshot_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME))
@@ -504,6 +525,11 @@ mod tests {
         let second = publish_static_site(&site_dir, &publish_root).expect("second publish");
         assert!(second.reused_immutable_site);
         assert_eq!(first.site_id, second.site_id);
+        assert_eq!(
+            fs::read(publish_root.join(CURRENT_POINTER_PROTO)).expect("second current pointer"),
+            first_pointer,
+            "republishing the current site must preserve protobuf pointer bytes"
+        );
         assert_eq!(
             fs::read(&catalog_path).expect("second catalog"),
             first_catalog,
