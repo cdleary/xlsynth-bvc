@@ -337,6 +337,7 @@ mod tests {
                 action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                     version: "v0.37.0".to_string(),
                     discovery_runtime: None,
+                    stdlib_tarball_sha256: "11".repeat(32),
                 },
                 lease_owner: "worker-test".to_string(),
                 lease_acquired_utc: Utc::now(),
@@ -669,6 +670,7 @@ mod tests {
         let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version: "v0.37.0".to_string(),
             discovery_runtime: None,
+            stdlib_tarball_sha256: "11".repeat(32),
         };
         let persisted = QueueFailed {
             schema_version: ACTION_SCHEMA_VERSION,

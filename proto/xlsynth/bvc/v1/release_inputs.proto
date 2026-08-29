@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package xlsynth.bvc.v1;
+
+import "xlsynth/bvc/v1/common.proto";
+
+// Immutable upstream inputs for one xlsynth release. This data is refreshed
+// out of band and compiled into the deployed binary.
+message ReleaseInput {
+  DsoVersion dso_version = 1;
+  Sha256Digest stdlib_tarball_sha256 = 2;
+  string source_commit = 3;
+}
+
+message ReleaseInputLock {
+  uint32 record_version = 1;
+  repeated ReleaseInput releases = 2;
+}

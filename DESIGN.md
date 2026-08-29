@@ -31,6 +31,14 @@ maintainer, reviewed as a source change, and deployed normally; the coordinator
 does not invoke it. A deployed binary whose map does not contain a requested
 crate version fails with an actionable diagnostic rather than updating itself.
 
+The same rule applies to upstream release bytes. The checked-in
+`release-inputs/v1.textproto` file binds every deployed DSO version to the
+SHA-256 of its stdlib archive and the exact source commit. It is compiled into
+the binary. Root action identities carry those values, stdlib downloads must
+match the declared digest, and source archives are fetched by commit rather
+than mutable tag. `scripts/sync-release-inputs.sh` is the out-of-band maintainer
+operation; the coordinator never rewrites or refreshes the lock.
+
 Build tools such as Cargo may write build outputs while constructing the
 application. Those writes happen before deployment and are not production
 runtime state.

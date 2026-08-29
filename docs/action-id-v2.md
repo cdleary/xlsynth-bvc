@@ -77,6 +77,10 @@ Any intentional byte change for an existing semantic action requires:
 - new golden vectors
 - a clean new action lineage
 
+Before the initial protobuf deployment, this repository may intentionally update
+the V2 schema and golden vectors because no compatible V2 store exists. Once a
+V2 store is deployed, the version-bump rule above applies.
+
 The initial deployment is on a fresh store, so there is no V1 migration or
 fallback path.
 

@@ -1413,6 +1413,7 @@ mod tests {
                     model::ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                         version: "v0.0.199".into(),
                         discovery_runtime: None,
+                        stdlib_tarball_sha256: "11".repeat(32),
                     },
                     stdlib_details,
                 ),
@@ -1424,6 +1425,7 @@ mod tests {
                         version: "v0.0.199".into(),
                         subtree: "xls/dslx/stdlib".into(),
                         discovery_runtime: None,
+                        source_commit: "2".repeat(40),
                     },
                     subtree_details,
                 ),

@@ -66,18 +66,21 @@ pub(crate) fn execute_action(
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version,
             discovery_runtime,
+            stdlib_tarball_sha256,
         } => run_download_stdlib_action(
             store,
             &repo_root,
             &action_id,
             version,
             discovery_runtime.as_ref(),
+            stdlib_tarball_sha256,
             &payload_dir,
         )?,
         ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
             version,
             subtree,
             discovery_runtime,
+            source_commit,
         } => run_download_source_subtree_action(
             store,
             &repo_root,
@@ -85,6 +88,7 @@ pub(crate) fn execute_action(
             version,
             subtree,
             discovery_runtime.as_ref(),
+            source_commit,
             &payload_dir,
         )?,
         ActionSpec::DriverDslxFnToIr {
@@ -650,6 +654,7 @@ pub(crate) fn run_download_stdlib_action(
     action_id: &str,
     version: &str,
     discovery_runtime: Option<&DriverRuntimeSpec>,
+    expected_sha256: &str,
     payload_dir: &Path,
 ) -> Result<ActionOutcome> {
     let client = Client::builder()
@@ -657,7 +662,6 @@ pub(crate) fn run_download_stdlib_action(
         .context("creating reqwest client")?;
     let base_url = format!("https://github.com/xlsynth/xlsynth/releases/download/{version}");
     let tarball_url = format!("{base_url}/dslx_stdlib.tar.gz");
-    let sha_url = format!("{tarball_url}.sha256");
 
     let tarball_path = payload_dir
         .parent()
@@ -665,16 +669,7 @@ pub(crate) fn run_download_stdlib_action(
         .join("dslx_stdlib.tar.gz");
 
     download_to_file(&client, &tarball_url, &tarball_path)?;
-    let sha_text = client
-        .get(&sha_url)
-        .send()
-        .with_context(|| format!("downloading sha256 file: {sha_url}"))?
-        .error_for_status()
-        .with_context(|| format!("status check for sha256 URL: {sha_url}"))?
-        .text()
-        .context("reading sha256 response body")?;
-
-    let expected_sha = parse_sha256_text(&sha_text)?;
+    let expected_sha = expected_sha256.to_string();
     let actual_sha = sha256_file(&tarball_path)?;
 
     if expected_sha != actual_sha {
@@ -701,7 +696,6 @@ pub(crate) fn run_download_stdlib_action(
         "download".to_string(),
         json!({
             "tarball_url": tarball_url,
-            "sha256_url": sha_url,
             "expected_sha256": expected_sha,
             "actual_sha256": actual_sha,
         }),
@@ -764,13 +758,14 @@ pub(crate) fn run_download_source_subtree_action(
     version: &str,
     subtree: &str,
     discovery_runtime: Option<&DriverRuntimeSpec>,
+    source_commit: &str,
     payload_dir: &Path,
 ) -> Result<ActionOutcome> {
     let normalized_subtree = normalize_subtree_path(subtree)?;
     let client = Client::builder()
         .build()
         .context("creating reqwest client")?;
-    let tarball_url = format!("{XLSYNTH_SOURCE_ARCHIVE_URL_PREFIX}/{version}.tar.gz");
+    let tarball_url = format!("{XLSYNTH_SOURCE_ARCHIVE_URL_PREFIX}/{source_commit}.tar.gz");
     let tarball_path = payload_dir
         .parent()
         .ok_or_else(|| anyhow!("payload path missing parent"))?
@@ -795,6 +790,7 @@ pub(crate) fn run_download_source_subtree_action(
         json!({
             "source_archive_url": tarball_url,
             "source_archive_sha256": source_tarball_sha256,
+            "source_commit": source_commit,
         }),
     );
     details.insert("subtree".to_string(), json!(normalized_subtree.clone()));
@@ -1224,17 +1220,6 @@ pub(crate) fn download_to_file(client: &Client, url: &str, path: &Path) -> Resul
     std::io::copy(&mut response, &mut out)
         .with_context(|| format!("streaming URL response into file: {}", path.display()))?;
     Ok(())
-}
-
-pub(crate) fn parse_sha256_text(text: &str) -> Result<String> {
-    let first = text
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| anyhow!("sha256 file did not contain checksum text"))?;
-    if first.len() != 64 || !first.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("invalid sha256 checksum format in sha256 file: {first}");
-    }
-    Ok(first.to_ascii_lowercase())
 }
 
 pub(crate) fn extract_tar_gz_safely(tarball_path: &Path, destination: &Path) -> Result<()> {

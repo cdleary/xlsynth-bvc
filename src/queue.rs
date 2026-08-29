@@ -1503,6 +1503,7 @@ mod tests {
         let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version: "v0.37.0".to_string(),
             discovery_runtime: None,
+            stdlib_tarball_sha256: "11".repeat(32),
         };
         let action_id = enqueue_action(&store, action.clone()).expect("enqueue action");
         assert!(store.pending_queue_path(&action_id).exists());
@@ -1529,6 +1530,7 @@ mod tests {
         let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version: "v0.37.0".to_string(),
             discovery_runtime: None,
+            stdlib_tarball_sha256: "11".repeat(32),
         };
         let action_id =
             enqueue_action_with_priority(&store, action.clone(), 0).expect("enqueue initial");
@@ -1559,11 +1561,13 @@ mod tests {
         let lower_action_priority = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version: "v0.37.0".to_string(),
             discovery_runtime: Some(runtime.clone()),
+            stdlib_tarball_sha256: "11".repeat(32),
         };
         let higher_action_priority = ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
             version: "v0.37.0".to_string(),
             subtree: "xls/modules/add_dual_path".to_string(),
             discovery_runtime: Some(runtime),
+            source_commit: "2".repeat(40),
         };
 
         let lower_id = crate::executor::compute_action_id(&lower_action_priority)
@@ -1684,6 +1688,7 @@ mod tests {
             action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "v0.37.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
             error: "boom".to_string(),
         };
@@ -2016,6 +2021,7 @@ mod tests {
         let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version: "v0.37.0".to_string(),
             discovery_runtime: None,
+            stdlib_tarball_sha256: "11".repeat(32),
         };
         let action_id = enqueue_action(&store, action).expect("enqueue action");
         let local_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());

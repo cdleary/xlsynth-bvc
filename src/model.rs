@@ -72,11 +72,13 @@ pub(crate) enum ActionSpec {
     DownloadAndExtractXlsynthReleaseStdlibTarball {
         version: String,
         discovery_runtime: Option<DriverRuntimeSpec>,
+        stdlib_tarball_sha256: String,
     },
     DownloadAndExtractXlsynthSourceSubtree {
         version: String,
         subtree: String,
         discovery_runtime: Option<DriverRuntimeSpec>,
+        source_commit: String,
     },
     DriverDslxFnToIr {
         dslx_subtree_action_id: String,

@@ -2139,6 +2139,7 @@ mod tests {
             version: version.to_string(),
             subtree: "xls/modules/add_dual_path".to_string(),
             discovery_runtime: None,
+            source_commit: "2".repeat(40),
         };
         write_completed_action(
             store,

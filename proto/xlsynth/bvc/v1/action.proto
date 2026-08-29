@@ -20,12 +20,14 @@ message ImportIrPackageFileAction {
 message DownloadAndExtractXlsynthReleaseStdlibTarballAction {
   DsoVersion dso_version = 1;
   DriverRuntimeSpec discovery_runtime = 2;
+  Sha256Digest stdlib_tarball_sha256 = 3;
 }
 
 message DownloadAndExtractXlsynthSourceSubtreeAction {
   DsoVersion dso_version = 1;
   NormalizedRelpath subtree = 2;
   DriverRuntimeSpec discovery_runtime = 3;
+  string source_commit = 4;
 }
 
 message DriverDslxFnToIrAction {

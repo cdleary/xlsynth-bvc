@@ -6267,9 +6267,23 @@ pub(crate) fn build_stdlib_enumeration_status(
                 };
             }
         };
+    let release_input = match crate::proto::release_input_for_dso_version(&dso_version) {
+        Ok(input) => input,
+        Err(_) => {
+            return StdlibEnumerationStatusView {
+                state: StdlibEnumerationState::Unknown,
+                reason: StdlibEnumerationReason::RootIdentityUnavailable,
+                scanned_files: 0,
+                failed_files: 0,
+                concrete_functions: 0,
+                suggested_actions: 0,
+            };
+        }
+    };
     let root_action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
         version: dso_version.clone(),
         discovery_runtime: Some(runtime),
+        stdlib_tarball_sha256: release_input.stdlib_tarball_sha256,
     };
     let root_action_id = match compute_action_id(&root_action) {
         Ok(action_id) => action_id,
@@ -6460,6 +6474,8 @@ pub(crate) fn build_unprocessed_version_rows(
         let root_action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version: dso.clone(),
             discovery_runtime: Some(runtime),
+            stdlib_tarball_sha256: crate::proto::release_input_for_dso_version(&dso)?
+                .stdlib_tarball_sha256,
         };
         let root_action_id = compute_action_id(&root_action)?;
         let root_queue_state = queue_state_for_action(store, &root_action_id);
@@ -6620,16 +6636,19 @@ pub(crate) fn canonical_root_actions_for_crate_version(
     dso_version: &str,
 ) -> Result<Vec<ActionSpec>> {
     let runtime = explicit_driver_runtime_for_crate_version(repo_root, crate_version, dso_version)?;
+    let release_input = crate::proto::release_input_for_dso_version(dso_version)?;
     let mut roots = Vec::with_capacity(1 + MODULE_SUBTREE_ROOT_PATHS.len());
     roots.push(ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
         version: dso_version.to_string(),
         discovery_runtime: Some(runtime.clone()),
+        stdlib_tarball_sha256: release_input.stdlib_tarball_sha256.clone(),
     });
     for subtree in MODULE_SUBTREE_ROOT_PATHS {
         roots.push(ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
             version: dso_version.to_string(),
             subtree: normalize_subtree_path(subtree)?,
             discovery_runtime: Some(runtime.clone()),
+            source_commit: release_input.source_commit.clone(),
         });
     }
     Ok(roots)
@@ -6707,6 +6726,7 @@ pub(crate) fn maybe_refresh_dslx_root_for_suggestion_discovery(
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version,
             discovery_runtime,
+            ..
         }
         | ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
             version,
@@ -7913,6 +7933,7 @@ mod tests {
             ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "0.35.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
         );
         action_specs.insert(
@@ -8137,6 +8158,7 @@ mod tests {
             action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "v0.35.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
             lease_owner: format!("{runner_prefix}3"),
             lease_acquired_utc: now,
@@ -8150,6 +8172,7 @@ mod tests {
             action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "v0.35.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
             lease_owner: "other-host:42:web-runner-7".to_string(),
             lease_acquired_utc: now,
@@ -8218,6 +8241,7 @@ mod tests {
             action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "v0.35.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
         };
         let non_expander_item = QueueItem {
@@ -10114,6 +10138,7 @@ fn only(z: bits[1] id=1) -> bits[1] {
                 version: "0.5.0".to_string(),
                 subtree: "xls/modules/add_dual_path".to_string(),
                 discovery_runtime: Some(test_runtime()),
+                source_commit: "2".repeat(40),
             },
             ArtifactType::DslxFileSubtree,
         );

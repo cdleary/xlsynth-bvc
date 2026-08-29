@@ -335,6 +335,13 @@ pub(crate) fn validate_action_spec(action: &pb::ActionSpec) -> Result<()> {
         }
         Kind::DownloadAndExtractXlsynthReleaseStdlibTarball(value) => {
             validate_dso_version(&value.dso_version, "download_release_stdlib.dso_version")?;
+            validate_digest(
+                required(
+                    &value.stdlib_tarball_sha256,
+                    "download_release_stdlib.stdlib_tarball_sha256",
+                )?,
+                "download_release_stdlib.stdlib_tarball_sha256.value",
+            )?;
             if let Some(runtime) = &value.discovery_runtime {
                 validate_driver_runtime(runtime, "download_release_stdlib.discovery_runtime")?;
             }
@@ -342,6 +349,16 @@ pub(crate) fn validate_action_spec(action: &pb::ActionSpec) -> Result<()> {
         }
         Kind::DownloadAndExtractXlsynthSourceSubtree(value) => {
             validate_dso_version(&value.dso_version, "download_source_subtree.dso_version")?;
+            if value.source_commit.len() != 40
+                || !value
+                    .source_commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                bail!(
+                    "download_source_subtree.source_commit must be a full 40-character hexadecimal commit"
+                );
+            }
             validate_canonical_relpath(
                 required(&value.subtree, "download_source_subtree.subtree")?,
                 "download_source_subtree.subtree.value",
@@ -582,6 +599,7 @@ fn action_spec_from_model(action: &model::ActionSpec) -> Result<pb::ActionSpec> 
         M::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version,
             discovery_runtime,
+            stdlib_tarball_sha256,
         } => Kind::DownloadAndExtractXlsynthReleaseStdlibTarball(
             pb::DownloadAndExtractXlsynthReleaseStdlibTarballAction {
                 dso_version: Some(dso_version(version, "download_release_stdlib.dso_version")?),
@@ -594,12 +612,17 @@ fn action_spec_from_model(action: &model::ActionSpec) -> Result<pb::ActionSpec> 
                         )
                     })
                     .transpose()?,
+                stdlib_tarball_sha256: Some(digest_from_hex(
+                    stdlib_tarball_sha256,
+                    "download_release_stdlib.stdlib_tarball_sha256",
+                )?),
             },
         ),
         M::DownloadAndExtractXlsynthSourceSubtree {
             version,
             subtree,
             discovery_runtime,
+            source_commit,
         } => Kind::DownloadAndExtractXlsynthSourceSubtree(
             pb::DownloadAndExtractXlsynthSourceSubtreeAction {
                 dso_version: Some(dso_version(version, "download_source_subtree.dso_version")?),
@@ -613,6 +636,7 @@ fn action_spec_from_model(action: &model::ActionSpec) -> Result<pb::ActionSpec> 
                         )
                     })
                     .transpose()?,
+                source_commit: source_commit.clone(),
             },
         ),
         M::DriverDslxFnToIr {
@@ -996,6 +1020,13 @@ pub(crate) fn action_spec_from_proto(action: &pb::ActionSpec) -> Result<model::A
                         driver_runtime_from_proto(v, "download_release_stdlib.discovery_runtime")
                     })
                     .transpose()?,
+                stdlib_tarball_sha256: digest_to_hex(
+                    required(
+                        &value.stdlib_tarball_sha256,
+                        "download_release_stdlib.stdlib_tarball_sha256",
+                    )?,
+                    "download_release_stdlib.stdlib_tarball_sha256",
+                )?,
             }
         }
         Kind::DownloadAndExtractXlsynthSourceSubtree(value) => {
@@ -1009,6 +1040,7 @@ pub(crate) fn action_spec_from_proto(action: &pb::ActionSpec) -> Result<model::A
                         driver_runtime_from_proto(v, "download_source_subtree.discovery_runtime")
                     })
                     .transpose()?,
+                source_commit: value.source_commit.clone(),
             }
         }
         Kind::DriverDslxFnToIr(value) => M::DriverDslxFnToIr {
@@ -1286,6 +1318,7 @@ mod tests {
                 model::ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                     version: "v0.47.0".to_string(),
                     discovery_runtime: Some(runtime.clone()),
+                    stdlib_tarball_sha256: "11".repeat(32),
                 },
             ),
             (
@@ -1294,6 +1327,7 @@ mod tests {
                     version: "v0.47.0".to_string(),
                     subtree: "xls\\modules/add_dual_path".to_string(),
                     discovery_runtime: Some(runtime.clone()),
+                    source_commit: "2".repeat(40),
                 },
             ),
             (
@@ -1446,6 +1480,7 @@ mod tests {
             version: "v0.47.0".to_string(),
             subtree: "xls\\modules\\add_dual_path".to_string(),
             discovery_runtime: Some(driver_runtime_fixture()),
+            source_commit: "2".repeat(40),
         };
         let validated = ValidatedActionSpec::try_from(&action).expect("convert");
         let pb::action_spec::Kind::DownloadAndExtractXlsynthSourceSubtree(value) =
@@ -1499,6 +1534,38 @@ mod tests {
     }
 
     #[test]
+    fn download_action_ids_bind_locked_upstream_inputs() {
+        let mut actions = sample_actions();
+        let (_, mut stdlib) = actions.remove(1);
+        let original = compute_model_action_id_v2(&stdlib).expect("stdlib original");
+        let model::ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+            stdlib_tarball_sha256,
+            ..
+        } = &mut stdlib
+        else {
+            panic!("expected stdlib action");
+        };
+        *stdlib_tarball_sha256 = "12".repeat(32);
+        assert_ne!(
+            original,
+            compute_model_action_id_v2(&stdlib).expect("stdlib changed")
+        );
+
+        let (_, mut source) = actions.remove(1);
+        let original = compute_model_action_id_v2(&source).expect("source original");
+        let model::ActionSpec::DownloadAndExtractXlsynthSourceSubtree { source_commit, .. } =
+            &mut source
+        else {
+            panic!("expected source action");
+        };
+        *source_commit = "3".repeat(40);
+        assert_ne!(
+            original,
+            compute_model_action_id_v2(&source).expect("source changed")
+        );
+    }
+
+    #[test]
     fn action_id_v2_golden_vectors() {
         const GOLDENS: &[(&str, &str)] = &[
             (
@@ -1507,11 +1574,11 @@ mod tests {
             ),
             (
                 "download_release_stdlib",
-                "9a01c73e1535d69a4a60bcdea14a1a2f550c674f14cafdde7be90aafdc181325",
+                "996ff4f566cbcda0f85239f80ae3923967552dfae87bd9b11eb20e4277d5aebc",
             ),
             (
                 "download_source_subtree",
-                "6ebe4cea3212e8eb4599604edb1442e9104788be94798fa7339e41aaccce39a1",
+                "f404c93d35aa6f66d55e3313fad4a85a27e6f7698e5754eea55d3db23d1bfb6d",
             ),
             (
                 "driver_dslx_fn_to_ir",

@@ -214,9 +214,11 @@ pub(crate) fn discover_releases(
                 repo_root,
                 &release.tag_name,
             )?;
+            let release_input = crate::proto::release_input_for_dso_version(&release.tag_name)?;
             let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: release.tag_name.clone(),
                 discovery_runtime: Some(runtime),
+                stdlib_tarball_sha256: release_input.stdlib_tarball_sha256,
             };
             let action_id = crate::executor::compute_action_id(&action)?;
             let was_known = store.action_exists(&action_id)

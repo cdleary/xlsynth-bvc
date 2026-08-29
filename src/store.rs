@@ -3991,6 +3991,7 @@ mod tests {
             action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "v0.37.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
             error: "synthetic failure".to_string(),
         };

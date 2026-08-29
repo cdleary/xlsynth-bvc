@@ -20,3 +20,13 @@ setup behavior.
 
 This compatibility JSON is the only third-party artifact intended to be updated
 from head as needed, via the local `refresh-version-compat` CLI command.
+
+## Immutable release-input lock
+
+- Path: `release-inputs/v1.textproto`
+- Source commit: resolved from each compatible `xlsynth/xlsynth` release tag
+- Stdlib digest: SHA-256 of the corresponding published `dslx_stdlib.tar.gz`
+- Refresh command: `scripts/sync-release-inputs.sh --update`
+
+The lock is protobuf source data compiled into the binary. Refresh is an
+out-of-band, reviewable source change; runtime code never updates it.

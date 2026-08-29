@@ -974,18 +974,22 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
     match action {
         RunAction::DownloadStdlib { version } => {
             let runtime = canonical_stdlib_discovery_runtime_for_version(repo_root, &version)?;
+            let release_input = crate::proto::release_input_for_dso_version(&version)?;
             Ok(ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version,
                 discovery_runtime: Some(runtime),
+                stdlib_tarball_sha256: release_input.stdlib_tarball_sha256,
             })
         }
         RunAction::DownloadSourceSubtree { version, subtree } => {
             validate_relative_subpath(&subtree)?;
             let runtime = canonical_stdlib_discovery_runtime_for_version(repo_root, &version)?;
+            let release_input = crate::proto::release_input_for_dso_version(&version)?;
             Ok(ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
                 version,
                 subtree,
                 discovery_runtime: Some(runtime),
+                source_commit: release_input.source_commit,
             })
         }
         RunAction::DslxFnToIr {
