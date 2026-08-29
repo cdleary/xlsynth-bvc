@@ -27,7 +27,7 @@ pub(crate) const STATIC_SITE_MANIFEST_FILENAME: &str = "site_manifest.v1.pb";
 
 const STYLE_CSS: &str = r#":root{color-scheme:light dark;--bg:#0d1117;--panel:#161b22;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--line:#30363d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}header,main{max-width:1180px;margin:auto;padding:24px}header{border-bottom:1px solid var(--line)}a{color:var(--accent)}h1,h2{font-family:ui-sans-serif,system-ui,sans-serif}.meta,.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.card code{overflow-wrap:anywhere}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:16px 0}select,input{font:inherit;padding:7px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px}pre{max-height:62vh;overflow:auto;background:#010409;padding:14px;border:1px solid var(--line);border-radius:8px}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border:1px solid var(--line);padding:6px;text-align:left;vertical-align:top}th{position:sticky;top:0;background:var(--panel)}.table-wrap{max-height:60vh;overflow:auto}svg{width:100%;height:300px;background:var(--panel);border:1px solid var(--line)}"#;
 
-const APP_JS: &str = r#"const base=document.querySelector('meta[name=bvc-base-url]').content;
+const APP_JS: &str = r#"const base=document.querySelector('meta[name=bvc-site-root]').content;
 const byId=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));
 function arrays(v,out=[],path='$'){if(Array.isArray(v)&&v.length&&typeof v[0]==='object')out.push([path,v]);else if(v&&typeof v==='object')for(const[k,x]of Object.entries(v))arrays(x,out,`${path}.${k}`);return out}
@@ -192,18 +192,64 @@ fn escape_html(value: &str) -> String {
 
 fn html_shell(
     title: &str,
-    base_url: &str,
+    site_root_url: &str,
     body: &str,
     css_name: &str,
     js_name: Option<&str>,
 ) -> String {
     let script = js_name
-        .map(|name| format!(r#"<script defer src="{base_url}assets/{name}"></script>"#))
+        .map(|name| format!(r#"<script defer src="{site_root_url}assets/{name}"></script>"#))
         .unwrap_or_default();
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"bvc-base-url\" content=\"{base_url}\"><title>{}</title><link rel=\"stylesheet\" href=\"{base_url}assets/{css_name}\">{script}</head><body>{body}</body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"bvc-site-root\" content=\"{site_root_url}\"><title>{}</title><link rel=\"stylesheet\" href=\"{site_root_url}assets/{css_name}\">{script}</head><body>{body}</body></html>",
         escape_html(title)
     )
+}
+
+fn site_root_url(page_relpath: &str) -> Result<String> {
+    let page_relpath = normalized_relpath(page_relpath)?;
+    if !page_relpath.ends_with(".html") {
+        bail!("site page relpath must end in .html: {page_relpath}");
+    }
+    let depth = Path::new(&page_relpath)
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
+    Ok(if depth == 0 {
+        "./".to_string()
+    } else {
+        "../".repeat(depth)
+    })
+}
+
+fn resolve_site_link(page_relpath: &str, url: &str) -> Result<String> {
+    if url.starts_with('/') {
+        bail!("site link must be relative so publication is relocatable: {url}");
+    }
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    let page_dir = Path::new(page_relpath).parent().unwrap_or(Path::new(""));
+    let joined = page_dir.join(path);
+    let mut parts = Vec::new();
+    for component in joined.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    bail!("site link escapes the immutable site root: {page_relpath} -> {url}");
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("site link must be relative: {page_relpath} -> {url}")
+            }
+        }
+    }
+    if path.ends_with('/') || parts.is_empty() {
+        parts.push("index.html".to_string());
+    }
+    Ok(parts.join("/"))
 }
 
 fn media_type(relpath: &str) -> &'static str {
@@ -255,6 +301,7 @@ pub(crate) fn build_static_site(
     verify_static_snapshot(&options.snapshot_dir).context("verifying source snapshot")?;
     let snapshot = load_static_snapshot_manifest(&options.snapshot_dir)?;
     let base_url = normalize_base_url(&options.base_url)?;
+    let root_site_url = site_root_url("index.html")?;
     ensure_empty_output_dir(&options.out_dir, options.overwrite)?;
 
     let css_hash = &sha256_hex(STYLE_CSS.as_bytes())[..16];
@@ -368,6 +415,8 @@ pub(crate) fn build_static_site(
     .context("copying source snapshot manifest into site")?;
 
     for run in &catalog.runs {
+        let page_relpath = format!("runs/{}/index.html", run.run_id);
+        let run_site_root_url = site_root_url(&page_relpath)?;
         let root_actions = run
             .root_action_ids
             .iter()
@@ -403,12 +452,12 @@ pub(crate) fn build_static_site(
             .as_deref()
             .map(|url| {
                 format!(
-                    "<p><a href=\"{base_url}{url}\">Download canonical findings protobuf</a></p>"
+                    "<p><a href=\"{run_site_root_url}{url}\">Download canonical findings protobuf</a></p>"
                 )
             })
             .unwrap_or_default();
         let body = format!(
-            "<header><p><a href=\"{base_url}runs.html\">← Runs</a></p><h1>{} crate v{}</h1><p class=\"meta\">Campaign {} v{} · DSO v{} · status <strong>{}</strong></p></header><main><div class=\"grid\"><article class=\"card\"><h2>Completion</h2><p>{} roots complete · {} failed · {} canceled</p><p>{} missing outputs · {} failed samples</p></article><article class=\"card\"><h2>Identity</h2><p>Run <code>{}</code></p><p>Campaign <code>{}</code></p><p><a href=\"{base_url}{}\">Download public run protobuf</a></p>{findings_download}</article></div><h2>Findings</h2><div class=\"table-wrap\"><table><thead><tr><th>Kind</th><th>Subject</th><th>Baseline loss</th><th>Current loss</th><th>Structural hash</th><th>Evidence actions</th></tr></thead><tbody>{finding_rows}</tbody></table></div><h2>Root actions</h2><ul>{root_actions}</ul><h2>Results</h2><p><a href=\"{base_url}dataset.html?key={}\">Open g8r versus Yosys/ABC dataset</a></p></main>",
+            "<header><p><a href=\"{run_site_root_url}runs.html\">← Runs</a></p><h1>{} crate v{}</h1><p class=\"meta\">Campaign {} v{} · DSO v{} · status <strong>{}</strong></p></header><main><div class=\"grid\"><article class=\"card\"><h2>Completion</h2><p>{} roots complete · {} failed · {} canceled</p><p>{} missing outputs · {} failed samples</p></article><article class=\"card\"><h2>Identity</h2><p>Run <code>{}</code></p><p>Campaign <code>{}</code></p><p><a href=\"{run_site_root_url}{}\">Download public run protobuf</a></p>{findings_download}</article></div><h2>Findings</h2><div class=\"table-wrap\"><table><thead><tr><th>Kind</th><th>Subject</th><th>Baseline loss</th><th>Current loss</th><th>Structural hash</th><th>Evidence actions</th></tr></thead><tbody>{finding_rows}</tbody></table></div><h2>Root actions</h2><ul>{root_actions}</ul><h2>Results</h2><p><a href=\"{run_site_root_url}dataset.html?key={}\">Open g8r versus Yosys/ABC dataset</a></p></main>",
             escape_html(&run.campaign_name),
             escape_html(&run.crate_version),
             escape_html(&run.campaign_name),
@@ -427,10 +476,10 @@ pub(crate) fn build_static_site(
         );
         write_file(
             &options.out_dir,
-            &format!("runs/{}/index.html", run.run_id),
+            &page_relpath,
             html_shell(
                 &format!("{} v{}", run.campaign_name, run.crate_version),
-                &base_url,
+                &run_site_root_url,
                 &body,
                 &css_name,
                 None,
@@ -444,7 +493,7 @@ pub(crate) fn build_static_site(
         .iter()
         .map(|run| {
             format!(
-                "<article class=\"card\"><h2><a href=\"{base_url}{}\">{} v{}</a></h2><p>Status <strong>{}</strong> · DSO v{}</p><code>{}</code></article>",
+                "<article class=\"card\"><h2><a href=\"{root_site_url}{}\">{} v{}</a></h2><p>Status <strong>{}</strong> · DSO v{}</p><code>{}</code></article>",
                 run.page_url,
                 escape_html(&run.campaign_name),
                 escape_html(&run.crate_version),
@@ -455,7 +504,7 @@ pub(crate) fn build_static_site(
         })
         .collect::<String>();
     let runs_body = format!(
-        "<header><p><a href=\"{base_url}\">← Results</a></p><h1>Campaign runs</h1><p class=\"meta\">{} verified public runs</p></header><main><div class=\"grid\">{run_cards}</div></main>",
+        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Campaign runs</h1><p class=\"meta\">{} verified public runs</p></header><main><div class=\"grid\">{run_cards}</div></main>",
         catalog.runs.len()
     );
     write_file(
@@ -463,7 +512,7 @@ pub(crate) fn build_static_site(
         "runs.html",
         html_shell(
             "xlsynth-bvc campaign runs",
-            &base_url,
+            &root_site_url,
             &runs_body,
             &css_name,
             None,
@@ -476,7 +525,7 @@ pub(crate) fn build_static_site(
         .iter()
         .map(|dataset| {
             format!(
-                "<article class=\"card\"><h2><a href=\"{base_url}dataset.html?key={}\">{}</a></h2><p>{} bytes</p><code>{}</code></article>",
+                "<article class=\"card\"><h2><a href=\"{root_site_url}dataset.html?key={}\">{}</a></h2><p>{} bytes</p><code>{}</code></article>",
                 url_encode(&dataset.logical_key),
                 escape_html(&dataset.logical_key),
                 dataset.bytes,
@@ -485,7 +534,7 @@ pub(crate) fn build_static_site(
         })
         .collect::<String>();
     let index_body = format!(
-        "<header><h1>xlsynth-bvc results</h1><p class=\"meta\">Snapshot <code>{}</code> · {} runs · {} datasets · generated {}</p></header><main><p>This is a self-contained static publication. The build machine and sled database are not involved at request time.</p><p><a href=\"{base_url}runs.html\">Browse campaign runs and versions →</a></p><h2>Datasets</h2><div class=\"grid\">{cards}</div></main>",
+        "<header><h1>xlsynth-bvc results</h1><p class=\"meta\">Snapshot <code>{}</code> · {} runs · {} datasets · generated {}</p></header><main><p>This is a self-contained static publication. The build machine and sled database are not involved at request time.</p><p><a href=\"{root_site_url}runs.html\">Browse campaign runs and versions →</a></p><h2>Datasets</h2><div class=\"grid\">{cards}</div></main>",
         snapshot.snapshot_id,
         catalog.runs.len(),
         catalog.datasets.len(),
@@ -496,7 +545,7 @@ pub(crate) fn build_static_site(
         "index.html",
         html_shell(
             "xlsynth-bvc results",
-            &base_url,
+            &root_site_url,
             &index_body,
             &css_name,
             None,
@@ -504,14 +553,14 @@ pub(crate) fn build_static_site(
         .as_bytes(),
     )?;
     let explorer_body = format!(
-        "<header><p><a href=\"{base_url}\">← Results</a></p><h1>Dataset explorer</h1><div class=\"toolbar\"><label>Dataset <select id=\"dataset\"></select></label><span id=\"dataset-meta\" class=\"meta\"></span></div><p id=\"error\"></p></header><main><section id=\"plot\"></section><section id=\"table\"></section><h2>Raw JSON</h2><pre id=\"raw\">Loading…</pre></main>"
+        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Dataset explorer</h1><div class=\"toolbar\"><label>Dataset <select id=\"dataset\"></select></label><span id=\"dataset-meta\" class=\"meta\"></span></div><p id=\"error\"></p></header><main><section id=\"plot\"></section><section id=\"table\"></section><h2>Raw JSON</h2><pre id=\"raw\">Loading…</pre></main>"
     );
     write_file(
         &options.out_dir,
         "dataset.html",
         html_shell(
             "xlsynth-bvc dataset explorer",
-            &base_url,
+            &root_site_url,
             &explorer_body,
             &css_name,
             Some(&js_name),
@@ -806,25 +855,18 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         if !html.to_ascii_lowercase().contains("<!doctype html>") {
             bail!("HTML file lacks doctype: {relpath}");
         }
+        let expected_site_root = site_root_url(relpath)?;
+        let expected_meta = format!("name=\"bvc-site-root\" content=\"{expected_site_root}\"");
+        if !html.contains(&expected_meta) {
+            bail!("HTML file has wrong site-root metadata in {relpath}");
+        }
         for captures in attr_re.captures_iter(&html) {
             let url = &captures[1];
             if url.starts_with("http:") || url.starts_with("https:") || url.starts_with('#') {
                 continue;
             }
-            if !url.starts_with(&base_url) {
-                bail!("site link does not honor base URL in {relpath}: {url}");
-            }
-            let local = url[base_url.len()..].split(['?', '#']).next().unwrap_or("");
-            let local_owned;
-            let local = if local.is_empty() {
-                "index.html"
-            } else if local.ends_with('/') {
-                local_owned = format!("{local}index.html");
-                &local_owned
-            } else {
-                local
-            };
-            if !declared.contains_key(local) {
+            let local = resolve_site_link(relpath, url)?;
+            if !declared.contains_key(&local) {
                 bail!("broken static link in {relpath}: {url} -> {local}");
             }
         }
@@ -1145,6 +1187,25 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("xlsynth-bvc-site-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn generated_site_links_are_relocatable() {
+        assert_eq!(site_root_url("index.html").expect("root URL"), "./");
+        assert_eq!(
+            site_root_url("runs/abc/index.html").expect("nested root URL"),
+            "../../"
+        );
+        assert_eq!(
+            resolve_site_link("runs/abc/index.html", "../../assets/site.css")
+                .expect("nested asset"),
+            "assets/site.css"
+        );
+        assert_eq!(
+            resolve_site_link("runs/abc/index.html", "../../").expect("root page"),
+            "index.html"
+        );
+        assert!(resolve_site_link("index.html", "/xlsynth-bvc/assets/site.css").is_err());
     }
 
     #[test]

@@ -186,6 +186,75 @@ fn discovery_details(value: &Value) -> Result<pb::DslxFunctionDiscoveryDetails> 
     })
 }
 
+fn discovery_details_from_proto(
+    value: &pb::DslxFunctionDiscoveryDetails,
+    source_dso_version: &str,
+    field: &str,
+) -> Result<Value> {
+    let source_runtime = driver_runtime_from_proto(
+        required(&value.source_runtime, &format!("{field}.source_runtime"))?,
+        &format!("{field}.source_runtime"),
+    )?;
+    let enumeration_runtime = driver_runtime_from_proto(
+        required(
+            &value.enumeration_runtime,
+            &format!("{field}.enumeration_runtime"),
+        )?,
+        &format!("{field}.enumeration_runtime"),
+    )?;
+    let enumeration_dso = required(
+        &value.enumeration_runtime_dso_version,
+        &format!("{field}.enumeration_runtime_dso_version"),
+    )?;
+    if enumeration_dso.value.is_empty() {
+        bail!("{field}.enumeration_runtime_dso_version must not be empty");
+    }
+    let enumeration_dso_version = format!("v{}", enumeration_dso.value);
+    let failed_dslx_files = value
+        .failed_dslx_files
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let path_field = format!("{field}.failed_dslx_files[{index}]");
+            if path.value.is_empty()
+                || path.value.starts_with('/')
+                || path.value.contains('\\')
+                || path
+                    .value
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                bail!("{path_field} must be a normalized relative path");
+            }
+            Ok(path.value.clone())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let failed_dslx_files_count = failed_dslx_files.len() as u64;
+    let crate_version_label =
+        crate::versioning::version_label("crate", &source_runtime.driver_version);
+    let dso_version_label = crate::versioning::version_label("dso", source_dso_version);
+    let enumeration_runtime_dso_version_label =
+        crate::versioning::version_label("dso", &enumeration_dso_version);
+    Ok(json!({
+        "driver_runtime": source_runtime,
+        "enumeration_runtime": enumeration_runtime,
+        "enumeration_runtime_xlsynth_version": enumeration_dso_version,
+        "enumeration_runtime_overrides_source": value.enumeration_runtime_overrides_source,
+        "crate_version_label": crate_version_label,
+        "dso_version_label": dso_version_label,
+        "enumeration_runtime_dso_version_label": enumeration_runtime_dso_version_label,
+        "dslx_path": value.dslx_path,
+        "dslx_stdlib_path": value.dslx_stdlib_path,
+        "stdlib_source": value.stdlib_source,
+        "scanned_dslx_files": value.scanned_dslx_files,
+        "listed_functions": value.listed_functions,
+        "concrete_functions": value.concrete_functions,
+        "failed_dslx_files_count": failed_dslx_files_count,
+        "failed_dslx_files": failed_dslx_files,
+        "suggested_actions": value.suggested_actions,
+    }))
+}
+
 fn details_to_proto(action: &model::ActionSpec, details: &Value) -> Result<pb::ActionDetails> {
     use model::ActionSpec as M;
     use pb::action_details::Kind;
@@ -661,7 +730,7 @@ fn details_from_proto(action: &model::ActionSpec, value: &pb::ActionDetails) -> 
             }
         }
         (
-            M::DownloadAndExtractXlsynthReleaseStdlibTarball { .. },
+            M::DownloadAndExtractXlsynthReleaseStdlibTarball { version, .. },
             Kind::DownloadReleaseStdlib(details),
         ) => {
             let mut download = Map::new();
@@ -680,12 +749,18 @@ fn details_from_proto(action: &model::ActionSpec, value: &pb::ActionDetails) -> 
                 );
             }
             map.insert("download".into(), Value::Object(download));
+            if let Some(discovery) = &details.function_discovery {
+                map.insert(
+                    "dslx_list_fns_discovery".into(),
+                    discovery_details_from_proto(discovery, version, "details.function_discovery")?,
+                );
+            }
             if let Some(error) = &details.function_discovery_error {
                 map.insert("dslx_list_fns_discovery_error".into(), json!(error));
             }
         }
         (
-            M::DownloadAndExtractXlsynthSourceSubtree { .. },
+            M::DownloadAndExtractXlsynthSourceSubtree { version, .. },
             Kind::DownloadSourceSubtree(details),
         ) => {
             let mut download = Map::new();
@@ -710,6 +785,12 @@ fn details_from_proto(action: &model::ActionSpec, value: &pb::ActionDetails) -> 
                 "extracted_file_count".into(),
                 json!(details.extracted_file_count),
             );
+            if let Some(discovery) = &details.function_discovery {
+                map.insert(
+                    "dslx_list_fns_discovery".into(),
+                    discovery_details_from_proto(discovery, version, "details.function_discovery")?,
+                );
+            }
             if let Some(error) = &details.function_discovery_error {
                 map.insert("dslx_list_fns_discovery_error".into(), json!(error));
             }
@@ -1241,6 +1322,120 @@ mod tests {
             }],
             details: json!({"source_path": "/input/package.ir", "import_kind": "local_ir_file"}),
             suggested_next_actions: Vec::new(),
+        }
+    }
+
+    fn sample_discovery_details(failed_file: bool) -> Value {
+        let source_runtime = model::DriverRuntimeSpec {
+            driver_version: "0.47.0".into(),
+            release_platform: "ubuntu2004".into(),
+            docker_image: "xlsynth-bvc-driver:0.47.0".into(),
+            dockerfile: "docker/xlsynth-driver.Dockerfile".into(),
+        };
+        let enumeration_runtime = model::DriverRuntimeSpec {
+            driver_version: "0.48.0".into(),
+            release_platform: "ubuntu2004".into(),
+            docker_image: "xlsynth-bvc-driver:0.48.0".into(),
+            dockerfile: "docker/xlsynth-driver.Dockerfile".into(),
+        };
+        let failed_dslx_files = if failed_file {
+            vec!["xls/dslx/stdlib/bad.x".to_string()]
+        } else {
+            Vec::new()
+        };
+        json!({
+            "driver_runtime": source_runtime,
+            "enumeration_runtime": enumeration_runtime,
+            "enumeration_runtime_xlsynth_version": "v0.0.200",
+            "enumeration_runtime_overrides_source": true,
+            "crate_version_label": "crate:v0.47.0",
+            "dso_version_label": "dso:v0.0.199",
+            "enumeration_runtime_dso_version_label": "dso:v0.0.200",
+            "dslx_path": "/inputs/subtree",
+            "dslx_stdlib_path": "/inputs/subtree/xls/dslx/stdlib",
+            "stdlib_source": "downloaded",
+            "scanned_dslx_files": 12,
+            "listed_functions": 8,
+            "concrete_functions": 7,
+            "failed_dslx_files_count": failed_dslx_files.len(),
+            "failed_dslx_files": failed_dslx_files,
+            "suggested_actions": 7,
+        })
+    }
+
+    fn sample_download_provenance(action: model::ActionSpec, details: Value) -> model::Provenance {
+        let action_id = crate::proto::compute_model_action_id_v2(&action)
+            .expect("action id")
+            .to_hex();
+        model::Provenance {
+            schema_version: PROVENANCE_RECORD_VERSION,
+            action_id: action_id.clone(),
+            created_utc: Utc.with_ymd_and_hms(2026, 8, 28, 1, 2, 3).unwrap(),
+            action,
+            dependencies: Vec::new(),
+            output_artifact: model::ArtifactRef {
+                action_id,
+                artifact_type: model::ArtifactType::DslxFileSubtree,
+                relpath: "payload".into(),
+            },
+            output_files: Vec::new(),
+            commands: Vec::new(),
+            details,
+            suggested_next_actions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn download_discovery_details_round_trip_for_both_root_actions() {
+        let stdlib_details = json!({
+            "download": {
+                "tarball_url": "https://example.test/dslx_stdlib.tar.gz",
+                "sha256_url": "https://example.test/dslx_stdlib.tar.gz.sha256",
+                "expected_sha256": "33".repeat(32),
+                "actual_sha256": "33".repeat(32),
+            },
+            "dslx_list_fns_discovery": sample_discovery_details(false),
+        });
+        let subtree_details = json!({
+            "download": {
+                "source_archive_url": "https://example.test/source.tar.gz",
+                "source_archive_sha256": "44".repeat(32),
+            },
+            "subtree": "xls/dslx/stdlib",
+            "extracted_file_count": 42,
+            "dslx_list_fns_discovery": sample_discovery_details(true),
+        });
+        let cases = [
+            (
+                sample_download_provenance(
+                    model::ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+                        version: "v0.0.199".into(),
+                        discovery_runtime: None,
+                    },
+                    stdlib_details,
+                ),
+                "ok",
+            ),
+            (
+                sample_download_provenance(
+                    model::ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
+                        version: "v0.0.199".into(),
+                        subtree: "xls/dslx/stdlib".into(),
+                        discovery_runtime: None,
+                    },
+                    subtree_details,
+                ),
+                "partial",
+            ),
+        ];
+        for (original, expected_badge) in cases {
+            let encoded = encode_provenance(&original).expect("encode discovery provenance");
+            let decoded = decode_provenance(&encoded).expect("decode discovery provenance");
+            assert_eq!(decoded.details, original.details);
+            assert_eq!(
+                crate::query::stdlib_enumeration_status_from_provenance(&decoded).badge_label,
+                expected_badge
+            );
         }
     }
 

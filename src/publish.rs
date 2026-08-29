@@ -21,6 +21,12 @@ const CURRENT_SITE_RECORD_VERSION: u32 = 1;
 const PUBLISHED_SITE_ID_DOMAIN: &[u8] = b"xlsynth-bvc/published-site/v1\0";
 const CURRENT_POINTER_PROTO: &str = "current.pb";
 const CURRENT_POINTER_JSON: &str = "current.json";
+const PUBLISHED_ROOT_INDEX_HTML: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>xlsynth-bvc results</title></head>
+<body><p id="status">Loading current xlsynth-bvc results…</p><script>
+fetch('current.json',{cache:'no-store'}).then(response=>{if(!response.ok)throw new Error(`current.json ${response.status}`);return response.json()}).then(current=>{if(current.schema_version!==1||!/^sites\/[0-9a-f]{64}\/$/.test(current.site_url))throw new Error('invalid current site pointer');window.location.replace(current.site_url)}).catch(error=>{document.getElementById('status').textContent=`Unable to load current results: ${error.message}`});
+</script></body></html>
+"#;
 static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize)]
@@ -238,6 +244,10 @@ pub(crate) fn publish_static_site(
     )?;
     fs::create_dir_all(publish_root)
         .with_context(|| format!("creating publish root: {}", publish_root.display()))?;
+    atomic_write(
+        &publish_root.join("index.html"),
+        PUBLISHED_ROOT_INDEX_HTML.as_bytes(),
+    )?;
     let site_relpath = format!("sites/{site_id}");
     let target = publish_root.join(&site_relpath);
     let reused_immutable_site = if target.exists() {
@@ -326,6 +336,12 @@ pub(crate) fn publish_static_site(
 }
 
 pub(crate) fn verify_published_site(publish_root: &Path) -> Result<VerifyPublishedSiteSummary> {
+    let landing =
+        fs::read(publish_root.join("index.html")).context("reading published root index")?;
+    if landing != PUBLISHED_ROOT_INDEX_HTML.as_bytes() {
+        bail!("published root index does not match the current-site loader");
+    }
+
     let pointer_bytes = fs::read(publish_root.join(CURRENT_POINTER_PROTO))
         .context("reading current protobuf pointer")?;
     let pointer = pb::CurrentSitePointer::decode(pointer_bytes.as_slice())
@@ -439,6 +455,18 @@ mod tests {
         let verified = verify_published_site(&publish_root).expect("verify publication");
         assert_eq!(verified.site_id, first.site_id);
         drop(store);
+        let browser: BrowserCurrentPointer = serde_json::from_slice(
+            &fs::read(publish_root.join(CURRENT_POINTER_JSON)).expect("read browser pointer"),
+        )
+        .expect("decode browser pointer");
+        assert_eq!(browser.site_url, format!("{}/", first.site_relpath));
+        let landing = fs::read_to_string(publish_root.join("index.html")).expect("landing");
+        assert!(landing.contains("current.json"));
+        let immutable_index =
+            fs::read_to_string(publish_root.join(&first.site_relpath).join("index.html"))
+                .expect("immutable index");
+        assert!(immutable_index.contains("name=\"bvc-site-root\" content=\"./\""));
+        assert!(!immutable_index.contains("/xlsynth-bvc/assets/"));
         fs::remove_dir_all(root).expect("cleanup");
     }
 }

@@ -17,10 +17,14 @@ promotes the site.
 
 The initial host is deliberately filesystem/object-layout neutral. `PUBLIC`
 contains immutable `sites/<site-id>/` trees, immutable
-`catalogs/<site-id>.pb` records, and the small `current.pb` plus browser-facing
-`current.json` pointers. Serve or synchronize that directory with any ordinary
-static host. Files below `sites/` and `catalogs/` should receive long immutable
-cache lifetimes; `current.json` should use no-cache or a short TTL.
+`catalogs/<site-id>.pb` records, the small `current.pb` plus browser-facing
+`current.json` pointers, and a stable root `index.html` loader. The loader reads
+`current.json` without caching and redirects to its immutable
+`sites/<site-id>/` tree. Site-internal URLs are relative to that immutable tree,
+so the same files work below the configured base URL without rewriting. Serve or
+synchronize `PUBLIC` with any ordinary static host. Files below `sites/` and
+`catalogs/` should receive long immutable cache lifetimes; `current.json` should
+use no-cache or a short TTL.
 
 ## Fresh machine
 
