@@ -85,8 +85,9 @@ The one permitted provenance update is typed discovery enrichment after a
 transient enumeration failure. It must go through the artifact-store API,
 preserve action identity, dependencies, output artifact, and output-file
 manifest, and atomically update both canonical Sled representations before
-invalidating materialized cache state. Direct writes to a materialized
-`provenance.pb` are forbidden.
+invalidating materialized cache state. Replacement and materialization are
+serialized so an in-flight reader cannot republish stale cache state. Direct
+writes to a materialized `provenance.pb` are forbidden.
 
 Dataset-index checkpoints are valid only for the exact canonical provenance
 inputs and exact web-index outputs from which they were built. The coordinator

@@ -188,6 +188,7 @@ fn promote_staging_action_dir_fs(staging_dir: &Path, final_dir: &Path) -> Result
 struct SledArtifactBackend {
     db_path: PathBuf,
     db: Mutex<Option<sled::Db>>,
+    materialization_lock: Mutex<()>,
 }
 
 impl SledArtifactBackend {
@@ -405,6 +406,10 @@ impl SledArtifactBackend {
     }
 
     fn materialize_action_from_db(&self, store_root: &Path, action_id: &str) -> Result<PathBuf> {
+        let _materialization_guard = self
+            .materialization_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("acquiring sled materialization lock"))?;
         let final_dir = self.materialized_action_dir_for(store_root, action_id);
         if final_dir.join("provenance.pb").exists() {
             return Ok(final_dir);
@@ -1943,6 +1948,10 @@ impl ArtifactBackend for SledArtifactBackend {
     }
 
     fn write_provenance(&self, store_root: &Path, provenance: &Provenance) -> Result<()> {
+        let _materialization_guard = self
+            .materialization_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("acquiring sled materialization lock"))?;
         let db = self.open_db()?;
         let provenance_tree = db
             .open_tree(Self::TREE_PROVENANCE_BY_ACTION)
@@ -2416,6 +2425,7 @@ impl ArtifactStore {
         let artifact_backend: Box<dyn ArtifactBackend> = Box::new(SledArtifactBackend {
             db_path,
             db: Mutex::new(None),
+            materialization_lock: Mutex::new(()),
         });
         Self {
             root,
