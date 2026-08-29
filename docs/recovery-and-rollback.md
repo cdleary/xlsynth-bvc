@@ -8,6 +8,11 @@ publication are idempotent. The last stage outcome is recorded in the run's
 protobuf coordinator state. Advisory locks disappear when the process exits;
 there is no stale PID lock to remove.
 
+Publication attempts use unique staging directories. While holding the
+publication-root lock, a retry removes abandoned staging entries for the same
+content-addressed site before copying, so a container that restarts as PID 1
+does not require manual staging cleanup.
+
 A successful dataset-index checkpoint is reused instead of regenerating
 timestamped browser projections only when its recorded provenance fingerprint
 matches the current store. Campaign and analysis records retain their

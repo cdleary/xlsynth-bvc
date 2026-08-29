@@ -193,6 +193,43 @@ fn copy_site(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn remove_abandoned_site_staging(staging_root: &Path, site_id: &str) -> Result<usize> {
+    if !staging_root.exists() {
+        return Ok(0);
+    }
+    let prefix = format!("site-{site_id}-");
+    let mut removed = 0;
+    for entry in fs::read_dir(staging_root)
+        .with_context(|| format!("reading publication staging: {}", staging_root.display()))?
+    {
+        let entry = entry.context("reading publication staging entry")?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading staging entry type: {}", path.display()))?;
+        if file_type.is_dir() {
+            fs::remove_dir_all(&path).with_context(|| {
+                format!("removing abandoned publication staging: {}", path.display())
+            })?;
+        } else {
+            fs::remove_file(&path).with_context(|| {
+                format!(
+                    "removing abandoned publication staging entry: {}",
+                    path.display()
+                )
+            })?;
+        }
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 fn site_identity(site_dir: &Path) -> Result<(pb::StaticSiteManifest, Vec<u8>, pb::Sha256Digest)> {
     verify_static_site(site_dir)?;
     let manifest_path = site_dir.join(STATIC_SITE_MANIFEST_FILENAME);
@@ -282,6 +319,9 @@ pub(crate) fn publish_static_site(
     )?;
     let site_relpath = format!("sites/{site_id}");
     let target = publish_root.join(&site_relpath);
+    let staging_root = publish_root.join(".staging");
+    fs::create_dir_all(&staging_root)?;
+    remove_abandoned_site_staging(&staging_root, &site_id)?;
     let reused_immutable_site = if target.exists() {
         let (_, existing_manifest, existing_site_id) = site_identity(&target)?;
         if existing_manifest != manifest_bytes || existing_site_id != site_id_digest {
@@ -292,15 +332,15 @@ pub(crate) fn publish_static_site(
         }
         true
     } else {
-        let staging_root = publish_root.join(".staging");
-        fs::create_dir_all(&staging_root)?;
-        let staged = staging_root.join(format!("site-{site_id}-{}", std::process::id()));
-        if staged.exists() {
-            bail!(
-                "stale publication staging path exists: {}",
-                staged.display()
-            );
-        }
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let nonce = WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let staged = staging_root.join(format!(
+            "site-{site_id}-{}-{timestamp}-{nonce}",
+            std::process::id()
+        ));
         copy_site(site_dir, &staged)?;
         let (_, staged_manifest, staged_site_id) = site_identity(&staged)?;
         if staged_manifest != manifest_bytes || staged_site_id != site_id_digest {
@@ -529,8 +569,18 @@ mod tests {
         assert!(!publish_root.join("index.html").exists());
         drop(held_lock);
 
+        let (_, _, site_id_digest) = site_identity(&site_dir).expect("site identity");
+        let site_id = digest_hex(&site_id_digest, "site id").expect("site id hex");
+        let abandoned = publish_root
+            .join(".staging")
+            .join(format!("site-{site_id}-{}", std::process::id()));
+        fs::create_dir_all(abandoned.join("partial")).expect("seed abandoned staging");
+        fs::write(abandoned.join("partial/index.html"), "partial")
+            .expect("write abandoned staging");
+
         let first = publish_static_site(&site_dir, &publish_root).expect("first publish");
         assert!(!first.reused_immutable_site);
+        assert!(!abandoned.exists());
         let catalog_path = publish_root.join(&first.catalog_relpath);
         let first_catalog = fs::read(&catalog_path).expect("first catalog");
         let first_pointer =
