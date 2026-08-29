@@ -38,7 +38,8 @@ const CAMPAIGN_RUN_IDENTITY_VERSION: u32 = 1;
 const CAMPAIGN_RUN_RECORD_VERSION: u32 = 1;
 const CAMPAIGN_ID_DOMAIN: &[u8] = b"xlsynth-bvc/campaign/v1\0";
 const CAMPAIGN_RUN_ID_DOMAIN: &[u8] = b"xlsynth-bvc/campaign-run/v1\0";
-const CAMPAIGN_RUN_MANIFEST_FILENAME: &str = "run-manifest.pb";
+pub(crate) const CAMPAIGN_RUN_MANIFEST_FILENAME: &str = "run-manifest.pb";
+pub(crate) const CAMPAIGN_ANALYSIS_FILENAME: &str = "analysis.pb";
 static MANIFEST_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,7 +217,7 @@ pub(crate) fn campaign_analysis_path(
     Ok(campaign_run_path(store, run_id)?
         .parent()
         .expect("campaign manifest has a parent")
-        .join("analysis.pb"))
+        .join(CAMPAIGN_ANALYSIS_FILENAME))
 }
 
 fn canonical_roots(
@@ -415,6 +416,10 @@ fn load_manifest(path: &Path) -> Result<pb::CampaignRunManifest> {
     validate_manifest(&manifest)
         .with_context(|| format!("validating campaign run manifest: {}", path.display()))?;
     Ok(manifest)
+}
+
+pub(crate) fn validate_campaign_run_file(path: &Path) -> Result<()> {
+    load_manifest(path).map(|_| ())
 }
 
 pub(crate) fn list_finalized_campaign_runs(

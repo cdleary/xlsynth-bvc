@@ -27,7 +27,7 @@ use crate::{
 };
 
 const COORDINATOR_RECORD_VERSION: u32 = 1;
-const COORDINATOR_LOCK_FILENAME: &str = "coordinator.lock";
+pub(crate) const COORDINATOR_LOCK_FILENAME: &str = "coordinator.lock";
 static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -163,6 +163,12 @@ fn validate_state(state: &pb::CoordinatorState) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn decode_coordinator_state(bytes: &[u8]) -> Result<pb::CoordinatorState> {
+    let state = pb::CoordinatorState::decode(bytes).context("decoding CoordinatorState")?;
+    validate_state(&state)?;
+    Ok(state)
+}
+
 fn atomic_write_state(path: &Path, state: &pb::CoordinatorState) -> Result<()> {
     validate_state(state)?;
     let parent = path
@@ -198,9 +204,8 @@ fn load_or_new_state(
     if path.exists() {
         let bytes = fs::read(path)
             .with_context(|| format!("reading coordinator state: {}", path.display()))?;
-        let state = pb::CoordinatorState::decode(bytes.as_slice())
-            .with_context(|| format!("decoding coordinator state: {}", path.display()))?;
-        validate_state(&state)?;
+        let state = decode_coordinator_state(&bytes)
+            .with_context(|| format!("validating coordinator state: {}", path.display()))?;
         if digest_hex(
             required(&state.run_id, "coordinator.run_id")?,
             "coordinator.run_id",
