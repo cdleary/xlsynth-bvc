@@ -28,7 +28,7 @@ use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
-pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 1;
+pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 2;
 pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.pb";
 pub(crate) const STATIC_SNAPSHOT_WEB_INDEX_DIR: &str = "web_index";
 
@@ -252,6 +252,7 @@ fn public_run_from_manifest(manifest: &pb::CampaignRunManifest) -> Result<pb::Pu
         canceled_count: completion.canceled_count,
         missing_output_count: completion.missing_outputs.len() as u64,
         failed_sample_count: completion.failed_samples.len() as u64,
+        intentionally_skipped_samples: completion.intentionally_skipped_samples.clone(),
     })
 }
 
@@ -312,6 +313,18 @@ fn validate_public_run(run: &pb::PublicCampaignRun) -> Result<()> {
             bail!("public run root action ids must be strictly sorted");
         }
         previous = Some(action_id.value.as_slice());
+    }
+    for skipped in &run.intentionally_skipped_samples {
+        let action_id = skipped
+            .action_id
+            .as_ref()
+            .context("public intentional skip is missing action id")?;
+        if action_id.value.len() != 32 {
+            bail!("public intentional skip action id must contain exactly 32 bytes");
+        }
+        if skipped.rule_id.trim().is_empty() || skipped.reason.trim().is_empty() {
+            bail!("public intentional skip requires a rule id and reason");
+        }
     }
     Ok(())
 }

@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::model::{
-    ActionBatchKey, ActionSpec, ArtifactRef, QueueCanceled, QueueDone, QueueFailed, QueueItem,
-    QueueRunning, QueueRunningWithPath, action_batch_key,
+    ActionBatchKey, ActionSpec, ArtifactRef, QueueCanceled, QueueCancellationKind, QueueDone,
+    QueueFailed, QueueItem, QueueRunning, QueueRunningWithPath, action_batch_key,
 };
 use crate::proto::{
     decode_queue_canceled, decode_queue_done, decode_queue_item, decode_queue_running,
@@ -896,6 +896,8 @@ pub(crate) fn write_canceled_record(
         root_failed_action_id: root_failed_action_id.to_string(),
         action,
         reason: reason.to_string(),
+        cancellation_kind: QueueCancellationKind::Dependency,
+        work_policy_rule_id: None,
     };
     let canceled_path = store.canceled_queue_path(action_id);
     if let Some(parent) = canceled_path.parent() {
@@ -904,6 +906,59 @@ pub(crate) fn write_canceled_record(
     }
     write_bytes_atomic(&canceled_path, &encode_queue_canceled(&canceled)?)?;
     Ok(())
+}
+
+pub(crate) fn write_work_policy_excluded_record(
+    store: &ArtifactStore,
+    action_id: &str,
+    source_action_id: &str,
+    action: ActionSpec,
+    rule_id: &str,
+    reason: &str,
+) -> Result<bool> {
+    if store.action_exists(action_id)
+        || store.running_queue_path(action_id).exists()
+        || store.done_queue_path(action_id).exists()
+    {
+        return Ok(false);
+    }
+
+    if let Some(existing) = load_queue_canceled_record(store, action_id)? {
+        if existing.cancellation_kind == QueueCancellationKind::Dependency {
+            return Ok(false);
+        }
+        if existing.work_policy_rule_id.as_deref() == Some(rule_id) {
+            remove_file_if_exists(&store.pending_queue_path(action_id))?;
+            store.delete_failed_action_record(action_id)?;
+            return Ok(true);
+        }
+    }
+
+    remove_file_if_exists(&store.pending_queue_path(action_id))?;
+    store.delete_failed_action_record(action_id)?;
+
+    let now = Utc::now();
+    let canceled = QueueCanceled {
+        schema_version: crate::ACTION_SCHEMA_VERSION,
+        action_id: action_id.to_string(),
+        enqueued_utc: now,
+        canceled_utc: now,
+        canceled_by: "campaign-work-policy".to_string(),
+        canceled_due_to_action_id: source_action_id.to_string(),
+        root_failed_action_id: action_id.to_string(),
+        action,
+        reason: reason.to_string(),
+        cancellation_kind: QueueCancellationKind::WorkPolicyExcluded,
+        work_policy_rule_id: Some(rule_id.to_string()),
+    };
+    let canceled_path = store.canceled_queue_path(action_id);
+    if let Some(parent) = canceled_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating canceled queue dir: {}", parent.display()))?;
+    }
+
+    write_bytes_atomic(&canceled_path, &encode_queue_canceled(&canceled)?)?;
+    Ok(true)
 }
 
 pub(crate) fn cancel_downstream_pending_actions(

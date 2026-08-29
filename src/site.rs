@@ -103,10 +103,18 @@ struct BrowserRun {
     canceled_count: u64,
     missing_output_count: u64,
     failed_sample_count: u64,
+    intentionally_skipped_samples: Vec<BrowserIntentionalSkip>,
     protobuf_url: String,
     page_url: String,
     findings_protobuf_url: Option<String>,
     findings: Vec<BrowserFinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BrowserIntentionalSkip {
+    action_id: String,
+    rule_id: String,
+    reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,8 +464,28 @@ pub(crate) fn build_static_site(
                 )
             })
             .unwrap_or_default();
+        let intentional_skip_items = if run.intentionally_skipped_samples.is_empty() {
+            "<li>None</li>".to_string()
+        } else {
+            run.intentionally_skipped_samples
+                .iter()
+                .map(|skipped| {
+                    format!(
+                        "<li><code>{}</code> via <strong>{}</strong>: {}</li>",
+                        escape_html(&skipped.action_id),
+                        escape_html(&skipped.rule_id),
+                        escape_html(&skipped.reason),
+                    )
+                })
+                .collect::<String>()
+        };
+        let intentional_skip_label = if run.intentionally_skipped_samples.len() == 1 {
+            "intentional skip"
+        } else {
+            "intentional skips"
+        };
         let body = format!(
-            "<header><p><a href=\"{run_site_root_url}runs.html\">← Runs</a></p><h1>{} crate v{}</h1><p class=\"meta\">Campaign {} v{} · DSO v{} · status <strong>{}</strong></p></header><main><div class=\"grid\"><article class=\"card\"><h2>Completion</h2><p>{} roots complete · {} failed · {} canceled</p><p>{} missing outputs · {} failed samples</p></article><article class=\"card\"><h2>Identity</h2><p>Run <code>{}</code></p><p>Campaign <code>{}</code></p><p><a href=\"{run_site_root_url}{}\">Download public run protobuf</a></p>{findings_download}</article></div><h2>Findings</h2><div class=\"table-wrap\"><table><thead><tr><th>Kind</th><th>Subject</th><th>Baseline loss</th><th>Current loss</th><th>Structural hash</th><th>Evidence actions</th></tr></thead><tbody>{finding_rows}</tbody></table></div><h2>Root actions</h2><ul>{root_actions}</ul><h2>Results</h2><p><a href=\"{run_site_root_url}dataset.html?key={}\">Open g8r versus Yosys/ABC dataset</a></p></main>",
+            "<header><p><a href=\"{run_site_root_url}runs.html\">← Runs</a></p><h1>{} crate v{}</h1><p class=\"meta\">Campaign {} v{} · DSO v{} · status <strong>{}</strong></p></header><main><div class=\"grid\"><article class=\"card\"><h2>Completion</h2><p>{} roots complete · {} failed · {} canceled</p><p>{} missing outputs · {} failed samples · {} {intentional_skip_label}</p></article><article class=\"card\"><h2>Identity</h2><p>Run <code>{}</code></p><p>Campaign <code>{}</code></p><p><a href=\"{run_site_root_url}{}\">Download public run protobuf</a></p>{findings_download}</article></div><h2>Intentional skips</h2><ul>{intentional_skip_items}</ul><h2>Findings</h2><div class=\"table-wrap\"><table><thead><tr><th>Kind</th><th>Subject</th><th>Baseline loss</th><th>Current loss</th><th>Structural hash</th><th>Evidence actions</th></tr></thead><tbody>{finding_rows}</tbody></table></div><h2>Root actions</h2><ul>{root_actions}</ul><h2>Results</h2><p><a href=\"{run_site_root_url}dataset.html?key={}\">Open g8r versus Yosys/ABC dataset</a></p></main>",
             escape_html(&run.campaign_name),
             escape_html(&run.crate_version),
             escape_html(&run.campaign_name),
@@ -469,6 +497,7 @@ pub(crate) fn build_static_site(
             run.canceled_count,
             run.missing_output_count,
             run.failed_sample_count,
+            run.intentionally_skipped_samples.len(),
             run.run_id,
             run.campaign_id,
             run.protobuf_url,
@@ -666,6 +695,27 @@ fn public_run_to_browser(run: &pb::PublicCampaignRun, protobuf_url: String) -> R
             Ok(hex::encode(&id.value))
         })
         .collect::<Result<Vec<_>>>()?;
+    let intentionally_skipped_samples = run
+        .intentionally_skipped_samples
+        .iter()
+        .map(|skipped| {
+            let action_id = skipped
+                .action_id
+                .as_ref()
+                .context("public intentional skip is missing action id")?;
+            if action_id.value.len() != 32 {
+                bail!("public intentional skip action id must contain 32 bytes");
+            }
+            if skipped.rule_id.trim().is_empty() || skipped.reason.trim().is_empty() {
+                bail!("public intentional skip requires a rule id and reason");
+            }
+            Ok(BrowserIntentionalSkip {
+                action_id: hex::encode(&action_id.value),
+                rule_id: skipped.rule_id.clone(),
+                reason: skipped.reason.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(BrowserRun {
         campaign_id,
         run_id: run_id.clone(),
@@ -694,6 +744,7 @@ fn public_run_to_browser(run: &pb::PublicCampaignRun, protobuf_url: String) -> R
         canceled_count: run.canceled_count,
         missing_output_count: run.missing_output_count,
         failed_sample_count: run.failed_sample_count,
+        intentionally_skipped_samples,
         protobuf_url,
         page_url: format!("runs/{run_id}/"),
         findings_protobuf_url: None,

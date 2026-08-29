@@ -47,6 +47,49 @@ fn validate_record_version(version: u32, field: &str) -> Result<()> {
     Ok(())
 }
 
+fn cancellation_kind_to_proto(value: model::QueueCancellationKind) -> pb::QueueCancellationKind {
+    match value {
+        model::QueueCancellationKind::Dependency => pb::QueueCancellationKind::Dependency,
+        model::QueueCancellationKind::WorkPolicyExcluded => {
+            pb::QueueCancellationKind::WorkPolicyExcluded
+        }
+    }
+}
+
+fn cancellation_kind_from_proto(raw: i32) -> Result<model::QueueCancellationKind> {
+    match pb::QueueCancellationKind::try_from(raw)
+        .context("queue_canceled.cancellation_kind is unknown")?
+    {
+        pb::QueueCancellationKind::Dependency => Ok(model::QueueCancellationKind::Dependency),
+        pb::QueueCancellationKind::WorkPolicyExcluded => {
+            Ok(model::QueueCancellationKind::WorkPolicyExcluded)
+        }
+        pb::QueueCancellationKind::Unspecified => {
+            bail!("queue_canceled.cancellation_kind must be specified")
+        }
+    }
+}
+
+fn validate_cancellation_kind(
+    kind: model::QueueCancellationKind,
+    work_policy_rule_id: &Option<String>,
+) -> Result<()> {
+    match (kind, work_policy_rule_id) {
+        (model::QueueCancellationKind::Dependency, None) => Ok(()),
+        (model::QueueCancellationKind::Dependency, Some(_)) => {
+            bail!("dependency cancellation must not have a work policy rule id")
+        }
+        (model::QueueCancellationKind::WorkPolicyExcluded, Some(rule_id))
+            if !rule_id.trim().is_empty() =>
+        {
+            Ok(())
+        }
+        (model::QueueCancellationKind::WorkPolicyExcluded, _) => {
+            bail!("work policy cancellation requires a rule id")
+        }
+    }
+}
+
 pub(crate) fn artifact_ref_to_proto(value: &model::ArtifactRef) -> Result<pb::ArtifactRef> {
     let artifact_type = match value.artifact_type {
         model::ArtifactType::DslxFileSubtree => pb::ArtifactType::DslxFileSubtree,
@@ -255,6 +298,7 @@ pub(crate) fn decode_queue_failed(bytes: &[u8]) -> Result<model::QueueFailed> {
 
 pub(crate) fn encode_queue_canceled(value: &model::QueueCanceled) -> Result<Vec<u8>> {
     validate_record_version(value.schema_version, "queue_canceled.record_version")?;
+    validate_cancellation_kind(value.cancellation_kind, &value.work_policy_rule_id)?;
     Ok(encode(&pb::QueueCanceledRecord {
         record_version: QUEUE_RECORD_VERSION,
         action_id: Some(action_id_to_proto(
@@ -274,6 +318,8 @@ pub(crate) fn encode_queue_canceled(value: &model::QueueCanceled) -> Result<Vec<
         )?),
         action: Some(action_spec_to_proto(&value.action)?),
         reason: value.reason.clone(),
+        cancellation_kind: cancellation_kind_to_proto(value.cancellation_kind) as i32,
+        work_policy_rule_id: value.work_policy_rule_id.clone(),
     }))
 }
 
@@ -283,6 +329,8 @@ pub(crate) fn decode_queue_canceled(bytes: &[u8]) -> Result<model::QueueCanceled
     if value.canceled_by.trim().is_empty() || value.reason.trim().is_empty() {
         bail!("queue_canceled.canceled_by and reason must not be empty");
     }
+    let cancellation_kind = cancellation_kind_from_proto(value.cancellation_kind)?;
+    validate_cancellation_kind(cancellation_kind, &value.work_policy_rule_id)?;
     Ok(model::QueueCanceled {
         schema_version: value.record_version,
         action_id: action_id_to_hex(
@@ -308,6 +356,8 @@ pub(crate) fn decode_queue_canceled(bytes: &[u8]) -> Result<model::QueueCanceled
         )?,
         action: action_spec_from_proto(required(&value.action, "queue_canceled.action")?)?,
         reason: value.reason,
+        cancellation_kind,
+        work_policy_rule_id: value.work_policy_rule_id,
     })
 }
 
@@ -413,6 +463,8 @@ mod tests {
             root_failed_action_id: hex::encode([0x44; 32]),
             action: action(),
             reason: "dependency failed".to_string(),
+            cancellation_kind: model::QueueCancellationKind::Dependency,
+            work_policy_rule_id: None,
         };
         assert_eq!(
             decode_queue_canceled(&encode_queue_canceled(&canceled).unwrap())

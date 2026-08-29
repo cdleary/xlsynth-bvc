@@ -67,4 +67,5 @@ message PublicCampaignRun {
   uint64 canceled_count = 15;
   uint64 missing_output_count = 16;
   uint64 failed_sample_count = 17;
+  repeated IntentionallySkippedSample intentionally_skipped_samples = 18;
 }

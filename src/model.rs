@@ -278,6 +278,13 @@ pub(crate) struct QueueFailed {
     pub(crate) error: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QueueCancellationKind {
+    Dependency,
+    WorkPolicyExcluded,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct QueueCanceled {
     pub(crate) schema_version: u32,
@@ -289,6 +296,8 @@ pub(crate) struct QueueCanceled {
     pub(crate) root_failed_action_id: String,
     pub(crate) action: ActionSpec,
     pub(crate) reason: String,
+    pub(crate) cancellation_kind: QueueCancellationKind,
+    pub(crate) work_policy_rule_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,6 +399,7 @@ pub(crate) struct EnqueueSuggestedSummary {
     pub(crate) already_canceled_count: usize,
     pub(crate) skipped_blocked_count: usize,
     pub(crate) skipped_not_previously_lossy_k_bool_count: usize,
+    pub(crate) skipped_work_policy_count: usize,
     pub(crate) unknown_queue_state_count: usize,
 }
 

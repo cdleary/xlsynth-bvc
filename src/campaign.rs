@@ -12,17 +12,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
+use crate::model::QueueCancellationKind;
 use crate::proto::v1 as pb;
 use crate::proto::{
     DEFAULT_RELEASE_CAMPAIGN, action_id_to_hex, action_id_to_proto, action_spec_from_proto,
-    action_spec_to_proto, compute_model_action_id_v2, decode_queue_canceled,
-    driver_runtime_from_proto, driver_runtime_to_proto, timestamp_from_proto, timestamp_to_proto,
+    action_spec_to_proto, compute_model_action_id_v2, driver_runtime_from_proto,
+    driver_runtime_to_proto, timestamp_from_proto, timestamp_to_proto,
 };
 use crate::query::{
     canonical_root_actions_for_crate_version, enqueue_processing_for_crate_version,
     load_stdlib_g8r_vs_yosys_dataset_index, load_versions_cards_index,
 };
-use crate::queue::{QueueState, queue_state_for_action};
+use crate::queue::{QueueState, load_queue_canceled_record, queue_state_for_action};
 use crate::runtime::explicit_driver_runtime_for_crate_version;
 use crate::store::ArtifactStore;
 use crate::versioning::{
@@ -58,6 +59,7 @@ pub(crate) struct CampaignRunSummary {
     pub(crate) canceled_count: u64,
     pub(crate) missing_outputs: Vec<String>,
     pub(crate) failed_samples: Vec<String>,
+    pub(crate) intentionally_skipped_samples: Vec<String>,
     pub(crate) manifest_path: String,
     pub(crate) persisted: bool,
 }
@@ -149,6 +151,48 @@ fn normalize_campaign(mut campaign: pb::CampaignSpec) -> Result<pb::CampaignSpec
             bail!("campaign.required_outputs contains duplicate {kind:?}");
         }
         previous = Some(*raw);
+    }
+    let work_policy = campaign
+        .work_policy
+        .as_mut()
+        .context("campaign.work_policy is required")?;
+    work_policy.rules.sort_by(|a, b| a.rule_id.cmp(&b.rule_id));
+    let mut previous_rule_id = None;
+    for rule in &mut work_policy.rules {
+        validate_nonempty(&rule.rule_id, "campaign.work_policy.rules.rule_id")?;
+        validate_nonempty(&rule.top_name, "campaign.work_policy.rules.top_name")?;
+        validate_nonempty(&rule.reason, "campaign.work_policy.rules.reason")?;
+        match pb::CampaignWorkDecision::try_from(rule.decision)
+            .context("campaign work rule decision is unknown")?
+        {
+            pb::CampaignWorkDecision::Exclude => {}
+            pb::CampaignWorkDecision::Unspecified => {
+                bail!("campaign work rule decision must be specified")
+            }
+        }
+        if previous_rule_id.as_deref() == Some(rule.rule_id.as_str()) {
+            bail!(
+                "campaign work policy contains duplicate rule id {:?}",
+                rule.rule_id
+            );
+        }
+        previous_rule_id = Some(rule.rule_id.clone());
+        if rule.action_kinds.is_empty() {
+            bail!("campaign work rule action_kinds must not be empty");
+        }
+        rule.action_kinds.sort_unstable();
+        let mut previous_kind = None;
+        for raw in &rule.action_kinds {
+            let kind = pb::CampaignActionKind::try_from(*raw)
+                .context("campaign work rule action kind is unknown")?;
+            if kind == pb::CampaignActionKind::Unspecified {
+                bail!("campaign work rule action kind must be specified");
+            }
+            if previous_kind == Some(*raw) {
+                bail!("campaign work rule contains duplicate action kind {kind:?}");
+            }
+            previous_kind = Some(*raw);
+        }
     }
     Ok(campaign)
 }
@@ -405,6 +449,23 @@ fn validate_manifest(manifest: &pb::CampaignRunManifest) -> Result<()> {
         )?;
         validate_nonempty(&failed.error, "completion.failed_samples.error")?;
     }
+    for skipped in &completion.intentionally_skipped_samples {
+        action_id_to_hex(
+            required(
+                &skipped.action_id,
+                "completion.intentionally_skipped_samples.action_id",
+            )?,
+            "completion.intentionally_skipped_samples.action_id",
+        )?;
+        validate_nonempty(
+            &skipped.rule_id,
+            "completion.intentionally_skipped_samples.rule_id",
+        )?;
+        validate_nonempty(
+            &skipped.reason,
+            "completion.intentionally_skipped_samples.reason",
+        )?;
+    }
     Ok(())
 }
 
@@ -621,16 +682,6 @@ fn failure_error(store: &ArtifactStore, action_id: &str) -> Result<String> {
         .unwrap_or_else(|| "failed action record is unavailable".to_string()))
 }
 
-fn canceled_error(store: &ArtifactStore, action_id: &str) -> String {
-    fs::read(store.canceled_queue_path(action_id))
-        .ok()
-        .and_then(|bytes| decode_queue_canceled(&bytes).ok())
-        .map(|record| {
-            normalize_completion_error(&record.reason, "canceled action reason is unavailable")
-        })
-        .unwrap_or_else(|| "canceled action record is unavailable".to_string())
-}
-
 fn evaluate_completion(
     store: &ArtifactStore,
     manifest: &pb::CampaignRunManifest,
@@ -664,6 +715,7 @@ fn evaluate_completion(
     let mut root_terminal_failure = false;
     let mut missing_outputs = Vec::new();
     let mut failed_samples = Vec::new();
+    let mut intentionally_skipped_samples = Vec::new();
 
     for action_id in &discovered {
         let is_root = root_ids.contains(action_id);
@@ -699,14 +751,42 @@ fn evaluate_completion(
             }
             QueueState::Canceled => {
                 canceled_count += 1;
-                let error = canceled_error(store, action_id);
-                if !is_root {
-                    failed_samples.push(pb::FailedSample {
-                        action_id: Some(action_id_to_proto(action_id, "failed_sample.action_id")?),
-                        error,
+                let canceled = load_queue_canceled_record(store, action_id)?;
+                let error = canceled
+                    .as_ref()
+                    .map(|record| {
+                        normalize_completion_error(
+                            &record.reason,
+                            "canceled action reason is unavailable",
+                        )
+                    })
+                    .unwrap_or_else(|| "canceled action record is unavailable".to_string());
+                if let Some(canceled) = canceled.as_ref().filter(|record| {
+                    record.cancellation_kind == QueueCancellationKind::WorkPolicyExcluded
+                }) {
+                    intentionally_skipped_samples.push(pb::IntentionallySkippedSample {
+                        action_id: Some(action_id_to_proto(
+                            action_id,
+                            "intentionally_skipped_sample.action_id",
+                        )?),
+                        rule_id: canceled
+                            .work_policy_rule_id
+                            .clone()
+                            .context("work policy cancellation is missing its rule id")?,
+                        reason: error,
                     });
+                } else {
+                    if !is_root {
+                        failed_samples.push(pb::FailedSample {
+                            action_id: Some(action_id_to_proto(
+                                action_id,
+                                "failed_sample.action_id",
+                            )?),
+                            error,
+                        });
+                    }
+                    root_terminal_failure |= is_root;
                 }
-                root_terminal_failure |= is_root;
             }
         }
         if is_root {
@@ -771,6 +851,13 @@ fn evaluate_completion(
             .map(|id| &id.value)
             .cmp(&b.action_id.as_ref().map(|id| &id.value))
     });
+    intentionally_skipped_samples.sort_by(|a, b| {
+        a.action_id
+            .as_ref()
+            .map(|id| &id.value)
+            .cmp(&b.action_id.as_ref().map(|id| &id.value))
+            .then(a.rule_id.cmp(&b.rule_id))
+    });
 
     let active = pending_count > 0 || running_count > 0;
     let sample_failure = !failed_samples.is_empty();
@@ -795,6 +882,7 @@ fn evaluate_completion(
         canceled_count,
         missing_outputs,
         failed_samples,
+        intentionally_skipped_samples,
     })
 }
 
@@ -863,6 +951,18 @@ fn summary(
             format!("{id}: {}", failed.error)
         })
         .collect();
+    let intentionally_skipped_samples = completion
+        .intentionally_skipped_samples
+        .iter()
+        .map(|skipped| {
+            let id = skipped
+                .action_id
+                .as_ref()
+                .and_then(|id| action_id_to_hex(id, "intentionally_skipped_sample.action_id").ok())
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("{id} ({}): {}", skipped.rule_id, skipped.reason)
+        })
+        .collect();
     Ok(CampaignRunSummary {
         campaign_id: digest_hex(
             required(&manifest.campaign_id, "campaign_run.campaign_id")?,
@@ -890,6 +990,7 @@ fn summary(
         canceled_count: completion.canceled_count,
         missing_outputs,
         failed_samples,
+        intentionally_skipped_samples,
         manifest_path: manifest_path.display().to_string(),
         persisted,
     })

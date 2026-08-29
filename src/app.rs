@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use crate::analysis::analyze_campaign_run;
 use crate::campaign::{
-    finalize_campaign_run, pending_campaign_versions, plan_campaign_run, reconcile_campaign_run,
+    finalize_campaign_run, load_default_campaign, pending_campaign_versions, plan_campaign_run,
+    reconcile_campaign_run,
 };
 use crate::cli::{Cli, RunAction, TopCommand};
 use crate::coordinator::{CoordinateReleaseOptions, coordinate_release};
@@ -26,6 +27,7 @@ use crate::executor::{
 };
 use crate::model::*;
 use crate::ops::run_workers;
+use crate::proto::v1 as pb;
 use crate::publish::{publish_static_site, verify_published_site};
 use crate::query::{
     action_kind_label, build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed,
@@ -59,16 +61,19 @@ static QUEUE_RUNTIME_PREPARE_AT: OnceLock<Mutex<Option<Instant>>> = OnceLock::ne
 static K3_CONE_CANONICAL_CACHE: OnceLock<Mutex<K3ConeCanonicalCache>> = OnceLock::new();
 static K_BOOL_PREVIOUS_LOSS_CACHE: OnceLock<Mutex<KBoolPreviousLossCache>> = OnceLock::new();
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct SuggestedEnqueuePolicy {
     only_previous_loss_k_cones: bool,
+    work_policy: pb::CampaignWorkPolicy,
 }
 
 impl SuggestedEnqueuePolicy {
-    fn from_env() -> Self {
-        Self {
+    fn from_env() -> Result<Self> {
+        let campaign = load_default_campaign()?;
+        Ok(Self {
             only_previous_loss_k_cones: queue_only_previous_loss_k_cones_enabled(),
-        }
+            work_policy: campaign.work_policy.unwrap_or_default(),
+        })
     }
 }
 
@@ -1500,7 +1505,7 @@ pub(crate) fn enqueue_suggested_actions(
         recursive,
         max_depth,
         priority,
-        SuggestedEnqueuePolicy::from_env(),
+        SuggestedEnqueuePolicy::from_env()?,
     )
 }
 
@@ -1533,6 +1538,7 @@ fn enqueue_suggested_actions_with_policy(
     let mut already_canceled_count = 0_usize;
     let mut skipped_blocked_count = 0_usize;
     let mut skipped_not_previously_lossy_k_bool_count = 0_usize;
+    let mut skipped_work_policy_count = 0_usize;
     let unknown_queue_state_count = 0_usize;
 
     while let Some((source_action_id, depth)) = queue.pop_front() {
@@ -1544,7 +1550,7 @@ fn enqueue_suggested_actions_with_policy(
             total_suggestions += 1;
             let action = canonicalize_suggested_action(store, repo_root, &suggested.action);
             let suggested_priority = suggested_action_queue_priority(priority, &action);
-            match classify_suggested_action_skip_reason(store, &action, policy)? {
+            match classify_suggested_action_skip_reason(store, &action, &policy)? {
                 Some(SuggestedActionSkipReason::DisabledDriverIrAigEquiv) => {
                     skipped_blocked_count += 1;
                     continue;
@@ -1558,6 +1564,17 @@ fn enqueue_suggested_actions_with_policy(
             let action_id = compute_action_id(&action)?;
             if store.action_exists(&action_id) {
                 already_done_count += 1;
+            } else if let Some(rule) = matching_work_policy_exclusion(&action, &policy.work_policy)?
+                && write_work_policy_excluded_record(
+                    store,
+                    &action_id,
+                    &source_action_id,
+                    action.clone(),
+                    &rule.rule_id,
+                    &rule.reason,
+                )?
+            {
+                skipped_work_policy_count += 1;
             } else {
                 match queue_state_for_action(store, &action_id) {
                     QueueState::Pending => {
@@ -1605,6 +1622,7 @@ fn enqueue_suggested_actions_with_policy(
         already_canceled_count,
         skipped_blocked_count,
         skipped_not_previously_lossy_k_bool_count,
+        skipped_work_policy_count,
         unknown_queue_state_count,
     })
 }
@@ -1618,7 +1636,7 @@ pub(crate) fn enqueue_missing_suggested_actions(
         store,
         repo_root,
         dry_run,
-        SuggestedEnqueuePolicy::from_env(),
+        SuggestedEnqueuePolicy::from_env()?,
     )
 }
 
@@ -1641,6 +1659,7 @@ fn enqueue_missing_suggested_actions_with_policy(
     let mut already_canceled_count = 0_usize;
     let mut skipped_blocked_count = 0_usize;
     let mut skipped_not_previously_lossy_k_bool_count = 0_usize;
+    let mut skipped_work_policy_count = 0_usize;
 
     for entry in audit.entries {
         if entry.completed {
@@ -1648,7 +1667,7 @@ fn enqueue_missing_suggested_actions_with_policy(
         }
         total_missing_entries += 1;
         let action = canonicalize_suggested_action(store, repo_root, &entry.action);
-        match classify_suggested_action_skip_reason(store, &action, policy)? {
+        match classify_suggested_action_skip_reason(store, &action, &policy)? {
             Some(SuggestedActionSkipReason::DisabledDriverIrAigEquiv) => {
                 skipped_blocked_count += 1;
                 continue;
@@ -1668,6 +1687,21 @@ fn enqueue_missing_suggested_actions_with_policy(
         if store.action_exists(&action_id) {
             already_done_count += 1;
             continue;
+        }
+        if let Some(rule) = matching_work_policy_exclusion(&action, &policy.work_policy)? {
+            let excluded = dry_run
+                || write_work_policy_excluded_record(
+                    store,
+                    &action_id,
+                    &entry.source_action_id,
+                    action.clone(),
+                    &rule.rule_id,
+                    &rule.reason,
+                )?;
+            if excluded {
+                skipped_work_policy_count += 1;
+                continue;
+            }
         }
         match queue_state_for_action(store, &action_id) {
             QueueState::Pending => {
@@ -1711,7 +1745,8 @@ fn enqueue_missing_suggested_actions_with_policy(
         "already_failed_count": already_failed_count,
         "already_canceled_count": already_canceled_count,
         "skipped_blocked_count": skipped_blocked_count,
-        "skipped_not_previously_lossy_k_bool_count": skipped_not_previously_lossy_k_bool_count
+        "skipped_not_previously_lossy_k_bool_count": skipped_not_previously_lossy_k_bool_count,
+        "skipped_work_policy_count": skipped_work_policy_count
     }))
 }
 
@@ -1729,7 +1764,38 @@ pub(crate) fn recursive_source_action_id_for_suggestion(
     None
 }
 
+fn matching_work_policy_exclusion<'a>(
+    action: &ActionSpec,
+    work_policy: &'a pb::CampaignWorkPolicy,
+) -> Result<Option<&'a pb::CampaignWorkRule>> {
+    let (action_kind, top_name) = match action {
+        ActionSpec::ComboVerilogToYosysAbcAig {
+            verilog_top_module_name: Some(top_name),
+            ..
+        } => (
+            pb::CampaignActionKind::ComboVerilogToYosysAbcAig,
+            top_name.as_str(),
+        ),
+        _ => return Ok(None),
+    };
+
+    for rule in &work_policy.rules {
+        let decision = pb::CampaignWorkDecision::try_from(rule.decision)
+            .context("campaign work rule decision is unknown")?;
+        if decision == pb::CampaignWorkDecision::Exclude
+            && rule
+                .action_kinds
+                .iter()
+                .any(|raw| *raw == action_kind as i32)
+            && rule.top_name == top_name
+        {
+            return Ok(Some(rule));
+        }
+    }
+    Ok(None)
+}
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+
 enum SuggestedActionSkipReason {
     DisabledDriverIrAigEquiv,
     NotPreviouslyLossyKBool,
@@ -1738,7 +1804,7 @@ enum SuggestedActionSkipReason {
 fn classify_suggested_action_skip_reason(
     store: &ArtifactStore,
     action: &ActionSpec,
-    policy: SuggestedEnqueuePolicy,
+    policy: &SuggestedEnqueuePolicy,
 ) -> Result<Option<SuggestedActionSkipReason>> {
     if should_skip_suggested_action(action) {
         return Ok(Some(SuggestedActionSkipReason::DisabledDriverIrAigEquiv));
@@ -1756,7 +1822,7 @@ fn should_skip_suggested_action(action: &ActionSpec) -> bool {
 fn should_skip_not_previously_lossy_k_bool_suggested_action(
     store: &ArtifactStore,
     action: &ActionSpec,
-    policy: SuggestedEnqueuePolicy,
+    policy: &SuggestedEnqueuePolicy,
 ) -> Result<bool> {
     if !policy.only_previous_loss_k_cones {
         return Ok(false);
@@ -3582,6 +3648,114 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_suggested_actions_records_work_policy_exclusion() {
+        let (store, root) = make_test_store("work-policy-exclusion");
+        let excluded_action = ActionSpec::ComboVerilogToYosysAbcAig {
+            verilog_action_id: test_action_id("fma-verilog"),
+            verilog_top_module_name: Some("__float64__fma".to_string()),
+            yosys_script_ref: ScriptRef {
+                path: "flows/yosys_to_aig.ys".to_string(),
+                sha256: "a".repeat(64),
+            },
+            runtime: default_yosys_runtime(),
+        };
+        let excluded_action_id =
+            compute_action_id(&excluded_action).expect("compute excluded action id");
+        let root_action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "b".repeat(64),
+            top_fn_name: Some("root".to_string()),
+        };
+        let root_action_id = compute_action_id(&root_action).expect("compute root action id");
+        let root_provenance = write_provenance_record(
+            &store,
+            root_action,
+            make_artifact(
+                &root_action_id,
+                ArtifactType::IrPackageFile,
+                "payload/root.ir",
+            ),
+            json!({}),
+            vec![SuggestedAction {
+                reason: "compare Yosys/ABC".to_string(),
+                action_id: excluded_action_id.clone(),
+                action: excluded_action.clone(),
+            }],
+            vec![("payload/root.ir".to_string(), b"package root".to_vec())],
+        );
+        let now = Utc::now();
+        store
+            .write_failed_action_record(&QueueFailed {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: excluded_action_id.clone(),
+                enqueued_utc: now,
+                failed_utc: now,
+                failed_by: "test-worker".to_string(),
+                action: excluded_action,
+                error: "TIMEOUT(900)".to_string(),
+            })
+            .expect("write prior timeout failure");
+
+        let work_policy = load_default_campaign()
+            .expect("load default campaign")
+            .work_policy
+            .expect("campaign work policy");
+        let policy = SuggestedEnqueuePolicy {
+            only_previous_loss_k_cones: false,
+            work_policy,
+        };
+        let summary = enqueue_suggested_actions_with_policy(
+            &store,
+            &root,
+            &root_provenance.action_id,
+            false,
+            1,
+            crate::DEFAULT_QUEUE_PRIORITY,
+            policy.clone(),
+        )
+        .expect("apply campaign work policy");
+
+        assert_eq!(summary.enqueued_count, 0);
+        assert_eq!(summary.skipped_work_policy_count, 1);
+        assert!(!store.failed_action_record_exists(&excluded_action_id));
+        assert_eq!(
+            queue_state_for_action(&store, &excluded_action_id),
+            QueueState::Canceled
+        );
+        let canceled = load_queue_canceled_record(&store, &excluded_action_id)
+            .expect("load canceled record")
+            .expect("canceled record exists");
+        assert_eq!(
+            canceled.cancellation_kind,
+            QueueCancellationKind::WorkPolicyExcluded
+        );
+        assert_eq!(
+            canceled.work_policy_rule_id.as_deref(),
+            Some("exclude-float64-fma-yosys")
+        );
+        let before = fs::read(store.canceled_queue_path(&excluded_action_id))
+            .expect("read canceled protobuf");
+
+        let second = enqueue_suggested_actions_with_policy(
+            &store,
+            &root,
+            &root_provenance.action_id,
+            false,
+            1,
+            crate::DEFAULT_QUEUE_PRIORITY,
+            policy,
+        )
+        .expect("reapply campaign work policy");
+        assert_eq!(second.skipped_work_policy_count, 1);
+        assert_eq!(
+            fs::read(store.canceled_queue_path(&excluded_action_id))
+                .expect("reread canceled protobuf"),
+            before
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
     fn enqueue_suggested_actions_skips_k_bool_without_previous_loss_history() {
         let (store, root) = make_test_store("skip-kbool-without-history");
         let runtime = test_runtime();
@@ -3597,6 +3771,7 @@ mod tests {
             crate::DEFAULT_QUEUE_PRIORITY,
             SuggestedEnqueuePolicy {
                 only_previous_loss_k_cones: true,
+                ..Default::default()
             },
         )
         .expect("enqueue suggested actions");
@@ -3670,6 +3845,7 @@ mod tests {
             crate::DEFAULT_QUEUE_PRIORITY,
             SuggestedEnqueuePolicy {
                 only_previous_loss_k_cones: true,
+                ..Default::default()
             },
         )
         .expect("enqueue suggested actions first pass");
@@ -3742,6 +3918,7 @@ mod tests {
             crate::DEFAULT_QUEUE_PRIORITY,
             SuggestedEnqueuePolicy {
                 only_previous_loss_k_cones: true,
+                ..Default::default()
             },
         )
         .expect("enqueue suggested actions second pass");

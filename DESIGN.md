@@ -55,6 +55,25 @@ runs, and analyses (or the Unix epoch when no included record has a timestamp).
 Rebuilding unchanged inputs therefore reproduces the same snapshot and site
 bytes even when the publication work directory has been lost.
 
+## Campaign work-policy invariant
+
+Release-campaign admission policy is canonical checked-in protobuf data and is
+part of the campaign identity. An exclusion rule has a stable rule ID, an
+explicit decision, one or more applicable action kinds, an exact top/module
+name, and a reviewable reason. Production release exclusions must not be
+hidden in environment variables or inferred from prior failures.
+
+Rules are evaluated before a suggested action enters the queue. A match is
+persisted as a typed `WORK_POLICY_EXCLUDED` queue cancellation containing the
+rule ID; it is terminal for campaign traversal but is reported separately from
+execution failures. Campaign manifests, public run protobufs, browser catalogs,
+and static run pages preserve that distinction.
+
+Changing a rule requires a campaign semantic-version bump. Changing its public
+projection also requires a publication-policy-version bump. This makes a policy
+change explicit in content identities and avoids silently reinterpreting an
+existing campaign run.
+
 ## Operational ownership
 
 The binary owns queue leases, the per-store coordinator lock, stage

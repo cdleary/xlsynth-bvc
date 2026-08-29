@@ -45,6 +45,12 @@ message QueueFailedRecord {
   string error = 7;
 }
 
+enum QueueCancellationKind {
+  QUEUE_CANCELLATION_KIND_UNSPECIFIED = 0;
+  QUEUE_CANCELLATION_KIND_DEPENDENCY = 1;
+  QUEUE_CANCELLATION_KIND_WORK_POLICY_EXCLUDED = 2;
+}
+
 message QueueCanceledRecord {
   uint32 record_version = 1;
   ActionId action_id = 2;
@@ -55,6 +61,8 @@ message QueueCanceledRecord {
   ActionId root_failed_action_id = 7;
   ActionSpec action = 8;
   string reason = 9;
+  QueueCancellationKind cancellation_kind = 10;
+  optional string work_policy_rule_id = 11;
 }
 
 message QueueRecord {

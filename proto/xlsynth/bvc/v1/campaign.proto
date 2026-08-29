@@ -25,6 +25,28 @@ message CampaignFailurePolicy {
   bool root_action_failure_is_terminal = 2;
 }
 
+enum CampaignWorkDecision {
+  CAMPAIGN_WORK_DECISION_UNSPECIFIED = 0;
+  CAMPAIGN_WORK_DECISION_EXCLUDE = 1;
+}
+
+enum CampaignActionKind {
+  CAMPAIGN_ACTION_KIND_UNSPECIFIED = 0;
+  CAMPAIGN_ACTION_KIND_COMBO_VERILOG_TO_YOSYS_ABC_AIG = 1;
+}
+
+message CampaignWorkRule {
+  string rule_id = 1;
+  CampaignWorkDecision decision = 2;
+  repeated CampaignActionKind action_kinds = 3;
+  string top_name = 4;
+  string reason = 5;
+}
+
+message CampaignWorkPolicy {
+  repeated CampaignWorkRule rules = 1;
+}
+
 message CampaignSpec {
   string campaign_name = 1;
   uint32 semantic_version = 2;
@@ -34,6 +56,7 @@ message CampaignSpec {
   CampaignFailurePolicy failure_policy = 6;
   uint32 analysis_algorithm_version = 7;
   uint32 publication_policy_version = 8;
+  CampaignWorkPolicy work_policy = 9;
 }
 
 message CampaignIdentity {
@@ -73,6 +96,12 @@ message FailedSample {
   string error = 2;
 }
 
+message IntentionallySkippedSample {
+  ActionId action_id = 1;
+  string rule_id = 2;
+  string reason = 3;
+}
+
 message CompletionReport {
   CampaignRunStatus status = 1;
   uint64 root_action_count = 2;
@@ -83,6 +112,7 @@ message CompletionReport {
   uint64 canceled_count = 7;
   repeated MissingOutput missing_outputs = 8;
   repeated FailedSample failed_samples = 9;
+  repeated IntentionallySkippedSample intentionally_skipped_samples = 10;
 }
 
 message CampaignRunManifest {
