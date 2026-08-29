@@ -19,7 +19,8 @@ use walkdir::WalkDir;
 use crate::analysis::decode_analysis_report;
 use crate::proto::v1 as pb;
 use crate::snapshot::{
-    STATIC_SNAPSHOT_MANIFEST_FILENAME, load_static_snapshot_manifest, verify_static_snapshot,
+    STATIC_SNAPSHOT_MANIFEST_FILENAME, load_static_snapshot_manifest,
+    should_include_snapshot_index_key, verify_static_snapshot,
 };
 
 pub(crate) const STATIC_SITE_RECORD_VERSION: u32 = 1;
@@ -924,16 +925,62 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     }
     let catalog: BrowserCatalog = serde_json::from_slice(&fs::read(site_dir.join("catalog.json"))?)
         .context("decoding browser catalog")?;
-    if catalog.snapshot_id != snapshot_id || catalog.base_url != base_url {
+    if catalog.schema_version != 1
+        || catalog.snapshot_id != snapshot_id
+        || catalog.base_url != base_url
+    {
         bail!("browser catalog does not match protobuf site manifest");
     }
+    let declared_dataset_urls = declared
+        .keys()
+        .filter(|relpath| relpath.starts_with("data/") && relpath.ends_with(".json"))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut catalog_dataset_keys = BTreeSet::new();
+    let mut catalog_dataset_urls = BTreeSet::new();
     for dataset in &catalog.datasets {
-        if !declared.contains_key(&dataset.url) {
+        if !should_include_snapshot_index_key(&dataset.logical_key) {
             bail!(
-                "browser catalog references undeclared dataset: {}",
+                "browser catalog contains a non-public dataset key: {}",
+                dataset.logical_key
+            );
+        }
+        let expected_url = format!("data/{}", dataset.logical_key);
+        if dataset.url != expected_url || !declared.contains_key(&dataset.url) {
+            bail!(
+                "browser catalog dataset path is missing or inconsistent: {}",
                 dataset.url
             );
         }
+        if !catalog_dataset_keys.insert(dataset.logical_key.clone())
+            || !catalog_dataset_urls.insert(dataset.url.clone())
+        {
+            bail!("browser catalog contains a duplicate dataset");
+        }
+        let bytes = fs::read(site_dir.join(&dataset.url))?;
+        if bytes.len() as u64 != dataset.bytes || sha256_hex(&bytes) != dataset.sha256 {
+            bail!(
+                "browser catalog dataset metadata mismatch: {}",
+                dataset.logical_key
+            );
+        }
+        let canonical =
+            crate::query::canonicalize_public_web_index_json(&dataset.logical_key, &bytes)
+                .with_context(|| {
+                    format!(
+                        "validating typed browser dataset during site verification: {}",
+                        dataset.logical_key
+                    )
+                })?;
+        if canonical != bytes {
+            bail!(
+                "browser catalog dataset is not canonically encoded: {}",
+                dataset.logical_key
+            );
+        }
+    }
+    if catalog_dataset_urls != declared_dataset_urls {
+        bail!("browser catalog datasets do not exactly match declared public JSON files");
     }
     if !catalog.runs.windows(2).all(|pair| {
         (&pair[0].crate_version, &pair[0].run_id) < (&pair[1].crate_version, &pair[1].run_id)
@@ -1453,6 +1500,64 @@ mod tests {
         .expect("build site");
         fs::write(site_dir.join("index.html"), "tampered").expect("tamper");
         assert!(verify_static_site(&site_dir).is_err());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn site_verifier_rejects_self_consistent_uncataloged_json() {
+        let root = temp_root();
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("store layout");
+        store
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
+            .expect("write dataset");
+        let snapshot_dir = root.join("snapshot");
+        build_static_snapshot(
+            &store,
+            &root,
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+        let site_dir = root.join("site");
+        build_static_site(&BuildStaticSiteOptions {
+            snapshot_dir,
+            out_dir: site_dir.clone(),
+            base_url: "/".into(),
+            overwrite: false,
+        })
+        .expect("build site");
+
+        let private_relpath = "data/internal-build-metadata.v1.json";
+        fs::write(
+            site_dir.join(private_relpath),
+            br#"{"private_path":"/srv/build/secrets"}"#,
+        )
+        .expect("write private site JSON");
+        let manifest_path = site_dir.join(STATIC_SITE_MANIFEST_FILENAME);
+        let mut manifest = pb::StaticSiteManifest::decode(
+            fs::read(&manifest_path)
+                .expect("read site manifest")
+                .as_slice(),
+        )
+        .expect("decode site manifest");
+        manifest
+            .files
+            .push(publication_file(&site_dir, private_relpath).expect("describe private file"));
+        fs::write(&manifest_path, manifest.encode_to_vec()).expect("rewrite site manifest");
+
+        let error = verify_static_site(&site_dir)
+            .expect_err("self-consistent uncataloged JSON must fail verification");
+        assert!(
+            format!("{error:#}").contains("do not exactly match"),
+            "unexpected error: {error:#}"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 

@@ -187,7 +187,7 @@ fn is_public_structural_group_index_key(index_key: &str) -> bool {
         && second_shard == &hash[2..4]
 }
 
-fn should_include_snapshot_index_key(index_key: &str) -> bool {
+pub(crate) fn should_include_snapshot_index_key(index_key: &str) -> bool {
     matches!(
         index_key,
         WEB_VERSIONS_SUMMARY_INDEX_FILENAME
@@ -1040,6 +1040,28 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
                 actual_sha
             );
         }
+        if !entry.index_key.starts_with("runs/") {
+            if !should_include_snapshot_index_key(&entry.index_key) {
+                bail!(
+                    "snapshot manifest contains a non-public dataset key: {}",
+                    entry.index_key
+                );
+            }
+            let canonical =
+                crate::query::canonicalize_public_web_index_json(&entry.index_key, &bytes)
+                    .with_context(|| {
+                        format!(
+                            "validating typed public dataset during snapshot verification: {}",
+                            entry.index_key
+                        )
+                    })?;
+            if canonical != bytes {
+                bail!(
+                    "snapshot public dataset is not canonically encoded: {}",
+                    entry.index_key
+                );
+            }
+        }
         if entry.index_key.starts_with("runs/") && entry.index_key.ends_with("/run.pb") {
             let public_run = pb::PublicCampaignRun::decode(bytes.as_slice())
                 .with_context(|| format!("decoding public campaign run: {}", entry.relpath))?;
@@ -1158,6 +1180,23 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rewrite_snapshot_manifest(snapshot_dir: &Path, mut manifest: StaticSnapshotManifest) {
+        manifest
+            .dataset_files
+            .sort_by(|a, b| a.index_key.cmp(&b.index_key));
+        manifest.total_dataset_bytes = manifest.dataset_files.iter().map(|entry| entry.bytes).sum();
+        manifest.snapshot_id = snapshot_id_for_dataset_files(
+            &manifest.dataset_files,
+            manifest.source_action_set_sha256.as_deref(),
+        )
+        .expect("recompute snapshot id");
+        fs::write(
+            snapshot_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME),
+            encode_static_snapshot_manifest(&manifest).expect("encode rewritten snapshot manifest"),
+        )
+        .expect("write rewritten snapshot manifest");
+    }
 
     fn empty_versions_index_bytes() -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
@@ -1315,6 +1354,102 @@ mod tests {
                 || err.to_string().contains("size mismatch"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn static_snapshot_verify_rejects_self_consistent_private_dataset() {
+        let root = make_temp_dir("verify-private-dataset");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("ensure layout");
+        store
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
+            .expect("write web index");
+        let snapshot_dir = root.join("snapshot-out");
+        build_static_snapshot(
+            &store,
+            &root,
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+
+        let private_key = "internal-build-metadata.v1.json";
+        let private_bytes = br#"{"private_path":"/srv/build/secrets"}"#;
+        let private_relpath = format!("{STATIC_SNAPSHOT_WEB_INDEX_DIR}/{private_key}");
+        fs::write(snapshot_dir.join(&private_relpath), private_bytes)
+            .expect("write private dataset");
+        let mut manifest = load_static_snapshot_manifest(&snapshot_dir).expect("load manifest");
+        manifest.dataset_files.push(StaticSnapshotDatasetFile {
+            index_key: private_key.to_string(),
+            relpath: private_relpath,
+            bytes: private_bytes.len() as u64,
+            sha256: sha256_hex(private_bytes),
+        });
+        rewrite_snapshot_manifest(&snapshot_dir, manifest);
+
+        let error = verify_static_snapshot(&snapshot_dir)
+            .expect_err("self-consistent private dataset must fail verification");
+        assert!(
+            format!("{error:#}").contains("non-public dataset key"),
+            "unexpected error: {error:#}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn static_snapshot_verify_rejects_self_consistent_typed_invalid_dataset() {
+        let root = make_temp_dir("verify-invalid-dataset");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("ensure layout");
+        store
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
+            .expect("write web index");
+        let snapshot_dir = root.join("snapshot-out");
+        build_static_snapshot(
+            &store,
+            &root,
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+
+        let invalid_bytes = br#"{"schema_version":3}"#;
+        fs::write(
+            snapshot_dir
+                .join(STATIC_SNAPSHOT_WEB_INDEX_DIR)
+                .join(WEB_VERSIONS_SUMMARY_INDEX_FILENAME),
+            invalid_bytes,
+        )
+        .expect("write typed-invalid dataset");
+        let mut manifest = load_static_snapshot_manifest(&snapshot_dir).expect("load manifest");
+        let entry = manifest
+            .dataset_files
+            .iter_mut()
+            .find(|entry| entry.index_key == WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .expect("versions entry");
+        entry.bytes = invalid_bytes.len() as u64;
+        entry.sha256 = sha256_hex(invalid_bytes);
+        rewrite_snapshot_manifest(&snapshot_dir, manifest);
+
+        let error = verify_static_snapshot(&snapshot_dir)
+            .expect_err("self-consistent typed-invalid dataset must fail verification");
+        assert!(
+            format!("{error:#}").contains("validating typed public dataset"),
+            "unexpected error: {error:#}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
