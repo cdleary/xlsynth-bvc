@@ -5,6 +5,7 @@ use chrono::Utc;
 use fs2::FileExt;
 use prost::Message;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use crate::analysis::analyze_campaign_run;
 use crate::campaign::{finalize_campaign_run, plan_campaign_run, reconcile_campaign_run};
 use crate::ops::run_workers;
 use crate::proto::v1 as pb;
-use crate::proto::{timestamp_from_proto, timestamp_to_proto};
+use crate::proto::{encode_provenance, timestamp_from_proto, timestamp_to_proto};
 use crate::publish::{publish_static_site, verify_published_site};
 use crate::query::rebuild_web_indices;
 use crate::service::{
@@ -30,6 +31,7 @@ use crate::{
 };
 
 const COORDINATOR_RECORD_VERSION: u32 = 1;
+const INDEXED_SOURCE_FINGERPRINT_DOMAIN: &[u8] = b"xlsynth-bvc/indexed-source/v1\0";
 pub(crate) const COORDINATOR_LOCK_FILENAME: &str = "coordinator.lock";
 static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -163,6 +165,9 @@ fn validate_state(state: &pb::CoordinatorState) -> Result<()> {
     if let Some(site_id) = &state.published_site_id {
         digest_hex(site_id, "coordinator.published_site_id")?;
     }
+    if let Some(fingerprint) = &state.indexed_source_fingerprint {
+        digest_hex(fingerprint, "coordinator.indexed_source_fingerprint")?;
+    }
     Ok(())
 }
 
@@ -231,6 +236,7 @@ fn load_or_new_state(
         snapshot_dir: String::new(),
         site_dir: String::new(),
         published_site_id: None,
+        indexed_source_fingerprint: None,
     })
 }
 
@@ -297,6 +303,38 @@ fn stage_succeeded(state: &pb::CoordinatorState, stage: pb::CoordinatorStage) ->
         result.stage == stage as i32
             && result.status == pb::CoordinatorStageStatus::Succeeded as i32
     })
+}
+
+fn indexed_source_fingerprint(store: &ArtifactStore) -> Result<pb::Sha256Digest> {
+    let mut records = store
+        .list_provenances()?
+        .into_iter()
+        .map(|provenance| {
+            let action_id = provenance.action_id.clone();
+            Ok((action_id, encode_provenance(&provenance)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    records.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = Sha256::new();
+    hasher.update(INDEXED_SOURCE_FINGERPRINT_DOMAIN);
+    for (action_id, bytes) in records {
+        hasher.update((action_id.len() as u64).to_be_bytes());
+        hasher.update(action_id.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    Ok(pb::Sha256Digest {
+        value: hasher.finalize().to_vec(),
+    })
+}
+
+fn indexed_checkpoint_matches(
+    state: &pb::CoordinatorState,
+    fingerprint: &pb::Sha256Digest,
+) -> bool {
+    stage_succeeded(state, pb::CoordinatorStage::Indexed)
+        && state.indexed_source_fingerprint.as_ref() == Some(fingerprint)
 }
 
 fn ensure_structural_index_current(
@@ -389,7 +427,13 @@ pub(crate) fn coordinate_release(
         },
     )?;
 
-    let indexed_already_succeeded = stage_succeeded(&state, pb::CoordinatorStage::Indexed);
+    let current_indexed_source_fingerprint = indexed_source_fingerprint(&store)?;
+    let current_indexed_source_fingerprint_hex = digest_hex(
+        &current_indexed_source_fingerprint,
+        "coordinator.indexed_source_fingerprint",
+    )?;
+    let indexed_already_succeeded =
+        indexed_checkpoint_matches(&state, &current_indexed_source_fingerprint);
     stage(
         &mut state,
         &path,
@@ -399,7 +443,9 @@ pub(crate) fn coordinate_release(
             if indexed_already_succeeded {
                 Ok((
                     (),
-                    "reused previously verified web/publication datasets".to_string(),
+                    format!(
+                        "reused previously verified web/publication datasets source_fingerprint={current_indexed_source_fingerprint_hex}"
+                    ),
                 ))
             } else {
                 let structural_index = ensure_structural_index_current(
@@ -419,6 +465,8 @@ pub(crate) fn coordinate_release(
             }
         },
     )?;
+    state.indexed_source_fingerprint = Some(current_indexed_source_fingerprint);
+    atomic_write_state(&path, &state)?;
 
     let finalized = stage(
         &mut state,
@@ -599,6 +647,68 @@ mod tests {
             &state,
             pb::CoordinatorStage::SnapshotVerified
         ));
+    }
+
+    #[test]
+    fn indexed_checkpoint_requires_exact_current_provenance_fingerprint() {
+        let root = temp_path("indexed-source-fingerprint");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let before = indexed_source_fingerprint(&store).expect("empty fingerprint");
+        let mut state = pb::CoordinatorState {
+            stage_results: vec![pb::CoordinatorStageResult {
+                stage: pb::CoordinatorStage::Indexed as i32,
+                status: pb::CoordinatorStageStatus::Succeeded as i32,
+                ..Default::default()
+            }],
+            indexed_source_fingerprint: Some(before.clone()),
+            ..Default::default()
+        };
+        assert!(indexed_checkpoint_matches(&state, &before));
+
+        let action = crate::model::ActionSpec::ImportIrPackageFile {
+            source_sha256: "a".repeat(64),
+            top_fn_name: Some("main".to_string()),
+        };
+        let action_id = crate::executor::compute_action_id(&action).expect("action id");
+        let mut provenance = crate::model::Provenance {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id: action_id.clone(),
+            created_utc: Utc::now(),
+            action,
+            dependencies: Vec::new(),
+            output_artifact: crate::model::ArtifactRef {
+                action_id,
+                artifact_type: crate::model::ArtifactType::IrPackageFile,
+                relpath: "payload/input.ir".to_string(),
+            },
+            output_files: Vec::new(),
+            commands: Vec::new(),
+            details: serde_json::json!({
+                "source_path": "first.ir",
+                "import_kind": "local_ir_file"
+            }),
+            suggested_next_actions: Vec::new(),
+        };
+        store
+            .write_provenance(&provenance)
+            .expect("write newly completed action");
+        let after_action = indexed_source_fingerprint(&store).expect("updated fingerprint");
+        assert_ne!(before, after_action);
+        assert!(!indexed_checkpoint_matches(&state, &after_action));
+
+        state.indexed_source_fingerprint = Some(after_action.clone());
+        assert!(indexed_checkpoint_matches(&state, &after_action));
+        provenance.details["source_path"] = serde_json::json!("refreshed.ir");
+        store
+            .write_provenance(&provenance)
+            .expect("refresh provenance contents");
+        let after_refresh = indexed_source_fingerprint(&store).expect("refreshed fingerprint");
+        assert_ne!(after_action, after_refresh);
+        assert!(!indexed_checkpoint_matches(&state, &after_refresh));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

@@ -68,4 +68,5 @@ message CoordinatorState {
   string snapshot_dir = 7;
   string site_dir = 8;
   optional Sha256Digest published_site_id = 9;
+  optional Sha256Digest indexed_source_fingerprint = 10;
 }
