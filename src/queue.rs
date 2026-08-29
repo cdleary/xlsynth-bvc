@@ -961,6 +961,20 @@ pub(crate) fn write_work_policy_excluded_record(
     Ok(true)
 }
 
+pub(crate) fn remove_work_policy_excluded_record(
+    store: &ArtifactStore,
+    action_id: &str,
+) -> Result<bool> {
+    let Some(existing) = load_queue_canceled_record(store, action_id)? else {
+        return Ok(false);
+    };
+    if existing.cancellation_kind != QueueCancellationKind::WorkPolicyExcluded {
+        return Ok(false);
+    }
+    remove_file_if_exists(&store.canceled_queue_path(action_id))?;
+    Ok(true)
+}
+
 pub(crate) fn cancel_downstream_pending_actions(
     store: &ArtifactStore,
     root_failed_action_id: &str,

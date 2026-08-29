@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use crate::analysis::analyze_campaign_run;
 use crate::campaign::{
-    finalize_campaign_run, load_default_campaign, pending_campaign_versions, plan_campaign_run,
-    reconcile_campaign_run,
+    finalize_campaign_run, load_default_campaign, matching_work_policy_exclusion,
+    pending_campaign_versions, plan_campaign_run, reconcile_campaign_run,
 };
 use crate::cli::{Cli, RunAction, TopCommand};
 use crate::coordinator::{CoordinateReleaseOptions, coordinate_release};
@@ -1576,6 +1576,7 @@ fn enqueue_suggested_actions_with_policy(
             {
                 skipped_work_policy_count += 1;
             } else {
+                remove_work_policy_excluded_record(store, &action_id)?;
                 match queue_state_for_action(store, &action_id) {
                     QueueState::Pending => {
                         enqueue_action_with_priority(store, action.clone(), suggested_priority)?;
@@ -1703,7 +1704,19 @@ fn enqueue_missing_suggested_actions_with_policy(
                 continue;
             }
         }
-        match queue_state_for_action(store, &action_id) {
+        let stale_work_policy_exclusion = if dry_run {
+            load_queue_canceled_record(store, &action_id)?.is_some_and(|record| {
+                record.cancellation_kind == QueueCancellationKind::WorkPolicyExcluded
+            })
+        } else {
+            remove_work_policy_excluded_record(store, &action_id)?
+        };
+        let queue_state = if stale_work_policy_exclusion {
+            QueueState::None
+        } else {
+            queue_state_for_action(store, &action_id)
+        };
+        match queue_state {
             QueueState::Pending => {
                 already_pending_count += 1;
             }
@@ -1764,36 +1777,6 @@ pub(crate) fn recursive_source_action_id_for_suggestion(
     None
 }
 
-fn matching_work_policy_exclusion<'a>(
-    action: &ActionSpec,
-    work_policy: &'a pb::CampaignWorkPolicy,
-) -> Result<Option<&'a pb::CampaignWorkRule>> {
-    let (action_kind, top_name) = match action {
-        ActionSpec::ComboVerilogToYosysAbcAig {
-            verilog_top_module_name: Some(top_name),
-            ..
-        } => (
-            pb::CampaignActionKind::ComboVerilogToYosysAbcAig,
-            top_name.as_str(),
-        ),
-        _ => return Ok(None),
-    };
-
-    for rule in &work_policy.rules {
-        let decision = pb::CampaignWorkDecision::try_from(rule.decision)
-            .context("campaign work rule decision is unknown")?;
-        if decision == pb::CampaignWorkDecision::Exclude
-            && rule
-                .action_kinds
-                .iter()
-                .any(|raw| *raw == action_kind as i32)
-            && rule.top_name == top_name
-        {
-            return Ok(Some(rule));
-        }
-    }
-    Ok(None)
-}
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 
 enum SuggestedActionSkipReason {
@@ -3650,8 +3633,28 @@ mod tests {
     #[test]
     fn enqueue_suggested_actions_records_work_policy_exclusion() {
         let (store, root) = make_test_store("work-policy-exclusion");
+        let verilog_action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "f".repeat(64),
+            top_fn_name: Some("fma-verilog".to_string()),
+        };
+        let verilog_action_id = compute_action_id(&verilog_action).expect("verilog action id");
+        write_provenance_record(
+            &store,
+            verilog_action,
+            make_artifact(
+                &verilog_action_id,
+                ArtifactType::VerilogFile,
+                "payload/fma.v",
+            ),
+            json!({}),
+            Vec::new(),
+            vec![(
+                "payload/fma.v".to_string(),
+                b"module fma; endmodule".to_vec(),
+            )],
+        );
         let excluded_action = ActionSpec::ComboVerilogToYosysAbcAig {
-            verilog_action_id: test_action_id("fma-verilog"),
+            verilog_action_id,
             verilog_top_module_name: Some("__float64__fma".to_string()),
             yosys_script_ref: ScriptRef {
                 path: "flows/yosys_to_aig.ys".to_string(),
@@ -3751,6 +3754,23 @@ mod tests {
                 .expect("reread canceled protobuf"),
             before
         );
+
+        let readmitted = enqueue_suggested_actions_with_policy(
+            &store,
+            &root,
+            &root_provenance.action_id,
+            false,
+            1,
+            crate::DEFAULT_QUEUE_PRIORITY,
+            SuggestedEnqueuePolicy {
+                only_previous_loss_k_cones: false,
+                work_policy: pb::CampaignWorkPolicy::default(),
+            },
+        )
+        .expect("reconcile after removing campaign exclusion");
+        assert_eq!(readmitted.enqueued_count, 1);
+        assert!(!store.canceled_queue_path(&excluded_action_id).exists());
+        assert!(store.pending_queue_path(&excluded_action_id).exists());
 
         fs::remove_dir_all(root).expect("cleanup temp store");
     }

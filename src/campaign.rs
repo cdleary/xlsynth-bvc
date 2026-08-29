@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-use crate::model::QueueCancellationKind;
+use crate::model::{ActionSpec, QueueCanceled, QueueCancellationKind};
 use crate::proto::v1 as pb;
 use crate::proto::{
     DEFAULT_RELEASE_CAMPAIGN, action_id_to_hex, action_id_to_proto, action_spec_from_proto,
@@ -201,6 +201,49 @@ pub(crate) fn load_default_campaign() -> Result<pb::CampaignSpec> {
     let campaign = pb::CampaignSpec::decode(DEFAULT_RELEASE_CAMPAIGN)
         .context("decoding embedded release campaign protobuf")?;
     normalize_campaign(campaign)
+}
+
+pub(crate) fn matching_work_policy_exclusion<'a>(
+    action: &ActionSpec,
+    work_policy: &'a pb::CampaignWorkPolicy,
+) -> Result<Option<&'a pb::CampaignWorkRule>> {
+    let (action_kind, top_name) = match action {
+        ActionSpec::ComboVerilogToYosysAbcAig {
+            verilog_top_module_name: Some(top_name),
+            ..
+        } => (
+            pb::CampaignActionKind::ComboVerilogToYosysAbcAig,
+            top_name.as_str(),
+        ),
+        _ => return Ok(None),
+    };
+
+    for rule in &work_policy.rules {
+        let decision = pb::CampaignWorkDecision::try_from(rule.decision)
+            .context("campaign work rule decision is unknown")?;
+        if decision == pb::CampaignWorkDecision::Exclude
+            && rule
+                .action_kinds
+                .iter()
+                .any(|raw| *raw == action_kind as i32)
+            && rule.top_name == top_name
+        {
+            return Ok(Some(rule));
+        }
+    }
+    Ok(None)
+}
+
+fn current_work_policy_exclusion<'a>(
+    canceled: &QueueCanceled,
+    work_policy: &'a pb::CampaignWorkPolicy,
+) -> Result<Option<&'a pb::CampaignWorkRule>> {
+    if canceled.cancellation_kind != QueueCancellationKind::WorkPolicyExcluded {
+        return Ok(None);
+    }
+    let matching = matching_work_policy_exclusion(&canceled.action, work_policy)?;
+    Ok(matching
+        .filter(|rule| canceled.work_policy_rule_id.as_deref() == Some(rule.rule_id.as_str())))
 }
 
 pub(crate) fn compute_campaign_id(campaign: &pb::CampaignSpec) -> Result<pb::Sha256Digest> {
@@ -521,14 +564,18 @@ pub(crate) fn pending_campaign_versions(
     store: &ArtifactStore,
     repo_root: &Path,
 ) -> Result<Vec<String>> {
-    let finalized = list_finalized_campaign_runs(store)?
+    let finalized_run_ids = list_finalized_campaign_runs(store)?
         .into_iter()
-        .filter_map(|manifest| manifest.crate_version.map(|version| version.value))
+        .filter_map(|manifest| manifest.run_id.map(|run_id| run_id.value))
         .collect::<BTreeSet<_>>();
-    let mut pending = load_version_compat_map(repo_root)?
-        .into_keys()
-        .filter(|version| !finalized.contains(version))
-        .collect::<Vec<_>>();
+    let mut pending = Vec::new();
+    for version in load_version_compat_map(repo_root)?.into_keys() {
+        let planned = new_manifest(repo_root, &version)?;
+        let run_id = required(&planned.run_id, "planned_campaign_run.run_id")?;
+        if !finalized_run_ids.contains(&run_id.value) {
+            pending.push(version);
+        }
+    }
     pending.sort_by(|a, b| cmp_dotted_numeric_version(a, b));
     Ok(pending)
 }
@@ -688,6 +735,7 @@ fn evaluate_completion(
 ) -> Result<pb::CompletionReport> {
     let campaign = required(&manifest.campaign, "campaign_run.campaign")?;
     let failure_policy = required(&campaign.failure_policy, "campaign.failure_policy")?;
+    let work_policy = required(&campaign.work_policy, "campaign.work_policy")?;
     let root_ids: BTreeSet<String> = manifest
         .root_actions
         .iter()
@@ -750,7 +798,6 @@ fn evaluate_completion(
                 root_terminal_failure |= is_root;
             }
             QueueState::Canceled => {
-                canceled_count += 1;
                 let canceled = load_queue_canceled_record(store, action_id)?;
                 let error = canceled
                     .as_ref()
@@ -761,21 +808,26 @@ fn evaluate_completion(
                         )
                     })
                     .unwrap_or_else(|| "canceled action record is unavailable".to_string());
-                if let Some(canceled) = canceled.as_ref().filter(|record| {
-                    record.cancellation_kind == QueueCancellationKind::WorkPolicyExcluded
-                }) {
+                let current_rule = match canceled.as_ref() {
+                    Some(record) => current_work_policy_exclusion(record, work_policy)?,
+                    None => None,
+                };
+                if let (Some(_), Some(rule)) = (canceled.as_ref(), current_rule) {
+                    canceled_count += 1;
                     intentionally_skipped_samples.push(pb::IntentionallySkippedSample {
                         action_id: Some(action_id_to_proto(
                             action_id,
                             "intentionally_skipped_sample.action_id",
                         )?),
-                        rule_id: canceled
-                            .work_policy_rule_id
-                            .clone()
-                            .context("work policy cancellation is missing its rule id")?,
+                        rule_id: rule.rule_id.clone(),
                         reason: error,
                     });
+                } else if canceled.as_ref().is_some_and(|record| {
+                    record.cancellation_kind == QueueCancellationKind::WorkPolicyExcluded
+                }) {
+                    pending_count += 1;
                 } else {
+                    canceled_count += 1;
                     if !is_root {
                         failed_samples.push(pb::FailedSample {
                             action_id: Some(action_id_to_proto(
@@ -1124,6 +1176,114 @@ mod tests {
             first,
             compute_campaign_id(&changed).expect("changed campaign id")
         );
+    }
+
+    #[test]
+    fn work_policy_cancellation_must_match_current_rule_and_action() {
+        let campaign = load_default_campaign().expect("default campaign");
+        let policy = campaign.work_policy.expect("work policy");
+        let rule = policy.rules.first().expect("checked-in exclusion rule");
+        let action = ActionSpec::ComboVerilogToYosysAbcAig {
+            verilog_action_id: "a".repeat(64),
+            verilog_top_module_name: Some(rule.top_name.clone()),
+            yosys_script_ref: crate::model::ScriptRef {
+                path: "flows/yosys_to_aig.ys".to_string(),
+                sha256: "b".repeat(64),
+            },
+            runtime: crate::runtime::default_yosys_runtime(),
+        };
+        let action_id = compute_model_action_id_v2(&action)
+            .expect("action id")
+            .to_hex();
+        let now = Utc::now();
+        let mut canceled = QueueCanceled {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id: action_id.clone(),
+            enqueued_utc: now,
+            canceled_utc: now,
+            canceled_by: "campaign-work-policy".to_string(),
+            canceled_due_to_action_id: action_id.clone(),
+            root_failed_action_id: action_id,
+            action,
+            reason: rule.reason.clone(),
+            cancellation_kind: QueueCancellationKind::WorkPolicyExcluded,
+            work_policy_rule_id: Some(rule.rule_id.clone()),
+        };
+
+        assert_eq!(
+            current_work_policy_exclusion(&canceled, &policy)
+                .expect("match current policy")
+                .map(|matched| matched.rule_id.as_str()),
+            Some(rule.rule_id.as_str())
+        );
+        assert!(
+            current_work_policy_exclusion(&canceled, &pb::CampaignWorkPolicy::default())
+                .expect("removed policy")
+                .is_none()
+        );
+        canceled.work_policy_rule_id = Some("obsolete-rule".to_string());
+        assert!(
+            current_work_policy_exclusion(&canceled, &policy)
+                .expect("obsolete rule")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pending_versions_compare_current_run_identity() {
+        let repo_root = std::env::current_dir().expect("current dir");
+        let root = temp_path("pending-current-campaign");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let version = known_crate_version(&repo_root);
+
+        let current = new_manifest(&repo_root, &version).expect("current manifest");
+        let mut older_campaign = current.clone();
+        let campaign = older_campaign.campaign.as_mut().expect("campaign");
+        campaign.semantic_version += 1;
+        let campaign_id = compute_campaign_id(campaign).expect("older campaign id");
+        older_campaign.campaign_id = Some(campaign_id.clone());
+        older_campaign.run_id = Some(
+            compute_run_id(&pb::CampaignRunIdentity {
+                identity_version: CAMPAIGN_RUN_IDENTITY_VERSION,
+                campaign_id: Some(campaign_id),
+                crate_version: older_campaign.crate_version.clone(),
+                dso_version: older_campaign.dso_version.clone(),
+                driver_runtime: older_campaign.driver_runtime.clone(),
+            })
+            .expect("older run id"),
+        );
+        older_campaign.status = pb::CampaignRunStatus::Complete as i32;
+        older_campaign.completion = Some(pb::CompletionReport {
+            status: pb::CampaignRunStatus::Complete as i32,
+            root_action_count: older_campaign.root_actions.len() as u64,
+            completed_root_count: older_campaign.root_actions.len() as u64,
+            ..Default::default()
+        });
+        write_manifest(&store, &older_campaign).expect("write older finalized campaign");
+
+        assert!(
+            pending_campaign_versions(&store, &repo_root)
+                .expect("pending under current campaign")
+                .contains(&version)
+        );
+
+        let mut current_finalized = current;
+        current_finalized.status = pb::CampaignRunStatus::Complete as i32;
+        current_finalized.completion = Some(pb::CompletionReport {
+            status: pb::CampaignRunStatus::Complete as i32,
+            root_action_count: current_finalized.root_actions.len() as u64,
+            completed_root_count: current_finalized.root_actions.len() as u64,
+            ..Default::default()
+        });
+        write_manifest(&store, &current_finalized).expect("write current finalized campaign");
+        assert!(
+            !pending_campaign_versions(&store, &repo_root)
+                .expect("not pending after current finalization")
+                .contains(&version)
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
