@@ -16,6 +16,7 @@ use crate::analysis::analyze_campaign_run;
 use crate::campaign::{
     finalize_campaign_run, load_default_campaign, matching_work_policy_exclusion,
     pending_campaign_versions, plan_campaign_run, reconcile_campaign_run,
+    work_policy_rule_fingerprint,
 };
 use crate::cli::{Cli, RunAction, TopCommand};
 use crate::coordinator::{CoordinateReleaseOptions, coordinate_release};
@@ -1572,6 +1573,7 @@ fn enqueue_suggested_actions_with_policy(
                     action.clone(),
                     &rule.rule_id,
                     &rule.reason,
+                    &work_policy_rule_fingerprint(rule)?,
                 )?
             {
                 skipped_work_policy_count += 1;
@@ -1698,6 +1700,7 @@ fn enqueue_missing_suggested_actions_with_policy(
                     action.clone(),
                     &rule.rule_id,
                     &rule.reason,
+                    &work_policy_rule_fingerprint(rule)?,
                 )?;
             if excluded {
                 skipped_work_policy_count += 1;
@@ -3735,6 +3738,10 @@ mod tests {
             canceled.work_policy_rule_id.as_deref(),
             Some("exclude-float64-fma-yosys")
         );
+        let initial_rule_fingerprint = canceled
+            .work_policy_rule_fingerprint
+            .clone()
+            .expect("rule fingerprint");
         let before = fs::read(store.canceled_queue_path(&excluded_action_id))
             .expect("read canceled protobuf");
 
@@ -3745,13 +3752,44 @@ mod tests {
             false,
             1,
             crate::DEFAULT_QUEUE_PRIORITY,
-            policy,
+            policy.clone(),
         )
         .expect("reapply campaign work policy");
         assert_eq!(second.skipped_work_policy_count, 1);
         assert_eq!(
             fs::read(store.canceled_queue_path(&excluded_action_id))
                 .expect("reread canceled protobuf"),
+            before
+        );
+
+        let mut changed_policy = policy;
+        changed_policy.work_policy.rules[0].reason =
+            "updated reviewed exclusion reason".to_string();
+        let refreshed = enqueue_suggested_actions_with_policy(
+            &store,
+            &root,
+            &root_provenance.action_id,
+            false,
+            1,
+            crate::DEFAULT_QUEUE_PRIORITY,
+            changed_policy,
+        )
+        .expect("refresh changed campaign work policy");
+        assert_eq!(refreshed.skipped_work_policy_count, 1);
+        let refreshed_canceled = load_queue_canceled_record(&store, &excluded_action_id)
+            .expect("load refreshed canceled record")
+            .expect("refreshed canceled record exists");
+        assert_eq!(
+            refreshed_canceled.reason,
+            "updated reviewed exclusion reason"
+        );
+        assert_ne!(
+            refreshed_canceled.work_policy_rule_fingerprint.as_deref(),
+            Some(initial_rule_fingerprint.as_str())
+        );
+        assert_ne!(
+            fs::read(store.canceled_queue_path(&excluded_action_id))
+                .expect("read refreshed canceled protobuf"),
             before
         );
 

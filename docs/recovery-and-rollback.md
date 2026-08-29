@@ -14,9 +14,11 @@ content-addressed site before copying, so a container that restarts as PID 1
 does not require manual staging cleanup.
 
 A successful dataset-index checkpoint is reused instead of regenerating
-timestamped browser projections only when its recorded provenance fingerprint
-matches the current store. Campaign and analysis records retain their
-timestamps when their semantic content is unchanged, and snapshot
+timestamped browser projections only when its recorded provenance and web-index
+output fingerprints match the current store. Missing or changed output rows
+therefore force a rebuild even when action inputs are unchanged. Campaign and
+analysis records retain their timestamps when their semantic content is
+unchanged, and snapshot
 `generated_at` is the deterministic newest-source watermark described in
 `DESIGN.md`. Consequently, rebuilding a lost work directory from unchanged
 store records reproduces the same snapshot manifest, site manifest, and

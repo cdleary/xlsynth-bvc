@@ -52,6 +52,9 @@ The public dataset projection is fail-closed: only explicitly named index keys
 and structurally validated content-addressed group keys may enter a snapshot.
 Adding a private index to the store does not publish it by default. Public
 schemas must not contain build-host paths such as store or work directories.
+Raw executor error strings are private operational data. Public failure records
+use a fixed structured class such as `timeout` or `failed`, never truncated or
+redacted fragments of arbitrary process output.
 
 Publication metadata follows the same content-idempotence rule as publication
 identity. A snapshot's `generated_at` value is a deterministic data watermark:
@@ -65,21 +68,33 @@ root. The lock spans immutable site and catalog promotion, both current-site
 pointers, and final verification. This is separate from the per-store
 coordinator lock: publishers using different stores but the same public root
 must not interleave their pointer updates.
+Publication attempts use unique staging names. While holding the same lock, a
+retry may remove abandoned staging entries for its validated content-addressed
+site ID; process IDs are not used as persistent ownership evidence.
 
 ## Content-addressed store invariant
 
-An action ID has exactly one committed provenance record and output-file set.
-Promotion is first-writer-wins in both filesystem and sled stores. A concurrent
-or repeated promotion for an existing ID may verify or discard its staging
-data, but it must never replace any part of the committed action. Sled commits
-the provenance and complete file set in one transaction so readers cannot
-observe a mixed action assembled from competing writers.
+An action ID has exactly one committed action identity and output-file set.
+Initial promotion is first-writer-wins. A concurrent or repeated promotion for
+an existing ID may verify or discard its staging data, but it must never replace
+the committed action or output contract. Sled commits the provenance and
+complete file set in one transaction so readers cannot observe a mixed action
+assembled from competing writers.
+
+The one permitted provenance update is typed discovery enrichment after a
+transient enumeration failure. It must go through the artifact-store API,
+preserve action identity, dependencies, output artifact, and output-file
+manifest, and atomically update both canonical Sled representations before
+invalidating materialized cache state. Direct writes to a materialized
+`provenance.pb` are forbidden.
 
 Dataset-index checkpoints are valid only for the exact canonical provenance
-inputs from which they were built. The coordinator records a deterministic
-fingerprint of action IDs and encoded provenance after reconciliation and queue
-drain, and reuses an indexed checkpoint only when that fingerprint still
-matches. New actions and provenance changes invalidate the checkpoint.
+inputs and exact web-index outputs from which they were built. The coordinator
+records deterministic fingerprints of action IDs/encoded provenance and the
+sorted web-index key/byte set after reconciliation and queue drain. Rebuilt Sled
+outputs are flushed durably before Indexed success is recorded. Reuse requires
+both fingerprints to match; new actions, provenance changes, missing outputs,
+and modified output bytes invalidate the checkpoint.
 
 ## Campaign work-policy invariant
 
@@ -91,17 +106,19 @@ hidden in environment variables or inferred from prior failures.
 
 Rules are evaluated before a suggested action enters the queue. A match is
 persisted as a typed `WORK_POLICY_EXCLUDED` queue cancellation containing the
-rule ID; it is terminal for campaign traversal but is reported separately from
-execution failures. Campaign manifests, public run protobufs, browser catalogs,
-and static run pages preserve that distinction.
+rule ID and a domain-separated fingerprint of the complete normalized rule; it
+is terminal for campaign traversal but is reported separately from execution
+failures. Campaign manifests, public run protobufs, browser catalogs, and static
+run pages preserve that distinction.
 
 A policy cancellation is evidence about the campaign policy that created it,
 not a permanent ban on the action ID. Reconciliation removes the cancellation
 when the current manifest no longer contains the matching rule and then admits
-the action normally. Completion accepts an intentional skip only when the
-cancellation's rule and action still match the current manifest. Pending-release
-discovery likewise compares current planned run identities, not crate-version
-strings alone.
+the action normally. Reconciliation refreshes the evidence when a stable rule
+ID changes content or source. Completion accepts an intentional skip only when
+the stored rule fingerprint, reason, and action match the current manifest, and
+publishes the current rule's reason. Pending-release discovery likewise
+compares current planned run identities, not crate-version strings alone.
 
 Changing a rule requires a campaign semantic-version bump. Changing its public
 projection also requires a publication-policy-version bump. This makes a policy

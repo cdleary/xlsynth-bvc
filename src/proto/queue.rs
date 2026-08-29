@@ -8,6 +8,7 @@ use prost_types::Timestamp;
 use crate::model;
 use crate::proto::action::{
     action_id_to_hex, action_id_to_proto, action_spec_from_proto, action_spec_to_proto,
+    digest_from_hex, digest_to_hex,
 };
 use crate::proto::v1 as pb;
 
@@ -73,19 +74,26 @@ fn cancellation_kind_from_proto(raw: i32) -> Result<model::QueueCancellationKind
 fn validate_cancellation_kind(
     kind: model::QueueCancellationKind,
     work_policy_rule_id: &Option<String>,
+    work_policy_rule_fingerprint: &Option<String>,
 ) -> Result<()> {
-    match (kind, work_policy_rule_id) {
-        (model::QueueCancellationKind::Dependency, None) => Ok(()),
-        (model::QueueCancellationKind::Dependency, Some(_)) => {
-            bail!("dependency cancellation must not have a work policy rule id")
+    match (kind, work_policy_rule_id, work_policy_rule_fingerprint) {
+        (model::QueueCancellationKind::Dependency, None, None) => Ok(()),
+        (model::QueueCancellationKind::Dependency, _, _) => {
+            bail!("dependency cancellation must not have work policy evidence")
         }
-        (model::QueueCancellationKind::WorkPolicyExcluded, Some(rule_id))
-            if !rule_id.trim().is_empty() =>
-        {
+        (
+            model::QueueCancellationKind::WorkPolicyExcluded,
+            Some(rule_id),
+            Some(rule_fingerprint),
+        ) if !rule_id.trim().is_empty() => {
+            digest_from_hex(
+                rule_fingerprint,
+                "queue_canceled.work_policy_rule_fingerprint",
+            )?;
             Ok(())
         }
-        (model::QueueCancellationKind::WorkPolicyExcluded, _) => {
-            bail!("work policy cancellation requires a rule id")
+        (model::QueueCancellationKind::WorkPolicyExcluded, _, _) => {
+            bail!("work policy cancellation requires a rule id and fingerprint")
         }
     }
 }
@@ -298,7 +306,11 @@ pub(crate) fn decode_queue_failed(bytes: &[u8]) -> Result<model::QueueFailed> {
 
 pub(crate) fn encode_queue_canceled(value: &model::QueueCanceled) -> Result<Vec<u8>> {
     validate_record_version(value.schema_version, "queue_canceled.record_version")?;
-    validate_cancellation_kind(value.cancellation_kind, &value.work_policy_rule_id)?;
+    validate_cancellation_kind(
+        value.cancellation_kind,
+        &value.work_policy_rule_id,
+        &value.work_policy_rule_fingerprint,
+    )?;
     Ok(encode(&pb::QueueCanceledRecord {
         record_version: QUEUE_RECORD_VERSION,
         action_id: Some(action_id_to_proto(
@@ -320,6 +332,13 @@ pub(crate) fn encode_queue_canceled(value: &model::QueueCanceled) -> Result<Vec<
         reason: value.reason.clone(),
         cancellation_kind: cancellation_kind_to_proto(value.cancellation_kind) as i32,
         work_policy_rule_id: value.work_policy_rule_id.clone(),
+        work_policy_rule_fingerprint: value
+            .work_policy_rule_fingerprint
+            .as_deref()
+            .map(|fingerprint| {
+                digest_from_hex(fingerprint, "queue_canceled.work_policy_rule_fingerprint")
+            })
+            .transpose()?,
     }))
 }
 
@@ -330,7 +349,18 @@ pub(crate) fn decode_queue_canceled(bytes: &[u8]) -> Result<model::QueueCanceled
         bail!("queue_canceled.canceled_by and reason must not be empty");
     }
     let cancellation_kind = cancellation_kind_from_proto(value.cancellation_kind)?;
-    validate_cancellation_kind(cancellation_kind, &value.work_policy_rule_id)?;
+    let work_policy_rule_fingerprint = value
+        .work_policy_rule_fingerprint
+        .as_ref()
+        .map(|fingerprint| {
+            digest_to_hex(fingerprint, "queue_canceled.work_policy_rule_fingerprint")
+        })
+        .transpose()?;
+    validate_cancellation_kind(
+        cancellation_kind,
+        &value.work_policy_rule_id,
+        &work_policy_rule_fingerprint,
+    )?;
     Ok(model::QueueCanceled {
         schema_version: value.record_version,
         action_id: action_id_to_hex(
@@ -358,6 +388,7 @@ pub(crate) fn decode_queue_canceled(bytes: &[u8]) -> Result<model::QueueCanceled
         reason: value.reason,
         cancellation_kind,
         work_policy_rule_id: value.work_policy_rule_id,
+        work_policy_rule_fingerprint,
     })
 }
 
@@ -465,6 +496,7 @@ mod tests {
             reason: "dependency failed".to_string(),
             cancellation_kind: model::QueueCancellationKind::Dependency,
             work_policy_rule_id: None,
+            work_policy_rule_fingerprint: None,
         };
         assert_eq!(
             decode_queue_canceled(&encode_queue_canceled(&canceled).unwrap())
@@ -487,5 +519,36 @@ mod tests {
             ..Default::default()
         };
         assert!(decode_queue_item(&wrong_version.encode_to_vec()).is_err());
+    }
+
+    #[test]
+    fn work_policy_cancellation_requires_a_valid_rule_fingerprint() {
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut canceled = model::QueueCanceled {
+            schema_version: QUEUE_RECORD_VERSION,
+            action_id: hex::encode([0x22; 32]),
+            enqueued_utc: now,
+            canceled_utc: now,
+            canceled_by: "campaign-work-policy".to_string(),
+            canceled_due_to_action_id: hex::encode([0x33; 32]),
+            root_failed_action_id: hex::encode([0x22; 32]),
+            action: action(),
+            reason: "reviewed exclusion".to_string(),
+            cancellation_kind: model::QueueCancellationKind::WorkPolicyExcluded,
+            work_policy_rule_id: Some("rule-1".to_string()),
+            work_policy_rule_fingerprint: None,
+        };
+        assert!(encode_queue_canceled(&canceled).is_err());
+        canceled.work_policy_rule_fingerprint = Some("not-a-digest".to_string());
+        assert!(encode_queue_canceled(&canceled).is_err());
+        canceled.work_policy_rule_fingerprint = Some(hex::encode([0x44; 32]));
+        let decoded = decode_queue_canceled(
+            &encode_queue_canceled(&canceled).expect("encode complete policy evidence"),
+        )
+        .expect("decode complete policy evidence");
+        assert_eq!(
+            decoded.work_policy_rule_fingerprint,
+            canceled.work_policy_rule_fingerprint
+        );
     }
 }

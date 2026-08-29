@@ -14,9 +14,10 @@ plans/reconciles roots, drains workers, rebuilds datasets, finalizes the declare
 completion contract, writes deterministic findings, verifies a protobuf
 publication snapshot, verifies the static site, and only then promotes the
 site. A completed dataset-index checkpoint is reused on retry only when its
-fingerprint still matches the exact current provenance inputs; the remaining
-content-producing stages preserve or derive stable timestamps when their inputs
-are unchanged.
+fingerprints still match the exact current provenance inputs and web-index
+output bytes. Rebuilt Sled indexes are flushed before checkpoint success. The
+remaining content-producing stages preserve or derive stable timestamps when
+their inputs are unchanged.
 
 The initial host is deliberately filesystem/object-layout neutral. `PUBLIC`
 contains immutable `sites/<site-id>/` trees, immutable

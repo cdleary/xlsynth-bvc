@@ -898,6 +898,7 @@ pub(crate) fn write_canceled_record(
         reason: reason.to_string(),
         cancellation_kind: QueueCancellationKind::Dependency,
         work_policy_rule_id: None,
+        work_policy_rule_fingerprint: None,
     };
     let canceled_path = store.canceled_queue_path(action_id);
     if let Some(parent) = canceled_path.parent() {
@@ -915,6 +916,7 @@ pub(crate) fn write_work_policy_excluded_record(
     action: ActionSpec,
     rule_id: &str,
     reason: &str,
+    rule_fingerprint: &str,
 ) -> Result<bool> {
     if store.action_exists(action_id)
         || store.running_queue_path(action_id).exists()
@@ -927,7 +929,16 @@ pub(crate) fn write_work_policy_excluded_record(
         if existing.cancellation_kind == QueueCancellationKind::Dependency {
             return Ok(false);
         }
-        if existing.work_policy_rule_id.as_deref() == Some(rule_id) {
+        let existing_action_matches = crate::executor::compute_action_id(&existing.action)
+            .is_ok_and(|existing_action_id| existing_action_id == action_id);
+        if existing.work_policy_rule_id.as_deref() == Some(rule_id)
+            && existing.work_policy_rule_fingerprint.as_deref() == Some(rule_fingerprint)
+            && existing.canceled_due_to_action_id == source_action_id
+            && existing.root_failed_action_id == action_id
+            && existing.canceled_by == "campaign-work-policy"
+            && existing.reason == reason
+            && existing_action_matches
+        {
             remove_file_if_exists(&store.pending_queue_path(action_id))?;
             store.delete_failed_action_record(action_id)?;
             return Ok(true);
@@ -950,6 +961,7 @@ pub(crate) fn write_work_policy_excluded_record(
         reason: reason.to_string(),
         cancellation_kind: QueueCancellationKind::WorkPolicyExcluded,
         work_policy_rule_id: Some(rule_id.to_string()),
+        work_policy_rule_fingerprint: Some(rule_fingerprint.to_string()),
     };
     let canceled_path = store.canceled_queue_path(action_id);
     if let Some(parent) = canceled_path.parent() {

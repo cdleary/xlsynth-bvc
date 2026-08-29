@@ -63,6 +63,7 @@ message QueueCanceledRecord {
   string reason = 9;
   QueueCancellationKind cancellation_kind = 10;
   optional string work_policy_rule_id = 11;
+  optional Sha256Digest work_policy_rule_fingerprint = 12;
 }
 
 message QueueRecord {

@@ -39,6 +39,7 @@ const CAMPAIGN_RUN_IDENTITY_VERSION: u32 = 1;
 const CAMPAIGN_RUN_RECORD_VERSION: u32 = 1;
 const CAMPAIGN_ID_DOMAIN: &[u8] = b"xlsynth-bvc/campaign/v1\0";
 const CAMPAIGN_RUN_ID_DOMAIN: &[u8] = b"xlsynth-bvc/campaign-run/v1\0";
+const WORK_POLICY_RULE_FINGERPRINT_DOMAIN: &[u8] = b"xlsynth-bvc/work-policy-rule/v1\0";
 pub(crate) const CAMPAIGN_RUN_MANIFEST_FILENAME: &str = "run-manifest.pb";
 pub(crate) const CAMPAIGN_ANALYSIS_FILENAME: &str = "analysis.pb";
 static MANIFEST_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -234,6 +235,39 @@ pub(crate) fn matching_work_policy_exclusion<'a>(
     Ok(None)
 }
 
+pub(crate) fn work_policy_rule_fingerprint(rule: &pb::CampaignWorkRule) -> Result<String> {
+    let mut normalized = rule.clone();
+    validate_nonempty(&normalized.rule_id, "campaign work rule rule_id")?;
+    validate_nonempty(&normalized.top_name, "campaign work rule top_name")?;
+    validate_nonempty(&normalized.reason, "campaign work rule reason")?;
+    if pb::CampaignWorkDecision::try_from(normalized.decision)
+        .context("campaign work rule decision is unknown")?
+        != pb::CampaignWorkDecision::Exclude
+    {
+        bail!("campaign work rule fingerprint requires an exclusion decision");
+    }
+    if normalized.action_kinds.is_empty() {
+        bail!("campaign work rule action_kinds must not be empty");
+    }
+    normalized.action_kinds.sort_unstable();
+    let mut previous = None;
+    for raw in &normalized.action_kinds {
+        let kind = pb::CampaignActionKind::try_from(*raw)
+            .context("campaign work rule action kind is unknown")?;
+        if kind == pb::CampaignActionKind::Unspecified || previous == Some(*raw) {
+            bail!("campaign work rule fingerprint requires unique concrete action kinds");
+        }
+        previous = Some(*raw);
+    }
+    digest_hex(
+        &domain_hash(
+            WORK_POLICY_RULE_FINGERPRINT_DOMAIN,
+            &normalized.encode_to_vec(),
+        ),
+        "campaign work rule fingerprint",
+    )
+}
+
 fn current_work_policy_exclusion<'a>(
     canceled: &QueueCanceled,
     work_policy: &'a pb::CampaignWorkPolicy,
@@ -241,9 +275,18 @@ fn current_work_policy_exclusion<'a>(
     if canceled.cancellation_kind != QueueCancellationKind::WorkPolicyExcluded {
         return Ok(None);
     }
-    let matching = matching_work_policy_exclusion(&canceled.action, work_policy)?;
-    Ok(matching
-        .filter(|rule| canceled.work_policy_rule_id.as_deref() == Some(rule.rule_id.as_str())))
+    let Some(rule) = matching_work_policy_exclusion(&canceled.action, work_policy)? else {
+        return Ok(None);
+    };
+    let fingerprint = work_policy_rule_fingerprint(rule)?;
+    if canceled.work_policy_rule_id.as_deref() == Some(rule.rule_id.as_str())
+        && canceled.work_policy_rule_fingerprint.as_deref() == Some(fingerprint.as_str())
+        && canceled.reason == rule.reason
+    {
+        Ok(Some(rule))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) fn compute_campaign_id(campaign: &pb::CampaignSpec) -> Result<pb::Sha256Digest> {
@@ -825,7 +868,7 @@ fn evaluate_completion(
                             "intentionally_skipped_sample.action_id",
                         )?),
                         rule_id: rule.rule_id.clone(),
-                        reason: error,
+                        reason: rule.reason.clone(),
                     });
                 } else if canceled.as_ref().is_some_and(|record| {
                     record.cancellation_kind == QueueCancellationKind::WorkPolicyExcluded
@@ -1200,6 +1243,7 @@ mod tests {
         let action_id = compute_model_action_id_v2(&action)
             .expect("action id")
             .to_hex();
+        let rule_fingerprint = work_policy_rule_fingerprint(rule).expect("rule fingerprint");
         let now = Utc::now();
         let mut canceled = QueueCanceled {
             schema_version: crate::ACTION_SCHEMA_VERSION,
@@ -1213,6 +1257,7 @@ mod tests {
             reason: rule.reason.clone(),
             cancellation_kind: QueueCancellationKind::WorkPolicyExcluded,
             work_policy_rule_id: Some(rule.rule_id.clone()),
+            work_policy_rule_fingerprint: Some(rule_fingerprint),
         };
 
         assert_eq!(
@@ -1225,6 +1270,23 @@ mod tests {
             current_work_policy_exclusion(&canceled, &pb::CampaignWorkPolicy::default())
                 .expect("removed policy")
                 .is_none()
+        );
+        let mut changed_policy = policy.clone();
+        changed_policy.rules[0].reason = "updated reviewed reason".to_string();
+        assert!(
+            current_work_policy_exclusion(&canceled, &changed_policy)
+                .expect("changed policy")
+                .is_none()
+        );
+        canceled.reason = changed_policy.rules[0].reason.clone();
+        canceled.work_policy_rule_fingerprint = Some(
+            work_policy_rule_fingerprint(&changed_policy.rules[0])
+                .expect("changed rule fingerprint"),
+        );
+        assert!(
+            current_work_policy_exclusion(&canceled, &changed_policy)
+                .expect("refreshed policy evidence")
+                .is_some()
         );
         canceled.work_policy_rule_id = Some("obsolete-rule".to_string());
         assert!(

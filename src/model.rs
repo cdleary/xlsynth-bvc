@@ -298,6 +298,7 @@ pub(crate) struct QueueCanceled {
     pub(crate) reason: String,
     pub(crate) cancellation_kind: QueueCancellationKind,
     pub(crate) work_policy_rule_id: Option<String>,
+    pub(crate) work_policy_rule_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
