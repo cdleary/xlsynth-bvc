@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result, anyhow, bail};
+use fs2::FileExt;
 use log::{info, warn};
 use prost::Message;
 use serde::Serialize;
@@ -9,7 +10,7 @@ use sled::transaction::{
     ConflictableTransactionError, ConflictableTransactionResult, Transactional,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Cursor;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -85,11 +86,33 @@ fn shard_dir(base: &Path, key: &str) -> PathBuf {
 const STORE_FORMAT_VERSION: u32 = 1;
 const STORE_FORMAT_NAME: &str = "xlsynth-bvc-protobuf-store";
 const STORE_FORMAT_MARKER: &str = "store-format.pb";
+const STORE_FORMAT_INIT_LOCK: &str = ".store-format-init.lock";
+const STORE_FORMAT_MARKER_STAGING: &str = ".store-format.pb.staging";
 
 fn ensure_store_format_marker(store_root: &Path) -> Result<()> {
     fs::create_dir_all(store_root)
         .with_context(|| format!("creating store root: {}", store_root.display()))?;
+    let init_lock_path = store_root.join(STORE_FORMAT_INIT_LOCK);
+    let init_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&init_lock_path)
+        .with_context(|| {
+            format!(
+                "opening store format initialization lock: {}",
+                init_lock_path.display()
+            )
+        })?;
+    init_lock.lock_exclusive().with_context(|| {
+        format!(
+            "locking store format initialization: {}",
+            init_lock_path.display()
+        )
+    })?;
+
     let marker_path = store_root.join(STORE_FORMAT_MARKER);
+    let staging_path = store_root.join(STORE_FORMAT_MARKER_STAGING);
     let descriptor_sha256 = Sha256::digest(FILE_DESCRIPTOR_SET).to_vec();
     if marker_path.exists() {
         let bytes = fs::read(&marker_path)
@@ -116,17 +139,43 @@ fn ensure_store_format_marker(store_root: &Path) -> Result<()> {
                 marker_path.display()
             );
         }
+        if staging_path.exists() {
+            fs::remove_file(&staging_path).with_context(|| {
+                format!(
+                    "removing abandoned store format staging file: {}",
+                    staging_path.display()
+                )
+            })?;
+        }
         return Ok(());
     }
-    let mut entries = fs::read_dir(store_root)
-        .with_context(|| format!("listing unmarked store root: {}", store_root.display()))?;
-    if let Some(entry) = entries.next() {
+    if staging_path.exists() {
+        fs::remove_file(&staging_path).with_context(|| {
+            format!(
+                "removing abandoned store format staging file: {}",
+                staging_path.display()
+            )
+        })?;
+    }
+    let mut foreign_entry = None;
+    for entry in fs::read_dir(store_root)
+        .with_context(|| format!("listing unmarked store root: {}", store_root.display()))?
+    {
         let entry = entry
             .with_context(|| format!("reading unmarked store entry in {}", store_root.display()))?;
+        if entry.file_name() == STORE_FORMAT_INIT_LOCK
+            || entry.file_name() == STORE_FORMAT_MARKER_STAGING
+        {
+            continue;
+        }
+        foreign_entry = Some(entry.path());
+        break;
+    }
+    if let Some(path) = foreign_entry {
         bail!(
             "refusing to initialize protobuf format marker in nonempty store {}; found {}; use a fresh empty store because legacy migration is intentionally unsupported",
             store_root.display(),
-            entry.path().display()
+            path.display()
         );
     }
     let marker = pb::StoreFormat {
@@ -136,8 +185,20 @@ fn ensure_store_format_marker(store_root: &Path) -> Result<()> {
             value: descriptor_sha256,
         }),
     };
-    fs::write(&marker_path, marker.encode_to_vec())
-        .with_context(|| format!("writing store format marker: {}", marker_path.display()))
+    fs::write(&staging_path, marker.encode_to_vec()).with_context(|| {
+        format!(
+            "writing staged store format marker: {}",
+            staging_path.display()
+        )
+    })?;
+    fs::rename(&staging_path, &marker_path).with_context(|| {
+        format!(
+            "promoting staged store format marker: {} -> {}",
+            staging_path.display(),
+            marker_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn promote_staging_action_dir_fs(staging_dir: &Path, final_dir: &Path) -> Result<()> {
@@ -3030,6 +3091,55 @@ mod tests {
                 .contains("legacy migration is intentionally unsupported")
         );
         assert!(!root.join(STORE_FORMAT_MARKER).exists());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn abandoned_store_format_staging_is_recovered_on_retry() {
+        let root = make_test_root("xlsynth-bvc-store-format-staging-retry");
+        std::fs::create_dir_all(&root).expect("create test root");
+        std::fs::write(root.join(STORE_FORMAT_MARKER_STAGING), b"truncated")
+            .expect("write abandoned staging");
+
+        ensure_store_format_marker(&root).expect("recover store marker initialization");
+        assert!(root.join(STORE_FORMAT_MARKER).is_file());
+        assert!(!root.join(STORE_FORMAT_MARKER_STAGING).exists());
+        ensure_store_format_marker(&root).expect("marker retry is idempotent");
+
+        let marker = pb::StoreFormat::decode(
+            std::fs::read(root.join(STORE_FORMAT_MARKER))
+                .expect("read marker")
+                .as_slice(),
+        )
+        .expect("decode marker");
+        assert_eq!(marker.format_version, STORE_FORMAT_VERSION);
+        assert_eq!(marker.format_name, STORE_FORMAT_NAME);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn concurrent_store_format_initialization_is_serialized() {
+        let root = make_test_root("xlsynth-bvc-store-format-concurrent");
+        let barrier = Arc::new(Barrier::new(8));
+        let threads = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_store_format_marker(&root)
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread
+                .join()
+                .expect("initializer thread")
+                .expect("initializer result");
+        }
+        assert!(root.join(STORE_FORMAT_MARKER).is_file());
+        assert!(!root.join(STORE_FORMAT_MARKER_STAGING).exists());
+        ensure_store_format_marker(&root).expect("marker remains reusable");
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 

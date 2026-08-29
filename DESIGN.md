@@ -43,6 +43,13 @@ restarted container can be rerun: advisory locks are released by process exit,
 stale application-owned staging is recoverable, and persisted checkpoints and
 content identities make normal retries idempotent.
 
+Fresh-store bootstrap follows the same process-restart contract. Initialization
+serializes through an advisory lock and promotes a fully encoded format marker
+from application-owned staging, so an interrupted initializer leaves the final
+marker absent rather than truncated and a retry can discard the staging file.
+This atomic replacement is not an `fsync` protocol and does not expand the
+host/storage durability claim below.
+
 The system does not claim end-to-end transactional durability across sudden
 host power loss, kernel failure, filesystem corruption, storage rollback, or
 persistence reordering between sled and separate filesystem objects. Atomic
