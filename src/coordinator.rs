@@ -20,7 +20,8 @@ use crate::proto::{encode_provenance, timestamp_from_proto, timestamp_to_proto};
 use crate::publish::{publish_static_site, verify_published_site};
 use crate::query::rebuild_web_indices;
 use crate::service::{
-    check_ir_fn_corpus_structural_freshness, populate_ir_fn_corpus_structural_index,
+    check_ir_fn_corpus_structural_freshness, default_worker_id,
+    populate_ir_fn_corpus_structural_index,
 };
 use crate::site::{BuildStaticSiteOptions, build_static_site, verify_static_site};
 use crate::snapshot::{BuildStaticSnapshotOptions, build_static_snapshot, verify_static_snapshot};
@@ -380,6 +381,10 @@ fn ensure_structural_index_current(
     ))
 }
 
+fn coordinator_worker_id_prefix(run_id: &str) -> String {
+    format!("{}:campaign:{}", default_worker_id(), &run_id[..12])
+}
+
 pub(crate) fn coordinate_release(
     store: ArtifactStore,
     repo_root: &Path,
@@ -425,7 +430,7 @@ pub(crate) fn coordinate_release(
     )?;
 
     let store = Arc::new(store);
-    let worker_id = format!("campaign:{}", &plan.run_id[..12]);
+    let worker_id = coordinator_worker_id_prefix(&plan.run_id);
     let workers = stage(
         &mut state,
         &path,
@@ -673,6 +678,16 @@ mod tests {
         CoordinatorLock::acquire(&store).expect("lock after drop");
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn coordinator_worker_prefix_retains_host_and_process_identity() {
+        let run_id = "a".repeat(64);
+        let prefix = coordinator_worker_id_prefix(&run_id);
+        assert_eq!(
+            prefix,
+            format!("{}:campaign:{}", default_worker_id(), &run_id[..12])
+        );
     }
 
     #[test]

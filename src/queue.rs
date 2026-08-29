@@ -2009,6 +2009,35 @@ mod tests {
     }
 
     #[test]
+    fn reclaims_unexpired_lease_from_dead_local_coordinator_process() {
+        let (store, root) = make_test_store();
+        let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+            version: "v0.37.0".to_string(),
+            discovery_runtime: None,
+        };
+        let action_id = enqueue_action(&store, action).expect("enqueue action");
+        let local_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
+        let dead_pid = u32::MAX;
+        assert!(!Path::new("/proc").join(dead_pid.to_string()).exists());
+        let owner = format!("{local_host}:{dead_pid}:campaign:test-run:runner-0");
+        let claimed = claim_next_pending_item(&store, &owner, 900)
+            .expect("claim pending action")
+            .expect("action should be claimed");
+        assert!(claimed.running.lease_expires_utc > Utc::now());
+        assert!(store.running_queue_path(&action_id).exists());
+
+        assert_eq!(
+            reclaim_expired_running_leases(&store).expect("reclaim dead coordinator lease"),
+            1
+        );
+        assert!(!store.running_queue_path(&action_id).exists());
+        assert!(store.pending_queue_path(&action_id).exists());
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
     fn running_owner_process_missing_on_local_host_false_for_other_host() {
         let local_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
         let owner = "other-host:999999:web-runner-0";
