@@ -22,13 +22,18 @@ use crate::store::ArtifactStore;
 use crate::view::StdlibTrendKind;
 use crate::{
     WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
-    WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+    WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME, WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY,
+    WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE, WEB_STDLIB_FN_TIMELINE_INDEX_FILENAME,
+    WEB_STDLIB_FNS_TREND_G8R_FRAIG_FALSE_INDEX_FILENAME,
+    WEB_STDLIB_FNS_TREND_YOSYS_ABC_INDEX_FILENAME,
+    WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
+    WEB_STDLIB_G8R_VS_YOSYS_FRAIG_TRUE_INDEX_FILENAME, WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
 };
 use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
-pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 2;
+pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 3;
 pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.pb";
 pub(crate) const STATIC_SNAPSHOT_WEB_INDEX_DIR: &str = "web_index";
 
@@ -158,8 +163,43 @@ fn index_key_to_relpath(index_key: &str) -> Result<PathBuf> {
     Ok(rel)
 }
 
+fn is_public_structural_group_index_key(index_key: &str) -> bool {
+    let Some(suffix) = index_key
+        .strip_prefix(WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE)
+        .and_then(|suffix| suffix.strip_prefix("/by-hash/"))
+    else {
+        return false;
+    };
+    let mut parts = suffix.split('/');
+    let (Some(first_shard), Some(second_shard), Some(filename), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let Some(hash) = filename.strip_suffix(".json") else {
+        return false;
+    };
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && first_shard == &hash[0..2]
+        && second_shard == &hash[2..4]
+}
+
 fn should_include_snapshot_index_key(index_key: &str) -> bool {
-    !index_key.contains("/incremental-delta/") && index_key != "stdlib-file-action-graph.v1.json"
+    matches!(
+        index_key,
+        WEB_VERSIONS_SUMMARY_INDEX_FILENAME
+            | WEB_STDLIB_FNS_TREND_G8R_FRAIG_FALSE_INDEX_FILENAME
+            | WEB_STDLIB_FNS_TREND_YOSYS_ABC_INDEX_FILENAME
+            | WEB_STDLIB_FN_TIMELINE_INDEX_FILENAME
+            | WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME
+            | WEB_STDLIB_G8R_VS_YOSYS_FRAIG_TRUE_INDEX_FILENAME
+            | WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
+            | WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
+            | WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY
+    ) || is_public_structural_group_index_key(index_key)
 }
 
 fn should_copy_snapshot_store_index(index_key: &str, direct_heavy_indices_written: bool) -> bool {
@@ -1289,6 +1329,82 @@ mod tests {
                 .exists(),
             "file action graph should be omitted from snapshot"
         );
+    }
+
+    #[test]
+    fn public_snapshot_index_allowlist_is_fail_closed() {
+        assert!(should_include_snapshot_index_key(
+            WEB_VERSIONS_SUMMARY_INDEX_FILENAME
+        ));
+        assert!(should_include_snapshot_index_key(
+            WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
+        ));
+        assert!(should_include_snapshot_index_key(
+            WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY
+        ));
+        let hash = "ab".repeat(32);
+        let group_key = format!(
+            "{WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE}/by-hash/{}/{}/{hash}.json",
+            &hash[0..2],
+            &hash[2..4]
+        );
+        assert!(should_include_snapshot_index_key(&group_key));
+
+        assert!(!should_include_snapshot_index_key(
+            "internal-build-metadata.v1.json"
+        ));
+        assert!(!should_include_snapshot_index_key(
+            "stdlib-file-action-graph.v1.json"
+        ));
+        assert!(!should_include_snapshot_index_key(
+            "ir-fn-corpus-g8r-vs-yosys-abc.v3.json/incremental-delta/row.json"
+        ));
+        assert!(!should_include_snapshot_index_key(&format!(
+            "{WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE}/by-hash/ff/ff/{hash}.json"
+        )));
+    }
+
+    #[test]
+    fn static_snapshot_excludes_unknown_private_index_and_host_path() {
+        let root = make_temp_dir("private-index");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("ensure layout");
+        store
+            .write_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME, br#"{"cards":[]}"#)
+            .expect("write public web index");
+        let private_key = "internal-build-metadata.v1.json";
+        let private_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "store_root": root.display().to_string()
+        }))
+        .expect("private JSON");
+        store
+            .write_web_index_bytes(private_key, &private_bytes)
+            .expect("write private web index");
+
+        let out_dir = root.join("snapshot-out");
+        let summary = build_static_snapshot(
+            &store,
+            &root,
+            &BuildStaticSnapshotOptions {
+                out_dir: out_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build public snapshot");
+        assert_eq!(summary.dataset_file_count, 1);
+        assert!(!out_dir.join("web_index").join(private_key).exists());
+
+        let private_path = root.display().to_string();
+        for entry in WalkDir::new(&out_dir) {
+            let entry = entry.expect("walk snapshot");
+            if entry.file_type().is_file()
+                && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            {
+                let text = fs::read_to_string(entry.path()).expect("read public JSON");
+                assert!(!text.contains(&private_path));
+            }
+        }
     }
 
     #[test]

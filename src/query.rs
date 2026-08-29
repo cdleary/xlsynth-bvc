@@ -9664,10 +9664,6 @@ fn only(z: bits[1] id=1) -> bits[1] {
         let manifest = IrFnCorpusStructuralManifest {
             schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
             generated_utc: Utc::now(),
-            store_root: root.display().to_string(),
-            output_dir: ir_fn_corpus_structural_index_location(
-                &ir_fn_corpus_structural_index_prefix(),
-            ),
             recompute_missing_hashes: false,
             total_actions_scanned: 1,
             total_driver_ir_to_opt_actions: 1,
@@ -9796,10 +9792,6 @@ fn only(z: bits[1] id=1) -> bits[1] {
         let manifest = IrFnCorpusStructuralManifest {
             schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
             generated_utc: Utc::now(),
-            store_root: root.display().to_string(),
-            output_dir: ir_fn_corpus_structural_index_location(
-                &ir_fn_corpus_structural_index_prefix(),
-            ),
             recompute_missing_hashes: false,
             total_actions_scanned: 1,
             total_driver_ir_to_opt_actions: 1,

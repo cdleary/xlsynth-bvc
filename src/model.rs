@@ -572,8 +572,6 @@ pub(crate) struct StructuralHashCoverageRecord {
 pub(crate) struct IrFnCorpusStructuralManifest {
     pub(crate) schema_version: u32,
     pub(crate) generated_utc: DateTime<Utc>,
-    pub(crate) store_root: String,
-    pub(crate) output_dir: String,
     pub(crate) recompute_missing_hashes: bool,
     pub(crate) total_actions_scanned: usize,
     pub(crate) total_driver_ir_to_opt_actions: usize,

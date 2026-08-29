@@ -694,8 +694,6 @@ pub(crate) fn populate_ir_fn_corpus_structural_index(
     let manifest = IrFnCorpusStructuralManifest {
         schema_version: IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
         generated_utc,
-        store_root: store.root.display().to_string(),
-        output_dir: ir_fn_corpus_structural_index_location(&index_prefix),
         recompute_missing_hashes,
         total_actions_scanned,
         total_driver_ir_to_opt_actions,
@@ -1372,10 +1370,6 @@ mod tests {
         let manifest = IrFnCorpusStructuralManifest {
             schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
             generated_utc: created + chrono::Duration::seconds(1),
-            store_root: store.root.display().to_string(),
-            output_dir: ir_fn_corpus_structural_index_location(
-                &ir_fn_corpus_structural_index_prefix(),
-            ),
             recompute_missing_hashes: false,
             total_actions_scanned: provenances.len(),
             total_driver_ir_to_opt_actions: 1,
@@ -1395,10 +1389,15 @@ mod tests {
             source_action_set_sha256: Some(source_hash),
             groups: Vec::new(),
         };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("serialize manifest");
+        let manifest_text = std::str::from_utf8(&manifest_bytes).expect("manifest UTF-8");
+        assert!(!manifest_text.contains("store_root"));
+        assert!(!manifest_text.contains("output_dir"));
+        assert!(!manifest_text.contains(&root.display().to_string()));
         store
             .write_web_index_bytes(
                 ir_fn_corpus_structural_manifest_index_key(),
-                &serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+                &manifest_bytes,
             )
             .expect("write manifest");
         let summary =
