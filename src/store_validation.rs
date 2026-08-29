@@ -193,9 +193,11 @@ pub(crate) fn validate_store(
     let mut verified_payload_bytes = 0_u64;
     if verify_payloads {
         for provenance in &provenances {
-            let action_dir = store.materialize_action_dir(&provenance.action_id)?;
+            let payload_dir = store
+                .materialize_action_dir(&provenance.action_id)?
+                .join("payload");
             for output in &provenance.output_files {
-                let path = action_dir.join(&output.path);
+                let path = payload_dir.join(&output.path);
                 let bytes = fs::read(&path).with_context(|| {
                     format!(
                         "reading declared output action_id={} path={}",
@@ -347,6 +349,62 @@ mod tests {
         fs::write(&analysis_path, b"not protobuf").expect("write corrupt analysis");
         let error = validate_store(&store, false).expect_err("corrupt analysis must fail");
         assert!(error.to_string().contains("validating campaign analysis"));
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn payload_verification_resolves_output_files_below_payload_root() {
+        use crate::executor::compute_action_id;
+        use crate::model::{ActionSpec, ArtifactRef, ArtifactType, OutputFile, Provenance};
+
+        let root = temp_path();
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "1".repeat(64),
+            top_fn_name: None,
+        };
+        let action_id = compute_action_id(&action).expect("action id");
+        let staging_dir = store.staging_dir().join(format!("{action_id}-stage"));
+        let payload_dir = staging_dir.join("payload");
+        fs::create_dir_all(&payload_dir).expect("payload directory");
+        let payload =
+            b"package test\n\nfn test() -> bits[1] { ret one: bits[1] = literal(value=1) }\n";
+        fs::write(payload_dir.join("input.ir"), payload).expect("payload file");
+        let provenance = Provenance {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id: action_id.clone(),
+            created_utc: Utc::now(),
+            action,
+            dependencies: Vec::new(),
+            output_artifact: ArtifactRef {
+                action_id: action_id.clone(),
+                artifact_type: ArtifactType::IrPackageFile,
+                relpath: "payload/input.ir".to_string(),
+            },
+            output_files: vec![OutputFile {
+                path: "input.ir".to_string(),
+                bytes: payload.len() as u64,
+                sha256: hex::encode(Sha256::digest(payload)),
+            }],
+            commands: Vec::new(),
+            details: serde_json::json!({}),
+            suggested_next_actions: Vec::new(),
+        };
+        fs::write(
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
+        )
+        .expect("provenance file");
+        store
+            .promote_staging_action_dir(&action_id, &staging_dir)
+            .expect("promote action");
+
+        let summary = validate_store(&store, true).expect("verify payload");
+        assert_eq!(summary.verified_payload_files, 1);
+        assert_eq!(summary.verified_payload_bytes, payload.len() as u64);
+
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
     }
