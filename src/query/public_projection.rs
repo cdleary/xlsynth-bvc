@@ -210,11 +210,6 @@ fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
             if let Some(version) = &failure.dso_version {
                 validate_version("version_card.failure.dso_version", version)?;
             }
-            validate_safe_public_text(
-                "version_card.failure.subject",
-                &failure.subject,
-                MAX_PUBLIC_LABEL_BYTES,
-            )?;
             let counts = observed_by_kind
                 .entry(failure.action_kind.as_str())
                 .or_default();

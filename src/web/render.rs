@@ -5531,7 +5531,7 @@ pub(super) fn render_versions_html(
                 "<details><summary>Failed actions ({})</summary>\
 <table>\
   <thead>\
-    <tr><th>Action ID</th><th>Kind</th><th>DSO</th><th>Subject</th><th>When (UTC)</th><th>Failure class</th></tr>\
+    <tr><th>Action ID</th><th>Kind</th><th>DSO</th><th>When (UTC)</th><th>Failure class</th></tr>\
   </thead>\
   <tbody>",
                 card.failures.len()
@@ -5545,13 +5545,11 @@ pub(super) fn render_versions_html(
   <td><code>{}</code></td>\
   <td>{}</td>\
   <td>{}</td>\
-  <td>{}</td>\
 </tr>",
                     html_escape(&row.action_id),
                     html_escape(&row.action_id),
                     html_escape(&row.action_kind),
                     html_escape(row.dso_version.as_deref().unwrap_or("-")),
-                    html_escape(&row.subject),
                     html_escape(&row.failed_utc.to_rfc3339()),
                     row.failure_class.as_label()
                 );

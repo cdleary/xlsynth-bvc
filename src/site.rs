@@ -1369,7 +1369,7 @@ mod tests {
             .expect("known crate version");
         let dso_version = resolve_xlsynth_version_for_driver(&repo_root, &crate_version)
             .expect("resolve DSO version");
-        let action =
+        let root_action =
             canonical_root_actions_for_crate_version(&repo_root, &crate_version, &dso_version)
                 .expect("canonical roots")
                 .into_iter()
@@ -1380,19 +1380,37 @@ mod tests {
                     )
                 })
                 .expect("stdlib root action");
-        let action_id = compute_action_id(&action).expect("action id");
+        let discovery_runtime = match &root_action {
+            ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+                discovery_runtime: Some(runtime),
+                ..
+            } => runtime.clone(),
+            _ => panic!("stdlib root has discovery runtime"),
+        };
+        let root_action_id = compute_action_id(&root_action).expect("root action id");
         let private_path = root.join("private-build/worker.log").display().to_string();
         let private_token = "BVC_TEST_CREDENTIAL=do-not-publish";
+        let private_windows_path = "C:/bvc-private/worker.log";
+        let private_file_uri = "file:///srv/bvc-private/worker.log";
+        let failed_action = ActionSpec::DriverIrToOpt {
+            ir_action_id: "a".repeat(64),
+            top_fn_name: Some(format!(
+                "top={private_path}; {private_windows_path}; {private_file_uri}; {private_token}"
+            )),
+            version: dso_version.clone(),
+            runtime: discovery_runtime,
+        };
+        let failed_action_id = compute_action_id(&failed_action).expect("failed action id");
         let now = Utc::now();
         store
             .write_provenance(&Provenance {
                 schema_version: crate::ACTION_SCHEMA_VERSION,
-                action_id: action_id.clone(),
+                action_id: root_action_id.clone(),
                 created_utc: now,
-                action: action.clone(),
+                action: root_action,
                 dependencies: Vec::new(),
                 output_artifact: ArtifactRef {
-                    action_id: action_id.clone(),
+                    action_id: root_action_id,
                     artifact_type: ArtifactType::DslxFileSubtree,
                     relpath: "payload".to_string(),
                 },
@@ -1409,11 +1427,11 @@ mod tests {
         store
             .write_failed_action_record(&QueueFailed {
                 schema_version: crate::ACTION_SCHEMA_VERSION,
-                action_id: action_id.clone(),
+                action_id: failed_action_id,
                 enqueued_utc: now,
                 failed_utc: now,
                 failed_by: "test-worker".to_string(),
-                action,
+                action: failed_action,
                 error: format!("executor failed at {private_path}; {private_token}"),
             })
             .expect("write private failure");
@@ -1440,6 +1458,8 @@ mod tests {
         assert!(versions_json.contains("\"reason\":\"discovery_failed\""));
         assert!(!versions_json.contains(&private_path));
         assert!(!versions_json.contains(private_token));
+        assert!(!versions_json.contains(private_windows_path));
+        assert!(!versions_json.contains(private_file_uri));
 
         let site_dir = root.join("site");
         build_static_site(&BuildStaticSiteOptions {
@@ -1463,6 +1483,16 @@ mod tests {
             let text = fs::read_to_string(entry.path()).expect("read public text file");
             assert!(!text.contains(&private_path), "{}", entry.path().display());
             assert!(!text.contains(private_token), "{}", entry.path().display());
+            assert!(
+                !text.contains(private_windows_path),
+                "{}",
+                entry.path().display()
+            );
+            assert!(
+                !text.contains(private_file_uri),
+                "{}",
+                entry.path().display()
+            );
         }
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");

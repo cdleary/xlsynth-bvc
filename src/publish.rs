@@ -528,7 +528,7 @@ mod tests {
     }
 
     fn empty_versions_index_bytes() -> &'static [u8] {
-        br#"{"schema_version":3,"generated_utc":"2026-08-29T12:00:00Z","report":{"cards":[],"unattributed_actions":[]}}"#
+        br#"{"schema_version":4,"generated_utc":"2026-08-29T12:00:00Z","report":{"cards":[],"unattributed_actions":[]}}"#
     }
 
     #[test]

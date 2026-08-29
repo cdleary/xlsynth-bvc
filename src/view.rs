@@ -133,7 +133,6 @@ pub(crate) struct FailedActionRowView {
     pub(crate) failed_utc: DateTime<Utc>,
     pub(crate) action_kind: String,
     pub(crate) dso_version: Option<String>,
-    pub(crate) subject: String,
     pub(crate) failure_class: PublicFailureClass,
 }
 

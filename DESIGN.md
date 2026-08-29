@@ -74,17 +74,21 @@ and structurally validated content-addressed group keys may enter a snapshot.
 Adding a private index to the store does not publish it by default. Public
 schemas must not contain build-host paths such as store or work directories.
 Every allowlisted JSON key has an exact typed Rust schema at the browser
-boundary. Snapshot construction decodes that schema, rejects unknown, omitted,
-or non-canonical fields, applies dataset-specific semantic validation, and
-canonically re-encodes the value before hashing or writing it. Structural index
-files additionally require their input bytes to already be in canonical form so
-their manifest-bound content digests remain stable.
+boundary. Snapshot construction, snapshot verification, and static-site
+verification decode that schema, reject unknown, omitted, or non-canonical
+fields, apply dataset-specific semantic validation, and require the canonical
+encoding before trusting the bytes. Structural index files additionally require
+their input bytes to already be in canonical form so their manifest-bound
+content digests remain stable.
 
 Raw executor and discovery error strings are private operational data. Public
 failure and enumeration records use fixed enums and structured counters, such
 as `timeout`, `failed`, or `discovery_failed`, never truncated or redacted
-fragments of arbitrary process output. Validation errors likewise identify the
-field contract without echoing a rejected value that may contain private text.
+fragments of arbitrary process output. Public failure rows intentionally contain
+only the action ID, controlled action-kind vocabulary, validated version, time,
+and failure class; they do not synthesize a display subject from arbitrary
+action arguments. Validation errors likewise identify the field contract
+without echoing a rejected value that may contain private text.
 
 Publication metadata follows the same content-idempotence rule as publication
 identity. A snapshot's `generated_at` value is a deterministic data watermark:

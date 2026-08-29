@@ -6137,7 +6137,6 @@ pub(crate) fn build_versions_cards(
             failed_utc: failed.failed_utc,
             action_kind: kind,
             dso_version: action_dso_version(&failed.action).map(|v| v.to_string()),
-            subject: action_subject(&failed.action),
             failure_class: if is_timeout {
                 PublicFailureClass::Timeout
             } else {

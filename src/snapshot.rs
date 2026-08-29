@@ -33,7 +33,7 @@ use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
-pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 6;
+pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 7;
 pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.pb";
 pub(crate) const STATIC_SNAPSHOT_WEB_INDEX_DIR: &str = "web_index";
 
@@ -1425,7 +1425,7 @@ mod tests {
         )
         .expect("build snapshot");
 
-        let invalid_bytes = br#"{"schema_version":3}"#;
+        let invalid_bytes = br#"{"schema_version":4}"#;
         fs::write(
             snapshot_dir
                 .join(STATIC_SNAPSHOT_WEB_INDEX_DIR)
