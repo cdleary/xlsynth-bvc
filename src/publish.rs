@@ -460,6 +460,13 @@ pub(crate) fn verify_published_site(publish_root: &Path) -> Result<VerifyPublish
     let catalog_relpath = required(&pointer.catalog_relpath, "current.catalog_relpath")?
         .value
         .clone();
+    let expected_catalog_relpath = format!("catalogs/{site_id}.pb");
+    if catalog_relpath != expected_catalog_relpath {
+        bail!(
+            "current catalog path is not canonical for site id: expected {}",
+            expected_catalog_relpath
+        );
+    }
     let catalog_bytes = fs::read(publish_root.join(&catalog_relpath))
         .context("reading current published catalog")?;
     let catalog = pb::PublishedSiteCatalog::decode(catalog_bytes.as_slice())
@@ -471,9 +478,16 @@ pub(crate) fn verify_published_site(publish_root: &Path) -> Result<VerifyPublish
     let site_relpath = required(&catalog.site_relpath, "catalog.site_relpath")?
         .value
         .clone();
+    let expected_site_relpath = format!("sites/{site_id}");
+    if site_relpath != expected_site_relpath {
+        bail!(
+            "published site path is not canonical for site id: expected {}",
+            expected_site_relpath
+        );
+    }
     let site_dir = publish_root.join(&site_relpath);
     let site_summary = verify_static_site(&site_dir)?;
-    let (_, manifest_bytes, actual_site_id) = site_identity(&site_dir)?;
+    let (site_manifest, manifest_bytes, actual_site_id) = site_identity(&site_dir)?;
     if actual_site_id != *required(&catalog.site_id, "catalog.site_id")?
         || digest(&manifest_bytes)
             != *required(
@@ -482,6 +496,11 @@ pub(crate) fn verify_published_site(publish_root: &Path) -> Result<VerifyPublish
             )?
     {
         bail!("published site content does not match catalog identity");
+    }
+    if catalog.source_snapshot_id != site_manifest.source_snapshot_id
+        || catalog.base_url != site_manifest.base_url
+    {
+        bail!("published catalog metadata disagrees with site manifest");
     }
     let browser: BrowserCurrentPointer = serde_json::from_slice(
         &fs::read(publish_root.join(CURRENT_POINTER_JSON))
@@ -651,10 +670,66 @@ mod tests {
         assert!(immutable_index.contains("name=\"bvc-site-root\" content=\"./\""));
         assert!(!immutable_index.contains("/xlsynth-bvc/assets/"));
 
+        let mut mutated_catalog =
+            pb::PublishedSiteCatalog::decode(first_catalog.as_slice()).expect("decode catalog");
+        mutated_catalog.source_snapshot_id = Some(digest(b"wrong snapshot"));
+        fs::write(&catalog_path, mutated_catalog.encode_to_vec())
+            .expect("write wrong snapshot catalog");
+        let error = verify_published_site(&publish_root)
+            .expect_err("catalog snapshot metadata mismatch must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("catalog metadata disagrees with site manifest")
+        );
+
+        let mut mutated_catalog =
+            pb::PublishedSiteCatalog::decode(first_catalog.as_slice()).expect("decode catalog");
+        mutated_catalog.site_relpath = Some(pb::NormalizedRelpath {
+            value: format!("alternate/{}", first.site_id),
+        });
+        fs::write(&catalog_path, mutated_catalog.encode_to_vec())
+            .expect("write noncanonical site path catalog");
+        let error = verify_published_site(&publish_root)
+            .expect_err("noncanonical catalog site path must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("published site path is not canonical")
+        );
+        fs::write(&catalog_path, &first_catalog).expect("restore canonical catalog");
+
+        let mut mutated_pointer =
+            pb::CurrentSitePointer::decode(first_pointer.as_slice()).expect("decode pointer");
+        mutated_pointer.catalog_relpath = Some(pb::NormalizedRelpath {
+            value: "alternate/catalog.pb".to_string(),
+        });
+        fs::write(
+            publish_root.join(CURRENT_POINTER_PROTO),
+            mutated_pointer.encode_to_vec(),
+        )
+        .expect("write noncanonical catalog path pointer");
+        let error = verify_published_site(&publish_root)
+            .expect_err("noncanonical current catalog path must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("current catalog path is not canonical")
+        );
+        fs::write(publish_root.join(CURRENT_POINTER_PROTO), &first_pointer)
+            .expect("restore canonical pointer");
+
         let mut conflicting =
             pb::PublishedSiteCatalog::decode(first_catalog.as_slice()).expect("decode catalog");
         conflicting.base_url = "/conflicting/".to_string();
         fs::write(&catalog_path, conflicting.encode_to_vec()).expect("write conflicting catalog");
+        let error = verify_published_site(&publish_root)
+            .expect_err("catalog base URL metadata mismatch must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("catalog metadata disagrees with site manifest")
+        );
         let error = publish_static_site(&site_dir, &publish_root)
             .expect_err("conflicting immutable catalog must fail");
         assert!(
