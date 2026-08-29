@@ -20,6 +20,7 @@ use crate::proto::{
 };
 use crate::query::{
     canonical_root_actions_for_crate_version, enqueue_processing_for_crate_version,
+    load_stdlib_g8r_vs_yosys_dataset_index, load_versions_cards_index,
 };
 use crate::queue::{QueueState, queue_state_for_action};
 use crate::runtime::explicit_driver_runtime_for_crate_version;
@@ -550,56 +551,50 @@ fn write_manifest(store: &ArtifactStore, manifest: &pb::CampaignRunManifest) -> 
     Ok(path)
 }
 
-fn json_contains_any_version(bytes: &[u8], versions: &[&str]) -> Result<bool> {
-    fn contains(value: &serde_json::Value, versions: &[&str]) -> bool {
-        match value {
-            serde_json::Value::String(value) => versions.iter().any(|version| value == version),
-            serde_json::Value::Array(values) => {
-                values.iter().any(|value| contains(value, versions))
-            }
-            serde_json::Value::Object(values) => {
-                values.values().any(|value| contains(value, versions))
-            }
-            _ => false,
-        }
-    }
-    let value: serde_json::Value =
-        serde_json::from_slice(bytes).context("parsing static-web JSON projection")?;
-    Ok(contains(&value, versions))
+fn canonical_version_matches(actual: &str, expected: &str) -> bool {
+    normalize_tag_version(actual) == normalize_tag_version(expected)
 }
 
-fn add_missing_dataset(
-    store: &ArtifactStore,
+fn add_missing_dataset_if(
     kind: pb::RequiredOutputKind,
     index_key: &str,
-    accepted_versions: &[&str],
+    crate_version: &str,
+    present: bool,
     missing: &mut Vec<pb::MissingOutput>,
-) -> Result<()> {
-    let Some(bytes) = store.load_web_index_bytes(index_key)? else {
-        missing.push(pb::MissingOutput {
-            kind: kind as i32,
-            action_id: None,
-            reason: format!("required dataset {index_key} is absent"),
-        });
-        return Ok(());
-    };
-    if bytes.is_empty() {
-        missing.push(pb::MissingOutput {
-            kind: kind as i32,
-            action_id: None,
-            reason: format!("required dataset {index_key} is empty"),
-        });
-    } else if !json_contains_any_version(&bytes, accepted_versions).unwrap_or(false) {
+) {
+    if !present {
         missing.push(pb::MissingOutput {
             kind: kind as i32,
             action_id: None,
             reason: format!(
-                "required dataset {index_key} does not contain campaign version {}",
-                accepted_versions[0]
+                "required dataset {index_key} does not contain crate version {crate_version}"
             ),
         });
     }
-    Ok(())
+}
+
+fn versions_summary_contains_crate(
+    report: &crate::view::VersionCardsReport,
+    version: &str,
+) -> bool {
+    report
+        .cards
+        .iter()
+        .any(|card| canonical_version_matches(&card.crate_version, version))
+}
+
+fn stdlib_dataset_contains_crate(
+    dataset: &crate::view::StdlibG8rVsYosysDataset,
+    version: &str,
+) -> bool {
+    dataset
+        .available_crate_versions
+        .iter()
+        .any(|candidate| canonical_version_matches(candidate, version))
+        || dataset
+            .samples
+            .iter()
+            .any(|sample| canonical_version_matches(&sample.crate_version, version))
 }
 
 fn failure_error(store: &ArtifactStore, action_id: &str) -> Result<String> {
@@ -708,33 +703,35 @@ fn evaluate_completion(
     }
 
     let crate_version = &required(&manifest.crate_version, "campaign_run.crate_version")?.value;
-    let dso_version = &required(&manifest.dso_version, "campaign_run.dso_version")?.value;
-    let crate_with_v = format!("v{crate_version}");
-    let dso_with_v = format!("v{dso_version}");
     for raw in &campaign.required_outputs {
         match pb::RequiredOutputKind::try_from(*raw)
             .context("campaign.required_outputs contains unknown value")?
         {
             pb::RequiredOutputKind::RootArtifacts => {}
-            pb::RequiredOutputKind::VersionsSummaryDataset => add_missing_dataset(
-                store,
-                pb::RequiredOutputKind::VersionsSummaryDataset,
-                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
-                &[crate_version, crate_with_v.as_str()],
-                &mut missing_outputs,
-            )?,
-            pb::RequiredOutputKind::StdlibG8rVsYosysDataset => add_missing_dataset(
-                store,
-                pb::RequiredOutputKind::StdlibG8rVsYosysDataset,
-                WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
-                &[
+            pb::RequiredOutputKind::VersionsSummaryDataset => {
+                let present = load_versions_cards_index(store)?
+                    .as_ref()
+                    .is_some_and(|report| versions_summary_contains_crate(report, crate_version));
+                add_missing_dataset_if(
+                    pb::RequiredOutputKind::VersionsSummaryDataset,
+                    WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
                     crate_version,
-                    crate_with_v.as_str(),
-                    dso_version,
-                    dso_with_v.as_str(),
-                ],
-                &mut missing_outputs,
-            )?,
+                    present,
+                    &mut missing_outputs,
+                );
+            }
+            pb::RequiredOutputKind::StdlibG8rVsYosysDataset => {
+                let present = load_stdlib_g8r_vs_yosys_dataset_index(store, false)?
+                    .as_ref()
+                    .is_some_and(|dataset| stdlib_dataset_contains_crate(dataset, crate_version));
+                add_missing_dataset_if(
+                    pb::RequiredOutputKind::StdlibG8rVsYosysDataset,
+                    WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
+                    crate_version,
+                    present,
+                    &mut missing_outputs,
+                );
+            }
             pb::RequiredOutputKind::Unspecified => unreachable!("campaign validated"),
         }
     }
@@ -914,6 +911,10 @@ mod tests {
     use super::*;
     use crate::queue::list_queue_files;
     use crate::versioning::load_version_compat_map;
+    use crate::view::{
+        StdlibEnumerationStatusView, StdlibG8rVsYosysDataset, StdlibG8rVsYosysSample,
+        VersionCardView, VersionCardsReport,
+    };
 
     fn temp_path(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1076,5 +1077,57 @@ mod tests {
         let manifest = pb::CampaignRunManifest::default();
         let error = validate_manifest(&manifest).expect_err("invalid manifest");
         assert!(error.to_string().contains("record version"));
+    }
+
+    #[test]
+    fn completion_dataset_checks_use_exact_crate_fields() {
+        let versions = VersionCardsReport {
+            cards: vec![VersionCardView {
+                crate_version: "0.40.0".to_string(),
+                crate_release_datetime: None,
+                total_materialized: 1,
+                failed_total: 0,
+                dso_versions: vec!["0.39.0".to_string()],
+                stdlib_enumeration: StdlibEnumerationStatusView {
+                    badge_class: "ok".to_string(),
+                    badge_label: "ok".to_string(),
+                    summary: "complete".to_string(),
+                },
+                failed_by_kind: Vec::new(),
+                failures: Vec::new(),
+            }],
+            unattributed_actions: Vec::new(),
+        };
+        assert!(versions_summary_contains_crate(&versions, "v0.40.0"));
+        assert!(!versions_summary_contains_crate(&versions, "0.41.0"));
+
+        let dataset = StdlibG8rVsYosysDataset {
+            fraig: false,
+            samples: vec![StdlibG8rVsYosysSample {
+                fn_key: "foo".to_string(),
+                crate_version: "0.40.0".to_string(),
+                dso_version: "0.39.0".to_string(),
+                ir_action_id: "ir".to_string(),
+                ir_top: None,
+                structural_hash: None,
+                ir_node_count: 1,
+                g8r_nodes: 1.0,
+                g8r_levels: 1.0,
+                yosys_abc_nodes: 1.0,
+                yosys_abc_levels: 1.0,
+                g8r_product: 1.0,
+                yosys_abc_product: 1.0,
+                g8r_product_loss: 0.0,
+                g8r_stats_action_id: "g8r".to_string(),
+                yosys_abc_stats_action_id: "yosys".to_string(),
+            }],
+            min_ir_nodes: 1,
+            max_ir_nodes: 1,
+            g8r_only_count: 0,
+            yosys_only_count: 0,
+            available_crate_versions: vec!["0.40.0".to_string()],
+        };
+        assert!(stdlib_dataset_contains_crate(&dataset, "0.40.0"));
+        assert!(!stdlib_dataset_contains_crate(&dataset, "0.41.0"));
     }
 }
