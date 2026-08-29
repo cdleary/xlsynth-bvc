@@ -322,6 +322,7 @@ mod tests {
             site_dir: String::new(),
             published_site_id: None,
             indexed_source_fingerprint: None,
+            indexed_output_fingerprint: None,
         };
         let state_path = store.coordinator_dir().join("aa/bb/state.pb");
         fs::create_dir_all(state_path.parent().expect("state parent"))

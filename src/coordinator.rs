@@ -32,6 +32,7 @@ use crate::{
 
 const COORDINATOR_RECORD_VERSION: u32 = 1;
 const INDEXED_SOURCE_FINGERPRINT_DOMAIN: &[u8] = b"xlsynth-bvc/indexed-source/v1\0";
+const INDEXED_OUTPUT_FINGERPRINT_DOMAIN: &[u8] = b"xlsynth-bvc/indexed-output/v1\0";
 pub(crate) const COORDINATOR_LOCK_FILENAME: &str = "coordinator.lock";
 static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -168,6 +169,9 @@ fn validate_state(state: &pb::CoordinatorState) -> Result<()> {
     if let Some(fingerprint) = &state.indexed_source_fingerprint {
         digest_hex(fingerprint, "coordinator.indexed_source_fingerprint")?;
     }
+    if let Some(fingerprint) = &state.indexed_output_fingerprint {
+        digest_hex(fingerprint, "coordinator.indexed_output_fingerprint")?;
+    }
     Ok(())
 }
 
@@ -237,6 +241,7 @@ fn load_or_new_state(
         site_dir: String::new(),
         published_site_id: None,
         indexed_source_fingerprint: None,
+        indexed_output_fingerprint: None,
     })
 }
 
@@ -329,12 +334,31 @@ fn indexed_source_fingerprint(store: &ArtifactStore) -> Result<pb::Sha256Digest>
     })
 }
 
+fn indexed_output_fingerprint(store: &ArtifactStore) -> Result<pb::Sha256Digest> {
+    let mut entries = store.list_web_index_entries_with_prefix("")?;
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = Sha256::new();
+    hasher.update(INDEXED_OUTPUT_FINGERPRINT_DOMAIN);
+    for (index_key, bytes) in entries {
+        hasher.update((index_key.len() as u64).to_be_bytes());
+        hasher.update(index_key.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    Ok(pb::Sha256Digest {
+        value: hasher.finalize().to_vec(),
+    })
+}
+
 fn indexed_checkpoint_matches(
     state: &pb::CoordinatorState,
-    fingerprint: &pb::Sha256Digest,
+    source_fingerprint: &pb::Sha256Digest,
+    output_fingerprint: &pb::Sha256Digest,
 ) -> bool {
     stage_succeeded(state, pb::CoordinatorStage::Indexed)
-        && state.indexed_source_fingerprint.as_ref() == Some(fingerprint)
+        && state.indexed_source_fingerprint.as_ref() == Some(source_fingerprint)
+        && state.indexed_output_fingerprint.as_ref() == Some(output_fingerprint)
 }
 
 fn ensure_structural_index_current(
@@ -432,9 +456,17 @@ pub(crate) fn coordinate_release(
         &current_indexed_source_fingerprint,
         "coordinator.indexed_source_fingerprint",
     )?;
-    let indexed_already_succeeded =
-        indexed_checkpoint_matches(&state, &current_indexed_source_fingerprint);
-    stage(
+    let current_indexed_output_fingerprint = indexed_output_fingerprint(&store)?;
+    let current_indexed_output_fingerprint_hex = digest_hex(
+        &current_indexed_output_fingerprint,
+        "coordinator.indexed_output_fingerprint",
+    )?;
+    let indexed_already_succeeded = indexed_checkpoint_matches(
+        &state,
+        &current_indexed_source_fingerprint,
+        &current_indexed_output_fingerprint,
+    );
+    let verified_indexed_output_fingerprint = stage(
         &mut state,
         &path,
         pb::CoordinatorStage::Indexed,
@@ -442,9 +474,9 @@ pub(crate) fn coordinate_release(
         || {
             if indexed_already_succeeded {
                 Ok((
-                    (),
+                    current_indexed_output_fingerprint.clone(),
                     format!(
-                        "reused previously verified web/publication datasets source_fingerprint={current_indexed_source_fingerprint_hex}"
+                        "reused previously verified web/publication datasets source_fingerprint={current_indexed_source_fingerprint_hex} output_fingerprint={current_indexed_output_fingerprint_hex}"
                     ),
                 ))
             } else {
@@ -455,17 +487,28 @@ pub(crate) fn coordinate_release(
                     options.workers,
                 )?;
                 rebuild_web_indices(&store, repo_root)?;
+                store
+                    .flush_durable()
+                    .context("durably flushing rebuilt web/publication datasets")?;
+                let output_fingerprint = indexed_output_fingerprint(&store)?;
+                let output_fingerprint_hex = digest_hex(
+                    &output_fingerprint,
+                    "coordinator.indexed_output_fingerprint",
+                )?;
                 Ok((
-                    (),
+                    output_fingerprint,
                     format!(
-                        "{}; rebuilt all declared web/publication datasets",
-                        structural_index
+                        "{}; rebuilt all declared web/publication datasets source_fingerprint={} output_fingerprint={}",
+                        structural_index,
+                        current_indexed_source_fingerprint_hex,
+                        output_fingerprint_hex,
                     ),
                 ))
             }
         },
     )?;
     state.indexed_source_fingerprint = Some(current_indexed_source_fingerprint);
+    state.indexed_output_fingerprint = Some(verified_indexed_output_fingerprint);
     atomic_write_state(&path, &state)?;
 
     let finalized = stage(
@@ -650,21 +693,27 @@ mod tests {
     }
 
     #[test]
-    fn indexed_checkpoint_requires_exact_current_provenance_fingerprint() {
+    fn indexed_checkpoint_requires_exact_current_input_and_output_fingerprints() {
         let root = temp_path("indexed-source-fingerprint");
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("layout");
-        let before = indexed_source_fingerprint(&store).expect("empty fingerprint");
+        let source_before = indexed_source_fingerprint(&store).expect("empty source fingerprint");
+        let output_before = indexed_output_fingerprint(&store).expect("empty output fingerprint");
         let mut state = pb::CoordinatorState {
             stage_results: vec![pb::CoordinatorStageResult {
                 stage: pb::CoordinatorStage::Indexed as i32,
                 status: pb::CoordinatorStageStatus::Succeeded as i32,
                 ..Default::default()
             }],
-            indexed_source_fingerprint: Some(before.clone()),
+            indexed_source_fingerprint: Some(source_before.clone()),
+            indexed_output_fingerprint: Some(output_before.clone()),
             ..Default::default()
         };
-        assert!(indexed_checkpoint_matches(&state, &before));
+        assert!(indexed_checkpoint_matches(
+            &state,
+            &source_before,
+            &output_before
+        ));
 
         let action = crate::model::ActionSpec::ImportIrPackageFile {
             source_sha256: "a".repeat(64),
@@ -693,19 +742,76 @@ mod tests {
         store
             .write_provenance(&provenance)
             .expect("write newly completed action");
-        let after_action = indexed_source_fingerprint(&store).expect("updated fingerprint");
-        assert_ne!(before, after_action);
-        assert!(!indexed_checkpoint_matches(&state, &after_action));
+        let source_after_action =
+            indexed_source_fingerprint(&store).expect("updated source fingerprint");
+        assert_ne!(source_before, source_after_action);
+        assert!(!indexed_checkpoint_matches(
+            &state,
+            &source_after_action,
+            &output_before
+        ));
 
-        state.indexed_source_fingerprint = Some(after_action.clone());
-        assert!(indexed_checkpoint_matches(&state, &after_action));
+        state.indexed_source_fingerprint = Some(source_after_action.clone());
+        assert!(indexed_checkpoint_matches(
+            &state,
+            &source_after_action,
+            &output_before
+        ));
         provenance.details["source_path"] = serde_json::json!("refreshed.ir");
         store
             .write_provenance(&provenance)
             .expect("refresh provenance contents");
-        let after_refresh = indexed_source_fingerprint(&store).expect("refreshed fingerprint");
-        assert_ne!(after_action, after_refresh);
-        assert!(!indexed_checkpoint_matches(&state, &after_refresh));
+        let source_after_refresh =
+            indexed_source_fingerprint(&store).expect("refreshed source fingerprint");
+        assert_ne!(source_after_action, source_after_refresh);
+        assert!(!indexed_checkpoint_matches(
+            &state,
+            &source_after_refresh,
+            &output_before
+        ));
+
+        state.indexed_source_fingerprint = Some(source_after_refresh.clone());
+        store
+            .write_web_index_bytes("checkpoint-test.v1.json", br#"{"value":1}"#)
+            .expect("write index output");
+        let output_after_write =
+            indexed_output_fingerprint(&store).expect("written output fingerprint");
+        assert_ne!(output_before, output_after_write);
+        assert!(!indexed_checkpoint_matches(
+            &state,
+            &source_after_refresh,
+            &output_after_write
+        ));
+
+        state.indexed_output_fingerprint = Some(output_after_write.clone());
+        assert!(indexed_checkpoint_matches(
+            &state,
+            &source_after_refresh,
+            &output_after_write
+        ));
+        store
+            .write_web_index_bytes("checkpoint-test.v1.json", br#"{"value":2}"#)
+            .expect("tamper index output");
+        let output_after_tamper =
+            indexed_output_fingerprint(&store).expect("tampered output fingerprint");
+        assert_ne!(output_after_write, output_after_tamper);
+        assert!(!indexed_checkpoint_matches(
+            &state,
+            &source_after_refresh,
+            &output_after_tamper
+        ));
+
+        store
+            .delete_web_index_keys_with_prefix("checkpoint-test.v1.json")
+            .expect("delete index output");
+        let output_after_delete =
+            indexed_output_fingerprint(&store).expect("deleted output fingerprint");
+        assert_eq!(output_before, output_after_delete);
+        assert!(!indexed_checkpoint_matches(
+            &state,
+            &source_after_refresh,
+            &output_after_delete
+        ));
 
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
