@@ -126,11 +126,11 @@ pub(crate) fn run_workers(
 }
 
 fn queue_is_idle(store: &ArtifactStore) -> bool {
-    count_queue_json_files(&store.queue_pending_dir()) == 0
-        && count_queue_json_files(&store.queue_running_dir()) == 0
+    count_queue_pb_files(&store.queue_pending_dir()) == 0
+        && count_queue_pb_files(&store.queue_running_dir()) == 0
 }
 
-fn count_queue_json_files(dir: &Path) -> usize {
+fn count_queue_pb_files(dir: &Path) -> usize {
     if !dir.exists() {
         return 0;
     }
@@ -144,7 +144,7 @@ fn count_queue_json_files(dir: &Path) -> usize {
                 .path()
                 .extension()
                 .and_then(|s| s.to_str())
-                .map(|ext| ext == "json")
+                .map(|ext| ext == "pb")
                 .unwrap_or(false)
         })
         .count()
@@ -194,14 +194,14 @@ mod tests {
     }
 
     #[test]
-    fn count_queue_json_files_ignores_non_json_files() {
+    fn count_queue_pb_files_ignores_non_pb_files() {
         let (store, root) = make_test_store("queue-count");
         let queue_dir = store.queue_pending_dir();
         fs::create_dir_all(&queue_dir).expect("create queue dir");
-        fs::write(queue_dir.join("a.json"), "{}").expect("write json");
+        fs::write(queue_dir.join("a.pb"), "{}").expect("write protobuf placeholder");
         fs::write(queue_dir.join("b.bad"), "{}").expect("write bad");
         fs::write(queue_dir.join("c.tmp"), "{}").expect("write tmp");
-        assert_eq!(count_queue_json_files(&queue_dir), 1);
+        assert_eq!(count_queue_pb_files(&queue_dir), 1);
 
         fs::remove_dir_all(root).expect("cleanup temp root");
     }

@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package xlsynth.bvc.v1;
+
+import "google/protobuf/timestamp.proto";
+import "xlsynth/bvc/v1/action.proto";
+import "xlsynth/bvc/v1/common.proto";
+
+message QueuePendingRecord {
+  uint32 record_version = 1;
+  ActionId action_id = 2;
+  google.protobuf.Timestamp enqueued_at = 3;
+  int32 priority = 4;
+  ActionSpec action = 5;
+}
+
+message QueueRunningRecord {
+  uint32 record_version = 1;
+  ActionId action_id = 2;
+  google.protobuf.Timestamp enqueued_at = 3;
+  int32 priority = 4;
+  ActionSpec action = 5;
+  string lease_owner = 6;
+  google.protobuf.Timestamp lease_acquired_at = 7;
+  google.protobuf.Timestamp lease_expires_at = 8;
+}
+
+message QueueDoneRecord {
+  uint32 record_version = 1;
+  ActionId action_id = 2;
+  google.protobuf.Timestamp completed_at = 3;
+  string completed_by = 4;
+  ArtifactRef output_artifact = 5;
+}
+
+message QueueFailedRecord {
+  uint32 record_version = 1;
+  ActionId action_id = 2;
+  google.protobuf.Timestamp enqueued_at = 3;
+  google.protobuf.Timestamp failed_at = 4;
+  string failed_by = 5;
+  ActionSpec action = 6;
+  string error = 7;
+}
+
+message QueueCanceledRecord {
+  uint32 record_version = 1;
+  ActionId action_id = 2;
+  google.protobuf.Timestamp enqueued_at = 3;
+  google.protobuf.Timestamp canceled_at = 4;
+  string canceled_by = 5;
+  ActionId canceled_due_to_action_id = 6;
+  ActionId root_failed_action_id = 7;
+  ActionSpec action = 8;
+  string reason = 9;
+}
+
+message QueueRecord {
+  oneof state {
+    QueuePendingRecord pending = 10;
+    QueueRunningRecord running = 11;
+    QueueDoneRecord done = 12;
+    QueueFailedRecord failed = 13;
+    QueueCanceledRecord canceled = 14;
+  }
+}

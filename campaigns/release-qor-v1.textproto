@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+
+campaign_name: "release-qor"
+semantic_version: 1
+corpus_source: "xlsynth release stdlib plus configured module subtrees"
+root_policy: CAMPAIGN_ROOT_POLICY_RELEASE_STDLIB_AND_MODULES
+required_outputs: REQUIRED_OUTPUT_KIND_ROOT_ARTIFACTS
+required_outputs: REQUIRED_OUTPUT_KIND_VERSIONS_SUMMARY_DATASET
+required_outputs: REQUIRED_OUTPUT_KIND_STDLIB_G8R_VS_YOSYS_DATASET
+failure_policy {
+  allow_sample_action_failures: true
+  root_action_failure_is_terminal: true
+}
+analysis_algorithm_version: 1
+publication_policy_version: 1

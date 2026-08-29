@@ -3,11 +3,15 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use log::warn;
-use serde::{Deserialize, Serialize};
+use prost::Message;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use walkdir::WalkDir;
 
+use crate::analysis::decode_analysis_report;
+use crate::campaign::{campaign_analysis_path, list_finalized_campaign_runs};
 use crate::query::{
     build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_bytes,
     build_ir_fn_corpus_g8r_vs_yosys_dataset_index_bytes,
@@ -20,12 +24,15 @@ use crate::{
     WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
     WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
 };
+use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
-pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.json";
+pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
+pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 1;
+pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.pb";
 pub(crate) const STATIC_SNAPSHOT_WEB_INDEX_DIR: &str = "web_index";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct StaticSnapshotDatasetFile {
     pub(crate) index_key: String,
     pub(crate) relpath: String,
@@ -33,7 +40,7 @@ pub(crate) struct StaticSnapshotDatasetFile {
     pub(crate) sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct StaticSnapshotManifest {
     pub(crate) schema_version: u32,
     pub(crate) snapshot_id: String,
@@ -42,6 +49,8 @@ pub(crate) struct StaticSnapshotManifest {
     pub(crate) source_action_set_sha256: Option<String>,
     pub(crate) dataset_files: Vec<StaticSnapshotDatasetFile>,
     pub(crate) total_dataset_bytes: u64,
+    pub(crate) campaign_ids: Vec<String>,
+    pub(crate) run_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,6 +62,7 @@ pub(crate) struct BuildStaticSnapshotSummary {
     pub(crate) git_commit: Option<String>,
     pub(crate) source_action_set_sha256: Option<String>,
     pub(crate) dataset_file_count: usize,
+    pub(crate) run_count: usize,
     pub(crate) total_dataset_bytes: u64,
     pub(crate) manifest_path: String,
 }
@@ -63,6 +73,7 @@ pub(crate) struct VerifyStaticSnapshotSummary {
     pub(crate) snapshot_id: String,
     pub(crate) generated_utc: DateTime<Utc>,
     pub(crate) dataset_file_count: usize,
+    pub(crate) run_count: usize,
     pub(crate) total_dataset_bytes: u64,
 }
 
@@ -151,6 +162,128 @@ fn write_snapshot_dataset_entry(
         bytes: bytes.len() as u64,
         sha256: sha256_hex(bytes),
     })
+}
+
+fn write_snapshot_run_entry(
+    out_dir: &Path,
+    run_id: &str,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<StaticSnapshotDatasetFile> {
+    let relpath = format!("runs/{run_id}/{filename}");
+    index_key_to_relpath(&relpath)?;
+    let disk_path = out_dir.join(&relpath);
+    if let Some(parent) = disk_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating public run parent: {}", parent.display()))?;
+    }
+    fs::write(&disk_path, bytes)
+        .with_context(|| format!("writing public run protobuf: {}", disk_path.display()))?;
+    Ok(StaticSnapshotDatasetFile {
+        index_key: relpath.clone(),
+        relpath,
+        bytes: bytes.len() as u64,
+        sha256: sha256_hex(bytes),
+    })
+}
+
+fn public_run_from_manifest(manifest: &pb::CampaignRunManifest) -> Result<pb::PublicCampaignRun> {
+    let campaign = manifest
+        .campaign
+        .as_ref()
+        .context("campaign run missing campaign")?;
+    let completion = manifest
+        .completion
+        .as_ref()
+        .context("campaign run missing completion")?;
+    Ok(pb::PublicCampaignRun {
+        record_version: 1,
+        campaign_id: manifest.campaign_id.clone(),
+        run_id: manifest.run_id.clone(),
+        campaign_name: campaign.campaign_name.clone(),
+        campaign_semantic_version: campaign.semantic_version,
+        crate_version: manifest.crate_version.clone(),
+        dso_version: manifest.dso_version.clone(),
+        status: manifest.status,
+        updated_at: manifest.updated_at,
+        root_action_ids: manifest
+            .root_actions
+            .iter()
+            .map(|root| {
+                root.action_id
+                    .clone()
+                    .context("campaign root missing action_id")
+            })
+            .collect::<Result<Vec<_>>>()?,
+        completed_root_count: completion.completed_root_count,
+        pending_count: completion.pending_count,
+        running_count: completion.running_count,
+        failed_count: completion.failed_count,
+        canceled_count: completion.canceled_count,
+        missing_output_count: completion.missing_outputs.len() as u64,
+        failed_sample_count: completion.failed_samples.len() as u64,
+    })
+}
+
+fn validate_public_run(run: &pb::PublicCampaignRun) -> Result<()> {
+    if run.record_version != 1 {
+        bail!(
+            "unsupported public campaign run version {}",
+            run.record_version
+        );
+    }
+    for (digest, field) in [
+        (&run.campaign_id, "public_run.campaign_id"),
+        (&run.run_id, "public_run.run_id"),
+    ] {
+        let digest = digest
+            .as_ref()
+            .with_context(|| format!("missing {field}"))?;
+        if digest.value.len() != 32 {
+            bail!("{field} must contain exactly 32 bytes");
+        }
+    }
+    if run.campaign_name.trim().is_empty()
+        || run.campaign_semantic_version == 0
+        || run
+            .crate_version
+            .as_ref()
+            .is_none_or(|v| v.value.is_empty())
+        || run.dso_version.as_ref().is_none_or(|v| v.value.is_empty())
+    {
+        bail!("public campaign run identity fields are incomplete");
+    }
+    let status = pb::CampaignRunStatus::try_from(run.status)
+        .context("public campaign run status is unknown")?;
+    if !matches!(
+        status,
+        pb::CampaignRunStatus::Complete | pb::CampaignRunStatus::Degraded
+    ) {
+        bail!("public campaign run must be complete or degraded, got {status:?}");
+    }
+    let timestamp = run
+        .updated_at
+        .as_ref()
+        .context("public run missing updated_at")?;
+    if !(0..1_000_000_000).contains(&timestamp.nanos)
+        || DateTime::from_timestamp(timestamp.seconds, timestamp.nanos as u32).is_none()
+    {
+        bail!("public run updated_at is invalid");
+    }
+    if run.root_action_ids.is_empty() {
+        bail!("public run must contain root action ids");
+    }
+    let mut previous: Option<&[u8]> = None;
+    for action_id in &run.root_action_ids {
+        if action_id.value.len() != 32 {
+            bail!("public run root action id must contain exactly 32 bytes");
+        }
+        if previous.is_some_and(|prior| prior >= action_id.value.as_slice()) {
+            bail!("public run root action ids must be strictly sorted");
+        }
+        previous = Some(action_id.value.as_slice());
+    }
+    Ok(())
 }
 
 fn rebuild_snapshot_web_indices(
@@ -249,17 +382,224 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn snapshot_id_for_dataset_files(files: &[StaticSnapshotDatasetFile]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(STATIC_SNAPSHOT_SCHEMA_VERSION.to_string().as_bytes());
-    for file in files {
-        hasher.update(file.index_key.as_bytes());
-        hasher.update([0]);
-        hasher.update(file.sha256.as_bytes());
-        hasher.update([0]);
-        hasher.update(file.bytes.to_le_bytes());
+fn digest_from_hex(value: &str, field: &str) -> Result<pb::Sha256Digest> {
+    let bytes = hex::decode(value).with_context(|| format!("decoding {field} as hex"))?;
+    if bytes.len() != 32 {
+        bail!("{field} must contain exactly 32 bytes, got {}", bytes.len());
     }
-    hex::encode(hasher.finalize())
+    Ok(pb::Sha256Digest { value: bytes })
+}
+
+fn digest_to_hex(value: &pb::Sha256Digest, field: &str) -> Result<String> {
+    if value.value.len() != 32 {
+        bail!(
+            "{field} must contain exactly 32 bytes, got {}",
+            value.value.len()
+        );
+    }
+    Ok(hex::encode(&value.value))
+}
+
+fn descriptor_sha256() -> String {
+    sha256_hex(FILE_DESCRIPTOR_SET)
+}
+
+fn media_type_for_relpath(relpath: &str) -> &'static str {
+    if relpath.ends_with(".json") {
+        "application/json"
+    } else if relpath.ends_with(".pb") {
+        "application/x-protobuf"
+    } else if relpath.ends_with(".html") {
+        "text/html; charset=utf-8"
+    } else if relpath.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else if relpath.ends_with(".js") {
+        "text/javascript; charset=utf-8"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn dataset_file_to_proto(file: &StaticSnapshotDatasetFile) -> Result<pb::PublicationFile> {
+    index_key_to_relpath(&file.index_key)?;
+    let relpath = index_key_to_relpath(&file.relpath)?
+        .to_string_lossy()
+        .replace('\\', "/");
+    Ok(pb::PublicationFile {
+        logical_key: file.index_key.clone(),
+        relpath: Some(pb::NormalizedRelpath { value: relpath }),
+        bytes: file.bytes,
+        sha256: Some(digest_from_hex(&file.sha256, "publication_file.sha256")?),
+        media_type: media_type_for_relpath(&file.relpath).to_string(),
+    })
+}
+
+fn dataset_file_from_proto(file: &pb::PublicationFile) -> Result<StaticSnapshotDatasetFile> {
+    if file.logical_key.trim().is_empty() {
+        bail!("publication_file.logical_key must not be empty");
+    }
+    index_key_to_relpath(&file.logical_key)?;
+    let relpath = file
+        .relpath
+        .as_ref()
+        .context("publication_file.relpath is required")?
+        .value
+        .clone();
+    let normalized = index_key_to_relpath(&relpath)?
+        .to_string_lossy()
+        .replace('\\', "/");
+    if relpath != normalized {
+        bail!(
+            "publication_file.relpath is not normalized: {:?} expected {:?}",
+            relpath,
+            normalized
+        );
+    }
+    if file.media_type != media_type_for_relpath(&relpath) {
+        bail!(
+            "publication_file.media_type mismatch for {}: got {:?} expected {:?}",
+            relpath,
+            file.media_type,
+            media_type_for_relpath(&relpath)
+        );
+    }
+    Ok(StaticSnapshotDatasetFile {
+        index_key: file.logical_key.clone(),
+        relpath,
+        bytes: file.bytes,
+        sha256: digest_to_hex(
+            file.sha256
+                .as_ref()
+                .context("publication_file.sha256 is required")?,
+            "publication_file.sha256",
+        )?,
+    })
+}
+
+fn normalized_dataset_files(
+    files: &[StaticSnapshotDatasetFile],
+) -> Result<Vec<pb::PublicationFile>> {
+    let mut files = files
+        .iter()
+        .map(dataset_file_to_proto)
+        .collect::<Result<Vec<_>>>()?;
+    files.sort_by(|a, b| {
+        a.logical_key.cmp(&b.logical_key).then_with(|| {
+            a.relpath
+                .as_ref()
+                .map(|v| &v.value)
+                .cmp(&b.relpath.as_ref().map(|v| &v.value))
+        })
+    });
+    for pair in files.windows(2) {
+        if pair[0].logical_key == pair[1].logical_key {
+            bail!("duplicate publication logical key: {}", pair[0].logical_key);
+        }
+        if pair[0].relpath == pair[1].relpath {
+            bail!(
+                "duplicate publication relpath: {}",
+                pair[0]
+                    .relpath
+                    .as_ref()
+                    .map(|v| v.value.as_str())
+                    .unwrap_or("<missing>")
+            );
+        }
+    }
+    Ok(files)
+}
+
+fn snapshot_id_for_dataset_files(
+    files: &[StaticSnapshotDatasetFile],
+    source_action_set_sha256: Option<&str>,
+) -> Result<String> {
+    let identity = pb::PublicationSnapshotIdentity {
+        identity_version: STATIC_SNAPSHOT_IDENTITY_VERSION,
+        publication_policy_version: PUBLICATION_POLICY_VERSION,
+        source_action_set_sha256: source_action_set_sha256
+            .map(|value| digest_from_hex(value, "source_action_set_sha256"))
+            .transpose()?,
+        schema_descriptor_sha256: Some(digest_from_hex(
+            &descriptor_sha256(),
+            "schema_descriptor_sha256",
+        )?),
+        dataset_files: normalized_dataset_files(files)?,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"xlsynth-bvc/publication-snapshot/v1\0");
+    hasher.update(identity.encode_to_vec());
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn encode_static_snapshot_manifest(manifest: &StaticSnapshotManifest) -> Result<Vec<u8>> {
+    if manifest.schema_version != STATIC_SNAPSHOT_SCHEMA_VERSION {
+        bail!(
+            "unsupported static snapshot schema_version={} expected {}",
+            manifest.schema_version,
+            STATIC_SNAPSHOT_SCHEMA_VERSION
+        );
+    }
+    let expected_id = snapshot_id_for_dataset_files(
+        &manifest.dataset_files,
+        manifest.source_action_set_sha256.as_deref(),
+    )?;
+    if manifest.snapshot_id != expected_id {
+        bail!(
+            "snapshot id mismatch before encoding: manifest={} actual={}",
+            manifest.snapshot_id,
+            expected_id
+        );
+    }
+    let total = manifest.dataset_files.iter().map(|v| v.bytes).sum::<u64>();
+    if manifest.total_dataset_bytes != total {
+        bail!(
+            "snapshot total bytes mismatch before encoding: manifest={} actual={}",
+            manifest.total_dataset_bytes,
+            total
+        );
+    }
+    let campaign_ids = manifest
+        .campaign_ids
+        .iter()
+        .map(|value| digest_from_hex(value, "campaign_id"))
+        .collect::<Result<Vec<_>>>()?;
+    let run_ids = manifest
+        .run_ids
+        .iter()
+        .map(|value| digest_from_hex(value, "run_id"))
+        .collect::<Result<Vec<_>>>()?;
+    if !manifest
+        .campaign_ids
+        .windows(2)
+        .all(|pair| pair[0] < pair[1])
+        || !manifest.run_ids.windows(2).all(|pair| pair[0] < pair[1])
+    {
+        bail!("snapshot campaign_ids and run_ids must be strictly sorted");
+    }
+    Ok(pb::PublicationSnapshotManifest {
+        record_version: STATIC_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_id: Some(digest_from_hex(&manifest.snapshot_id, "snapshot_id")?),
+        generated_at: Some(prost_types::Timestamp {
+            seconds: manifest.generated_utc.timestamp(),
+            nanos: manifest.generated_utc.timestamp_subsec_nanos() as i32,
+        }),
+        producing_git_commit: manifest.git_commit.clone(),
+        source_action_set_sha256: manifest
+            .source_action_set_sha256
+            .as_deref()
+            .map(|value| digest_from_hex(value, "source_action_set_sha256"))
+            .transpose()?,
+        schema_descriptor_sha256: Some(digest_from_hex(
+            &descriptor_sha256(),
+            "schema_descriptor_sha256",
+        )?),
+        publication_policy_version: PUBLICATION_POLICY_VERSION,
+        dataset_files: normalized_dataset_files(&manifest.dataset_files)?,
+        total_dataset_bytes: manifest.total_dataset_bytes,
+        campaign_ids,
+        run_ids,
+    }
+    .encode_to_vec())
 }
 
 fn read_git_commit(repo_root: &Path) -> Option<String> {
@@ -305,18 +645,101 @@ pub(crate) fn load_static_snapshot_manifest(snapshot_dir: &Path) -> Result<Stati
             manifest_path.display()
         )
     })?;
-    let manifest: StaticSnapshotManifest = serde_json::from_slice(&bytes).with_context(|| {
+    let wire = pb::PublicationSnapshotManifest::decode(bytes.as_slice()).with_context(|| {
         format!(
-            "parsing static snapshot manifest: {}",
+            "decoding protobuf static snapshot manifest: {}",
             manifest_path.display()
         )
     })?;
-    if manifest.schema_version != STATIC_SNAPSHOT_SCHEMA_VERSION {
+    if wire.record_version != STATIC_SNAPSHOT_SCHEMA_VERSION {
         bail!(
-            "unsupported static snapshot schema_version={} (expected {}) at {}",
-            manifest.schema_version,
+            "unsupported static snapshot record_version={} (expected {}) at {}",
+            wire.record_version,
             STATIC_SNAPSHOT_SCHEMA_VERSION,
             manifest_path.display()
+        );
+    }
+    if wire.publication_policy_version != PUBLICATION_POLICY_VERSION {
+        bail!(
+            "unsupported publication_policy_version={} (expected {}) at {}",
+            wire.publication_policy_version,
+            PUBLICATION_POLICY_VERSION,
+            manifest_path.display()
+        );
+    }
+    let descriptor = wire
+        .schema_descriptor_sha256
+        .as_ref()
+        .context("snapshot manifest missing schema_descriptor_sha256")?;
+    let descriptor = digest_to_hex(descriptor, "schema_descriptor_sha256")?;
+    if descriptor != descriptor_sha256() {
+        bail!(
+            "snapshot schema descriptor mismatch at {}; expected a fresh snapshot for this binary",
+            manifest_path.display()
+        );
+    }
+    let timestamp = wire
+        .generated_at
+        .as_ref()
+        .context("snapshot manifest missing generated_at")?;
+    if !(0..1_000_000_000).contains(&timestamp.nanos) {
+        bail!(
+            "snapshot generated_at nanos out of range: {}",
+            timestamp.nanos
+        );
+    }
+    let generated_utc = DateTime::from_timestamp(timestamp.seconds, timestamp.nanos as u32)
+        .context("snapshot generated_at is outside chrono's supported range")?;
+    let dataset_files = wire
+        .dataset_files
+        .iter()
+        .map(dataset_file_from_proto)
+        .collect::<Result<Vec<_>>>()?;
+    let campaign_ids = wire
+        .campaign_ids
+        .iter()
+        .map(|value| digest_to_hex(value, "campaign_id"))
+        .collect::<Result<Vec<_>>>()?;
+    let run_ids = wire
+        .run_ids
+        .iter()
+        .map(|value| digest_to_hex(value, "run_id"))
+        .collect::<Result<Vec<_>>>()?;
+    if !campaign_ids.windows(2).all(|pair| pair[0] < pair[1])
+        || !run_ids.windows(2).all(|pair| pair[0] < pair[1])
+    {
+        bail!("snapshot campaign_ids and run_ids must be strictly sorted");
+    }
+    let manifest = StaticSnapshotManifest {
+        schema_version: wire.record_version,
+        snapshot_id: digest_to_hex(
+            wire.snapshot_id
+                .as_ref()
+                .context("snapshot manifest missing snapshot_id")?,
+            "snapshot_id",
+        )?,
+        generated_utc,
+        git_commit: wire.producing_git_commit,
+        source_action_set_sha256: wire
+            .source_action_set_sha256
+            .as_ref()
+            .map(|value| digest_to_hex(value, "source_action_set_sha256"))
+            .transpose()?,
+        dataset_files,
+        total_dataset_bytes: wire.total_dataset_bytes,
+        campaign_ids,
+        run_ids,
+    };
+    let expected_id = snapshot_id_for_dataset_files(
+        &manifest.dataset_files,
+        manifest.source_action_set_sha256.as_deref(),
+    )?;
+    if manifest.snapshot_id != expected_id {
+        bail!(
+            "snapshot id mismatch at {}: manifest={} actual={}",
+            manifest_path.display(),
+            manifest.snapshot_id,
+            expected_id
         );
     }
     Ok(manifest)
@@ -362,20 +785,80 @@ pub(crate) fn build_static_snapshot(
         dataset_files.push(entry);
     }
 
-    let snapshot_id = snapshot_id_for_dataset_files(&dataset_files);
+    let finalized_runs = list_finalized_campaign_runs(store)?;
+    let mut campaign_ids = std::collections::BTreeSet::new();
+    let mut run_ids = Vec::with_capacity(finalized_runs.len());
+    for run in finalized_runs {
+        let public_run = public_run_from_manifest(&run)?;
+        validate_public_run(&public_run)?;
+        let campaign_id = digest_to_hex(
+            public_run
+                .campaign_id
+                .as_ref()
+                .context("public run missing campaign_id")?,
+            "public_run.campaign_id",
+        )?;
+        let run_id = digest_to_hex(
+            public_run
+                .run_id
+                .as_ref()
+                .context("public run missing run_id")?,
+            "public_run.run_id",
+        )?;
+        campaign_ids.insert(campaign_id);
+        run_ids.push(run_id.clone());
+        let entry = write_snapshot_run_entry(
+            &options.out_dir,
+            &run_id,
+            "run.pb",
+            &public_run.encode_to_vec(),
+        )?;
+        total_dataset_bytes += entry.bytes;
+        dataset_files.push(entry);
+        let analysis_path = campaign_analysis_path(
+            store,
+            run.run_id.as_ref().context("campaign run missing run_id")?,
+        )?;
+        if analysis_path.exists() {
+            let analysis_bytes = fs::read(&analysis_path).with_context(|| {
+                format!("reading campaign analysis: {}", analysis_path.display())
+            })?;
+            let analysis = decode_analysis_report(&analysis_bytes)?;
+            if analysis.run_id != run.run_id || analysis.campaign_id != run.campaign_id {
+                bail!("analysis identity does not match campaign run {run_id}");
+            }
+            let entry = write_snapshot_run_entry(
+                &options.out_dir,
+                &run_id,
+                "findings.pb",
+                &analysis_bytes,
+            )?;
+            total_dataset_bytes += entry.bytes;
+            dataset_files.push(entry);
+        }
+    }
+    run_ids.sort();
+    let campaign_ids = campaign_ids.into_iter().collect::<Vec<_>>();
+
+    let source_action_set_sha256 = read_source_action_set_sha256(store);
+    let snapshot_id =
+        snapshot_id_for_dataset_files(&dataset_files, source_action_set_sha256.as_deref())?;
     let manifest = StaticSnapshotManifest {
         schema_version: STATIC_SNAPSHOT_SCHEMA_VERSION,
         snapshot_id: snapshot_id.clone(),
         generated_utc: Utc::now(),
         git_commit: read_git_commit(repo_root),
-        source_action_set_sha256: read_source_action_set_sha256(store),
+        source_action_set_sha256,
         dataset_files,
         total_dataset_bytes,
+        campaign_ids,
+        run_ids,
     };
     let manifest_path = options.out_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME);
     fs::write(
         &manifest_path,
-        serde_json::to_vec_pretty(&manifest).context("serializing static snapshot manifest")?,
+        encode_static_snapshot_manifest(&manifest)
+            .context("encoding protobuf static snapshot manifest")?,
     )
     .with_context(|| {
         format!(
@@ -392,6 +875,7 @@ pub(crate) fn build_static_snapshot(
         git_commit: manifest.git_commit,
         source_action_set_sha256: manifest.source_action_set_sha256,
         dataset_file_count: manifest.dataset_files.len(),
+        run_count: manifest.run_ids.len(),
         total_dataset_bytes: manifest.total_dataset_bytes,
         manifest_path: manifest_path.display().to_string(),
     })
@@ -401,12 +885,21 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
     let manifest = load_static_snapshot_manifest(snapshot_dir)?;
 
     let mut recomputed_total_bytes = 0_u64;
+    let mut declared_relpaths = std::collections::BTreeSet::new();
+    let mut decoded_campaign_ids = std::collections::BTreeSet::new();
+    let mut decoded_run_ids = std::collections::BTreeSet::new();
+    declared_relpaths.insert(STATIC_SNAPSHOT_MANIFEST_FILENAME.to_string());
     for entry in &manifest.dataset_files {
-        let expected_relpath = index_key_to_relpath(&entry.index_key)?;
-        let expected_relpath = Path::new(STATIC_SNAPSHOT_WEB_INDEX_DIR)
-            .join(expected_relpath)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let expected_relpath = if entry.index_key.starts_with("runs/") {
+            index_key_to_relpath(&entry.index_key)?
+                .to_string_lossy()
+                .replace('\\', "/")
+        } else {
+            Path::new(STATIC_SNAPSHOT_WEB_INDEX_DIR)
+                .join(index_key_to_relpath(&entry.index_key)?)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
         if expected_relpath != entry.relpath {
             bail!(
                 "snapshot dataset relpath mismatch for key {}: manifest={} expected={}",
@@ -414,6 +907,9 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
                 entry.relpath,
                 expected_relpath
             );
+        }
+        if !declared_relpaths.insert(entry.relpath.clone()) {
+            bail!("duplicate snapshot dataset relpath: {}", entry.relpath);
         }
 
         let disk_path = snapshot_dir.join(&entry.relpath);
@@ -437,7 +933,58 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
                 actual_sha
             );
         }
+        if entry.index_key.starts_with("runs/") && entry.index_key.ends_with("/run.pb") {
+            let public_run = pb::PublicCampaignRun::decode(bytes.as_slice())
+                .with_context(|| format!("decoding public campaign run: {}", entry.relpath))?;
+            validate_public_run(&public_run)?;
+            let run_id = digest_to_hex(
+                public_run
+                    .run_id
+                    .as_ref()
+                    .context("public run missing run_id")?,
+                "public_run.run_id",
+            )?;
+            let campaign_id = digest_to_hex(
+                public_run
+                    .campaign_id
+                    .as_ref()
+                    .context("public run missing campaign_id")?,
+                "public_run.campaign_id",
+            )?;
+            if entry.index_key != format!("runs/{run_id}/run.pb") {
+                bail!(
+                    "public run path does not match encoded run id: {}",
+                    entry.index_key
+                );
+            }
+            decoded_campaign_ids.insert(campaign_id);
+            decoded_run_ids.insert(run_id);
+        } else if entry.index_key.starts_with("runs/") && entry.index_key.ends_with("/findings.pb")
+        {
+            let report = decode_analysis_report(&bytes)?;
+            let run_id = digest_to_hex(
+                report
+                    .run_id
+                    .as_ref()
+                    .context("analysis report missing run_id")?,
+                "analysis.run_id",
+            )?;
+            if entry.index_key != format!("runs/{run_id}/findings.pb") {
+                bail!(
+                    "analysis report path does not match encoded run id: {}",
+                    entry.index_key
+                );
+            }
+        } else if entry.index_key.starts_with("runs/") {
+            bail!("unknown run publication file: {}", entry.index_key);
+        }
         recomputed_total_bytes += actual_bytes;
+    }
+
+    if decoded_campaign_ids.into_iter().collect::<Vec<_>>() != manifest.campaign_ids
+        || decoded_run_ids.into_iter().collect::<Vec<_>>() != manifest.run_ids
+    {
+        bail!("snapshot campaign_ids/run_ids do not exactly match public run files");
     }
 
     if recomputed_total_bytes != manifest.total_dataset_bytes {
@@ -448,7 +995,10 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
         );
     }
 
-    let recomputed_snapshot_id = snapshot_id_for_dataset_files(&manifest.dataset_files);
+    let recomputed_snapshot_id = snapshot_id_for_dataset_files(
+        &manifest.dataset_files,
+        manifest.source_action_set_sha256.as_deref(),
+    )?;
     if recomputed_snapshot_id != manifest.snapshot_id {
         bail!(
             "snapshot id mismatch: manifest={} actual={}",
@@ -457,11 +1007,34 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
         );
     }
 
+    for entry in WalkDir::new(snapshot_dir).sort_by_file_name() {
+        let entry = entry.context("walking snapshot directory during verification")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relpath = entry
+            .path()
+            .strip_prefix(snapshot_dir)
+            .context("stripping snapshot root during verification")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !declared_relpaths.remove(&relpath) {
+            bail!("snapshot contains undeclared file: {relpath}");
+        }
+    }
+    if !declared_relpaths.is_empty() {
+        bail!(
+            "snapshot manifest declares files that were not found: {:?}",
+            declared_relpaths
+        );
+    }
+
     Ok(VerifyStaticSnapshotSummary {
         snapshot_dir: snapshot_dir.display().to_string(),
         snapshot_id: manifest.snapshot_id,
         generated_utc: manifest.generated_utc,
         dataset_file_count: manifest.dataset_files.len(),
+        run_count: manifest.run_ids.len(),
         total_dataset_bytes: manifest.total_dataset_bytes,
     })
 }
@@ -496,7 +1069,7 @@ mod tests {
         store
             .write_web_index_bytes(
                 "ir-fn-corpus-structural.v1/manifest.json",
-                br#"{"source_action_set_sha256":"abc123"}"#,
+                br#"{"source_action_set_sha256":"abababababababababababababababababababababababababababababababab"}"#,
             )
             .expect("write structural manifest");
 

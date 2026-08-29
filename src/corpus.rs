@@ -1280,10 +1280,11 @@ fn ensure_imported_ir_action(
         }),
         suggested_next_actions: Vec::new(),
     };
-    let provenance_path = staging_dir.join("provenance.json");
+    let provenance_path = staging_dir.join("provenance.pb");
     fs::write(
         &provenance_path,
-        serde_json::to_string_pretty(&provenance).context("serializing imported IR provenance")?,
+        crate::proto::encode_provenance(&provenance)
+            .context("encoding imported IR protobuf provenance")?,
     )
     .with_context(|| format!("writing provenance: {}", provenance_path.display()))?;
     store.promote_staging_action_dir(&action_id, &staging_dir)?;
@@ -2163,8 +2164,8 @@ mod tests {
             fs::write(path, bytes).expect("write staged file");
         }
         fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(&provenance).expect("serialize provenance"),
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
         )
         .expect("write staged provenance");
         store

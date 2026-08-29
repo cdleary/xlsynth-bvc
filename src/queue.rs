@@ -3,7 +3,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,12 +14,16 @@ use crate::model::{
     ActionBatchKey, ActionSpec, ArtifactRef, QueueCanceled, QueueDone, QueueFailed, QueueItem,
     QueueRunning, QueueRunningWithPath, action_batch_key,
 };
+use crate::proto::{
+    decode_queue_canceled, decode_queue_done, decode_queue_item, decode_queue_running,
+    encode_queue_canceled, encode_queue_done, encode_queue_item, encode_queue_running,
+};
 use crate::store::ArtifactStore;
 
 static CLAIM_SCAN_CURSOR: AtomicUsize = AtomicUsize::new(0);
 static QUEUE_WRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn write_text_atomic(path: &Path, contents: &str) -> Result<()> {
+fn write_bytes_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("path missing parent: {}", path.display()))?;
@@ -202,8 +205,8 @@ pub(crate) fn queue_state_for_action(store: &ArtifactStore, action_id: &str) -> 
     }
     let running_path = store.running_queue_path(action_id);
     if running_path.exists() {
-        if let Ok(text) = fs::read_to_string(&running_path)
-            && let Ok(running) = serde_json::from_str::<QueueRunning>(&text)
+        if let Ok(bytes) = fs::read(&running_path)
+            && let Ok(running) = decode_queue_running(&bytes)
         {
             return QueueState::Running {
                 owner: Some(running.lease_owner),
@@ -247,23 +250,21 @@ pub(crate) fn enqueue_action_with_priority(
     }
 
     if pending_path.exists() {
-        let text = match fs::read_to_string(&pending_path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        let bytes = match fs::read(&pending_path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
                 return Err(e)
                     .with_context(|| format!("reading queue item: {}", pending_path.display()));
             }
         };
-        if !text.is_empty()
-            && let Ok(mut item) = serde_json::from_str::<QueueItem>(&text)
+        if !bytes.is_empty()
+            && let Ok(mut item) = decode_queue_item(&bytes)
             && item.action_id == action_id
             && item.priority < priority
         {
             item.priority = priority;
-            let serialized =
-                serde_json::to_string_pretty(&item).context("serializing promoted queue item")?;
-            write_text_atomic(&pending_path, &serialized)?;
+            write_bytes_atomic(&pending_path, &encode_queue_item(&item)?)?;
         }
         return Ok(action_id);
     }
@@ -281,8 +282,7 @@ pub(crate) fn enqueue_action_with_priority(
         priority,
         action,
     };
-    let serialized = serde_json::to_string_pretty(&item).context("serializing queue item")?;
-    write_text_atomic(&pending_path, &serialized)?;
+    write_bytes_atomic(&pending_path, &encode_queue_item(&item)?)?;
     Ok(action_id)
 }
 
@@ -339,8 +339,8 @@ pub(crate) fn claim_next_pending_item(
     for i in 0..total_pending {
         let pending_path = pending[(start_offset + i) % total_pending].clone();
         scanned += 1;
-        let text = match fs::read_to_string(&pending_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&pending_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -349,7 +349,7 @@ pub(crate) fn claim_next_pending_item(
             }
         };
         let (action_id, enqueued_utc, priority, action) =
-            match parse_queue_work_item(&text, &pending_path) {
+            match parse_queue_work_item(&bytes, &pending_path) {
                 Ok(parsed) => parsed,
                 Err(err) => {
                     quarantine_corrupt_queue_file(
@@ -471,8 +471,8 @@ pub(crate) fn claim_compatible_pending_items(
 
     let mut ready_candidates = Vec::new();
     for pending_path in pending {
-        let text = match fs::read_to_string(&pending_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&pending_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -481,7 +481,7 @@ pub(crate) fn claim_compatible_pending_items(
             }
         };
         let (action_id, enqueued_utc, priority, action) =
-            match parse_queue_work_item(&text, &pending_path) {
+            match parse_queue_work_item(&bytes, &pending_path) {
                 Ok(parsed) => parsed,
                 Err(err) => {
                     quarantine_corrupt_queue_file(
@@ -666,9 +666,9 @@ pub(crate) fn load_canceled_root_failed_action_id(
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(&path)
+    let bytes = fs::read(&path)
         .with_context(|| format!("reading canceled queue record: {}", path.display()))?;
-    let canceled: QueueCanceled = serde_json::from_str(&text)
+    let canceled = decode_queue_canceled(&bytes)
         .with_context(|| format!("parsing canceled queue record: {}", path.display()))?;
     Ok(Some(canceled.root_failed_action_id))
 }
@@ -713,10 +713,10 @@ pub(crate) fn try_claim_pending_item(
         }
     }
 
-    let text = fs::read_to_string(&running_path)
+    let bytes = fs::read(&running_path)
         .with_context(|| format!("reading claimed queue item: {}", running_path.display()))?;
     let (action_id_from_file, enqueued_utc, priority, action) =
-        parse_queue_work_item(&text, &running_path)?;
+        parse_queue_work_item(&bytes, &running_path)?;
     if action_id_from_file != action_id {
         bail!(
             "claimed queue action id mismatch in {}: path={} file={}",
@@ -747,9 +747,7 @@ pub(crate) fn try_claim_pending_item(
         lease_acquired_utc,
         lease_expires_utc,
     };
-    let serialized =
-        serde_json::to_string_pretty(&running).context("serializing running queue record")?;
-    write_text_atomic(&running_path, &serialized)?;
+    write_bytes_atomic(&running_path, &encode_queue_running(&running)?)?;
     Ok(Some(QueueRunningWithPath {
         running,
         path: running_path,
@@ -774,9 +772,7 @@ pub(crate) fn write_done_record(
         fs::create_dir_all(parent)
             .with_context(|| format!("creating done queue dir: {}", parent.display()))?;
     }
-    let serialized =
-        serde_json::to_string_pretty(&done).context("serializing queue done record")?;
-    write_text_atomic(&done_path, &serialized)?;
+    write_bytes_atomic(&done_path, &encode_queue_done(&done)?)?;
     Ok(())
 }
 
@@ -906,9 +902,7 @@ pub(crate) fn write_canceled_record(
         fs::create_dir_all(parent)
             .with_context(|| format!("creating canceled queue dir: {}", parent.display()))?;
     }
-    let serialized =
-        serde_json::to_string_pretty(&canceled).context("serializing canceled queue item")?;
-    write_text_atomic(&canceled_path, &serialized)?;
+    write_bytes_atomic(&canceled_path, &encode_queue_canceled(&canceled)?)?;
     Ok(())
 }
 
@@ -926,8 +920,8 @@ pub(crate) fn cancel_downstream_pending_actions(
         let mut pending_paths = list_queue_files(&store.queue_pending_dir())?;
         pending_paths.sort();
         for pending_path in pending_paths {
-            let text = match fs::read_to_string(&pending_path) {
-                Ok(text) => text,
+            let bytes = match fs::read(&pending_path) {
+                Ok(bytes) => bytes,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
                     return Err(e).with_context(|| {
@@ -935,7 +929,8 @@ pub(crate) fn cancel_downstream_pending_actions(
                     });
                 }
             };
-            let (action_id, enqueued_utc, _, action) = parse_queue_work_item(&text, &pending_path)?;
+            let (action_id, enqueued_utc, _, action) =
+                parse_queue_work_item(&bytes, &pending_path)?;
             if blocked_ids.contains(&action_id) {
                 continue;
             }
@@ -988,8 +983,8 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
     let mut running_paths = list_queue_files(&store.queue_running_dir())?;
     running_paths.sort();
     for running_path in running_paths {
-        let text = match fs::read_to_string(&running_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&running_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -998,7 +993,7 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
             }
         };
 
-        let reclaim = if let Ok(running) = serde_json::from_str::<QueueRunning>(&text) {
+        let reclaim = if let Ok(running) = decode_queue_running(&bytes) {
             running.lease_expires_utc <= now
                 || running_owner_process_missing_on_local_host(&running.lease_owner, &local_host)
         } else {
@@ -1009,7 +1004,7 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
         }
 
         let (action_id, enqueued_utc, priority, action) =
-            match parse_queue_work_item(&text, &running_path) {
+            match parse_queue_work_item(&bytes, &running_path) {
                 Ok(parsed) => parsed,
                 Err(err) => {
                     quarantine_corrupt_queue_file(
@@ -1033,9 +1028,7 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
                 .with_context(|| format!("creating pending queue dir: {}", parent.display()))?;
         }
         if !pending_path.exists() {
-            let serialized = serde_json::to_string_pretty(&pending)
-                .context("serializing reclaimed queue item")?;
-            write_text_atomic(&pending_path, &serialized)?;
+            write_bytes_atomic(&pending_path, &encode_queue_item(&pending)?)?;
         }
         remove_file_if_exists(&running_path)?;
         reclaimed += 1;
@@ -1075,18 +1068,10 @@ pub(crate) fn queue_action_id_from_path(path: &Path) -> Option<String> {
 }
 
 pub(crate) fn parse_queue_work_item(
-    text: &str,
+    bytes: &[u8],
     path: &Path,
 ) -> Result<(String, DateTime<Utc>, i32, ActionSpec)> {
-    if let Ok(running) = serde_json::from_str::<QueueRunning>(text) {
-        if running.schema_version != crate::ACTION_SCHEMA_VERSION {
-            bail!(
-                "running queue schema mismatch for {}: got {} expected {}",
-                path.display(),
-                running.schema_version,
-                crate::ACTION_SCHEMA_VERSION
-            );
-        }
+    if let Ok(running) = decode_queue_running(bytes) {
         return Ok((
             running.action_id,
             running.enqueued_utc,
@@ -1095,16 +1080,8 @@ pub(crate) fn parse_queue_work_item(
         ));
     }
 
-    let item: QueueItem = serde_json::from_str(text)
+    let item = decode_queue_item(bytes)
         .with_context(|| format!("parsing queue item: {}", path.display()))?;
-    if item.schema_version != crate::ACTION_SCHEMA_VERSION {
-        bail!(
-            "queue item schema mismatch for {}: got {} expected {}",
-            path.display(),
-            item.schema_version,
-            crate::ACTION_SCHEMA_VERSION
-        );
-    }
     Ok((
         item.action_id,
         item.enqueued_utc,
@@ -1124,7 +1101,7 @@ pub(crate) fn list_queue_files(root: &Path) -> Result<Vec<PathBuf>> {
             continue;
         }
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+        if path.extension().and_then(|s| s.to_str()) == Some("pb") {
             files.push(path.to_path_buf());
         }
     }
@@ -1135,21 +1112,33 @@ pub(crate) fn load_queue_pending_record(
     store: &ArtifactStore,
     action_id: &str,
 ) -> Result<Option<QueueItem>> {
-    load_queue_record(&store.pending_queue_path(action_id), "pending queue record")
+    load_queue_record(
+        &store.pending_queue_path(action_id),
+        "pending queue record",
+        decode_queue_item,
+    )
 }
 
 pub(crate) fn load_queue_running_record(
     store: &ArtifactStore,
     action_id: &str,
 ) -> Result<Option<QueueRunning>> {
-    load_queue_record(&store.running_queue_path(action_id), "running queue record")
+    load_queue_record(
+        &store.running_queue_path(action_id),
+        "running queue record",
+        decode_queue_running,
+    )
 }
 
 pub(crate) fn load_queue_done_record(
     store: &ArtifactStore,
     action_id: &str,
 ) -> Result<Option<QueueDone>> {
-    load_queue_record(&store.done_queue_path(action_id), "done queue record")
+    load_queue_record(
+        &store.done_queue_path(action_id),
+        "done queue record",
+        decode_queue_done,
+    )
 }
 
 pub(crate) fn load_queue_failed_record(
@@ -1166,20 +1155,21 @@ pub(crate) fn load_queue_canceled_record(
     load_queue_record(
         &store.canceled_queue_path(action_id),
         "canceled queue record",
+        decode_queue_canceled,
     )
 }
 
-pub(crate) fn load_queue_record<T: DeserializeOwned>(
+pub(crate) fn load_queue_record<T>(
     path: &Path,
     label: &str,
+    decode: fn(&[u8]) -> Result<T>,
 ) -> Result<Option<T>> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading {}: {}", label, path.display()))?;
-    let record: T = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}: {}", label, path.display()))?;
+    let bytes = fs::read(path).with_context(|| format!("reading {}: {}", label, path.display()))?;
+    let record =
+        decode(&bytes).with_context(|| format!("parsing {}: {}", label, path.display()))?;
     Ok(Some(record))
 }
 
@@ -1206,15 +1196,15 @@ pub(crate) fn repair_corrupt_queue_records(
     fn scan_and_validate_queue_dir(
         root: &Path,
         queue_state: &str,
-        parser: fn(&str, &Path) -> Result<String>,
+        parser: fn(&[u8], &Path) -> Result<String>,
         scanned_files: &mut usize,
         corrupt_records: &mut Vec<CorruptQueueRecord>,
     ) -> Result<()> {
         for path in list_queue_files(root)? {
             *scanned_files += 1;
             let action_id_hint = queue_action_id_from_path(&path);
-            let text = match fs::read_to_string(&path) {
-                Ok(text) => text,
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
                     corrupt_records.push(CorruptQueueRecord {
@@ -1226,7 +1216,7 @@ pub(crate) fn repair_corrupt_queue_records(
                     continue;
                 }
             };
-            let parsed_action_id = match parser(&text, &path) {
+            let parsed_action_id = match parser(&bytes, &path) {
                 Ok(action_id) => action_id,
                 Err(err) => {
                     corrupt_records.push(CorruptQueueRecord {
@@ -1256,59 +1246,27 @@ pub(crate) fn repair_corrupt_queue_records(
         Ok(())
     }
 
-    fn parse_pending_record(text: &str, path: &Path) -> Result<String> {
-        let item: QueueItem = serde_json::from_str(text)
+    fn parse_pending_record(bytes: &[u8], path: &Path) -> Result<String> {
+        let item = decode_queue_item(bytes)
             .with_context(|| format!("parsing pending queue record: {}", path.display()))?;
-        if item.schema_version != crate::ACTION_SCHEMA_VERSION {
-            bail!(
-                "pending queue schema mismatch for {}: got {} expected {}",
-                path.display(),
-                item.schema_version,
-                crate::ACTION_SCHEMA_VERSION
-            );
-        }
         Ok(item.action_id)
     }
 
-    fn parse_running_record(text: &str, path: &Path) -> Result<String> {
-        let running: QueueRunning = serde_json::from_str(text)
+    fn parse_running_record(bytes: &[u8], path: &Path) -> Result<String> {
+        let running = decode_queue_running(bytes)
             .with_context(|| format!("parsing running queue record: {}", path.display()))?;
-        if running.schema_version != crate::ACTION_SCHEMA_VERSION {
-            bail!(
-                "running queue schema mismatch for {}: got {} expected {}",
-                path.display(),
-                running.schema_version,
-                crate::ACTION_SCHEMA_VERSION
-            );
-        }
         Ok(running.action_id)
     }
 
-    fn parse_done_record(text: &str, path: &Path) -> Result<String> {
-        let done: QueueDone = serde_json::from_str(text)
+    fn parse_done_record(bytes: &[u8], path: &Path) -> Result<String> {
+        let done = decode_queue_done(bytes)
             .with_context(|| format!("parsing done queue record: {}", path.display()))?;
-        if done.schema_version != crate::ACTION_SCHEMA_VERSION {
-            bail!(
-                "done queue schema mismatch for {}: got {} expected {}",
-                path.display(),
-                done.schema_version,
-                crate::ACTION_SCHEMA_VERSION
-            );
-        }
         Ok(done.action_id)
     }
 
-    fn parse_canceled_record(text: &str, path: &Path) -> Result<String> {
-        let canceled: QueueCanceled = serde_json::from_str(text)
+    fn parse_canceled_record(bytes: &[u8], path: &Path) -> Result<String> {
+        let canceled = decode_queue_canceled(bytes)
             .with_context(|| format!("parsing canceled queue record: {}", path.display()))?;
-        if canceled.schema_version != crate::ACTION_SCHEMA_VERSION {
-            bail!(
-                "canceled queue schema mismatch for {}: got {} expected {}",
-                path.display(),
-                canceled.schema_version,
-                crate::ACTION_SCHEMA_VERSION
-            );
-        }
         Ok(canceled.action_id)
     }
 
@@ -1398,16 +1356,18 @@ mod tests {
         }
     }
 
-    fn write_completed_provenance(store: &ArtifactStore, action_id: &str) {
+    fn write_completed_provenance(store: &ArtifactStore, seed_digest: &str) -> String {
         let bytes = b"package test\n";
+        let action = ActionSpec::ImportIrPackageFile {
+            source_sha256: seed_digest.to_string(),
+            top_fn_name: Some("main".to_string()),
+        };
+        let action_id = crate::executor::compute_action_id(&action).expect("compute V2 action id");
         let provenance = Provenance {
             schema_version: crate::ACTION_SCHEMA_VERSION,
             action_id: action_id.to_string(),
             created_utc: Utc::now(),
-            action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
-                version: "v0.37.0".to_string(),
-                discovery_runtime: None,
-            },
+            action,
             dependencies: Vec::new(),
             output_artifact: ArtifactRef {
                 action_id: action_id.to_string(),
@@ -1427,13 +1387,14 @@ mod tests {
         fs::create_dir_all(staging_dir.join("payload")).expect("create ready payload");
         fs::write(staging_dir.join("payload/input.ir"), bytes).expect("write ready input");
         fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(&provenance).expect("serialize provenance"),
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
         )
         .expect("write provenance");
         store
-            .promote_staging_action_dir(action_id, &staging_dir)
+            .promote_staging_action_dir(&action_id, &staging_dir)
             .expect("promote ready action");
+        action_id
     }
 
     #[test]
@@ -1550,8 +1511,7 @@ mod tests {
     #[test]
     fn claim_compatible_pending_items_only_claims_matching_g8r_batch_key() {
         let (store, root) = make_test_store();
-        let dep_id = "d".repeat(64);
-        write_completed_provenance(&store, &dep_id);
+        let dep_id = write_completed_provenance(&store, &"d".repeat(64));
 
         let matching_a = ActionSpec::DriverIrToG8rAig {
             ir_action_id: dep_id.clone(),
@@ -1707,19 +1667,21 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup temp store");
     }
 
-    fn touch_fake_provenance(store: &ArtifactStore, action_id: &str) {
+    fn touch_fake_provenance(store: &ArtifactStore, seed_digest: &str) -> String {
+        let action = ActionSpec::ImportIrPackageFile {
+            source_sha256: seed_digest.to_string(),
+            top_fn_name: Some("main".to_string()),
+        };
+        let action_id = crate::executor::compute_action_id(&action).expect("compute V2 action id");
         let staging_dir = store.staging_dir().join(format!("{action_id}-fake"));
         let payload_dir = staging_dir.join("payload");
         fs::create_dir_all(&payload_dir).expect("create fake payload dir");
-        fs::write(payload_dir.join("marker.txt"), action_id).expect("write fake payload marker");
+        fs::write(payload_dir.join("marker.txt"), &action_id).expect("write fake payload marker");
         let provenance = crate::model::Provenance {
             schema_version: crate::ACTION_SCHEMA_VERSION,
             action_id: action_id.to_string(),
             created_utc: Utc::now(),
-            action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
-                version: "v0.37.0".to_string(),
-                discovery_runtime: None,
-            },
+            action,
             dependencies: Vec::new(),
             output_artifact: ArtifactRef {
                 action_id: action_id.to_string(),
@@ -1736,28 +1698,25 @@ mod tests {
             suggested_next_actions: Vec::new(),
         };
         fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(&provenance).expect("serialize fake provenance"),
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode fake provenance"),
         )
         .expect("write fake provenance");
         store
-            .promote_staging_action_dir(action_id, &staging_dir)
+            .promote_staging_action_dir(&action_id, &staging_dir)
             .expect("promote fake provenance action");
+        action_id
     }
 
     #[test]
     fn claim_next_pending_item_prefers_leaf_priority_over_lexicographic_order() {
         let (store, root) = make_test_store();
         let runtime = sample_runtime();
-        let low_dep_id = "1".repeat(64);
-        touch_fake_provenance(&store, &low_dep_id);
+        let low_dep_id = touch_fake_provenance(&store, &"1".repeat(64));
 
-        let dep_a = "a".repeat(64);
-        let dep_b = "b".repeat(64);
-        let dep_c = "c".repeat(64);
-        touch_fake_provenance(&store, &dep_a);
-        touch_fake_provenance(&store, &dep_b);
-        touch_fake_provenance(&store, &dep_c);
+        let dep_a = touch_fake_provenance(&store, &"a".repeat(64));
+        let dep_b = touch_fake_provenance(&store, &"b".repeat(64));
+        let dep_c = touch_fake_provenance(&store, &"c".repeat(64));
 
         let high_action = ActionSpec::AigStatDiff {
             opt_ir_action_id: dep_a.clone(),
@@ -1912,7 +1871,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_corrupt_queue_records_detects_corrupt_running_json() {
+    fn repair_corrupt_queue_records_detects_corrupt_running_protobuf() {
         let (store, root) = make_test_store();
         let action_id = "a".repeat(64);
         let running_path = store.running_queue_path(&action_id);

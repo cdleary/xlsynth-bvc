@@ -1,0 +1,1005 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use anyhow::{Context, Result, anyhow, bail};
+use chrono::Utc;
+use prost::Message;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+use walkdir::WalkDir;
+
+use crate::proto::v1 as pb;
+use crate::proto::{
+    DEFAULT_RELEASE_CAMPAIGN, action_id_to_hex, action_id_to_proto, action_spec_from_proto,
+    action_spec_to_proto, compute_model_action_id_v2, decode_queue_canceled,
+    driver_runtime_from_proto, driver_runtime_to_proto, timestamp_from_proto, timestamp_to_proto,
+};
+use crate::query::{
+    canonical_root_actions_for_crate_version, enqueue_processing_for_crate_version,
+};
+use crate::queue::{QueueState, queue_state_for_action};
+use crate::runtime::explicit_driver_runtime_for_crate_version;
+use crate::store::ArtifactStore;
+use crate::versioning::{
+    cmp_dotted_numeric_version, load_version_compat_map, normalize_tag_version,
+    resolve_xlsynth_version_for_driver,
+};
+use crate::{
+    WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME, WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+};
+
+const CAMPAIGN_IDENTITY_VERSION: u32 = 1;
+const CAMPAIGN_RUN_IDENTITY_VERSION: u32 = 1;
+const CAMPAIGN_RUN_RECORD_VERSION: u32 = 1;
+const CAMPAIGN_ID_DOMAIN: &[u8] = b"xlsynth-bvc/campaign/v1\0";
+const CAMPAIGN_RUN_ID_DOMAIN: &[u8] = b"xlsynth-bvc/campaign-run/v1\0";
+const CAMPAIGN_RUN_MANIFEST_FILENAME: &str = "run-manifest.pb";
+static MANIFEST_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CampaignRunSummary {
+    pub(crate) campaign_id: String,
+    pub(crate) run_id: String,
+    pub(crate) campaign_name: String,
+    pub(crate) crate_version: String,
+    pub(crate) dso_version: String,
+    pub(crate) status: String,
+    pub(crate) root_action_count: u64,
+    pub(crate) completed_root_count: u64,
+    pub(crate) pending_count: u64,
+    pub(crate) running_count: u64,
+    pub(crate) failed_count: u64,
+    pub(crate) canceled_count: u64,
+    pub(crate) missing_outputs: Vec<String>,
+    pub(crate) failed_samples: Vec<String>,
+    pub(crate) manifest_path: String,
+    pub(crate) persisted: bool,
+}
+
+fn required<'a, T>(value: &'a Option<T>, field: &str) -> Result<&'a T> {
+    value
+        .as_ref()
+        .with_context(|| format!("missing required protobuf field {field}"))
+}
+
+fn validate_nonempty(value: &str, field: &str) -> Result<()> {
+    if value.is_empty() || value.trim() != value || value.contains('\0') {
+        bail!("{field} must be nonempty, trimmed, and contain no NUL");
+    }
+    Ok(())
+}
+
+fn normalize_version(value: &str, field: &str) -> Result<String> {
+    validate_nonempty(value, field)?;
+    let normalized = normalize_tag_version(value);
+    let (base, suffix) = normalized
+        .split_once('-')
+        .map_or((normalized, None), |(base, suffix)| (base, Some(suffix)));
+    let parts: Vec<&str> = base.split('.').collect();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        bail!("{field} must be a numeric X.Y.Z version, got {value:?}");
+    }
+    if let Some(suffix) = suffix
+        && (suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()))
+    {
+        bail!("{field} suffix must be numeric, got {value:?}");
+    }
+    Ok(normalized.to_string())
+}
+
+fn validate_digest(value: &pb::Sha256Digest, field: &str) -> Result<()> {
+    if value.value.len() != 32 {
+        bail!("{field} must contain exactly 32 bytes");
+    }
+    Ok(())
+}
+
+fn digest_hex(value: &pb::Sha256Digest, field: &str) -> Result<String> {
+    validate_digest(value, field)?;
+    Ok(hex::encode(&value.value))
+}
+
+fn domain_hash(domain: &[u8], payload: &[u8]) -> pb::Sha256Digest {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(payload);
+    pb::Sha256Digest {
+        value: hasher.finalize().to_vec(),
+    }
+}
+
+fn normalize_campaign(mut campaign: pb::CampaignSpec) -> Result<pb::CampaignSpec> {
+    validate_nonempty(&campaign.campaign_name, "campaign.campaign_name")?;
+    validate_nonempty(&campaign.corpus_source, "campaign.corpus_source")?;
+    if campaign.semantic_version == 0
+        || campaign.analysis_algorithm_version == 0
+        || campaign.publication_policy_version == 0
+    {
+        bail!("campaign semantic, analysis, and publication versions must be nonzero");
+    }
+    match pb::CampaignRootPolicy::try_from(campaign.root_policy)
+        .context("campaign.root_policy is unknown")?
+    {
+        pb::CampaignRootPolicy::ReleaseStdlibAndModules => {}
+        pb::CampaignRootPolicy::Unspecified => bail!("campaign.root_policy must be specified"),
+    }
+    required(&campaign.failure_policy, "campaign.failure_policy")?;
+    if campaign.required_outputs.is_empty() {
+        bail!("campaign.required_outputs must not be empty");
+    }
+    campaign.required_outputs.sort_unstable();
+    let mut previous = None;
+    for raw in &campaign.required_outputs {
+        let kind = pb::RequiredOutputKind::try_from(*raw)
+            .context("campaign.required_outputs contains an unknown value")?;
+        if kind == pb::RequiredOutputKind::Unspecified {
+            bail!("campaign.required_outputs must not contain UNSPECIFIED");
+        }
+        if previous == Some(*raw) {
+            bail!("campaign.required_outputs contains duplicate {kind:?}");
+        }
+        previous = Some(*raw);
+    }
+    Ok(campaign)
+}
+
+pub(crate) fn load_default_campaign() -> Result<pb::CampaignSpec> {
+    let campaign = pb::CampaignSpec::decode(DEFAULT_RELEASE_CAMPAIGN)
+        .context("decoding embedded release campaign protobuf")?;
+    normalize_campaign(campaign)
+}
+
+pub(crate) fn compute_campaign_id(campaign: &pb::CampaignSpec) -> Result<pb::Sha256Digest> {
+    let campaign = normalize_campaign(campaign.clone())?;
+    let identity = pb::CampaignIdentity {
+        identity_version: CAMPAIGN_IDENTITY_VERSION,
+        campaign: Some(campaign),
+    };
+    Ok(domain_hash(CAMPAIGN_ID_DOMAIN, &identity.encode_to_vec()))
+}
+
+fn compute_run_id(identity: &pb::CampaignRunIdentity) -> Result<pb::Sha256Digest> {
+    if identity.identity_version != CAMPAIGN_RUN_IDENTITY_VERSION {
+        bail!(
+            "unsupported campaign run identity version {}",
+            identity.identity_version
+        );
+    }
+    validate_digest(
+        required(&identity.campaign_id, "run_identity.campaign_id")?,
+        "run_identity.campaign_id",
+    )?;
+    normalize_version(
+        &required(&identity.crate_version, "run_identity.crate_version")?.value,
+        "run_identity.crate_version",
+    )?;
+    normalize_version(
+        &required(&identity.dso_version, "run_identity.dso_version")?.value,
+        "run_identity.dso_version",
+    )?;
+    driver_runtime_from_proto(
+        required(&identity.driver_runtime, "run_identity.driver_runtime")?,
+        "run_identity.driver_runtime",
+    )?;
+    Ok(domain_hash(
+        CAMPAIGN_RUN_ID_DOMAIN,
+        &identity.encode_to_vec(),
+    ))
+}
+
+pub(crate) fn campaign_run_path(
+    store: &ArtifactStore,
+    run_id: &pb::Sha256Digest,
+) -> Result<PathBuf> {
+    let run_id = digest_hex(run_id, "run_id")?;
+    Ok(store
+        .campaign_runs_dir()
+        .join(&run_id[0..2])
+        .join(&run_id[2..4])
+        .join(run_id)
+        .join(CAMPAIGN_RUN_MANIFEST_FILENAME))
+}
+
+pub(crate) fn campaign_analysis_path(
+    store: &ArtifactStore,
+    run_id: &pb::Sha256Digest,
+) -> Result<PathBuf> {
+    Ok(campaign_run_path(store, run_id)?
+        .parent()
+        .expect("campaign manifest has a parent")
+        .join("analysis.pb"))
+}
+
+fn canonical_roots(
+    repo_root: &Path,
+    crate_version: &str,
+    dso_version: &str,
+) -> Result<Vec<pb::CampaignRootAction>> {
+    let roots = canonical_root_actions_for_crate_version(repo_root, crate_version, dso_version)?;
+    let mut result = Vec::with_capacity(roots.len());
+    for action in roots {
+        let action_id = compute_model_action_id_v2(&action)?.to_hex();
+        result.push(pb::CampaignRootAction {
+            action_id: Some(action_id_to_proto(
+                &action_id,
+                "campaign.root_action.action_id",
+            )?),
+            action: Some(action_spec_to_proto(&action)?),
+        });
+    }
+    result.sort_by(|a, b| {
+        a.action_id
+            .as_ref()
+            .map(|id| id.value.as_slice())
+            .cmp(&b.action_id.as_ref().map(|id| id.value.as_slice()))
+    });
+    Ok(result)
+}
+
+fn new_manifest(
+    repo_root: &Path,
+    requested_crate_version: &str,
+) -> Result<pb::CampaignRunManifest> {
+    let campaign = load_default_campaign()?;
+    let campaign_id = compute_campaign_id(&campaign)?;
+    let crate_version = normalize_version(requested_crate_version, "crate_version")?;
+    let dso_with_v = resolve_xlsynth_version_for_driver(repo_root, &crate_version)?;
+    let dso_version = normalize_version(&dso_with_v, "dso_version")?;
+    let runtime =
+        explicit_driver_runtime_for_crate_version(repo_root, &crate_version, &dso_version)?;
+    let runtime_pb = driver_runtime_to_proto(&runtime, "driver_runtime")?;
+    let identity = pb::CampaignRunIdentity {
+        identity_version: CAMPAIGN_RUN_IDENTITY_VERSION,
+        campaign_id: Some(campaign_id.clone()),
+        crate_version: Some(pb::CrateVersion {
+            value: crate_version.clone(),
+        }),
+        dso_version: Some(pb::DsoVersion {
+            value: dso_version.clone(),
+        }),
+        driver_runtime: Some(runtime_pb.clone()),
+    };
+    let run_id = compute_run_id(&identity)?;
+    let now = Utc::now();
+    let root_actions = canonical_roots(repo_root, &crate_version, &dso_version)?;
+    let root_action_count = root_actions.len() as u64;
+    Ok(pb::CampaignRunManifest {
+        record_version: CAMPAIGN_RUN_RECORD_VERSION,
+        campaign_id: Some(campaign_id),
+        run_id: Some(run_id),
+        campaign: Some(campaign),
+        crate_version: Some(pb::CrateVersion {
+            value: crate_version,
+        }),
+        dso_version: Some(pb::DsoVersion { value: dso_version }),
+        driver_runtime: Some(runtime_pb),
+        root_actions,
+        status: pb::CampaignRunStatus::Building as i32,
+        created_at: Some(timestamp_to_proto(&now)),
+        updated_at: Some(timestamp_to_proto(&now)),
+        completion: Some(pb::CompletionReport {
+            status: pb::CampaignRunStatus::Building as i32,
+            root_action_count,
+            ..Default::default()
+        }),
+    })
+}
+
+fn action_id_from_root(root: &pb::CampaignRootAction) -> Result<String> {
+    action_id_to_hex(
+        required(&root.action_id, "campaign.root_actions.action_id")?,
+        "campaign.root_actions.action_id",
+    )
+}
+
+fn validate_manifest(manifest: &pb::CampaignRunManifest) -> Result<()> {
+    if manifest.record_version != CAMPAIGN_RUN_RECORD_VERSION {
+        bail!(
+            "unsupported campaign run record version {}; expected {}",
+            manifest.record_version,
+            CAMPAIGN_RUN_RECORD_VERSION
+        );
+    }
+    let campaign =
+        normalize_campaign(required(&manifest.campaign, "campaign_run.campaign")?.clone())?;
+    let expected_campaign_id = compute_campaign_id(&campaign)?;
+    let campaign_id = required(&manifest.campaign_id, "campaign_run.campaign_id")?;
+    validate_digest(campaign_id, "campaign_run.campaign_id")?;
+    if campaign_id != &expected_campaign_id {
+        bail!("campaign_run.campaign_id does not match campaign contents");
+    }
+    let crate_version = required(&manifest.crate_version, "campaign_run.crate_version")?;
+    let dso_version = required(&manifest.dso_version, "campaign_run.dso_version")?;
+    if normalize_version(&crate_version.value, "campaign_run.crate_version")? != crate_version.value
+        || normalize_version(&dso_version.value, "campaign_run.dso_version")? != dso_version.value
+    {
+        bail!("campaign run versions must use canonical values without a leading v");
+    }
+    let runtime = required(&manifest.driver_runtime, "campaign_run.driver_runtime")?;
+    let runtime_model = driver_runtime_from_proto(runtime, "campaign_run.driver_runtime")?;
+    if normalize_version(
+        &runtime_model.driver_version,
+        "driver_runtime.driver_version",
+    )? != crate_version.value
+    {
+        bail!("campaign run runtime crate version does not match crate_version");
+    }
+    let identity = pb::CampaignRunIdentity {
+        identity_version: CAMPAIGN_RUN_IDENTITY_VERSION,
+        campaign_id: Some(campaign_id.clone()),
+        crate_version: Some(crate_version.clone()),
+        dso_version: Some(dso_version.clone()),
+        driver_runtime: Some(runtime.clone()),
+    };
+    let expected_run_id = compute_run_id(&identity)?;
+    let run_id = required(&manifest.run_id, "campaign_run.run_id")?;
+    validate_digest(run_id, "campaign_run.run_id")?;
+    if run_id != &expected_run_id {
+        bail!("campaign_run.run_id does not match run identity");
+    }
+    if manifest.root_actions.is_empty() {
+        bail!("campaign_run.root_actions must not be empty");
+    }
+    let mut prior: Option<Vec<u8>> = None;
+    for root in &manifest.root_actions {
+        let id = action_id_from_root(root)?;
+        let action_pb = required(&root.action, "campaign_run.root_actions.action")?;
+        let action = action_spec_from_proto(action_pb)?;
+        let expected_id = compute_model_action_id_v2(&action)?.to_hex();
+        if id != expected_id {
+            bail!("root action id {id} does not match its protobuf ActionSpec");
+        }
+        let bytes = root.action_id.as_ref().expect("validated").value.clone();
+        if let Some(prior) = &prior
+            && prior >= &bytes
+        {
+            bail!("campaign_run.root_actions must be strictly sorted by action id");
+        }
+        prior = Some(bytes);
+    }
+    let status = pb::CampaignRunStatus::try_from(manifest.status)
+        .context("campaign_run.status is unknown")?;
+    if status == pb::CampaignRunStatus::Unspecified {
+        bail!("campaign_run.status must be specified");
+    }
+    let created = timestamp_from_proto(&manifest.created_at, "campaign_run.created_at")?;
+    let updated = timestamp_from_proto(&manifest.updated_at, "campaign_run.updated_at")?;
+    if updated < created {
+        bail!("campaign_run.updated_at precedes created_at");
+    }
+    let completion = required(&manifest.completion, "campaign_run.completion")?;
+    let completion_status = pb::CampaignRunStatus::try_from(completion.status)
+        .context("campaign_run.completion.status is unknown")?;
+    if completion_status != status {
+        bail!("campaign run status disagrees with completion report status");
+    }
+    if completion.root_action_count != manifest.root_actions.len() as u64
+        || completion.completed_root_count > completion.root_action_count
+    {
+        bail!("campaign run completion root counts are inconsistent");
+    }
+    for missing in &completion.missing_outputs {
+        let kind = pb::RequiredOutputKind::try_from(missing.kind)
+            .context("completion.missing_outputs.kind is unknown")?;
+        if kind == pb::RequiredOutputKind::Unspecified || missing.reason.trim().is_empty() {
+            bail!("completion missing outputs require a kind and reason");
+        }
+        if let Some(action_id) = &missing.action_id {
+            action_id_to_hex(action_id, "completion.missing_outputs.action_id")?;
+        }
+    }
+    for failed in &completion.failed_samples {
+        action_id_to_hex(
+            required(&failed.action_id, "completion.failed_samples.action_id")?,
+            "completion.failed_samples.action_id",
+        )?;
+        validate_nonempty(&failed.error, "completion.failed_samples.error")?;
+    }
+    Ok(())
+}
+
+fn load_manifest(path: &Path) -> Result<pb::CampaignRunManifest> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("reading campaign run manifest: {}", path.display()))?;
+    let manifest = pb::CampaignRunManifest::decode(bytes.as_slice())
+        .with_context(|| format!("decoding campaign run manifest: {}", path.display()))?;
+    validate_manifest(&manifest)
+        .with_context(|| format!("validating campaign run manifest: {}", path.display()))?;
+    Ok(manifest)
+}
+
+pub(crate) fn list_finalized_campaign_runs(
+    store: &ArtifactStore,
+) -> Result<Vec<pb::CampaignRunManifest>> {
+    let root = store.campaign_runs_dir();
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut manifests = Vec::new();
+    for entry in WalkDir::new(&root).sort_by_file_name() {
+        let entry = entry.with_context(|| format!("walking campaign runs: {}", root.display()))?;
+        if !entry.file_type().is_file()
+            || entry.file_name().to_string_lossy() != CAMPAIGN_RUN_MANIFEST_FILENAME
+        {
+            continue;
+        }
+        let manifest = load_manifest(entry.path())?;
+        let status = pb::CampaignRunStatus::try_from(manifest.status)
+            .context("campaign run status is unknown")?;
+        if matches!(
+            status,
+            pb::CampaignRunStatus::Complete | pb::CampaignRunStatus::Degraded
+        ) {
+            manifests.push(manifest);
+        }
+    }
+    manifests.sort_by(|a, b| {
+        a.run_id
+            .as_ref()
+            .map(|id| id.value.as_slice())
+            .cmp(&b.run_id.as_ref().map(|id| id.value.as_slice()))
+    });
+    Ok(manifests)
+}
+
+pub(crate) fn pending_campaign_versions(
+    store: &ArtifactStore,
+    repo_root: &Path,
+) -> Result<Vec<String>> {
+    let finalized = list_finalized_campaign_runs(store)?
+        .into_iter()
+        .filter_map(|manifest| manifest.crate_version.map(|version| version.value))
+        .collect::<BTreeSet<_>>();
+    let mut pending = load_version_compat_map(repo_root)?
+        .into_keys()
+        .filter(|version| !finalized.contains(version))
+        .collect::<Vec<_>>();
+    pending.sort_by(|a, b| cmp_dotted_numeric_version(a, b));
+    Ok(pending)
+}
+
+pub(crate) fn load_finalized_campaign_run_for_version(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    crate_version: &str,
+) -> Result<pb::CampaignRunManifest> {
+    let planned = new_manifest(repo_root, crate_version)?;
+    let existing = load_existing_manifest(store, &planned)?.with_context(|| {
+        format!(
+            "campaign run for crate version {} has not been reconciled/finalized",
+            crate_version
+        )
+    })?;
+    let status = pb::CampaignRunStatus::try_from(existing.status)
+        .context("campaign run status is unknown")?;
+    if !matches!(
+        status,
+        pb::CampaignRunStatus::Complete | pb::CampaignRunStatus::Degraded
+    ) {
+        bail!(
+            "campaign run for crate version {} is not finalized: {:?}",
+            crate_version,
+            status
+        );
+    }
+    Ok(existing)
+}
+
+fn load_existing_manifest(
+    store: &ArtifactStore,
+    planned: &pb::CampaignRunManifest,
+) -> Result<Option<pb::CampaignRunManifest>> {
+    let path = campaign_run_path(
+        store,
+        required(&planned.run_id, "planned_campaign_run.run_id")?,
+    )?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let existing = load_manifest(&path)?;
+    if existing.campaign_id != planned.campaign_id
+        || existing.run_id != planned.run_id
+        || existing.campaign != planned.campaign
+        || existing.crate_version != planned.crate_version
+        || existing.dso_version != planned.dso_version
+        || existing.driver_runtime != planned.driver_runtime
+        || existing.root_actions != planned.root_actions
+    {
+        bail!(
+            "existing campaign run manifest identity differs from current campaign plan: {}",
+            path.display()
+        );
+    }
+    Ok(Some(existing))
+}
+
+fn write_manifest(store: &ArtifactStore, manifest: &pb::CampaignRunManifest) -> Result<PathBuf> {
+    validate_manifest(manifest)?;
+    let path = campaign_run_path(store, required(&manifest.run_id, "campaign_run.run_id")?)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("campaign run path has no parent"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating campaign run directory: {}", parent.display()))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = MANIFEST_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(
+        ".{CAMPAIGN_RUN_MANIFEST_FILENAME}.tmp-{}-{timestamp}-{nonce}",
+        std::process::id()
+    ));
+    fs::write(&temp, manifest.encode_to_vec())
+        .with_context(|| format!("writing campaign run temp manifest: {}", temp.display()))?;
+    fs::rename(&temp, &path).with_context(|| {
+        format!(
+            "atomically promoting campaign run manifest: {} -> {}",
+            temp.display(),
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+fn json_contains_any_version(bytes: &[u8], versions: &[&str]) -> Result<bool> {
+    fn contains(value: &serde_json::Value, versions: &[&str]) -> bool {
+        match value {
+            serde_json::Value::String(value) => versions.iter().any(|version| value == version),
+            serde_json::Value::Array(values) => {
+                values.iter().any(|value| contains(value, versions))
+            }
+            serde_json::Value::Object(values) => {
+                values.values().any(|value| contains(value, versions))
+            }
+            _ => false,
+        }
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("parsing static-web JSON projection")?;
+    Ok(contains(&value, versions))
+}
+
+fn add_missing_dataset(
+    store: &ArtifactStore,
+    kind: pb::RequiredOutputKind,
+    index_key: &str,
+    accepted_versions: &[&str],
+    missing: &mut Vec<pb::MissingOutput>,
+) -> Result<()> {
+    let Some(bytes) = store.load_web_index_bytes(index_key)? else {
+        missing.push(pb::MissingOutput {
+            kind: kind as i32,
+            action_id: None,
+            reason: format!("required dataset {index_key} is absent"),
+        });
+        return Ok(());
+    };
+    if bytes.is_empty() {
+        missing.push(pb::MissingOutput {
+            kind: kind as i32,
+            action_id: None,
+            reason: format!("required dataset {index_key} is empty"),
+        });
+    } else if !json_contains_any_version(&bytes, accepted_versions).unwrap_or(false) {
+        missing.push(pb::MissingOutput {
+            kind: kind as i32,
+            action_id: None,
+            reason: format!(
+                "required dataset {index_key} does not contain campaign version {}",
+                accepted_versions[0]
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn failure_error(store: &ArtifactStore, action_id: &str) -> Result<String> {
+    Ok(store
+        .load_failed_action_record(action_id)?
+        .map(|failed| failed.error)
+        .unwrap_or_else(|| "failed action record is unavailable".to_string()))
+}
+
+fn canceled_error(store: &ArtifactStore, action_id: &str) -> String {
+    fs::read(store.canceled_queue_path(action_id))
+        .ok()
+        .and_then(|bytes| decode_queue_canceled(&bytes).ok())
+        .map(|record| record.reason)
+        .unwrap_or_else(|| "canceled action record is unavailable".to_string())
+}
+
+fn evaluate_completion(
+    store: &ArtifactStore,
+    manifest: &pb::CampaignRunManifest,
+) -> Result<pb::CompletionReport> {
+    let campaign = required(&manifest.campaign, "campaign_run.campaign")?;
+    let failure_policy = required(&campaign.failure_policy, "campaign.failure_policy")?;
+    let root_ids: BTreeSet<String> = manifest
+        .root_actions
+        .iter()
+        .map(action_id_from_root)
+        .collect::<Result<_>>()?;
+    let mut discovered = root_ids.clone();
+    let mut queue: VecDeque<String> = root_ids.iter().cloned().collect();
+    while let Some(action_id) = queue.pop_front() {
+        if !store.action_exists(&action_id) {
+            continue;
+        }
+        let provenance = store.load_provenance(&action_id)?;
+        for suggestion in provenance.suggested_next_actions {
+            if discovered.insert(suggestion.action_id.clone()) {
+                queue.push_back(suggestion.action_id);
+            }
+        }
+    }
+
+    let mut completed_root_count = 0_u64;
+    let mut pending_count = 0_u64;
+    let mut running_count = 0_u64;
+    let mut failed_count = 0_u64;
+    let mut canceled_count = 0_u64;
+    let mut root_terminal_failure = false;
+    let mut missing_outputs = Vec::new();
+    let mut failed_samples = Vec::new();
+
+    for action_id in &discovered {
+        let is_root = root_ids.contains(action_id);
+        if store.action_exists(action_id) {
+            if is_root {
+                completed_root_count += 1;
+            }
+            continue;
+        }
+        match queue_state_for_action(store, action_id) {
+            QueueState::Pending | QueueState::None => pending_count += 1,
+            QueueState::Running { .. } => running_count += 1,
+            QueueState::Done => {
+                failed_count += 1;
+                if !is_root {
+                    failed_samples.push(pb::FailedSample {
+                        action_id: Some(action_id_to_proto(action_id, "failed_sample.action_id")?),
+                        error: "queue says done but the output artifact is absent".to_string(),
+                    });
+                }
+                root_terminal_failure |= is_root;
+            }
+            QueueState::Failed => {
+                failed_count += 1;
+                let error = failure_error(store, action_id)?;
+                if !is_root {
+                    failed_samples.push(pb::FailedSample {
+                        action_id: Some(action_id_to_proto(action_id, "failed_sample.action_id")?),
+                        error,
+                    });
+                }
+                root_terminal_failure |= is_root;
+            }
+            QueueState::Canceled => {
+                canceled_count += 1;
+                let error = canceled_error(store, action_id);
+                if !is_root {
+                    failed_samples.push(pb::FailedSample {
+                        action_id: Some(action_id_to_proto(action_id, "failed_sample.action_id")?),
+                        error,
+                    });
+                }
+                root_terminal_failure |= is_root;
+            }
+        }
+        if is_root {
+            missing_outputs.push(pb::MissingOutput {
+                kind: pb::RequiredOutputKind::RootArtifacts as i32,
+                action_id: Some(action_id_to_proto(action_id, "missing_output.action_id")?),
+                reason: format!(
+                    "root action artifact is absent; queue state is {}",
+                    queue_state_for_action(store, action_id).key()
+                ),
+            });
+        }
+    }
+
+    let crate_version = &required(&manifest.crate_version, "campaign_run.crate_version")?.value;
+    let dso_version = &required(&manifest.dso_version, "campaign_run.dso_version")?.value;
+    let crate_with_v = format!("v{crate_version}");
+    let dso_with_v = format!("v{dso_version}");
+    for raw in &campaign.required_outputs {
+        match pb::RequiredOutputKind::try_from(*raw)
+            .context("campaign.required_outputs contains unknown value")?
+        {
+            pb::RequiredOutputKind::RootArtifacts => {}
+            pb::RequiredOutputKind::VersionsSummaryDataset => add_missing_dataset(
+                store,
+                pb::RequiredOutputKind::VersionsSummaryDataset,
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &[crate_version, crate_with_v.as_str()],
+                &mut missing_outputs,
+            )?,
+            pb::RequiredOutputKind::StdlibG8rVsYosysDataset => add_missing_dataset(
+                store,
+                pb::RequiredOutputKind::StdlibG8rVsYosysDataset,
+                WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
+                &[
+                    crate_version,
+                    crate_with_v.as_str(),
+                    dso_version,
+                    dso_with_v.as_str(),
+                ],
+                &mut missing_outputs,
+            )?,
+            pb::RequiredOutputKind::Unspecified => unreachable!("campaign validated"),
+        }
+    }
+    missing_outputs.sort_by(|a, b| {
+        a.kind
+            .cmp(&b.kind)
+            .then(
+                a.action_id
+                    .as_ref()
+                    .map(|id| &id.value)
+                    .cmp(&b.action_id.as_ref().map(|id| &id.value)),
+            )
+            .then(a.reason.cmp(&b.reason))
+    });
+    failed_samples.sort_by(|a, b| {
+        a.action_id
+            .as_ref()
+            .map(|id| &id.value)
+            .cmp(&b.action_id.as_ref().map(|id| &id.value))
+    });
+
+    let active = pending_count > 0 || running_count > 0;
+    let sample_failure = !failed_samples.is_empty();
+    let status = if root_terminal_failure && failure_policy.root_action_failure_is_terminal {
+        pb::CampaignRunStatus::Failed
+    } else if active || completed_root_count < root_ids.len() as u64 {
+        pb::CampaignRunStatus::Building
+    } else if sample_failure && !failure_policy.allow_sample_action_failures {
+        pb::CampaignRunStatus::Failed
+    } else if root_terminal_failure || sample_failure || !missing_outputs.is_empty() {
+        pb::CampaignRunStatus::Degraded
+    } else {
+        pb::CampaignRunStatus::Complete
+    };
+    Ok(pb::CompletionReport {
+        status: status as i32,
+        root_action_count: root_ids.len() as u64,
+        completed_root_count,
+        pending_count,
+        running_count,
+        failed_count,
+        canceled_count,
+        missing_outputs,
+        failed_samples,
+    })
+}
+
+fn evaluated_manifest(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    crate_version: &str,
+) -> Result<pb::CampaignRunManifest> {
+    let mut planned = new_manifest(repo_root, crate_version)?;
+    if let Some(existing) = load_existing_manifest(store, &planned)? {
+        planned.created_at = existing.created_at;
+    }
+    let completion = evaluate_completion(store, &planned)?;
+    planned.status = completion.status;
+    planned.completion = Some(completion);
+    planned.updated_at = Some(timestamp_to_proto(&Utc::now()));
+    validate_manifest(&planned)?;
+    Ok(planned)
+}
+
+fn status_label(raw: i32) -> Result<String> {
+    let status = pb::CampaignRunStatus::try_from(raw).context("campaign status is unknown")?;
+    Ok(status
+        .as_str_name()
+        .trim_start_matches("CAMPAIGN_RUN_STATUS_")
+        .to_ascii_lowercase())
+}
+
+fn summary(
+    manifest: &pb::CampaignRunManifest,
+    manifest_path: &Path,
+    persisted: bool,
+) -> Result<CampaignRunSummary> {
+    let completion = required(&manifest.completion, "campaign_run.completion")?;
+    let missing_outputs = completion
+        .missing_outputs
+        .iter()
+        .map(|missing| {
+            let kind = pb::RequiredOutputKind::try_from(missing.kind)
+                .map(|kind| kind.as_str_name().to_string())
+                .unwrap_or_else(|_| format!("UNKNOWN_{}", missing.kind));
+            let action = missing
+                .action_id
+                .as_ref()
+                .and_then(|id| action_id_to_hex(id, "missing_output.action_id").ok())
+                .map(|id| format!(" action_id={id}"))
+                .unwrap_or_default();
+            format!("{kind}{action}: {}", missing.reason)
+        })
+        .collect();
+    let failed_samples = completion
+        .failed_samples
+        .iter()
+        .map(|failed| {
+            let id = failed
+                .action_id
+                .as_ref()
+                .and_then(|id| action_id_to_hex(id, "failed_sample.action_id").ok())
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("{id}: {}", failed.error)
+        })
+        .collect();
+    Ok(CampaignRunSummary {
+        campaign_id: digest_hex(
+            required(&manifest.campaign_id, "campaign_run.campaign_id")?,
+            "campaign_run.campaign_id",
+        )?,
+        run_id: digest_hex(
+            required(&manifest.run_id, "campaign_run.run_id")?,
+            "campaign_run.run_id",
+        )?,
+        campaign_name: required(&manifest.campaign, "campaign_run.campaign")?
+            .campaign_name
+            .clone(),
+        crate_version: required(&manifest.crate_version, "campaign_run.crate_version")?
+            .value
+            .clone(),
+        dso_version: required(&manifest.dso_version, "campaign_run.dso_version")?
+            .value
+            .clone(),
+        status: status_label(manifest.status)?,
+        root_action_count: completion.root_action_count,
+        completed_root_count: completion.completed_root_count,
+        pending_count: completion.pending_count,
+        running_count: completion.running_count,
+        failed_count: completion.failed_count,
+        canceled_count: completion.canceled_count,
+        missing_outputs,
+        failed_samples,
+        manifest_path: manifest_path.display().to_string(),
+        persisted,
+    })
+}
+
+pub(crate) fn plan_campaign_run(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    crate_version: &str,
+) -> Result<CampaignRunSummary> {
+    let manifest = evaluated_manifest(store, repo_root, crate_version)?;
+    let path = campaign_run_path(store, required(&manifest.run_id, "campaign_run.run_id")?)?;
+    summary(&manifest, &path, false)
+}
+
+pub(crate) fn reconcile_campaign_run(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    crate_version: &str,
+    priority: i32,
+) -> Result<CampaignRunSummary> {
+    let planned = new_manifest(repo_root, crate_version)?;
+    let canonical_crate = required(&planned.crate_version, "campaign_run.crate_version")?
+        .value
+        .clone();
+    enqueue_processing_for_crate_version(store, repo_root, &canonical_crate, priority)?;
+    let manifest = evaluated_manifest(store, repo_root, &canonical_crate)?;
+    let path = write_manifest(store, &manifest)?;
+    summary(&manifest, &path, true)
+}
+
+pub(crate) fn finalize_campaign_run(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    crate_version: &str,
+) -> Result<CampaignRunSummary> {
+    let manifest = evaluated_manifest(store, repo_root, crate_version)?;
+    let path = write_manifest(store, &manifest)?;
+    summary(&manifest, &path, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queue::list_queue_files;
+    use crate::versioning::load_version_compat_map;
+
+    fn temp_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "xlsynth-bvc-campaign-{label}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn known_crate_version(repo_root: &Path) -> String {
+        load_version_compat_map(repo_root)
+            .expect("load version map")
+            .keys()
+            .next()
+            .expect("nonempty version map")
+            .clone()
+    }
+
+    #[test]
+    fn campaign_id_is_deterministic_and_semantic() {
+        let campaign = load_default_campaign().expect("load campaign");
+        let first = compute_campaign_id(&campaign).expect("campaign id");
+        let second = compute_campaign_id(&campaign).expect("campaign id");
+        assert_eq!(first, second);
+        let mut changed = campaign;
+        changed.analysis_algorithm_version += 1;
+        assert_ne!(
+            first,
+            compute_campaign_id(&changed).expect("changed campaign id")
+        );
+    }
+
+    #[test]
+    fn plan_is_read_only_and_run_id_is_stable() {
+        let repo_root = std::env::current_dir().expect("current dir");
+        let root = temp_path("plan");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let version = known_crate_version(&repo_root);
+        let first = plan_campaign_run(&store, &repo_root, &version).expect("first plan");
+        let second = plan_campaign_run(&store, &repo_root, &version).expect("second plan");
+        assert_eq!(first.run_id, second.run_id);
+        assert!(!Path::new(&first.manifest_path).exists());
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reconcile_is_idempotent_and_finalize_explains_incomplete_run() {
+        let repo_root = std::env::current_dir().expect("current dir");
+        let root = temp_path("reconcile");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let version = known_crate_version(&repo_root);
+        let first = reconcile_campaign_run(&store, &repo_root, &version, 0).expect("reconcile");
+        let pending_once = list_queue_files(&store.queue_pending_dir())
+            .expect("pending files")
+            .len();
+        let second = reconcile_campaign_run(&store, &repo_root, &version, 0).expect("reconcile");
+        let pending_twice = list_queue_files(&store.queue_pending_dir())
+            .expect("pending files")
+            .len();
+        assert_eq!(first.run_id, second.run_id);
+        assert_eq!(pending_once, pending_twice);
+        assert_eq!(pending_once as u64, first.root_action_count);
+        let finalized = finalize_campaign_run(&store, &repo_root, &version).expect("finalize");
+        assert_eq!(finalized.status, "building");
+        assert_eq!(finalized.pending_count, finalized.root_action_count);
+        assert!(
+            finalized
+                .missing_outputs
+                .iter()
+                .any(|reason| reason.contains("root action artifact is absent"))
+        );
+        assert!(Path::new(&finalized.manifest_path).exists());
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn malformed_manifest_is_rejected() {
+        let manifest = pb::CampaignRunManifest::default();
+        let error = validate_manifest(&manifest).expect_err("invalid manifest");
+        assert!(error.to_string().contains("record version"));
+    }
+}

@@ -10,19 +10,26 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 
+mod analysis;
 mod app;
+mod campaign;
 mod cli;
+mod coordinator;
 mod corpus;
 mod executor;
 mod model;
 mod ops;
+mod proto;
+mod publish;
 mod query;
 mod queue;
 mod runtime;
 mod service;
+mod site;
 mod sled_space;
 mod snapshot;
 mod store;
+mod store_validation;
 mod versioning;
 mod view;
 mod web;
@@ -629,7 +636,7 @@ mod tests {
     #[test]
     fn write_failed_record_persists_failed_action_record_without_queue_failed_copy() {
         let (store, root) = make_test_store();
-        let action_id = "abcd1234";
+        let action_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let running = sample_running(action_id);
         write_failed_record(&store, &running, "worker-a", "boom").expect("writing failed record");
 
@@ -646,7 +653,7 @@ mod tests {
     #[test]
     fn load_failed_queue_records_reads_persisted_records_only() {
         let (store, root) = make_test_store();
-        let action_id = "persisted-1";
+        let action_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version: "v0.37.0".to_string(),
             discovery_runtime: None,
@@ -662,7 +669,7 @@ mod tests {
         };
         write_failed_action_record(&store, &persisted).expect("writing persisted failed record");
 
-        let persisted_only_id = "persisted-only-2";
+        let persisted_only_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let persisted_only = QueueFailed {
             schema_version: ACTION_SCHEMA_VERSION,
             action_id: persisted_only_id.to_string(),

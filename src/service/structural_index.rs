@@ -1038,9 +1038,9 @@ pub(crate) fn enqueue_structural_opt_ir_g8r_actions(
     let mut pending_paths = list_queue_files(&store.queue_pending_dir())?;
     pending_paths.sort();
     for path in pending_paths {
-        let text = fs::read_to_string(&path)
+        let bytes = fs::read(&path)
             .with_context(|| format!("reading pending queue record: {}", path.display()))?;
-        let (_action_id, _, _, action) = parse_queue_work_item(&text, &path)?;
+        let (_action_id, _, _, action) = parse_queue_work_item(&bytes, &path)?;
         if let Some(structural_hash) = structural_hash_for_matching_target_g8r_action(
             &action,
             None,
@@ -1060,9 +1060,9 @@ pub(crate) fn enqueue_structural_opt_ir_g8r_actions(
     let mut running_paths = list_queue_files(&store.queue_running_dir())?;
     running_paths.sort();
     for path in running_paths {
-        let text = fs::read_to_string(&path)
+        let bytes = fs::read(&path)
             .with_context(|| format!("reading running queue record: {}", path.display()))?;
-        let (_action_id, _, _, action) = parse_queue_work_item(&text, &path)?;
+        let (_action_id, _, _, action) = parse_queue_work_item(&bytes, &path)?;
         if let Some(structural_hash) = structural_hash_for_matching_target_g8r_action(
             &action,
             None,
@@ -1099,9 +1099,9 @@ pub(crate) fn enqueue_structural_opt_ir_g8r_actions(
     let mut canceled_paths = list_queue_files(&store.queue_canceled_dir())?;
     canceled_paths.sort();
     for path in canceled_paths {
-        let text = fs::read_to_string(&path)
+        let bytes = fs::read(&path)
             .with_context(|| format!("reading canceled queue record: {}", path.display()))?;
-        let canceled: QueueCanceled = serde_json::from_str(&text)
+        let canceled = crate::proto::decode_queue_canceled(&bytes)
             .with_context(|| format!("parsing canceled queue record: {}", path.display()))?;
         if let Some(structural_hash) = structural_hash_for_matching_target_g8r_action(
             &canceled.action,
@@ -1262,10 +1262,11 @@ mod tests {
     }
 
     fn sample_provenance(
-        action_id: &str,
+        _seed_action_id: &str,
         created_utc: DateTime<Utc>,
         action: ActionSpec,
     ) -> Provenance {
+        let action_id = crate::executor::compute_action_id(&action).expect("compute V2 action id");
         Provenance {
             schema_version: crate::ACTION_SCHEMA_VERSION,
             action_id: action_id.to_string(),
@@ -1279,7 +1280,7 @@ mod tests {
             },
             output_files: Vec::new(),
             commands: Vec::new(),
-            details: serde_json::Value::Null,
+            details: serde_json::json!({}),
             suggested_next_actions: Vec::new(),
         }
     }
@@ -1766,9 +1767,9 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
     let mut pending_paths = list_queue_files(&store.queue_pending_dir())?;
     pending_paths.sort();
     for path in pending_paths {
-        let text = fs::read_to_string(&path)
+        let bytes = fs::read(&path)
             .with_context(|| format!("reading pending queue record: {}", path.display()))?;
-        let (_action_id, _, queue_priority, action) = parse_queue_work_item(&text, &path)?;
+        let (_action_id, _, queue_priority, action) = parse_queue_work_item(&bytes, &path)?;
         if let Some(structural_hash) = structural_hash_for_matching_target_k_bool_action(
             &action,
             None,
@@ -1795,9 +1796,9 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
     let mut running_paths = list_queue_files(&store.queue_running_dir())?;
     running_paths.sort();
     for path in running_paths {
-        let text = fs::read_to_string(&path)
+        let bytes = fs::read(&path)
             .with_context(|| format!("reading running queue record: {}", path.display()))?;
-        let (_action_id, _, _, action) = parse_queue_work_item(&text, &path)?;
+        let (_action_id, _, _, action) = parse_queue_work_item(&bytes, &path)?;
         if let Some(structural_hash) = structural_hash_for_matching_target_k_bool_action(
             &action,
             None,
@@ -1836,9 +1837,9 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
     let mut canceled_paths = list_queue_files(&store.queue_canceled_dir())?;
     canceled_paths.sort();
     for path in canceled_paths {
-        let text = fs::read_to_string(&path)
+        let bytes = fs::read(&path)
             .with_context(|| format!("reading canceled queue record: {}", path.display()))?;
-        let canceled: QueueCanceled = serde_json::from_str(&text)
+        let canceled = crate::proto::decode_queue_canceled(&bytes)
             .with_context(|| format!("parsing canceled queue record: {}", path.display()))?;
         if let Some(structural_hash) = structural_hash_for_matching_target_k_bool_action(
             &canceled.action,

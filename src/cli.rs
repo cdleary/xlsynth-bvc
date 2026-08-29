@@ -61,6 +61,59 @@ pub enum TopCommand {
         #[arg(long, default_value_t = crate::DEFAULT_QUEUE_PRIORITY)]
         priority: i32,
     },
+    /// Compute the deterministic release campaign/run identities and inspect completion.
+    PlanCampaignRun {
+        #[arg(long)]
+        crate_version: String,
+    },
+    /// Idempotently enqueue campaign roots and persist the protobuf run manifest.
+    ReconcileCampaignRun {
+        #[arg(long)]
+        crate_version: String,
+        #[arg(long, default_value_t = crate::DEFAULT_QUEUE_PRIORITY)]
+        priority: i32,
+    },
+    /// Re-evaluate declared outputs and persist a truthful terminal/building status.
+    FinalizeCampaignRun {
+        #[arg(long)]
+        crate_version: String,
+    },
+    /// Produce deterministic typed findings for a finalized campaign run.
+    AnalyzeCampaignRun {
+        #[arg(long)]
+        crate_version: String,
+        #[arg(long)]
+        baseline_crate_version: Option<String>,
+    },
+    /// Run the idempotent build-machine pipeline through optional publication.
+    CoordinateRelease {
+        #[arg(long)]
+        crate_version: String,
+        #[arg(long)]
+        baseline_crate_version: Option<String>,
+        #[arg(long, value_name = "DIR", default_value = "bvc-publication-work")]
+        work_dir: PathBuf,
+        #[arg(long, default_value = "/")]
+        base_url: String,
+        #[arg(long, value_name = "DIR")]
+        publish_root: Option<PathBuf>,
+        #[arg(long, default_value_t = crate::runtime::default_web_runner_workers())]
+        workers: usize,
+        #[arg(long, default_value_t = crate::DEFAULT_QUEUE_PRIORITY)]
+        priority: i32,
+    },
+    /// Print known crate versions that have no complete/degraded campaign run.
+    ListPendingCampaignVersions,
+    /// Validate all canonical protobuf records in the build store.
+    ValidateStore {
+        /// Also materialize and hash every declared action output.
+        #[arg(long)]
+        verify_payloads: bool,
+    },
+    /// Print the canonical queue record for one action as a JSON CLI projection.
+    ShowQueueRecord {
+        action_id: String,
+    },
     DrainQueue {
         #[arg(long)]
         limit: Option<usize>,
@@ -180,6 +233,39 @@ pub enum TopCommand {
         #[arg(long, value_name = "DIR")]
         snapshot_dir: PathBuf,
     },
+    BuildStaticSite {
+        #[arg(long, value_name = "DIR")]
+        snapshot_dir: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        out_dir: PathBuf,
+        #[arg(long, default_value = "/")]
+        base_url: String,
+        #[arg(long)]
+        overwrite: bool,
+    },
+    VerifyStaticSite {
+        #[arg(long, value_name = "DIR")]
+        site_dir: PathBuf,
+    },
+    /// Serve the generated site locally and exercise it with headless Chrome.
+    SmokeStaticSite {
+        #[arg(long, value_name = "DIR")]
+        site_dir: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        browser: Option<PathBuf>,
+        #[arg(long, default_value_t = 60)]
+        timeout_seconds: u64,
+    },
+    PublishStaticSite {
+        #[arg(long, value_name = "DIR")]
+        site_dir: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        publish_root: PathBuf,
+    },
+    VerifyPublishedSite {
+        #[arg(long, value_name = "DIR")]
+        publish_root: PathBuf,
+    },
     AnalyzeSledSpace {
         #[arg(long, default_value_t = 25)]
         top: usize,
@@ -293,12 +379,6 @@ pub enum TopCommand {
         apply: bool,
         #[arg(long)]
         reenqueue_missing_suggested: bool,
-    },
-    IngestLegacyFailedRecords {
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long)]
-        keep_legacy_files: bool,
     },
     RefreshVersionCompat,
     DslxToMangledIrFnName {

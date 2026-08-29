@@ -16,6 +16,9 @@ use crate::executor::{
     compute_action_id, discover_dslx_fn_to_ir_suggestions, extract_ir_fn_block_by_name,
 };
 use crate::model::*;
+use crate::proto::{decode_queue_canceled, decode_queue_running};
+#[cfg(test)]
+use crate::proto::{encode_queue_item, encode_queue_running};
 use crate::queue::*;
 use crate::runtime::*;
 use crate::service::*;
@@ -3505,8 +3508,8 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
     }
 
     for queue_path in list_queue_files(&store.queue_pending_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -3514,7 +3517,7 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
                 });
             }
         };
-        let (action_id, _, _, action) = match parse_queue_work_item(&text, &queue_path) {
+        let (action_id, _, _, action) = match parse_queue_work_item(&bytes, &queue_path) {
             Ok(item) => item,
             Err(err) => {
                 eprintln!(
@@ -3528,8 +3531,8 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
         action_specs.entry(action_id).or_insert(action);
     }
     for queue_path in list_queue_files(&store.queue_running_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -3537,7 +3540,7 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
                 });
             }
         };
-        let (action_id, _, _, action) = match parse_queue_work_item(&text, &queue_path) {
+        let (action_id, _, _, action) = match parse_queue_work_item(&bytes, &queue_path) {
             Ok(item) => item,
             Err(err) => {
                 eprintln!(
@@ -3556,8 +3559,8 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
             .or_insert(failed.action);
     }
     for queue_path in list_queue_files(&store.queue_canceled_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -3565,7 +3568,7 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
                 });
             }
         };
-        let canceled: QueueCanceled = match serde_json::from_str(&text)
+        let canceled: QueueCanceled = match decode_queue_canceled(&bytes)
             .with_context(|| format!("parsing canceled queue record: {}", queue_path.display()))
         {
             Ok(record) => record,
@@ -3947,8 +3950,8 @@ fn collect_runtime_action_specs_for_stdlib_file_action_graph(
 ) -> Result<Vec<(String, ActionSpec)>> {
     let mut action_specs_by_id: BTreeMap<String, ActionSpec> = BTreeMap::new();
     for queue_path in list_queue_files(&store.queue_pending_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -3956,7 +3959,7 @@ fn collect_runtime_action_specs_for_stdlib_file_action_graph(
                 });
             }
         };
-        let (action_id, _, _, action) = match parse_queue_work_item(&text, &queue_path) {
+        let (action_id, _, _, action) = match parse_queue_work_item(&bytes, &queue_path) {
             Ok(item) => item,
             Err(err) => {
                 eprintln!(
@@ -3970,8 +3973,8 @@ fn collect_runtime_action_specs_for_stdlib_file_action_graph(
         action_specs_by_id.entry(action_id).or_insert(action);
     }
     for queue_path in list_queue_files(&store.queue_running_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -3979,7 +3982,7 @@ fn collect_runtime_action_specs_for_stdlib_file_action_graph(
                 });
             }
         };
-        let (action_id, _, _, action) = match parse_queue_work_item(&text, &queue_path) {
+        let (action_id, _, _, action) = match parse_queue_work_item(&bytes, &queue_path) {
             Ok(item) => item,
             Err(err) => {
                 eprintln!(
@@ -3998,8 +4001,8 @@ fn collect_runtime_action_specs_for_stdlib_file_action_graph(
             .or_insert(failed.action);
     }
     for queue_path in list_queue_files(&store.queue_canceled_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -4007,7 +4010,7 @@ fn collect_runtime_action_specs_for_stdlib_file_action_graph(
                 });
             }
         };
-        let canceled: QueueCanceled = match serde_json::from_str(&text)
+        let canceled: QueueCanceled = match decode_queue_canceled(&bytes)
             .with_context(|| format!("parsing canceled queue record: {}", queue_path.display()))
         {
             Ok(record) => record,
@@ -6395,15 +6398,15 @@ pub(crate) fn build_unprocessed_version_rows(
     let mut active_queue_by_crate: BTreeMap<String, usize> = BTreeMap::new();
     for queue_dir in [store.queue_pending_dir(), store.queue_running_dir()] {
         for path in list_queue_files(&queue_dir)? {
-            let text = match fs::read_to_string(&path) {
-                Ok(text) => text,
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
                     return Err(e)
                         .with_context(|| format!("reading queue item: {}", path.display()));
                 }
             };
-            let (_, _, _, action) = match parse_queue_work_item(&text, &path) {
+            let (_, _, _, action) = match parse_queue_work_item(&bytes, &path) {
                 Ok(item) => item,
                 Err(err) => {
                     eprintln!(
@@ -6477,15 +6480,15 @@ pub(crate) fn build_queue_live_status(
     let pending = pending_paths.len();
     let mut pending_expanders = 0_usize;
     for path in pending_paths {
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e)
                     .with_context(|| format!("reading pending queue record: {}", path.display()));
             }
         };
-        let action = match parse_queue_work_item(&text, &path) {
+        let action = match parse_queue_work_item(&bytes, &path) {
             Ok((_action_id, _enqueued_utc, _priority, action)) => action,
             Err(err) => {
                 eprintln!(
@@ -6513,15 +6516,15 @@ pub(crate) fn build_queue_live_status(
         .map(str::trim)
         .filter(|prefix| !prefix.is_empty());
     for path in list_queue_files(&store.queue_running_dir())? {
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e)
                     .with_context(|| format!("reading running queue record: {}", path.display()));
             }
         };
-        let running: QueueRunning = match serde_json::from_str(&text)
+        let running: QueueRunning = match decode_queue_running(&bytes)
             .with_context(|| format!("parsing running queue record: {}", path.display()))
         {
             Ok(record) => record,
@@ -6739,7 +6742,8 @@ pub(crate) fn maybe_refresh_dslx_root_for_suggestion_discovery(
     let provenance_path = store.provenance_path(root_action_id);
     fs::write(
         &provenance_path,
-        serde_json::to_string_pretty(&provenance).context("serializing refreshed provenance")?,
+        crate::proto::encode_provenance(&provenance)
+            .context("encoding refreshed protobuf provenance")?,
     )
     .with_context(|| {
         format!(
@@ -6899,8 +6903,8 @@ fn collect_known_action_specs_and_provenances(
     }
 
     for queue_path in list_queue_files(&store.queue_pending_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -6908,7 +6912,7 @@ fn collect_known_action_specs_and_provenances(
                 });
             }
         };
-        let (queue_action_id, _, _, queue_action) = match parse_queue_work_item(&text, &queue_path)
+        let (queue_action_id, _, _, queue_action) = match parse_queue_work_item(&bytes, &queue_path)
         {
             Ok(item) => item,
             Err(err) => {
@@ -6924,8 +6928,8 @@ fn collect_known_action_specs_and_provenances(
     }
 
     for queue_path in list_queue_files(&store.queue_running_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -6933,7 +6937,7 @@ fn collect_known_action_specs_and_provenances(
                 });
             }
         };
-        let (queue_action_id, _, _, queue_action) = match parse_queue_work_item(&text, &queue_path)
+        let (queue_action_id, _, _, queue_action) = match parse_queue_work_item(&bytes, &queue_path)
         {
             Ok(item) => item,
             Err(err) => {
@@ -6955,8 +6959,8 @@ fn collect_known_action_specs_and_provenances(
     }
 
     for queue_path in list_queue_files(&store.queue_canceled_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -6964,7 +6968,7 @@ fn collect_known_action_specs_and_provenances(
                 });
             }
         };
-        let canceled: QueueCanceled = match serde_json::from_str(&text)
+        let canceled: QueueCanceled = match decode_queue_canceled(&bytes)
             .with_context(|| format!("parsing canceled queue record: {}", queue_path.display()))
         {
             Ok(record) => record,
@@ -7716,11 +7720,12 @@ mod tests {
 
     fn materialize_test_provenance(
         store: &ArtifactStore,
-        action_id: &str,
+        _seed_action_id: &str,
         action: ActionSpec,
         artifact_type: ArtifactType,
         relpath: &str,
-    ) {
+    ) -> String {
+        let action_id = crate::executor::compute_action_id(&action).expect("compute V2 action id");
         let staging_dir = store.staging_dir().join(format!("{action_id}-stage"));
         let output_path = staging_dir.join(relpath);
         if let Some(parent) = output_path.parent() {
@@ -7749,13 +7754,14 @@ mod tests {
             suggested_next_actions: Vec::new(),
         };
         fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(&provenance).expect("serialize test provenance"),
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode test provenance"),
         )
         .expect("write test provenance");
         store
-            .promote_staging_action_dir(action_id, &staging_dir)
+            .promote_staging_action_dir(&action_id, &staging_dir)
             .expect("promote test provenance");
+        action_id
     }
 
     fn overwrite_test_artifact(
@@ -7785,7 +7791,7 @@ mod tests {
         let source_ir_action_id = "b".repeat(64);
         let structural_hash = "c".repeat(64);
         let fn_name = format!("__mffc_{}", &structural_hash[..16]);
-        materialize_test_provenance(
+        let action_id = materialize_test_provenance(
             &store,
             &action_id,
             ActionSpec::IrFnToMffcCorpus {
@@ -8143,7 +8149,7 @@ mod tests {
             }
             fs::write(
                 &path,
-                serde_json::to_string_pretty(running).expect("serialize running record"),
+                encode_queue_running(running).expect("encode running record"),
             )
             .expect("write running queue record");
         }
@@ -8218,7 +8224,7 @@ mod tests {
             }
             fs::write(
                 &path,
-                serde_json::to_string_pretty(item).expect("serialize pending record"),
+                encode_queue_item(item).expect("encode pending record"),
             )
             .expect("write pending queue record");
         }
@@ -8377,7 +8383,7 @@ mod tests {
         let k3_id = "4".repeat(64);
         let k3_child_id = "5".repeat(64);
 
-        materialize_test_provenance(
+        let ir_id = materialize_test_provenance(
             &store,
             &ir_id,
             ActionSpec::DriverDslxFnToIr {
@@ -8390,7 +8396,7 @@ mod tests {
             ArtifactType::IrPackageFile,
             "payload/ir.ir",
         );
-        materialize_test_provenance(
+        let opt_id = materialize_test_provenance(
             &store,
             &opt_id,
             ActionSpec::DriverIrToOpt {
@@ -8402,7 +8408,7 @@ mod tests {
             ArtifactType::IrPackageFile,
             "payload/opt.ir",
         );
-        materialize_test_provenance(
+        let _direct_aig_id = materialize_test_provenance(
             &store,
             &direct_aig_id,
             ActionSpec::DriverIrToG8rAig {
@@ -8416,7 +8422,7 @@ mod tests {
             ArtifactType::AigFile,
             "payload/direct.aig",
         );
-        materialize_test_provenance(
+        let k3_id = materialize_test_provenance(
             &store,
             &k3_id,
             ActionSpec::IrFnToKBoolConeCorpus {
@@ -8430,7 +8436,7 @@ mod tests {
             ArtifactType::IrPackageFile,
             "payload/k3.ir",
         );
-        materialize_test_provenance(
+        let k3_child_id = materialize_test_provenance(
             &store,
             &k3_child_id,
             ActionSpec::DriverIrToG8rAig {
@@ -8491,7 +8497,7 @@ mod tests {
         let opt_id = "2".repeat(64);
         let ir_top = "__float32__add";
 
-        materialize_test_provenance(
+        let ir_id = materialize_test_provenance(
             &store,
             &ir_id,
             ActionSpec::DriverDslxFnToIr {
@@ -8504,7 +8510,7 @@ mod tests {
             ArtifactType::IrPackageFile,
             "payload/ir.ir",
         );
-        materialize_test_provenance(
+        let opt_id = materialize_test_provenance(
             &store,
             &opt_id,
             ActionSpec::DriverIrToOpt {
@@ -8583,7 +8589,7 @@ mod tests {
         let dslx_fn_name = "eq_2";
         let ir_top = "__float32__eq_2";
 
-        materialize_test_provenance(
+        let dslx_id = materialize_test_provenance(
             &store,
             &dslx_id,
             ActionSpec::DriverDslxFnToIr {
@@ -8596,7 +8602,7 @@ mod tests {
             ArtifactType::IrPackageFile,
             "payload/dslx.ir",
         );
-        materialize_test_provenance(
+        let opt_id = materialize_test_provenance(
             &store,
             &opt_id,
             ActionSpec::DriverIrToOpt {
@@ -8608,7 +8614,7 @@ mod tests {
             ArtifactType::IrPackageFile,
             "payload/opt.ir",
         );
-        materialize_test_provenance(
+        let g8r_aig_false_id = materialize_test_provenance(
             &store,
             &g8r_aig_false_id,
             ActionSpec::DriverIrToG8rAig {
@@ -8622,7 +8628,7 @@ mod tests {
             ArtifactType::AigFile,
             "payload/g8r_false.aig",
         );
-        materialize_test_provenance(
+        let g8r_stats_false_id = materialize_test_provenance(
             &store,
             &g8r_stats_false_id,
             ActionSpec::DriverAigToStats {
@@ -8641,7 +8647,7 @@ mod tests {
             r#"{"and_nodes": 42, "depth": 6}"#,
         );
 
-        materialize_test_provenance(
+        let g8r_aig_true_id = materialize_test_provenance(
             &store,
             &g8r_aig_true_id,
             ActionSpec::DriverIrToG8rAig {
@@ -8655,7 +8661,7 @@ mod tests {
             ArtifactType::AigFile,
             "payload/g8r_true.aig",
         );
-        materialize_test_provenance(
+        let g8r_stats_true_id = materialize_test_provenance(
             &store,
             &g8r_stats_true_id,
             ActionSpec::DriverAigToStats {
@@ -8674,7 +8680,7 @@ mod tests {
             r#"{"and_nodes": 40, "depth": 5}"#,
         );
 
-        materialize_test_provenance(
+        let ir2combo_id = materialize_test_provenance(
             &store,
             &ir2combo_id,
             ActionSpec::IrFnToCombinationalVerilog {
@@ -8687,7 +8693,7 @@ mod tests {
             ArtifactType::VerilogFile,
             "payload/combo.v",
         );
-        materialize_test_provenance(
+        let yosys_aig_id = materialize_test_provenance(
             &store,
             &yosys_aig_id,
             ActionSpec::ComboVerilogToYosysAbcAig {
@@ -8702,7 +8708,7 @@ mod tests {
             ArtifactType::AigFile,
             "payload/yosys.aig",
         );
-        materialize_test_provenance(
+        let yosys_stats_id = materialize_test_provenance(
             &store,
             &yosys_stats_id,
             ActionSpec::DriverAigToStats {
@@ -8721,7 +8727,7 @@ mod tests {
             r#"{"and_nodes": 55, "depth": 7}"#,
         );
 
-        materialize_test_provenance(
+        let delay_id = materialize_test_provenance(
             &store,
             &delay_id,
             ActionSpec::DriverIrToDelayInfo {

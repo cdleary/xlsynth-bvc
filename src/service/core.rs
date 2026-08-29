@@ -992,8 +992,8 @@ mod tests {
             fs::write(path, bytes).expect("write staged file");
         }
         fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(provenance).expect("serialize provenance"),
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(provenance).expect("encode provenance"),
         )
         .expect("write provenance");
         store
@@ -1004,18 +1004,19 @@ mod tests {
     #[test]
     fn resolve_known_input_ir_structural_hash_reads_producer_output_hash() {
         let (store, root) = make_test_store();
-        let producer_id = "a".repeat(64);
         let hash = "b".repeat(64);
+        let action = ActionSpec::DriverIrToOpt {
+            ir_action_id: "c".repeat(64),
+            top_fn_name: Some("__top".to_string()),
+            version: "v0.39.0".to_string(),
+            runtime: sample_runtime(),
+        };
+        let producer_id = crate::executor::compute_action_id(&action).expect("compute producer id");
         let provenance = Provenance {
             schema_version: crate::ACTION_SCHEMA_VERSION,
             action_id: producer_id.clone(),
             created_utc: Utc::now(),
-            action: ActionSpec::DriverIrToOpt {
-                ir_action_id: "c".repeat(64),
-                top_fn_name: Some("__top".to_string()),
-                version: "v0.39.0".to_string(),
-                runtime: sample_runtime(),
-            },
+            action,
             dependencies: Vec::new(),
             output_artifact: ArtifactRef {
                 action_id: producer_id.clone(),
@@ -1048,7 +1049,6 @@ mod tests {
     #[test]
     fn resolve_known_input_ir_structural_hash_reads_k_bool_manifest_entry() {
         let (store, root) = make_test_store();
-        let action_id = "d".repeat(64);
         let hash = "e".repeat(64);
         let runtime = sample_runtime();
         let manifest = KBoolConeCorpusManifest {
@@ -1074,18 +1074,20 @@ mod tests {
                 ir_op_count: Some(3),
             }],
         };
+        let action = ActionSpec::IrFnToKBoolConeCorpus {
+            ir_action_id: "f".repeat(64),
+            top_fn_name: Some("__orig".to_string()),
+            k: 3,
+            max_ir_ops: Some(16),
+            version: "v0.39.0".to_string(),
+            runtime,
+        };
+        let action_id = crate::executor::compute_action_id(&action).expect("compute corpus id");
         let provenance = Provenance {
             schema_version: crate::ACTION_SCHEMA_VERSION,
             action_id: action_id.clone(),
             created_utc: Utc::now(),
-            action: ActionSpec::IrFnToKBoolConeCorpus {
-                ir_action_id: "f".repeat(64),
-                top_fn_name: Some("__orig".to_string()),
-                k: 3,
-                max_ir_ops: Some(16),
-                version: "v0.39.0".to_string(),
-                runtime,
-            },
+            action,
             dependencies: Vec::new(),
             output_artifact: ArtifactRef {
                 action_id: action_id.clone(),

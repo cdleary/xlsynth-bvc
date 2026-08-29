@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package xlsynth.bvc.v1;
+
+import "google/protobuf/timestamp.proto";
+import "xlsynth/bvc/v1/action.proto";
+import "xlsynth/bvc/v1/common.proto";
+
+enum CampaignRootPolicy {
+  CAMPAIGN_ROOT_POLICY_UNSPECIFIED = 0;
+  CAMPAIGN_ROOT_POLICY_RELEASE_STDLIB_AND_MODULES = 1;
+}
+
+enum RequiredOutputKind {
+  REQUIRED_OUTPUT_KIND_UNSPECIFIED = 0;
+  REQUIRED_OUTPUT_KIND_ROOT_ARTIFACTS = 1;
+  REQUIRED_OUTPUT_KIND_VERSIONS_SUMMARY_DATASET = 2;
+  REQUIRED_OUTPUT_KIND_STDLIB_G8R_VS_YOSYS_DATASET = 3;
+}
+
+message CampaignFailurePolicy {
+  bool allow_sample_action_failures = 1;
+  bool root_action_failure_is_terminal = 2;
+}
+
+message CampaignSpec {
+  string campaign_name = 1;
+  uint32 semantic_version = 2;
+  string corpus_source = 3;
+  CampaignRootPolicy root_policy = 4;
+  repeated RequiredOutputKind required_outputs = 5;
+  CampaignFailurePolicy failure_policy = 6;
+  uint32 analysis_algorithm_version = 7;
+  uint32 publication_policy_version = 8;
+}
+
+message CampaignIdentity {
+  uint32 identity_version = 1;
+  CampaignSpec campaign = 2;
+}
+
+message CampaignRunIdentity {
+  uint32 identity_version = 1;
+  Sha256Digest campaign_id = 2;
+  CrateVersion crate_version = 3;
+  DsoVersion dso_version = 4;
+  DriverRuntimeSpec driver_runtime = 5;
+}
+
+enum CampaignRunStatus {
+  CAMPAIGN_RUN_STATUS_UNSPECIFIED = 0;
+  CAMPAIGN_RUN_STATUS_BUILDING = 1;
+  CAMPAIGN_RUN_STATUS_COMPLETE = 2;
+  CAMPAIGN_RUN_STATUS_DEGRADED = 3;
+  CAMPAIGN_RUN_STATUS_FAILED = 4;
+}
+
+message CampaignRootAction {
+  ActionId action_id = 1;
+  ActionSpec action = 2;
+}
+
+message MissingOutput {
+  RequiredOutputKind kind = 1;
+  optional ActionId action_id = 2;
+  string reason = 3;
+}
+
+message FailedSample {
+  ActionId action_id = 1;
+  string error = 2;
+}
+
+message CompletionReport {
+  CampaignRunStatus status = 1;
+  uint64 root_action_count = 2;
+  uint64 completed_root_count = 3;
+  uint64 pending_count = 4;
+  uint64 running_count = 5;
+  uint64 failed_count = 6;
+  uint64 canceled_count = 7;
+  repeated MissingOutput missing_outputs = 8;
+  repeated FailedSample failed_samples = 9;
+}
+
+message CampaignRunManifest {
+  uint32 record_version = 1;
+  Sha256Digest campaign_id = 2;
+  Sha256Digest run_id = 3;
+  CampaignSpec campaign = 4;
+  CrateVersion crate_version = 5;
+  DsoVersion dso_version = 6;
+  DriverRuntimeSpec driver_runtime = 7;
+  repeated CampaignRootAction root_actions = 8;
+  CampaignRunStatus status = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  CompletionReport completion = 12;
+}

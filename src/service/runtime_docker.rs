@@ -197,15 +197,15 @@ pub(crate) fn collect_pending_queue_actions(store: &ArtifactStore) -> Result<Vec
     paths.sort();
     let mut actions = Vec::new();
     for path in paths {
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e)
                     .with_context(|| format!("reading pending queue record: {}", path.display()));
             }
         };
-        match parse_queue_work_item(&text, &path) {
+        match parse_queue_work_item(&bytes, &path) {
             Ok((_, _, _, action)) => actions.push(action),
             Err(err) => {
                 quarantine_corrupt_queue_file(
@@ -1894,8 +1894,9 @@ mod tests {
             suggested_next_actions: Vec::new(),
         };
         fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(&provenance).context("serializing seeded provenance")?,
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance)
+                .context("encoding seeded protobuf provenance")?,
         )
         .with_context(|| format!("writing seeded provenance for {}", action_id))?;
         store.promote_staging_action_dir(&action_id, &staging_dir)?;

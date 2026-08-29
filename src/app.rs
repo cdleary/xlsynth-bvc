@@ -12,7 +12,12 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::analysis::analyze_campaign_run;
+use crate::campaign::{
+    finalize_campaign_run, pending_campaign_versions, plan_campaign_run, reconcile_campaign_run,
+};
 use crate::cli::{Cli, RunAction, TopCommand};
+use crate::coordinator::{CoordinateReleaseOptions, coordinate_release};
 use crate::corpus::{refresh_ir_dir_corpus_status, run_ir_dir_corpus, show_ir_dir_corpus_progress};
 use crate::driver_ir_aig_equiv_enabled;
 use crate::executor::{
@@ -21,6 +26,7 @@ use crate::executor::{
 };
 use crate::model::*;
 use crate::ops::run_workers;
+use crate::publish::{publish_static_site, verify_published_site};
 use crate::query::{
     action_kind_label, build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed,
     enqueue_processing_for_crate_version,
@@ -30,12 +36,16 @@ use crate::queue::*;
 use crate::queue_only_previous_loss_k_cones_enabled;
 use crate::runtime::*;
 use crate::service::*;
+use crate::site::{
+    BuildStaticSiteOptions, build_static_site, smoke_static_site, verify_static_site,
+};
 use crate::sled_space::analyze_sled_space;
 use crate::snapshot::{BuildStaticSnapshotOptions, build_static_snapshot, verify_static_snapshot};
 use crate::store::{
     ArtifactStore, backfill_sled_action_file_compression, compact_sled_db,
-    ingest_legacy_failed_records, prune_sled_actions_by_ids, prune_sled_actions_by_relpath_size,
+    prune_sled_actions_by_ids, prune_sled_actions_by_relpath_size,
 };
+use crate::store_validation::{show_queue_record, validate_store};
 use crate::versioning::*;
 use crate::web::{self, types::WebRunnerConfig};
 use crate::{
@@ -203,11 +213,22 @@ pub(crate) fn run() -> Result<()> {
         );
         return Ok(());
     }
-    let artifacts_via_sled = artifacts_via_sled.ok_or_else(|| {
-        anyhow::anyhow!(
-            "--artifacts-via-sled is required for all commands except `run-ir-dir-corpus`, `show-corpus-progress`, and `refresh-corpus-status`"
-        )
-    })?;
+    let database_free_command = matches!(
+        &command,
+        TopCommand::VerifyStaticSnapshot { .. }
+            | TopCommand::BuildStaticSite { .. }
+            | TopCommand::VerifyStaticSite { .. }
+            | TopCommand::SmokeStaticSite { .. }
+            | TopCommand::PublishStaticSite { .. }
+            | TopCommand::VerifyPublishedSite { .. }
+    );
+    let artifacts_via_sled = match artifacts_via_sled {
+        Some(path) => path,
+        None if database_free_command => store_dir.join(".unused-static-command.sled"),
+        None => {
+            bail!("--artifacts-via-sled is required for commands that access the build store")
+        }
+    };
     if let TopCommand::AnalyzeSledSpace { top, sample } = &command {
         let summary = analyze_sled_space(&artifacts_via_sled, *top, *sample)?;
         println!(
@@ -300,6 +321,69 @@ pub(crate) fn run() -> Result<()> {
         );
         return Ok(());
     }
+    if let TopCommand::BuildStaticSite {
+        snapshot_dir,
+        out_dir,
+        base_url,
+        overwrite,
+    } = &command
+    {
+        let summary = build_static_site(&BuildStaticSiteOptions {
+            snapshot_dir: snapshot_dir.clone(),
+            out_dir: out_dir.clone(),
+            base_url: base_url.clone(),
+            overwrite: *overwrite,
+        })?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary).expect("serializing build static site summary")
+        );
+        return Ok(());
+    }
+    if let TopCommand::VerifyStaticSite { site_dir } = &command {
+        let summary = verify_static_site(site_dir)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary).expect("serializing verify static site summary")
+        );
+        return Ok(());
+    }
+    if let TopCommand::SmokeStaticSite {
+        site_dir,
+        browser,
+        timeout_seconds,
+    } = &command
+    {
+        let summary = smoke_static_site(site_dir, browser.as_deref(), *timeout_seconds)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .expect("serializing static site browser smoke summary")
+        );
+        return Ok(());
+    }
+    if let TopCommand::PublishStaticSite {
+        site_dir,
+        publish_root,
+    } = &command
+    {
+        let summary = publish_static_site(site_dir, publish_root)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .expect("serializing static publication CLI projection")
+        );
+        return Ok(());
+    }
+    if let TopCommand::VerifyPublishedSite { publish_root } = &command {
+        let summary = verify_published_site(publish_root)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .expect("serializing publication verification CLI projection")
+        );
+        return Ok(());
+    }
     if let TopCommand::ServeWeb {
         bind,
         no_runner,
@@ -355,6 +439,98 @@ pub(crate) fn run() -> Result<()> {
         } => {
             enqueue_processing_for_crate_version(&store, &repo_root, &crate_version, priority)?;
             println!("{}", version_label("crate", &crate_version));
+        }
+        TopCommand::PlanCampaignRun { crate_version } => {
+            let summary = plan_campaign_run(&store, &repo_root, &crate_version)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing campaign plan CLI projection")
+            );
+        }
+        TopCommand::ReconcileCampaignRun {
+            crate_version,
+            priority,
+        } => {
+            let summary = reconcile_campaign_run(&store, &repo_root, &crate_version, priority)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing campaign reconcile CLI projection")
+            );
+        }
+        TopCommand::FinalizeCampaignRun { crate_version } => {
+            let summary = finalize_campaign_run(&store, &repo_root, &crate_version)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing campaign finalize CLI projection")
+            );
+        }
+        TopCommand::AnalyzeCampaignRun {
+            crate_version,
+            baseline_crate_version,
+        } => {
+            let summary = analyze_campaign_run(
+                &store,
+                &repo_root,
+                &crate_version,
+                baseline_crate_version.as_deref(),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing campaign analysis CLI projection")
+            );
+        }
+        TopCommand::CoordinateRelease {
+            crate_version,
+            baseline_crate_version,
+            work_dir,
+            base_url,
+            publish_root,
+            workers,
+            priority,
+        } => {
+            let summary = coordinate_release(
+                store,
+                &repo_root,
+                &CoordinateReleaseOptions {
+                    crate_version,
+                    baseline_crate_version,
+                    work_dir,
+                    base_url,
+                    publish_root,
+                    workers,
+                    priority,
+                },
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing coordinator CLI projection")
+            );
+        }
+        TopCommand::ListPendingCampaignVersions => {
+            for version in pending_campaign_versions(&store, &repo_root)? {
+                println!("{version}");
+            }
+        }
+        TopCommand::ValidateStore { verify_payloads } => {
+            let summary = validate_store(&store, verify_payloads)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing store validation CLI projection")
+            );
+        }
+        TopCommand::ShowQueueRecord { action_id } => {
+            let record = show_queue_record(&store, &action_id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&record)
+                    .expect("serializing queue record CLI projection")
+            );
         }
         TopCommand::DrainQueue {
             limit,
@@ -558,6 +734,21 @@ pub(crate) fn run() -> Result<()> {
         TopCommand::VerifyStaticSnapshot { .. } => {
             unreachable!("verify-static-snapshot handled before store initialization")
         }
+        TopCommand::BuildStaticSite { .. } => {
+            unreachable!("build-static-site handled before store initialization")
+        }
+        TopCommand::VerifyStaticSite { .. } => {
+            unreachable!("verify-static-site handled before store initialization")
+        }
+        TopCommand::SmokeStaticSite { .. } => {
+            unreachable!("smoke-static-site handled before store initialization")
+        }
+        TopCommand::PublishStaticSite { .. } => {
+            unreachable!("publish-static-site handled before store initialization")
+        }
+        TopCommand::VerifyPublishedSite { .. } => {
+            unreachable!("verify-published-site handled before store initialization")
+        }
         TopCommand::AnalyzeSledSpace { .. } => {
             unreachable!("analyze-sled-space handled before store initialization")
         }
@@ -721,17 +912,7 @@ pub(crate) fn run() -> Result<()> {
                 serde_json::to_string_pretty(&summary).expect("serializing repair-queue summary")
             );
         }
-        TopCommand::IngestLegacyFailedRecords {
-            dry_run,
-            keep_legacy_files,
-        } => {
-            let summary = ingest_legacy_failed_records(&store, dry_run, keep_legacy_files)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&summary)
-                    .expect("serializing legacy failed-record ingest summary")
-            );
-        }
+
         TopCommand::RefreshVersionCompat => {
             let summary = refresh_version_compat_json()?;
             println!(
@@ -2861,8 +3042,8 @@ fn promote_mffc_derived_pending_actions(
     let mut pending_paths = list_queue_files(&store.queue_pending_dir())?;
     pending_paths.sort();
     for pending_path in pending_paths {
-        let text = match fs::read_to_string(&pending_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&pending_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -2871,7 +3052,7 @@ fn promote_mffc_derived_pending_actions(
             }
         };
         let (action_id, _enqueued_utc, priority, action) =
-            parse_queue_work_item(&text, &pending_path)?;
+            parse_queue_work_item(&bytes, &pending_path)?;
         scanned_pending += 1;
         if !is_mffc_named_action(&action) {
             continue;
@@ -3114,6 +3295,10 @@ mod tests {
         }
     }
 
+    fn test_action_id(seed: &str) -> String {
+        format!("{:x}", Sha256::digest(seed.as_bytes()))
+    }
+
     fn make_artifact(action_id: &str, artifact_type: ArtifactType, relpath: &str) -> ArtifactRef {
         ArtifactRef {
             action_id: action_id.to_string(),
@@ -3162,8 +3347,8 @@ mod tests {
             fs::write(path, bytes).expect("write staged file");
         }
         fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(&provenance).expect("serialize provenance"),
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
         )
         .expect("write staged provenance");
         store
@@ -3214,10 +3399,13 @@ mod tests {
     ) -> Provenance {
         let source_opt = write_provenance_record(
             store,
-            make_opt_action(&format!("src-ir-{seed}"), runtime),
+            make_opt_action(&test_action_id(&format!("src-ir-{seed}")), runtime),
             make_artifact(
-                &compute_action_id(&make_opt_action(&format!("src-ir-{seed}"), runtime))
-                    .expect("compute source opt action id"),
+                &compute_action_id(&make_opt_action(
+                    &test_action_id(&format!("src-ir-{seed}")),
+                    runtime,
+                ))
+                .expect("compute source opt action id"),
                 ArtifactType::IrPackageFile,
                 "payload/opt.ir",
             ),
@@ -3244,7 +3432,7 @@ mod tests {
         );
 
         let g8r_stats_action = ActionSpec::DriverAigToStats {
-            aig_action_id: format!("g8r-aig-{seed}"),
+            aig_action_id: test_action_id(&format!("g8r-aig-{seed}")),
             version: "v0.39.0".to_string(),
             runtime: runtime.clone(),
         };
@@ -3269,7 +3457,7 @@ mod tests {
         );
 
         let yosys_stats_action = ActionSpec::DriverAigToStats {
-            aig_action_id: format!("yosys-aig-{seed}"),
+            aig_action_id: test_action_id(&format!("yosys-aig-{seed}")),
             version: "v0.39.0".to_string(),
             runtime: runtime.clone(),
         };
@@ -3319,7 +3507,8 @@ mod tests {
         structural_hash: &str,
         seed: &str,
     ) -> (Provenance, SuggestedAction) {
-        let current_opt_action = make_opt_action(&format!("current-ir-{seed}"), runtime);
+        let current_opt_action =
+            make_opt_action(&test_action_id(&format!("current-ir-{seed}")), runtime);
         let current_opt_action_id =
             compute_action_id(&current_opt_action).expect("compute current opt action id");
         let suggestion = make_k_bool_suggestion(&current_opt_action_id, runtime);
@@ -3345,7 +3534,7 @@ mod tests {
     fn finalize_successful_queue_action_keeps_running_visible_until_done_write() {
         let (store, root) = make_test_store("finalize-success-order");
         let runtime = test_runtime();
-        let action = make_opt_action("finalize-success-order-ir", &runtime);
+        let action = make_opt_action(&test_action_id("finalize-success-order-ir"), &runtime);
         let action_id = compute_action_id(&action).expect("compute queue action id");
         let now = Utc::now();
         let running = QueueRunningWithPath {
@@ -3366,7 +3555,8 @@ mod tests {
         }
         fs::write(
             &running.path,
-            serde_json::to_string_pretty(&running.running).expect("serialize running queue record"),
+            crate::proto::encode_queue_running(&running.running)
+                .expect("encode running queue record"),
         )
         .expect("write running queue record");
 

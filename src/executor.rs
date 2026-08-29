@@ -4,7 +4,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use reqwest::blocking::Client;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -338,8 +337,9 @@ fn finish_action_execution(
         suggested_next_actions: outcome.suggested_next_actions,
     };
 
-    let provenance_path = staging_dir.join("provenance.json");
-    let serialized = serde_json::to_string_pretty(&provenance).context("serializing provenance")?;
+    let provenance_path = staging_dir.join("provenance.pb");
+    let serialized =
+        crate::proto::encode_provenance(&provenance).context("encoding protobuf provenance")?;
     fs::write(&provenance_path, serialized)
         .with_context(|| format!("writing provenance file: {}", provenance_path.display()))?;
 
@@ -596,7 +596,7 @@ pub(crate) fn promote_staging_action_dir(staging_dir: &Path, final_dir: &Path) -
                 });
             }
 
-            let final_provenance = final_dir.join("provenance.json");
+            let final_provenance = final_dir.join("provenance.pb");
             if final_provenance.exists() {
                 fs::remove_dir_all(staging_dir).ok();
                 return Ok(());
@@ -621,13 +621,7 @@ pub(crate) fn promote_staging_action_dir(staging_dir: &Path, final_dir: &Path) -
 }
 
 pub(crate) fn compute_action_id(action: &ActionSpec) -> Result<String> {
-    let payload = json!({
-        "schema_version": ACTION_SCHEMA_VERSION,
-        "action": action,
-    });
-    let bytes = serde_json::to_vec(&payload).context("serializing action fingerprint")?;
-    let digest = Sha256::digest(bytes);
-    Ok(hex::encode(digest))
+    Ok(crate::proto::compute_model_action_id_v2(action)?.to_hex())
 }
 
 pub(crate) fn make_staging_dir(store: &ArtifactStore, action_id: &str) -> Result<PathBuf> {
@@ -5341,7 +5335,7 @@ mod tests {
         let action_id = compute_action_id(&action).expect("compute action id");
         assert_eq!(
             action_id,
-            "2541d69cb429497c67d00151da6a85074c72bf702a12e280490e040aff9dd946"
+            "bc2736bf20c8c6968041b7cb602e46c7f5ffe5f02d323b9d0a38db28cc07cb73"
         );
     }
 
@@ -5389,14 +5383,14 @@ mod tests {
         let final_dir = root.join("artifacts").join("aa").join("bb").join("action");
         fs::create_dir_all(&staging_dir).expect("create staging dir");
         fs::create_dir_all(&final_dir).expect("create final dir");
-        fs::write(staging_dir.join("provenance.json"), "{\"ok\":true}")
+        fs::write(staging_dir.join("provenance.pb"), "{\"ok\":true}")
             .expect("write staged provenance");
         fs::write(final_dir.join("failed.json"), "{\"error\":\"boom\"}")
             .expect("write failed marker");
 
         promote_staging_action_dir(&staging_dir, &final_dir).expect("promote staging");
 
-        assert!(final_dir.join("provenance.json").exists());
+        assert!(final_dir.join("provenance.pb").exists());
         assert!(!final_dir.join("failed.json").exists());
         assert!(!staging_dir.exists());
         fs::remove_dir_all(&root).ok();
@@ -5417,15 +5411,15 @@ mod tests {
         let final_dir = root.join("artifacts").join("aa").join("bb").join("action");
         fs::create_dir_all(&staging_dir).expect("create staging dir");
         fs::create_dir_all(&final_dir).expect("create final dir");
-        fs::write(staging_dir.join("provenance.json"), "{\"ok\":\"staged\"}")
+        fs::write(staging_dir.join("provenance.pb"), "{\"ok\":\"staged\"}")
             .expect("write staged provenance");
-        fs::write(final_dir.join("provenance.json"), "{\"ok\":\"final\"}")
+        fs::write(final_dir.join("provenance.pb"), "{\"ok\":\"final\"}")
             .expect("write final provenance");
 
         promote_staging_action_dir(&staging_dir, &final_dir).expect("promote staging");
 
         let final_text =
-            fs::read_to_string(final_dir.join("provenance.json")).expect("read final provenance");
+            fs::read_to_string(final_dir.join("provenance.pb")).expect("read final provenance");
         assert_eq!(final_text, "{\"ok\":\"final\"}");
         assert!(!staging_dir.exists());
         fs::remove_dir_all(&root).ok();

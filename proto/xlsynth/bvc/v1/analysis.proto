@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package xlsynth.bvc.v1;
+
+import "google/protobuf/timestamp.proto";
+import "xlsynth/bvc/v1/common.proto";
+
+enum FindingKind {
+  FINDING_KIND_UNSPECIFIED = 0;
+  FINDING_KIND_REGRESSION = 1;
+  FINDING_KIND_IMPROVEMENT = 2;
+  FINDING_KIND_NEW_FAILURE = 3;
+  FINDING_KIND_FIXED_FAILURE = 4;
+  FINDING_KIND_PERSISTENT_OUTLIER = 5;
+  FINDING_KIND_STRUCTURAL_HASH_LOSS = 6;
+}
+
+message FindingMetric {
+  string name = 1;
+  optional sint64 baseline_microunits = 2;
+  optional sint64 current_microunits = 3;
+  string unit = 4;
+}
+
+message FindingEvidence {
+  string role = 1;
+  ActionId action_id = 2;
+  optional Sha256Digest artifact_sha256 = 3;
+}
+
+// Canonical identity input. Fixed-point metrics avoid platform-dependent
+// floating point identity behavior.
+message FindingIdentity {
+  uint32 identity_version = 1;
+  Sha256Digest campaign_id = 2;
+  Sha256Digest run_id = 3;
+  optional Sha256Digest baseline_run_id = 4;
+  FindingKind kind = 5;
+  string subject_key = 6;
+  FindingMetric metric = 7;
+  uint32 analysis_algorithm_version = 8;
+}
+
+message AnalysisFinding {
+  Sha256Digest finding_id = 1;
+  FindingIdentity identity = 2;
+  optional Sha256Digest structural_hash = 3;
+  repeated FindingEvidence evidence = 4;
+}
+
+message AnalysisReport {
+  uint32 record_version = 1;
+  Sha256Digest campaign_id = 2;
+  Sha256Digest run_id = 3;
+  optional Sha256Digest baseline_run_id = 4;
+  CrateVersion crate_version = 5;
+  optional CrateVersion baseline_crate_version = 6;
+  uint32 analysis_algorithm_version = 7;
+  google.protobuf.Timestamp generated_at = 8;
+  repeated AnalysisFinding findings = 9;
+}

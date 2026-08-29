@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package xlsynth.bvc.v1;
+
+// A SHA-256 digest. Validators require exactly 32 bytes.
+message Sha256Digest {
+  bytes value = 1;
+}
+
+// A content-addressed action identifier. Validators require exactly 32 bytes.
+message ActionId {
+  bytes value = 1;
+}
+
+// A normalized xlsynth DSO/tool release without a leading "v".
+message DsoVersion {
+  string value = 1;
+}
+
+// A normalized xlsynth-driver crate release without a leading "v".
+message CrateVersion {
+  string value = 1;
+}
+
+// A relative path normalized to "/" separators with no "." or ".." components.
+message NormalizedRelpath {
+  string value = 1;
+}
+
+// Runtime identity for xlsynth-driver-backed actions.
+message DriverRuntimeSpec {
+  CrateVersion driver_crate_version = 1;
+  string release_platform = 2;
+  string docker_image = 3;
+  NormalizedRelpath dockerfile = 4;
+}
+
+// Runtime identity for Yosys/ABC-backed actions.
+message YosysRuntimeSpec {
+  string docker_image = 1;
+  NormalizedRelpath dockerfile = 2;
+  optional string upstream_commit = 3;
+}
+
+// A checked-in script and the digest captured when the action is created.
+message ScriptRef {
+  NormalizedRelpath path = 1;
+  Sha256Digest sha256 = 2;
+}
+
+enum ArtifactType {
+  ARTIFACT_TYPE_UNSPECIFIED = 0;
+  ARTIFACT_TYPE_DSLX_FILE_SUBTREE = 1;
+  ARTIFACT_TYPE_IR_PACKAGE_FILE = 2;
+  ARTIFACT_TYPE_IR_DELAY_INFO_FILE = 3;
+  ARTIFACT_TYPE_AIG_FILE = 4;
+  ARTIFACT_TYPE_VERILOG_FILE = 5;
+  ARTIFACT_TYPE_AIG_STATS_FILE = 6;
+  ARTIFACT_TYPE_AIG_STAT_DIFF_FILE = 7;
+  ARTIFACT_TYPE_EQUIV_REPORT_FILE = 8;
+}
+
+// A reference from one action record to a typed artifact produced by another.
+message ArtifactRef {
+  ActionId action_id = 1;
+  ArtifactType artifact_type = 2;
+  NormalizedRelpath relpath = 3;
+}

@@ -1,0 +1,272 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package xlsynth.bvc.v1;
+
+import "google/protobuf/timestamp.proto";
+import "xlsynth/bvc/v1/action.proto";
+import "xlsynth/bvc/v1/common.proto";
+
+message OutputFile {
+  NormalizedRelpath path = 1;
+  uint64 bytes = 2;
+  Sha256Digest sha256 = 3;
+}
+
+message CommandTrace {
+  repeated string argv = 1;
+  int32 exit_code = 2;
+}
+
+message SuggestedAction {
+  string reason = 1;
+  ActionId action_id = 2;
+  ActionSpec action = 3;
+}
+
+// A typed execution diagnostic. Code is a stable, action-specific identifier;
+// message is human-readable context. This is intentionally not an attribute
+// map and cannot carry arbitrary values.
+message ExecutionDiagnostic {
+  string code = 1;
+  string message = 2;
+}
+
+message DslxFunctionDiscoveryDetails {
+  DriverRuntimeSpec source_runtime = 1;
+  DriverRuntimeSpec enumeration_runtime = 2;
+  DsoVersion enumeration_runtime_dso_version = 3;
+  bool enumeration_runtime_overrides_source = 4;
+  string dslx_path = 5;
+  string dslx_stdlib_path = 6;
+  string stdlib_source = 7;
+  uint64 scanned_dslx_files = 8;
+  uint64 listed_functions = 9;
+  uint64 concrete_functions = 10;
+  repeated NormalizedRelpath failed_dslx_files = 11;
+  uint64 suggested_actions = 12;
+}
+
+message SemanticCacheHitDetails { ActionId from_action_id = 1; }
+
+message CommonDriverActionDetails {
+  DriverRuntimeSpec driver_runtime = 1;
+  DsoVersion dso_version = 2;
+  optional string crate_version_label = 3;
+  optional string dso_version_label = 4;
+  optional string ir_top = 5;
+  optional string driver_subcommand = 6;
+  optional Sha256Digest input_ir_fn_structural_hash = 7;
+  optional Sha256Digest output_ir_fn_structural_hash = 8;
+  optional uint64 output_ir_op_count = 9;
+  optional NormalizedRelpath output_manifest_relpath = 10;
+  SemanticCacheHitDetails semantic_cache_hit = 11;
+  optional bool synthetic = 12;
+  optional string test_label = 13;
+  optional DriverRuntimeSpec driver_ir_aig_equiv_runtime = 14;
+  optional string input_ir_fn_structural_hash_source = 15;
+  optional bool ir_top_explicit = 16;
+  optional NormalizedRelpath output_ir_relpath = 17;
+  repeated ExecutionDiagnostic diagnostics = 18;
+}
+
+message ImportIrPackageFileDetails {
+  optional string source_path = 1;
+  Sha256Digest source_sha256 = 2;
+  optional string top_fn_name = 3;
+  string import_kind = 4;
+}
+
+message DownloadReleaseStdlibDetails {
+  string tarball_url = 1;
+  string sha256_url = 2;
+  Sha256Digest expected_sha256 = 3;
+  Sha256Digest actual_sha256 = 4;
+  DslxFunctionDiscoveryDetails function_discovery = 5;
+  optional string function_discovery_error = 6;
+}
+
+message DownloadSourceSubtreeDetails {
+  string source_archive_url = 1;
+  Sha256Digest source_archive_sha256 = 2;
+  NormalizedRelpath subtree = 3;
+  uint64 extracted_file_count = 4;
+  DslxFunctionDiscoveryDetails function_discovery = 5;
+  optional string function_discovery_error = 6;
+}
+
+message DriverDslxFnToIrDetails {
+  CommonDriverActionDetails common = 1;
+  NormalizedRelpath dslx_file = 2;
+  string dslx_fn_name = 3;
+  string dslx_path = 4;
+  string dslx_stdlib_path = 5;
+  string stdlib_source = 6;
+}
+
+message DriverIrToOptDetails {
+  CommonDriverActionDetails common = 1;
+  optional bool driver_ir_aig_equiv_supported = 2;
+  optional bool driver_ir_aig_equiv_quarantined = 3;
+  optional string driver_ir_aig_equiv_mode = 4;
+  optional string driver_ir_aig_equiv_error = 5;
+  bool mffc_suggestion_eligible = 6;
+  string mffc_suggestion_reason = 7;
+  uint64 mffc_min_internal_non_literal = 8;
+}
+
+message DriverIrToDelayInfoDetails {
+  CommonDriverActionDetails common = 1;
+  string delay_model = 2;
+  string output_format = 3;
+  optional string delay_info_textproto = 4;
+  optional string parse_error = 5;
+  string delay_info_proto_schema_url = 6;
+  string op_proto_schema_url = 7;
+}
+
+message DriverIrEquivDetails {
+  CommonDriverActionDetails common = 1;
+  string mode = 2;
+  uint64 timeout_seconds = 3;
+  optional int32 return_code = 4;
+  optional string stdout_tail = 5;
+  optional string stderr_tail = 6;
+}
+
+message DriverIrAigEquivDetails {
+  CommonDriverActionDetails common = 1;
+  string mode = 2;
+  uint64 timeout_seconds = 3;
+  optional int32 return_code = 4;
+  optional string stdout_tail = 5;
+  optional string stderr_tail = 6;
+}
+
+message DriverIrToG8rAigDetails {
+  CommonDriverActionDetails common = 1;
+  bool fraig = 2;
+  G8rLoweringMode lowering_mode = 3;
+  optional string driver_ir2g8r_cli_mode = 4;
+  optional bool driver_ir2g8r_passed_top = 5;
+  optional bool driver_ir_aig_equiv_supported = 6;
+  optional bool driver_ir_aig_equiv_quarantined = 7;
+  optional string driver_ir_aig_equiv_mode = 8;
+  optional NormalizedRelpath legacy_g8r_stats_relpath = 9;
+  optional uint64 batch_size = 10;
+  optional uint64 member_index = 11;
+  optional bool prepared_ir_supported = 12;
+  optional NormalizedRelpath prepared_ir_relpath = 13;
+  optional string prepared_ir_reason = 14;
+  optional string output_kind = 15;
+  optional string top_ignored_reason = 16;
+  string lowering_mode_flags = 17;
+}
+
+message IrFnToCombinationalVerilogDetails {
+  CommonDriverActionDetails common = 1;
+  bool use_system_verilog = 2;
+  bool driver_ir2combo_top_rewritten = 3;
+}
+
+message IrFnToKBoolConeCorpusDetails {
+  CommonDriverActionDetails common = 1;
+  uint32 k = 2;
+  optional uint64 max_ir_ops = 3;
+  uint64 total_manifest_rows = 4;
+  uint64 emitted_cone_files = 5;
+  uint64 deduped_unique_cones = 6;
+  uint64 cone_entry_count = 7;
+  string text_id_validation = 8;
+  uint64 suggested_actions = 9;
+  optional uint64 filtered_out_ir_op_count = 10;
+  optional NormalizedRelpath output_ir_relpath = 11;
+}
+
+message IrFnToMffcCorpusDetails {
+  CommonDriverActionDetails common = 1;
+  optional uint64 max_mffcs = 2;
+  uint64 min_internal_non_literal = 3;
+  optional uint64 max_frontier_non_literal = 4;
+  uint64 total_manifest_rows = 5;
+  uint64 emitted_mffc_files = 6;
+  uint64 deduped_unique_mffcs = 7;
+  uint64 mffc_entry_count = 8;
+  uint64 suggested_actions = 9;
+}
+
+message ComboVerilogToYosysAbcAigDetails {
+  YosysRuntimeSpec yosys_runtime = 1;
+  ScriptRef yosys_script_ref = 2;
+  optional string verilog_top_module_name = 3;
+  string flow = 4;
+}
+
+message AigToYosysAbcAigDetails {
+  YosysRuntimeSpec yosys_runtime = 1;
+  ScriptRef yosys_script_ref = 2;
+  string flow = 3;
+}
+
+message LegacyG8rStatsSourceDetails {
+  ActionId ir_action_id = 1;
+  bool fraig = 2;
+  DriverRuntimeSpec source_runtime = 3;
+  DsoVersion source_dso_version = 4;
+}
+
+message DriverAigToStatsDetails {
+  CommonDriverActionDetails common = 1;
+  DsoVersion runtime_dso_version = 2;
+  string aig_stats_mode = 3;
+  LegacyG8rStatsSourceDetails legacy_g8r_source = 4;
+  optional NormalizedRelpath legacy_g8r_stats_relpath = 5;
+  DriverRuntimeSpec source_aig_driver_runtime = 6;
+  optional string source_aig_crate_version_label = 7;
+  optional string source_aig_dso_version_label = 8;
+  optional string runtime_xlsynth_version = 9;
+  optional string stats_runtime_crate_version_label = 10;
+  optional string stats_runtime_dso_version_label = 11;
+}
+
+message AigStatDiffDetails {
+  ActionId opt_ir_action_id = 1;
+  ActionId g8r_aig_stats_action_id = 2;
+  ActionId yosys_abc_aig_stats_action_id = 3;
+  uint64 numeric_delta_count = 4;
+}
+
+message ActionDetails {
+  oneof kind {
+    ImportIrPackageFileDetails import_ir_package_file = 10;
+    DownloadReleaseStdlibDetails download_release_stdlib = 11;
+    DownloadSourceSubtreeDetails download_source_subtree = 12;
+    DriverDslxFnToIrDetails driver_dslx_fn_to_ir = 13;
+    DriverIrToOptDetails driver_ir_to_opt = 14;
+    DriverIrToDelayInfoDetails driver_ir_to_delay_info = 15;
+    DriverIrEquivDetails driver_ir_equiv = 16;
+    DriverIrAigEquivDetails driver_ir_aig_equiv = 17;
+    DriverIrToG8rAigDetails driver_ir_to_g8r_aig = 18;
+    IrFnToCombinationalVerilogDetails ir_fn_to_combinational_verilog = 19;
+    IrFnToKBoolConeCorpusDetails ir_fn_to_k_bool_cone_corpus = 20;
+    IrFnToMffcCorpusDetails ir_fn_to_mffc_corpus = 21;
+    ComboVerilogToYosysAbcAigDetails combo_verilog_to_yosys_abc_aig = 22;
+    AigToYosysAbcAigDetails aig_to_yosys_abc_aig = 23;
+    DriverAigToStatsDetails driver_aig_to_stats = 24;
+    AigStatDiffDetails aig_stat_diff = 25;
+  }
+}
+
+message Provenance {
+  uint32 record_version = 1;
+  ActionId action_id = 2;
+  google.protobuf.Timestamp created_at = 3;
+  ActionSpec action = 4;
+  repeated ArtifactRef dependencies = 5;
+  ArtifactRef output_artifact = 6;
+  repeated OutputFile output_files = 7;
+  repeated CommandTrace commands = 8;
+  ActionDetails details = 9;
+  repeated SuggestedAction suggested_next_actions = 10;
+}
