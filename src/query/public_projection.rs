@@ -322,18 +322,29 @@ fn validate_comparison_sample(field: &str, sample: &StdlibG8rVsYosysSample) -> R
     if let Some(hash) = &sample.structural_hash {
         validate_hex_digest(&format!("{field}.structural_hash"), hash)?;
     }
-    if [
+    let metrics = [
         sample.g8r_nodes,
         sample.g8r_levels,
         sample.yosys_abc_nodes,
         sample.yosys_abc_levels,
         sample.g8r_product,
         sample.yosys_abc_product,
-    ]
-    .into_iter()
-    .any(|value| value < 0.0)
-    {
+        sample.g8r_product_loss,
+    ];
+    if metrics.into_iter().any(|value| !value.is_finite()) {
+        bail!("{field} contains a non-finite comparison metric");
+    }
+    if metrics[..6].iter().any(|value| *value < 0.0) {
         bail!("{field} contains negative size/depth/product metrics");
+    }
+    let expected_g8r_product = sample.g8r_nodes * sample.g8r_levels;
+    let expected_yosys_product = sample.yosys_abc_nodes * sample.yosys_abc_levels;
+    let expected_loss = expected_g8r_product - expected_yosys_product;
+    if sample.g8r_product != expected_g8r_product
+        || sample.yosys_abc_product != expected_yosys_product
+        || sample.g8r_product_loss != expected_loss
+    {
+        bail!("{field} contains inconsistent derived comparison metrics");
     }
     Ok(())
 }
@@ -984,5 +995,54 @@ mod tests {
         let error = canonicalize_public_web_index_json(&wrong_group_key, &group_bytes).unwrap_err();
         let error = format!("{error:#}");
         assert!(error.contains("key does not match its payload hash"));
+    }
+
+    #[test]
+    fn public_projection_rejects_inconsistent_derived_comparison_metrics() {
+        let mut value = empty_comparison_value(
+            crate::WEB_STDLIB_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+            false,
+            false,
+        );
+        value["dataset"]["available_crate_versions"] = json!(["0.35.0"]);
+        value["dataset"]["samples"] = json!([{
+            "fn_key": "xls/dslx/stdlib/sample.x::sample",
+            "crate_version": "0.35.0",
+            "dso_version": "0.35.0",
+            "ir_action_id": "1".repeat(64),
+            "ir_top": "__sample",
+            "structural_hash": null,
+            "ir_node_count": 8,
+            "g8r_nodes": 10.0,
+            "g8r_levels": 2.0,
+            "yosys_abc_nodes": 5.0,
+            "yosys_abc_levels": 3.0,
+            "g8r_product": 20.0,
+            "yosys_abc_product": 15.0,
+            "g8r_product_loss": 6.0,
+            "g8r_stats_action_id": "2".repeat(64),
+            "yosys_abc_stats_action_id": "3".repeat(64)
+        }]);
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
+            &serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("inconsistent derived comparison metrics"),
+            "unexpected error: {error:#}"
+        );
+
+        value["dataset"]["samples"][0]["g8r_product_loss"] = json!(5.0);
+        value["dataset"]["samples"][0]["g8r_product"] = json!(21.0);
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
+            &serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("inconsistent derived comparison metrics"),
+            "unexpected error: {error:#}"
+        );
     }
 }
