@@ -9,7 +9,8 @@ xlsynth_bvc --store-dir STORE --artifacts-via-sled STORE/artifacts.sled \
 ```
 
 The coordinator holds an advisory lock for the store, checkpoints each stage in
-`STORE/coordinator/**/*.pb`, and safely resumes after interruption. It
+`STORE/coordinator/**/*.pb`, and safely resumes after process interruption while
+the host filesystem and storage remain healthy. It
 plans/reconciles roots, drains workers, rebuilds datasets, finalizes the declared
 completion contract, writes deterministic findings, verifies a protobuf
 publication snapshot, verifies the static site, and only then promotes the
@@ -18,6 +19,12 @@ fingerprints still match the exact current provenance inputs and web-index
 output bytes. Rebuilt Sled indexes are flushed before checkpoint success. The
 remaining content-producing stages preserve or derive stable timestamps when
 their inputs are unchanged.
+
+This is a process-restart guarantee, not an end-to-end power-loss durability
+guarantee. Sudden host power loss, kernel failure, filesystem corruption, and
+storage rollback require operator validation and may require restoring or
+rebuilding state as described in `DESIGN.md` and
+`docs/recovery-and-rollback.md`.
 
 The initial host is deliberately filesystem/object-layout neutral. `PUBLIC`
 contains immutable `sites/<site-id>/` trees, immutable

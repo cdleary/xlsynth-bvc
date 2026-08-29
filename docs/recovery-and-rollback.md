@@ -1,5 +1,20 @@
 # Recovery and rollback
 
+## Failure model
+
+The automatic procedures below cover process termination and container restart
+while the operating system, filesystem, and storage remain healthy. They do not
+promise transactionally ordered persistence across sudden host power loss,
+kernel failure, filesystem corruption, or storage rollback.
+
+After a host-level failure, stop writers and run `validate-store
+--verify-payloads` plus `verify-published-site` before resuming. If validation
+fails, restore `STORE` and its sled database from one consistent backup
+generation. `WORK` is replaceable. `PUBLIC` can be restored from backup or
+discarded and rebuilt from an intact store. An unmarked or otherwise invalid
+store must not be relabeled in place without independent evidence that its
+contents belong to the current protobuf format.
+
 ## Interrupted coordinator
 
 Run the same `coordinate-release` command again. Queue insertion, action

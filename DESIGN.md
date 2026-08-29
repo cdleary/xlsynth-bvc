@@ -35,6 +35,27 @@ Build tools such as Cargo may write build outputs while constructing the
 application. Those writes happen before deployment and are not production
 runtime state.
 
+## Supported recovery and host-failure non-goal
+
+`xlsynth-bvc` supports recovery from process-level interruption while the
+operating system, filesystem, and storage remain healthy. A killed command or
+restarted container can be rerun: advisory locks are released by process exit,
+stale application-owned staging is recoverable, and persisted checkpoints and
+content identities make normal retries idempotent.
+
+The system does not claim end-to-end transactional durability across sudden
+host power loss, kernel failure, filesystem corruption, storage rollback, or
+persistence reordering between sled and separate filesystem objects. Atomic
+renames and explicit sled flushes reduce exposure but do not constitute an
+`fsync` protocol covering every file and parent directory. After a host-level
+failure, operators must validate the store and publication before reuse and may
+need to restore a consistent backup or discard and rebuild `STORE`, `WORK`, or
+`PUBLIC` from declared inputs.
+
+This non-goal is limited to host/storage failure. It does not relax fail-closed
+public-data validation, ordinary concurrent-execution correctness, process-
+restart recovery, or the read-only resource invariant.
+
 ## Canonical data and publication boundary
 
 Canonical Rust-side identities and persisted operational records use validated
@@ -93,7 +114,7 @@ Dataset-index checkpoints are valid only for the exact canonical provenance
 inputs and exact web-index outputs from which they were built. The coordinator
 records deterministic fingerprints of action IDs/encoded provenance and the
 sorted web-index key/byte set after reconciliation and queue drain. Rebuilt Sled
-outputs are flushed durably before Indexed success is recorded. Reuse requires
+outputs are flushed before Indexed success is recorded. Reuse requires
 both fingerprints to match; new actions, provenance changes, missing outputs,
 and modified output bytes invalidate the checkpoint.
 
