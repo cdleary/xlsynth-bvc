@@ -46,7 +46,9 @@ use crate::{
 };
 
 mod corpus_structural;
+mod public_projection;
 pub(crate) use corpus_structural::*;
+pub(crate) use public_projection::*;
 
 type ProvenanceLookup<'a> = BTreeMap<&'a str, &'a Provenance>;
 
@@ -6237,9 +6239,12 @@ pub(crate) fn build_stdlib_enumeration_status(
 ) -> StdlibEnumerationStatusView {
     let Some(compat_entry) = compat.get(crate_version) else {
         return StdlibEnumerationStatusView {
-            badge_class: "enum-unknown".to_string(),
-            badge_label: "unknown".to_string(),
-            summary: "crate missing in compatibility map".to_string(),
+            state: StdlibEnumerationState::Unknown,
+            reason: StdlibEnumerationReason::CompatibilityMapMissing,
+            scanned_files: 0,
+            failed_files: 0,
+            concrete_functions: 0,
+            suggested_actions: 0,
         };
     };
 
@@ -6252,11 +6257,14 @@ pub(crate) fn build_stdlib_enumeration_status(
     let runtime =
         match explicit_driver_runtime_for_crate_version(repo_root, crate_version, &dso_version) {
             Ok(runtime) => runtime,
-            Err(err) => {
+            Err(_) => {
                 return StdlibEnumerationStatusView {
-                    badge_class: "enum-unknown".to_string(),
-                    badge_label: "unknown".to_string(),
-                    summary: summarize_error(&format!("runtime setup failed: {:#}", err)),
+                    state: StdlibEnumerationState::Unknown,
+                    reason: StdlibEnumerationReason::RuntimeUnavailable,
+                    scanned_files: 0,
+                    failed_files: 0,
+                    concrete_functions: 0,
+                    suggested_actions: 0,
                 };
             }
         };
@@ -6266,32 +6274,38 @@ pub(crate) fn build_stdlib_enumeration_status(
     };
     let root_action_id = match compute_action_id(&root_action) {
         Ok(action_id) => action_id,
-        Err(err) => {
+        Err(_) => {
             return StdlibEnumerationStatusView {
-                badge_class: "enum-unknown".to_string(),
-                badge_label: "unknown".to_string(),
-                summary: summarize_error(&format!("failed computing canonical root id: {:#}", err)),
+                state: StdlibEnumerationState::Unknown,
+                reason: StdlibEnumerationReason::RootIdentityUnavailable,
+                scanned_files: 0,
+                failed_files: 0,
+                concrete_functions: 0,
+                suggested_actions: 0,
             };
         }
     };
     if !store.action_exists(&root_action_id) {
         return StdlibEnumerationStatusView {
-            badge_class: "enum-missing".to_string(),
-            badge_label: "not run".to_string(),
-            summary: format!(
-                "canonical root stdlib action not materialized for dso:{}",
-                normalize_tag_version(&dso_version)
-            ),
+            state: StdlibEnumerationState::Missing,
+            reason: StdlibEnumerationReason::RootNotMaterialized,
+            scanned_files: 0,
+            failed_files: 0,
+            concrete_functions: 0,
+            suggested_actions: 0,
         };
     }
 
     let provenance = match store.load_provenance(&root_action_id) {
         Ok(p) => p,
-        Err(err) => {
+        Err(_) => {
             return StdlibEnumerationStatusView {
-                badge_class: "enum-unknown".to_string(),
-                badge_label: "unknown".to_string(),
-                summary: summarize_error(&format!("failed loading root provenance: {:#}", err)),
+                state: StdlibEnumerationState::Unknown,
+                reason: StdlibEnumerationReason::ProvenanceUnavailable,
+                scanned_files: 0,
+                failed_files: 0,
+                concrete_functions: 0,
+                suggested_actions: 0,
             };
         }
     };
@@ -6304,14 +6318,17 @@ pub(crate) fn stdlib_enumeration_status_from_provenance(
 ) -> StdlibEnumerationStatusView {
     let details = provenance.details.as_object();
 
-    if let Some(error_value) = details.and_then(|d| d.get("dslx_list_fns_discovery_error")) {
+    if details
+        .and_then(|d| d.get("dslx_list_fns_discovery_error"))
+        .is_some()
+    {
         return StdlibEnumerationStatusView {
-            badge_class: "enum-failed".to_string(),
-            badge_label: "failed".to_string(),
-            summary: summarize_error(&format!(
-                "enumeration error: {}",
-                json_value_compact(error_value)
-            )),
+            state: StdlibEnumerationState::Failed,
+            reason: StdlibEnumerationReason::DiscoveryFailed,
+            scanned_files: 0,
+            failed_files: 0,
+            concrete_functions: 0,
+            suggested_actions: 0,
         };
     }
 
@@ -6321,18 +6338,21 @@ pub(crate) fn stdlib_enumeration_status_from_provenance(
     let Some(discovery) = discovery else {
         if !provenance.suggested_next_actions.is_empty() {
             return StdlibEnumerationStatusView {
-                badge_class: "enum-partial".to_string(),
-                badge_label: "partial".to_string(),
-                summary: format!(
-                    "suggestions={} (discovery metadata missing)",
-                    provenance.suggested_next_actions.len()
-                ),
+                state: StdlibEnumerationState::Partial,
+                reason: StdlibEnumerationReason::DiscoveryMetadataMissing,
+                scanned_files: 0,
+                failed_files: 0,
+                concrete_functions: 0,
+                suggested_actions: provenance.suggested_next_actions.len() as u64,
             };
         }
         return StdlibEnumerationStatusView {
-            badge_class: "enum-failed".to_string(),
-            badge_label: "failed".to_string(),
-            summary: "no discovery metadata and no suggested actions".to_string(),
+            state: StdlibEnumerationState::Failed,
+            reason: StdlibEnumerationReason::DiscoveryEmpty,
+            scanned_files: 0,
+            failed_files: 0,
+            concrete_functions: 0,
+            suggested_actions: 0,
         };
     };
 
@@ -6352,39 +6372,35 @@ pub(crate) fn stdlib_enumeration_status_from_provenance(
         .get("suggested_actions")
         .and_then(|v| v.as_u64())
         .unwrap_or(provenance.suggested_next_actions.len() as u64);
-    let summary = format!(
-        "concrete={} suggested={} failed_files={}/{}",
-        concrete_functions, suggested_actions, failed_files, scanned_files
-    );
-
     let all_files_failed = scanned_files > 0 && failed_files >= scanned_files;
     let no_concrete_outputs = concrete_functions == 0 && suggested_actions == 0;
     if all_files_failed || (failed_files > 0 && no_concrete_outputs) {
         return StdlibEnumerationStatusView {
-            badge_class: "enum-failed".to_string(),
-            badge_label: "failed".to_string(),
-            summary,
+            state: StdlibEnumerationState::Failed,
+            reason: StdlibEnumerationReason::DiscoveryCounts,
+            scanned_files,
+            failed_files,
+            concrete_functions,
+            suggested_actions,
         };
     }
     if failed_files > 0 || no_concrete_outputs {
         return StdlibEnumerationStatusView {
-            badge_class: "enum-partial".to_string(),
-            badge_label: "partial".to_string(),
-            summary,
+            state: StdlibEnumerationState::Partial,
+            reason: StdlibEnumerationReason::DiscoveryCounts,
+            scanned_files,
+            failed_files,
+            concrete_functions,
+            suggested_actions,
         };
     }
     StdlibEnumerationStatusView {
-        badge_class: "enum-ok".to_string(),
-        badge_label: "ok".to_string(),
-        summary,
-    }
-}
-
-pub(crate) fn json_value_compact(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => s.clone(),
-        _ => serde_json::to_string(value)
-            .unwrap_or_else(|_| "<json serialization error>".to_string()),
+        state: StdlibEnumerationState::Ok,
+        reason: StdlibEnumerationReason::DiscoveryCounts,
+        scanned_files,
+        failed_files,
+        concrete_functions,
+        suggested_actions,
     }
 }
 

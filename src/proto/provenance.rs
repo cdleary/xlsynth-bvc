@@ -1433,7 +1433,7 @@ mod tests {
             let decoded = decode_provenance(&encoded).expect("decode discovery provenance");
             assert_eq!(decoded.details, original.details);
             assert_eq!(
-                crate::query::stdlib_enumeration_status_from_provenance(&decoded).badge_label,
+                crate::query::stdlib_enumeration_status_from_provenance(&decoded).badge_label(),
                 expected_badge
             );
         }

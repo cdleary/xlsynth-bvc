@@ -1240,6 +1240,15 @@ mod tests {
         std::env::temp_dir().join(format!("xlsynth-bvc-site-{}-{nanos}", std::process::id()))
     }
 
+    fn empty_versions_index_bytes() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
+            "generated_utc": "2026-08-29T12:00:00Z",
+            "report": {"cards": [], "unattributed_actions": []}
+        }))
+        .expect("serialize empty versions index")
+    }
+
     #[test]
     fn generated_site_links_are_relocatable() {
         assert_eq!(site_root_url("index.html").expect("root URL"), "./");
@@ -1267,7 +1276,7 @@ mod tests {
         store
             .write_web_index_bytes(
                 crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
-                br#"{"cards":[]}"#,
+                &empty_versions_index_bytes(),
             )
             .expect("write dataset");
         let snapshot_dir = root.join("snapshot");
@@ -1329,9 +1338,31 @@ mod tests {
         let private_token = "BVC_TEST_CREDENTIAL=do-not-publish";
         let now = Utc::now();
         store
+            .write_provenance(&Provenance {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: action_id.clone(),
+                created_utc: now,
+                action: action.clone(),
+                dependencies: Vec::new(),
+                output_artifact: ArtifactRef {
+                    action_id: action_id.clone(),
+                    artifact_type: ArtifactType::DslxFileSubtree,
+                    relpath: "payload".to_string(),
+                },
+                output_files: Vec::new(),
+                commands: Vec::new(),
+                details: json!({
+                    "dslx_list_fns_discovery_error": format!(
+                        "discovery failed at {private_path}; {private_token}"
+                    )
+                }),
+                suggested_next_actions: Vec::new(),
+            })
+            .expect("write private discovery failure provenance");
+        store
             .write_failed_action_record(&QueueFailed {
                 schema_version: crate::ACTION_SCHEMA_VERSION,
-                action_id,
+                action_id: action_id.clone(),
                 enqueued_utc: now,
                 failed_utc: now,
                 failed_by: "test-worker".to_string(),
@@ -1359,6 +1390,7 @@ mod tests {
         )
         .expect("read public versions dataset");
         assert!(versions_json.contains("\"failure_class\":\"failed\""));
+        assert!(versions_json.contains("\"reason\":\"discovery_failed\""));
         assert!(!versions_json.contains(&private_path));
         assert!(!versions_json.contains(private_token));
 
@@ -1397,7 +1429,7 @@ mod tests {
         store
             .write_web_index_bytes(
                 crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
-                br#"{"cards":[]}"#,
+                &empty_versions_index_bytes(),
             )
             .expect("write dataset");
         let snapshot_dir = root.join("snapshot");
@@ -1483,9 +1515,12 @@ mod tests {
                     "failed_total": 0,
                     "dso_versions": [dso_version],
                     "stdlib_enumeration": {
-                        "badge_class": "ok",
-                        "badge_label": "ok",
-                        "summary": "complete"
+                        "state": "ok",
+                        "reason": "discovery_counts",
+                        "scanned_files": 1,
+                        "failed_files": 0,
+                        "concrete_functions": 1,
+                        "suggested_actions": 1
                     },
                     "failed_by_kind": [],
                     "failures": []

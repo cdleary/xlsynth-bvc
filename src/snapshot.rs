@@ -33,7 +33,7 @@ use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
-pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 5;
+pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 6;
 pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.pb";
 pub(crate) const STATIC_SNAPSHOT_WEB_INDEX_DIR: &str = "web_index";
 
@@ -214,12 +214,14 @@ fn write_snapshot_dataset_entry(
     index_key: &str,
     bytes: &[u8],
 ) -> Result<StaticSnapshotDatasetFile> {
+    let bytes = crate::query::canonicalize_public_web_index_json(index_key, bytes)
+        .with_context(|| format!("projecting allowlisted public dataset {index_key}"))?;
     let disk_path = snapshot_web_index_path(out_dir, index_key)?;
     if let Some(parent) = disk_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating snapshot dataset parent: {}", parent.display()))?;
     }
-    fs::write(&disk_path, bytes)
+    fs::write(&disk_path, &bytes)
         .with_context(|| format!("writing snapshot dataset file: {}", disk_path.display()))?;
     let relpath = disk_path
         .strip_prefix(out_dir)
@@ -230,7 +232,7 @@ fn write_snapshot_dataset_entry(
         index_key: index_key.to_string(),
         relpath,
         bytes: bytes.len() as u64,
-        sha256: sha256_hex(bytes),
+        sha256: sha256_hex(&bytes),
     })
 }
 
@@ -1157,6 +1159,37 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
 mod tests {
     use super::*;
 
+    fn empty_versions_index_bytes() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
+            "generated_utc": Utc::now(),
+            "report": {
+                "cards": [],
+                "unattributed_actions": []
+            }
+        }))
+        .expect("serialize empty versions index")
+    }
+
+    fn empty_ir_corpus_index_bytes() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+            "generated_utc": Utc::now(),
+            "dataset": {
+                "fraig": false,
+                "samples": [],
+                "min_ir_nodes": 0,
+                "max_ir_nodes": 0,
+                "g8r_only_count": 0,
+                "yosys_only_count": 0,
+                "available_crate_versions": []
+            },
+            "g8r_points": [],
+            "yosys_points": []
+        }))
+        .expect("serialize empty IR corpus index")
+    }
+
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1178,7 +1211,10 @@ mod tests {
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("ensure layout");
         store
-            .write_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME, br#"{"cards":[]}"#)
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
             .expect("write web index");
         let structural_manifest = crate::model::IrFnCorpusStructuralManifest {
             schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
@@ -1251,7 +1287,10 @@ mod tests {
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("ensure layout");
         store
-            .write_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME, br#"{"cards":[]}"#)
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
             .expect("write web index");
 
         let out_dir = root.join("snapshot-out");
@@ -1286,7 +1325,7 @@ mod tests {
         store
             .write_web_index_bytes(
                 "ir-fn-corpus-g8r-vs-yosys-abc.v3.json",
-                br#"{"schema_version":3}"#,
+                &empty_ir_corpus_index_bytes(),
             )
             .expect("write base index");
         store
@@ -1331,7 +1370,10 @@ mod tests {
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("ensure layout");
         store
-            .write_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME, br#"{"cards":[]}"#)
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
             .expect("write versions index");
         store
             .write_web_index_bytes(
@@ -1466,7 +1508,10 @@ mod tests {
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("ensure layout");
         store
-            .write_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME, br#"{"cards":[]}"#)
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
             .expect("write public web index");
         let private_key = "internal-build-metadata.v1.json";
         let private_bytes = serde_json::to_vec_pretty(&serde_json::json!({

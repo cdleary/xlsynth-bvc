@@ -527,6 +527,10 @@ mod tests {
         ))
     }
 
+    fn empty_versions_index_bytes() -> &'static [u8] {
+        br#"{"schema_version":3,"generated_utc":"2026-08-29T12:00:00Z","report":{"cards":[],"unattributed_actions":[]}}"#
+    }
+
     #[test]
     fn publication_is_verified_and_idempotent() {
         let root = temp_path("roundtrip");
@@ -535,7 +539,7 @@ mod tests {
         store
             .write_web_index_bytes(
                 crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
-                br#"{"cards":[]}"#,
+                empty_versions_index_bytes(),
             )
             .expect("write index");
         let snapshot_dir = root.join("snapshot");

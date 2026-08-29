@@ -5468,9 +5468,9 @@ pub(super) fn render_versions_html(
             html_escape(&crate_label),
             html_escape(crate_release_datetime),
             card.total_materialized,
-            html_escape(&card.stdlib_enumeration.badge_class),
-            html_escape(&card.stdlib_enumeration.badge_label),
-            html_escape(&card.stdlib_enumeration.summary),
+            html_escape(card.stdlib_enumeration.badge_class()),
+            html_escape(card.stdlib_enumeration.badge_label()),
+            html_escape(&card.stdlib_enumeration.summary()),
             if card.failed_total > 0 {
                 "fail-flag"
             } else {
