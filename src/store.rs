@@ -1878,6 +1878,9 @@ impl ArtifactBackend for SledArtifactBackend {
         action_id: &str,
     ) -> Result<Option<QueueFailed>> {
         if let Some(record) = load_failed_action_record_from_disk(store_root, action_id)? {
+            if record.action_id != action_id {
+                bail!("failed action record path does not match its embedded action_id");
+            }
             return Ok(Some(record));
         }
         let db = self.open_db()?;
@@ -1890,6 +1893,9 @@ impl ArtifactBackend for SledArtifactBackend {
         {
             let parsed = decode_queue_failed(bytes.as_ref())
                 .context("parsing failed action record protobuf row from sled")?;
+            if parsed.action_id != action_id {
+                bail!("failed action record Sled key does not match its embedded action_id");
+            }
             return Ok(Some(parsed));
         }
         Ok(None)
@@ -2070,9 +2076,12 @@ impl ArtifactBackend for SledArtifactBackend {
         let mut records = Vec::new();
 
         for row in tree.iter() {
-            let (_key, value) = row.context("iterating failed action record rows from sled")?;
+            let (key, value) = row.context("iterating failed action record rows from sled")?;
             let record = decode_queue_failed(value.as_ref())
                 .context("parsing failed action record protobuf row from sled")?;
+            if key.as_ref() != record.action_id.as_bytes() {
+                bail!("failed action record Sled key does not match its embedded action_id");
+            }
             records.push(record);
         }
         records.sort_by(|a, b| a.action_id.cmp(&b.action_id));
@@ -2779,6 +2788,10 @@ impl ArtifactStore {
 
     pub(crate) fn load_failed_action_records(&self) -> Result<Vec<QueueFailed>> {
         Ok(self.load_failed_action_records_shared()?.as_ref().clone())
+    }
+
+    pub(crate) fn load_failed_action_records_uncached(&self) -> Result<Vec<QueueFailed>> {
+        self.artifact_backend.load_failed_action_records(&self.root)
     }
 
     pub(crate) fn artifacts_db_size_bytes(&self) -> Result<u64> {

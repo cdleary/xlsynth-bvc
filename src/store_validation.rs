@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::analysis::decode_analysis_report;
@@ -12,6 +12,7 @@ use crate::campaign::{
     CAMPAIGN_ANALYSIS_FILENAME, CAMPAIGN_RUN_MANIFEST_FILENAME, validate_campaign_run_file,
 };
 use crate::coordinator::{COORDINATOR_LOCK_FILENAME, decode_coordinator_state};
+use crate::executor::compute_action_id;
 use crate::model::{QueueCanceled, QueueDone, QueueFailed, QueueItem, QueueRunning};
 use crate::proto::{
     decode_queue_canceled, decode_queue_done, decode_queue_item, decode_queue_running,
@@ -116,7 +117,38 @@ fn list_regular_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(paths)
 }
 
-fn validate_queue_dir<T>(dir: &Path, decode: impl Fn(&[u8]) -> Result<T>) -> Result<usize> {
+fn validate_action_record_identity(
+    state: &str,
+    action_id: &str,
+    action: &crate::model::ActionSpec,
+) -> Result<()> {
+    let computed = compute_action_id(action)
+        .with_context(|| format!("computing {state} queue action identity"))?;
+    if computed != action_id {
+        bail!("{state} queue action_id does not match its typed action identity");
+    }
+    Ok(())
+}
+
+fn validate_done_record_identity(done: &QueueDone) -> Result<()> {
+    if done.output_artifact.action_id != done.action_id {
+        bail!("done queue output artifact action_id does not match queue action_id");
+    }
+    Ok(())
+}
+
+fn expected_queue_record_relpath(action_id: &str) -> PathBuf {
+    PathBuf::from(&action_id[0..2])
+        .join(&action_id[2..4])
+        .join(format!("{action_id}.pb"))
+}
+
+fn validate_queue_dir<T>(
+    dir: &Path,
+    state: &str,
+    decode: impl Fn(&[u8]) -> Result<T>,
+    validate: impl Fn(&T) -> Result<String>,
+) -> Result<usize> {
     let paths = list_regular_files(dir)?;
     for path in &paths {
         if path.extension().and_then(|value| value.to_str()) != Some("pb") {
@@ -124,7 +156,16 @@ fn validate_queue_dir<T>(dir: &Path, decode: impl Fn(&[u8]) -> Result<T>) -> Res
         }
         let bytes =
             fs::read(path).with_context(|| format!("reading queue record: {}", path.display()))?;
-        decode(&bytes).with_context(|| format!("validating queue record: {}", path.display()))?;
+        let record = decode(&bytes)
+            .with_context(|| format!("validating queue record: {}", path.display()))?;
+        let action_id = validate(&record)
+            .with_context(|| format!("validating {state} queue identity: {}", path.display()))?;
+        let relative = path
+            .strip_prefix(dir)
+            .with_context(|| format!("resolving {state} queue record path"))?;
+        if relative != expected_queue_record_relpath(&action_id) {
+            bail!("{state} queue record path does not match its embedded action_id");
+        }
     }
     Ok(paths.len())
 }
@@ -181,11 +222,46 @@ pub(crate) fn validate_store(
     verify_payloads: bool,
 ) -> Result<ValidateStoreSummary> {
     let provenances = store.list_provenances()?;
-    let failed_records = store.load_failed_action_records()?;
-    let pending_records = validate_queue_dir(&store.queue_pending_dir(), decode_queue_item)?;
-    let running_records = validate_queue_dir(&store.queue_running_dir(), decode_queue_running)?;
-    let done_records = validate_queue_dir(&store.queue_done_dir(), decode_queue_done)?;
-    let canceled_records = validate_queue_dir(&store.queue_canceled_dir(), decode_queue_canceled)?;
+    let failed_records = store.load_failed_action_records_uncached()?;
+    for failed in &failed_records {
+        validate_action_record_identity("failed", &failed.action_id, &failed.action)?;
+    }
+    let pending_records = validate_queue_dir(
+        &store.queue_pending_dir(),
+        "pending",
+        decode_queue_item,
+        |record| {
+            validate_action_record_identity("pending", &record.action_id, &record.action)?;
+            Ok(record.action_id.clone())
+        },
+    )?;
+    let running_records = validate_queue_dir(
+        &store.queue_running_dir(),
+        "running",
+        decode_queue_running,
+        |record| {
+            validate_action_record_identity("running", &record.action_id, &record.action)?;
+            Ok(record.action_id.clone())
+        },
+    )?;
+    let done_records = validate_queue_dir(
+        &store.queue_done_dir(),
+        "done",
+        decode_queue_done,
+        |record| {
+            validate_done_record_identity(record)?;
+            Ok(record.action_id.clone())
+        },
+    )?;
+    let canceled_records = validate_queue_dir(
+        &store.queue_canceled_dir(),
+        "canceled",
+        decode_queue_canceled,
+        |record| {
+            validate_action_record_identity("canceled", &record.action_id, &record.action)?;
+            Ok(record.action_id.clone())
+        },
+    )?;
     let (campaign_run_records, analysis_records) =
         validate_campaign_records(&store.campaign_runs_dir())?;
     let coordinator_records = validate_coordinator_records(&store.coordinator_dir())?;
@@ -254,7 +330,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::campaign::reconcile_campaign_run;
-    use crate::proto::{timestamp_to_proto, v1 as pb};
+    use crate::model::{ActionSpec, ArtifactRef, ArtifactType, QueueDone};
+    use crate::proto::{encode_queue_failed, encode_queue_item, timestamp_to_proto, v1 as pb};
     use crate::versioning::load_version_compat_map;
 
     fn temp_path() -> PathBuf {
@@ -266,6 +343,13 @@ mod tests {
             "xlsynth-bvc-validate-store-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn identity_test_action() -> ActionSpec {
+        ActionSpec::ImportIrPackageFile {
+            source_sha256: "1".repeat(64),
+            top_fn_name: Some("main".to_string()),
+        }
     }
 
     #[test]
@@ -292,6 +376,109 @@ mod tests {
             .expect("write unexpected queue record");
         let error = validate_store(&store, false).expect_err("unexpected queue file must fail");
         assert!(error.to_string().contains("non-protobuf record"));
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn queue_identity_validators_cover_every_action_bearing_state_and_done_output() {
+        let action = identity_test_action();
+        let wrong_action_id = "f".repeat(64);
+        for state in ["pending", "running", "failed", "canceled"] {
+            let error = validate_action_record_identity(state, &wrong_action_id, &action)
+                .expect_err("computed action mismatch must fail");
+            assert!(
+                format!("{error:#}").contains("does not match its typed action identity"),
+                "unexpected error: {error:#}"
+            );
+        }
+
+        let action_id = compute_action_id(&action).expect("action id");
+        let done = QueueDone {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id,
+            completed_utc: Utc::now(),
+            completed_by: "test-worker".to_string(),
+            output_artifact: ArtifactRef {
+                action_id: "e".repeat(64),
+                artifact_type: ArtifactType::IrPackageFile,
+                relpath: "payload/input.ir".to_string(),
+            },
+        };
+        let error = validate_done_record_identity(&done)
+            .expect_err("done output ownership mismatch must fail");
+        assert!(format!("{error:#}").contains("output artifact action_id"));
+    }
+
+    #[test]
+    fn validate_store_rejects_queue_path_identity_mismatch() {
+        let root = temp_path();
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let action = identity_test_action();
+        let action_id = compute_action_id(&action).expect("action id");
+        let pending = QueueItem {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id,
+            enqueued_utc: Utc::now(),
+            priority: crate::DEFAULT_QUEUE_PRIORITY,
+            action,
+        };
+        let wrong_path = store.pending_queue_path(&"e".repeat(64));
+        fs::create_dir_all(wrong_path.parent().expect("queue parent")).expect("create queue path");
+        fs::write(
+            &wrong_path,
+            encode_queue_item(&pending).expect("encode pending"),
+        )
+        .expect("write misplaced pending record");
+
+        let error =
+            validate_store(&store, false).expect_err("misplaced queue record must fail validation");
+        assert!(
+            format!("{error:#}").contains("path does not match its embedded action_id"),
+            "unexpected error: {error:#}"
+        );
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn validate_store_rejects_sled_failed_key_identity_mismatch() {
+        let root = temp_path();
+        let db_path = root.join("artifacts.test.sled");
+        let initializer = ArtifactStore::new_with_sled(root.clone(), db_path.clone());
+        initializer.ensure_layout().expect("layout");
+        drop(initializer);
+        let action = identity_test_action();
+        let action_id = compute_action_id(&action).expect("action id");
+        let now = Utc::now();
+        let failed = QueueFailed {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id,
+            enqueued_utc: now,
+            failed_utc: now,
+            failed_by: "test-worker".to_string(),
+            action,
+            error: "test failure".to_string(),
+        };
+        let db = sled::open(&db_path).expect("open sled");
+        let tree = db.open_tree("failed_by_action").expect("open failed tree");
+        tree.insert(
+            "e".repeat(64).as_bytes(),
+            encode_queue_failed(&failed).expect("encode failed"),
+        )
+        .expect("insert mismatched failed row");
+        db.flush().expect("flush mismatched failed row");
+        drop(tree);
+        drop(db);
+
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path);
+        let error =
+            validate_store(&store, false).expect_err("mismatched Sled key must fail validation");
+        assert!(
+            format!("{error:#}").contains("Sled key does not match"),
+            "unexpected error: {error:#}"
+        );
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
     }
