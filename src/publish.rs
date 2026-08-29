@@ -418,8 +418,10 @@ pub(crate) fn verify_published_site(publish_root: &Path) -> Result<VerifyPublish
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::site::{BuildStaticSiteOptions, build_static_site};
-    use crate::snapshot::{BuildStaticSnapshotOptions, build_static_snapshot};
+    use crate::site::{BuildStaticSiteOptions, STATIC_SITE_MANIFEST_FILENAME, build_static_site};
+    use crate::snapshot::{
+        BuildStaticSnapshotOptions, STATIC_SNAPSHOT_MANIFEST_FILENAME, build_static_snapshot,
+    };
     use crate::store::ArtifactStore;
     use std::path::PathBuf;
 
@@ -455,7 +457,7 @@ mod tests {
         .expect("snapshot");
         let site_dir = root.join("site");
         build_static_site(&BuildStaticSiteOptions {
-            snapshot_dir,
+            snapshot_dir: snapshot_dir.clone(),
             out_dir: site_dir.clone(),
             base_url: "/xlsynth-bvc/".to_string(),
             overwrite: false,
@@ -466,6 +468,39 @@ mod tests {
         assert!(!first.reused_immutable_site);
         let catalog_path = publish_root.join(&first.catalog_relpath);
         let first_catalog = fs::read(&catalog_path).expect("first catalog");
+
+        let first_snapshot_manifest =
+            fs::read(snapshot_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME))
+                .expect("first snapshot manifest");
+        let first_site_manifest =
+            fs::read(site_dir.join(STATIC_SITE_MANIFEST_FILENAME)).expect("first site manifest");
+        build_static_snapshot(
+            &store,
+            &root,
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: true,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("rebuild snapshot");
+        assert_eq!(
+            fs::read(snapshot_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME))
+                .expect("rebuilt snapshot manifest"),
+            first_snapshot_manifest
+        );
+        build_static_site(&BuildStaticSiteOptions {
+            snapshot_dir: snapshot_dir.clone(),
+            out_dir: site_dir.clone(),
+            base_url: "/xlsynth-bvc/".to_string(),
+            overwrite: true,
+        })
+        .expect("rebuild site");
+        assert_eq!(
+            fs::read(site_dir.join(STATIC_SITE_MANIFEST_FILENAME)).expect("rebuilt site manifest"),
+            first_site_manifest
+        );
+
         let second = publish_static_site(&site_dir, &publish_root).expect("second publish");
         assert!(second.reused_immutable_site);
         assert_eq!(first.site_id, second.site_id);

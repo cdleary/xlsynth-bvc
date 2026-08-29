@@ -9,11 +9,13 @@ xlsynth_bvc --store-dir STORE --artifacts-via-sled STORE/artifacts.sled \
 ```
 
 The coordinator holds an advisory lock for the store, checkpoints each stage in
-`STORE/coordinator/**/*.pb`, and safely reruns every stage after interruption.
-It plans/reconciles roots, drains workers, rebuilds datasets, finalizes the
-declared completion contract, writes deterministic findings, verifies a
-protobuf publication snapshot, verifies the static site, and only then
-promotes the site.
+`STORE/coordinator/**/*.pb`, and safely resumes after interruption. It
+plans/reconciles roots, drains workers, rebuilds datasets, finalizes the declared
+completion contract, writes deterministic findings, verifies a protobuf
+publication snapshot, verifies the static site, and only then promotes the
+site. A completed dataset-index checkpoint is reused on retry; the remaining
+content-producing stages preserve or derive stable timestamps when their inputs
+are unchanged.
 
 The initial host is deliberately filesystem/object-layout neutral. `PUBLIC`
 contains immutable `sites/<site-id>/` trees, immutable

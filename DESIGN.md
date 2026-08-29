@@ -48,6 +48,13 @@ browser datasets, builds a verified static site, and promotes immutable site
 and catalog objects before updating the small current-site pointers. Static web
 serving requires neither the Rust process nor sled.
 
+Publication metadata follows the same content-idempotence rule as publication
+identity. A snapshot's `generated_at` value is a deterministic data watermark:
+the newest generation/update timestamp among its included datasets, campaign
+runs, and analyses (or the Unix epoch when no included record has a timestamp).
+Rebuilding unchanged inputs therefore reproduces the same snapshot and site
+bytes even when the publication work directory has been lost.
+
 ## Operational ownership
 
 The binary owns queue leases, the per-store coordinator lock, stage

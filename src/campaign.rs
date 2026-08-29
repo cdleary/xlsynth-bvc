@@ -790,13 +790,19 @@ fn evaluated_manifest(
     crate_version: &str,
 ) -> Result<pb::CampaignRunManifest> {
     let mut planned = new_manifest(repo_root, crate_version)?;
-    if let Some(existing) = load_existing_manifest(store, &planned)? {
-        planned.created_at = existing.created_at;
+    let existing = load_existing_manifest(store, &planned)?;
+    if let Some(existing) = &existing {
+        planned.created_at = existing.created_at.clone();
     }
     let completion = evaluate_completion(store, &planned)?;
     planned.status = completion.status;
     planned.completion = Some(completion);
-    planned.updated_at = Some(timestamp_to_proto(&Utc::now()));
+    planned.updated_at = existing
+        .filter(|existing| {
+            existing.status == planned.status && existing.completion == planned.completion
+        })
+        .and_then(|existing| existing.updated_at)
+        .or_else(|| Some(timestamp_to_proto(&Utc::now())));
     validate_manifest(&planned)?;
     Ok(planned)
 }
@@ -1053,14 +1059,17 @@ mod tests {
         store.ensure_layout().expect("layout");
         let version = known_crate_version(&repo_root);
         let first = reconcile_campaign_run(&store, &repo_root, &version, 0).expect("reconcile");
+        let first_manifest = fs::read(&first.manifest_path).expect("first manifest bytes");
         let pending_once = list_queue_files(&store.queue_pending_dir())
             .expect("pending files")
             .len();
         let second = reconcile_campaign_run(&store, &repo_root, &version, 0).expect("reconcile");
+        let second_manifest = fs::read(&second.manifest_path).expect("second manifest bytes");
         let pending_twice = list_queue_files(&store.queue_pending_dir())
             .expect("pending files")
             .len();
         assert_eq!(first.run_id, second.run_id);
+        assert_eq!(first_manifest, second_manifest);
         assert_eq!(pending_once, pending_twice);
         assert_eq!(pending_once as u64, first.root_action_count);
         let finalized = finalize_campaign_run(&store, &repo_root, &version).expect("finalize");

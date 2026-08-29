@@ -289,6 +289,13 @@ fn stage<T>(
     }
 }
 
+fn stage_succeeded(state: &pb::CoordinatorState, stage: pb::CoordinatorStage) -> bool {
+    state.stage_results.iter().any(|result| {
+        result.stage == stage as i32
+            && result.status == pb::CoordinatorStageStatus::Succeeded as i32
+    })
+}
+
 pub(crate) fn coordinate_release(
     store: ArtifactStore,
     repo_root: &Path,
@@ -360,17 +367,25 @@ pub(crate) fn coordinate_release(
         },
     )?;
 
+    let indexed_already_succeeded = stage_succeeded(&state, pb::CoordinatorStage::Indexed);
     stage(
         &mut state,
         &path,
         pb::CoordinatorStage::Indexed,
         pb::CoordinatorStageStatus::FailedTransient,
         || {
-            let summary = rebuild_web_indices(&store, repo_root)?;
-            Ok((
-                summary,
-                "rebuilt all declared web/publication datasets".to_string(),
-            ))
+            if indexed_already_succeeded {
+                Ok((
+                    (),
+                    "reused previously verified web/publication datasets".to_string(),
+                ))
+            } else {
+                rebuild_web_indices(&store, repo_root)?;
+                Ok((
+                    (),
+                    "rebuilt all declared web/publication datasets".to_string(),
+                ))
+            }
         },
     )?;
 
@@ -536,5 +551,22 @@ mod tests {
         CoordinatorLock::acquire(&store).expect("lock after drop");
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn succeeded_stage_checkpoint_is_detected() {
+        let state = pb::CoordinatorState {
+            stage_results: vec![pb::CoordinatorStageResult {
+                stage: pb::CoordinatorStage::Indexed as i32,
+                status: pb::CoordinatorStageStatus::Succeeded as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(stage_succeeded(&state, pb::CoordinatorStage::Indexed));
+        assert!(!stage_succeeded(
+            &state,
+            pb::CoordinatorStage::SnapshotVerified
+        ));
     }
 }

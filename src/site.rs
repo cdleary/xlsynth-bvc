@@ -1325,17 +1325,50 @@ mod tests {
                 })
                 .expect("write root provenance");
         }
-        let version_json = format!(r#"{{"version":"{crate_version}"}}"#);
+        let generated_utc = Utc::now();
+        let versions_json = serde_json::to_vec(&json!({
+            "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
+            "generated_utc": generated_utc,
+            "report": {
+                "cards": [{
+                    "crate_version": crate_version,
+                    "crate_release_datetime": null,
+                    "total_materialized": 1,
+                    "failed_total": 0,
+                    "dso_versions": [dso_version],
+                    "stdlib_enumeration": {
+                        "badge_class": "ok",
+                        "badge_label": "ok",
+                        "summary": "complete"
+                    },
+                    "failed_by_kind": [],
+                    "failures": []
+                }],
+                "unattributed_actions": []
+            }
+        }))
+        .expect("serialize versions dataset");
         store
-            .write_web_index_bytes(
-                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
-                version_json.as_bytes(),
-            )
+            .write_web_index_bytes(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME, &versions_json)
             .expect("versions dataset");
+        let comparison_json = serde_json::to_vec(&json!({
+            "schema_version": crate::WEB_STDLIB_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+            "generated_utc": generated_utc,
+            "dataset": {
+                "fraig": false,
+                "samples": [],
+                "min_ir_nodes": 0,
+                "max_ir_nodes": 0,
+                "g8r_only_count": 0,
+                "yosys_only_count": 0,
+                "available_crate_versions": [crate_version]
+            }
+        }))
+        .expect("serialize comparison dataset");
         store
             .write_web_index_bytes(
                 crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
-                version_json.as_bytes(),
+                &comparison_json,
             )
             .expect("comparison dataset");
         let finalized =

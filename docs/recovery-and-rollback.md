@@ -8,6 +8,14 @@ publication are idempotent. The last stage outcome is recorded in the run's
 protobuf coordinator state. Advisory locks disappear when the process exits;
 there is no stale PID lock to remove.
 
+A successful dataset-index checkpoint is reused instead of regenerating
+timestamped browser projections. Campaign and analysis records retain their
+timestamps when their semantic content is unchanged, and snapshot
+`generated_at` is the deterministic newest-source watermark described in
+`DESIGN.md`. Consequently, rebuilding a lost work directory from unchanged
+store records reproduces the same snapshot manifest, site manifest, and
+immutable publication identity.
+
 ## Static publication rollback
 
 Immutable sites are never replaced. To roll back, select the previous

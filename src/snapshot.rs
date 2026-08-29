@@ -101,6 +101,36 @@ fn ensure_empty_output_dir(path: &Path, overwrite: bool) -> Result<()> {
     Ok(())
 }
 
+fn observe_generated_utc(latest: &mut Option<DateTime<Utc>>, candidate: DateTime<Utc>) {
+    if latest.as_ref().is_none_or(|current| candidate > *current) {
+        *latest = Some(candidate);
+    }
+}
+
+fn observe_json_generated_utc(latest: &mut Option<DateTime<Utc>>, bytes: &[u8]) {
+    let Some(value) = serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| value.get("generated_utc").cloned())
+        .and_then(|value| value.as_str().map(str::to_string))
+        .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+    else {
+        return;
+    };
+    observe_generated_utc(latest, value.with_timezone(&Utc));
+}
+
+fn observe_proto_generated_utc(
+    latest: &mut Option<DateTime<Utc>>,
+    timestamp: Option<&prost_types::Timestamp>,
+) {
+    if let Some(value) = timestamp
+        .filter(|timestamp| (0..1_000_000_000).contains(&timestamp.nanos))
+        .and_then(|timestamp| DateTime::from_timestamp(timestamp.seconds, timestamp.nanos as u32))
+    {
+        observe_generated_utc(latest, value);
+    }
+}
+
 fn index_key_to_relpath(index_key: &str) -> Result<PathBuf> {
     let trimmed = index_key.trim().trim_start_matches('/');
     if trimmed.is_empty() {
@@ -763,10 +793,17 @@ pub(crate) fn build_static_snapshot(
 
     let mut dataset_files = Vec::new();
     let mut total_dataset_bytes = 0_u64;
+    let mut latest_source_generated_utc = None;
     let direct_heavy_indices_written = !options.skip_rebuild_web_indices;
     if !options.skip_rebuild_web_indices {
         let direct_files = rebuild_snapshot_web_indices(store, repo_root, &options.out_dir)
             .context("rebuilding snapshot web indices before snapshot")?;
+        for entry in &direct_files {
+            let path = options.out_dir.join(&entry.relpath);
+            let bytes = fs::read(&path)
+                .with_context(|| format!("reading rebuilt snapshot dataset: {}", path.display()))?;
+            observe_json_generated_utc(&mut latest_source_generated_utc, &bytes);
+        }
         total_dataset_bytes += direct_files.iter().map(|entry| entry.bytes).sum::<u64>();
         dataset_files.extend(direct_files);
     }
@@ -780,6 +817,7 @@ pub(crate) fn build_static_snapshot(
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (index_key, bytes) in entries {
+        observe_json_generated_utc(&mut latest_source_generated_utc, &bytes);
         let entry = write_snapshot_dataset_entry(&options.out_dir, &index_key, &bytes)?;
         total_dataset_bytes += entry.bytes;
         dataset_files.push(entry);
@@ -791,6 +829,10 @@ pub(crate) fn build_static_snapshot(
     for run in finalized_runs {
         let public_run = public_run_from_manifest(&run)?;
         validate_public_run(&public_run)?;
+        observe_proto_generated_utc(
+            &mut latest_source_generated_utc,
+            public_run.updated_at.as_ref(),
+        );
         let campaign_id = digest_to_hex(
             public_run
                 .campaign_id
@@ -824,6 +866,10 @@ pub(crate) fn build_static_snapshot(
                 format!("reading campaign analysis: {}", analysis_path.display())
             })?;
             let analysis = decode_analysis_report(&analysis_bytes)?;
+            observe_proto_generated_utc(
+                &mut latest_source_generated_utc,
+                analysis.generated_at.as_ref(),
+            );
             if analysis.run_id != run.run_id || analysis.campaign_id != run.campaign_id {
                 bail!("analysis identity does not match campaign run {run_id}");
             }
@@ -843,11 +889,14 @@ pub(crate) fn build_static_snapshot(
     let source_action_set_sha256 = read_source_action_set_sha256(store);
     let snapshot_id =
         snapshot_id_for_dataset_files(&dataset_files, source_action_set_sha256.as_deref())?;
+    let git_commit = read_git_commit(repo_root);
+    let generated_utc = latest_source_generated_utc
+        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).expect("Unix epoch is representable"));
     let manifest = StaticSnapshotManifest {
         schema_version: STATIC_SNAPSHOT_SCHEMA_VERSION,
         snapshot_id: snapshot_id.clone(),
-        generated_utc: Utc::now(),
-        git_commit: read_git_commit(repo_root),
+        generated_utc,
+        git_commit,
         source_action_set_sha256,
         dataset_files,
         total_dataset_bytes,
@@ -1088,6 +1137,24 @@ mod tests {
 
         let verify = verify_static_snapshot(&out_dir).expect("verify snapshot");
         assert_eq!(verify.dataset_file_count, 2);
+
+        let first_manifest =
+            fs::read(out_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME)).expect("first manifest");
+        let second = build_static_snapshot(
+            &store,
+            &root,
+            &BuildStaticSnapshotOptions {
+                out_dir: out_dir.clone(),
+                overwrite: true,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("rebuild snapshot");
+        assert_eq!(summary.snapshot_id, second.snapshot_id);
+        assert_eq!(
+            first_manifest,
+            fs::read(out_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME)).expect("second manifest")
+        );
     }
 
     #[test]

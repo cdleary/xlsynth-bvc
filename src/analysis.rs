@@ -320,6 +320,20 @@ pub(crate) fn decode_analysis_report(bytes: &[u8]) -> Result<pb::AnalysisReport>
     Ok(report)
 }
 
+fn preserve_generated_at_if_unchanged(
+    existing: &pb::AnalysisReport,
+    mut candidate: pb::AnalysisReport,
+) -> pb::AnalysisReport {
+    let candidate_generated_at = candidate.generated_at.clone();
+    candidate.generated_at = existing.generated_at.clone();
+    if &candidate == existing {
+        existing.clone()
+    } else {
+        candidate.generated_at = candidate_generated_at;
+        candidate
+    }
+}
+
 pub(crate) fn analyze_campaign_run(
     store: &ArtifactStore,
     repo_root: &Path,
@@ -428,7 +442,7 @@ pub(crate) fn analyze_campaign_run(
             .map(|id| id.value.as_slice())
             .cmp(&b.finding_id.as_ref().map(|id| id.value.as_slice()))
     });
-    let report = pb::AnalysisReport {
+    let mut report = pb::AnalysisReport {
         record_version: ANALYSIS_RECORD_VERSION,
         campaign_id: Some(campaign_id.clone()),
         run_id: Some(run_id.clone()),
@@ -444,6 +458,12 @@ pub(crate) fn analyze_campaign_run(
         findings,
     };
     let path = campaign_analysis_path(store, run_id)?;
+    if path.exists() {
+        let bytes = fs::read(&path)
+            .with_context(|| format!("reading existing campaign analysis: {}", path.display()))?;
+        let existing = decode_analysis_report(&bytes)?;
+        report = preserve_generated_at_if_unchanged(&existing, report);
+    }
     write_report(&path, &report)?;
     let mut by_kind = BTreeMap::new();
     for finding in &report.findings {
@@ -502,5 +522,33 @@ mod tests {
     fn malformed_analysis_report_is_rejected() {
         let error = validate_report(&pb::AnalysisReport::default()).expect_err("invalid");
         assert!(error.to_string().contains("version"));
+    }
+
+    #[test]
+    fn unchanged_analysis_preserves_generation_timestamp() {
+        let mut existing = pb::AnalysisReport {
+            record_version: 1,
+            generated_at: Some(prost_types::Timestamp {
+                seconds: 100,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        let mut candidate = existing.clone();
+        candidate.generated_at = Some(prost_types::Timestamp {
+            seconds: 200,
+            nanos: 0,
+        });
+        assert_eq!(
+            preserve_generated_at_if_unchanged(&existing, candidate.clone()),
+            existing
+        );
+
+        existing.analysis_algorithm_version = 1;
+        let changed = preserve_generated_at_if_unchanged(&existing, candidate);
+        assert_eq!(
+            changed.generated_at.expect("candidate timestamp").seconds,
+            200
+        );
     }
 }
