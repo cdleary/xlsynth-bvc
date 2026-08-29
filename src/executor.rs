@@ -5767,6 +5767,7 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
         };
 
         let suggestions = build_k_bool_cone_corpus_suggested_actions(
@@ -5846,6 +5847,7 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.46.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
         };
 
         let suggestions = build_mffc_corpus_suggested_actions(
@@ -5896,6 +5898,7 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
         };
         let opt_ir_action_id = "f1a545045a06d81c95bd6d70447918805d408b02d4f262b73cf625a4e5feb4ac";
         let no_fraig_aig_action_id =

@@ -1,6 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use prost::Message;
+
+const RUNTIME_FINGERPRINT_LABEL: &str = "org.xlsynth-bvc.runtime-fingerprint";
+
+fn runtime_fingerprint(kind: &str, encoded: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"xlsynth-bvc/runtime-image/v1\0");
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(encoded);
+    hex::encode(hasher.finalize())
+}
+
+fn driver_runtime_fingerprint(runtime: &DriverRuntimeSpec) -> Result<String> {
+    let runtime = crate::proto::driver_runtime_to_proto(runtime, "driver_runtime")?;
+    Ok(runtime_fingerprint("driver", &runtime.encode_to_vec()))
+}
+
+fn yosys_runtime_fingerprint(runtime: &YosysRuntimeSpec) -> Result<String> {
+    let runtime = crate::proto::yosys_runtime_to_proto(runtime, "yosys_runtime")?;
+    Ok(runtime_fingerprint("yosys", &runtime.encode_to_vec()))
+}
 
 pub(crate) fn driver_cache_mount(store: &ArtifactStore) -> Result<DockerMount> {
     DockerMount::read_only(&store.driver_release_cache_root(), "/cache")
@@ -327,34 +349,76 @@ impl DockerMount {
     }
 }
 
-pub(crate) fn ensure_driver_image(
+fn checked_runtime_dockerfile(
     repo_root: &Path,
-    runtime: &DriverRuntimeSpec,
-) -> Result<Option<CommandTrace>> {
-    let inspect_args = vec![
-        "image".to_string(),
-        "inspect".to_string(),
-        runtime.docker_image.clone(),
-    ];
-    let inspect_out = Command::new("docker")
-        .args(&inspect_args)
+    dockerfile: &str,
+    expected_sha256: &str,
+) -> Result<PathBuf> {
+    let path = PathBuf::from(dockerfile);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    };
+    if !path.is_file() {
+        bail!("dockerfile not found: {}", path.display());
+    }
+    let actual_sha256 = runtime_dockerfile_sha256(repo_root, dockerfile)?;
+    if actual_sha256 != expected_sha256 {
+        bail!(
+            "runtime Dockerfile digest mismatch for {}: expected {} got {}",
+            path.display(),
+            expected_sha256,
+            actual_sha256
+        );
+    }
+    Ok(path)
+}
+
+fn inspect_image_runtime_fingerprint(image: &str) -> Result<Option<String>> {
+    let format = format!(
+        "{{{{ index .Config.Labels \"{}\" }}}}",
+        RUNTIME_FINGERPRINT_LABEL
+    );
+    let output = Command::new("docker")
+        .args(["image", "inspect", "--format", &format, image])
         .output()
-        .context("running `docker image inspect`")?;
-    if inspect_out.status.success() {
+        .context("running `docker image inspect` for runtime fingerprint")?;
+    if !output.status.success() {
         return Ok(None);
     }
+    Ok(Some(
+        String::from_utf8(output.stdout)
+            .context("decoding docker runtime fingerprint label")?
+            .trim()
+            .to_string(),
+    ))
+}
 
-    let dockerfile_path = PathBuf::from(&runtime.dockerfile);
-    let dockerfile = if dockerfile_path.is_absolute() {
-        dockerfile_path
-    } else {
-        repo_root.join(dockerfile_path)
-    };
-    if !dockerfile.exists() {
-        bail!("dockerfile not found: {}", dockerfile.display());
+fn require_image_runtime_fingerprint(image: &str, expected: &str) -> Result<()> {
+    let actual = inspect_image_runtime_fingerprint(image)?
+        .with_context(|| format!("built docker image `{image}` is missing"))?;
+    if actual != expected {
+        bail!(
+            "docker image `{}` runtime fingerprint mismatch: expected {} got {}",
+            image,
+            expected,
+            if actual.is_empty() || actual == "<no value>" {
+                "<missing>"
+            } else {
+                actual.as_str()
+            }
+        );
     }
+    Ok(())
+}
 
-    let build_args = vec![
+fn driver_image_build_args(
+    runtime: &DriverRuntimeSpec,
+    dockerfile: PathBuf,
+    fingerprint: &str,
+) -> Vec<OsString> {
+    vec![
         OsString::from("build"),
         OsString::from("--file"),
         dockerfile.into_os_string(),
@@ -362,8 +426,56 @@ pub(crate) fn ensure_driver_image(
         OsString::from(runtime.docker_image.clone()),
         OsString::from("--build-arg"),
         OsString::from(format!("DRIVER_CRATE_VERSION={}", runtime.driver_version)),
+        OsString::from("--build-arg"),
+        OsString::from(format!("BVC_RUNTIME_FINGERPRINT={fingerprint}")),
         OsString::from("."),
-    ];
+    ]
+}
+
+fn yosys_image_build_args(
+    runtime: &YosysRuntimeSpec,
+    dockerfile: PathBuf,
+    fingerprint: &str,
+) -> Result<Vec<OsString>> {
+    let commit = runtime
+        .upstream_commit
+        .as_deref()
+        .context("yosys runtime requires upstream_commit")?;
+    let commit_prefix = &commit[..8];
+    Ok(vec![
+        OsString::from("build"),
+        OsString::from("--file"),
+        dockerfile.into_os_string(),
+        OsString::from("--tag"),
+        OsString::from(runtime.docker_image.clone()),
+        OsString::from("--build-arg"),
+        OsString::from(format!("YOSYS_COMMIT={commit}")),
+        OsString::from("--build-arg"),
+        OsString::from(format!("YOSYS_COMMIT_PREFIX={commit_prefix}")),
+        OsString::from("--build-arg"),
+        OsString::from(format!("BVC_RUNTIME_FINGERPRINT={fingerprint}")),
+        OsString::from("."),
+    ])
+}
+
+pub(crate) fn ensure_driver_image(
+    repo_root: &Path,
+    runtime: &DriverRuntimeSpec,
+) -> Result<Option<CommandTrace>> {
+    let dockerfile =
+        checked_runtime_dockerfile(repo_root, &runtime.dockerfile, &runtime.dockerfile_sha256)?;
+    let fingerprint = driver_runtime_fingerprint(runtime)?;
+    if let Some(actual) = inspect_image_runtime_fingerprint(&runtime.docker_image)? {
+        if actual != fingerprint {
+            bail!(
+                "existing driver image `{}` does not match its declared runtime identity",
+                runtime.docker_image
+            );
+        }
+        return Ok(None);
+    }
+
+    let build_args = driver_image_build_args(runtime, dockerfile, &fingerprint);
 
     let status = Command::new("docker")
         .args(&build_args)
@@ -379,6 +491,7 @@ pub(crate) fn ensure_driver_image(
         );
     }
 
+    require_image_runtime_fingerprint(&runtime.docker_image, &fingerprint)?;
     Ok(Some(CommandTrace {
         argv: os_args_to_string("docker", &build_args),
         exit_code: status.code().unwrap_or(1),
@@ -389,37 +502,26 @@ pub(crate) fn ensure_yosys_image(
     repo_root: &Path,
     runtime: &YosysRuntimeSpec,
 ) -> Result<Option<CommandTrace>> {
-    let inspect_args = vec![
-        "image".to_string(),
-        "inspect".to_string(),
-        runtime.docker_image.clone(),
-    ];
-    let inspect_out = Command::new("docker")
-        .args(&inspect_args)
-        .output()
-        .context("running `docker image inspect`")?;
-    if inspect_out.status.success() && image_has_python3(&runtime.docker_image)? {
+    let dockerfile =
+        checked_runtime_dockerfile(repo_root, &runtime.dockerfile, &runtime.dockerfile_sha256)?;
+    let fingerprint = yosys_runtime_fingerprint(runtime)?;
+    if let Some(actual) = inspect_image_runtime_fingerprint(&runtime.docker_image)? {
+        if actual != fingerprint {
+            bail!(
+                "existing Yosys image `{}` does not match its declared runtime identity",
+                runtime.docker_image
+            );
+        }
+        if !image_has_python3(&runtime.docker_image)? {
+            bail!(
+                "existing Yosys image `{}` lacks python3",
+                runtime.docker_image
+            );
+        }
         return Ok(None);
     }
 
-    let dockerfile_path = PathBuf::from(&runtime.dockerfile);
-    let dockerfile = if dockerfile_path.is_absolute() {
-        dockerfile_path
-    } else {
-        repo_root.join(dockerfile_path)
-    };
-    if !dockerfile.exists() {
-        bail!("dockerfile not found: {}", dockerfile.display());
-    }
-
-    let build_args = vec![
-        OsString::from("build"),
-        OsString::from("--file"),
-        dockerfile.into_os_string(),
-        OsString::from("--tag"),
-        OsString::from(runtime.docker_image.clone()),
-        OsString::from("."),
-    ];
+    let build_args = yosys_image_build_args(runtime, dockerfile, &fingerprint)?;
 
     let status = Command::new("docker")
         .args(&build_args)
@@ -435,6 +537,10 @@ pub(crate) fn ensure_yosys_image(
         );
     }
 
+    require_image_runtime_fingerprint(&runtime.docker_image, &fingerprint)?;
+    if !image_has_python3(&runtime.docker_image)? {
+        bail!("built Yosys image `{}` lacks python3", runtime.docker_image);
+    }
     Ok(Some(CommandTrace {
         argv: os_args_to_string("docker", &build_args),
         exit_code: status.code().unwrap_or(1),
@@ -1794,6 +1900,9 @@ mod tests {
             release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: image,
             dockerfile: "testdata/persistent_runners/fake-driver.Dockerfile".to_string(),
+            dockerfile_sha256: hex::encode(Sha256::digest(include_bytes!(
+                "../../testdata/persistent_runners/fake-driver.Dockerfile"
+            ))),
         }
     }
 
@@ -1801,8 +1910,56 @@ mod tests {
         YosysRuntimeSpec {
             docker_image: image,
             dockerfile: "testdata/persistent_runners/fake-yosys.Dockerfile".to_string(),
-            upstream_commit: None,
+            dockerfile_sha256: hex::encode(Sha256::digest(include_bytes!(
+                "../../testdata/persistent_runners/fake-yosys.Dockerfile"
+            ))),
+            upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
         }
+    }
+
+    #[test]
+    fn runtime_fingerprints_bind_dockerfile_digest_and_yosys_commit() {
+        let driver = fake_driver_runtime("0.47.0", "driver:test".to_string());
+        let driver_fingerprint = driver_runtime_fingerprint(&driver).expect("driver fingerprint");
+        let mut changed_driver = driver.clone();
+        changed_driver.dockerfile_sha256 = "e".repeat(64);
+        assert_ne!(
+            driver_fingerprint,
+            driver_runtime_fingerprint(&changed_driver).expect("changed driver fingerprint")
+        );
+
+        let yosys = fake_yosys_runtime("yosys:test".to_string());
+        let yosys_fingerprint = yosys_runtime_fingerprint(&yosys).expect("yosys fingerprint");
+        let mut changed_yosys = yosys.clone();
+        changed_yosys.upstream_commit =
+            Some("abcdef0123456789abcdef0123456789abcdef01".to_string());
+        assert_ne!(
+            yosys_fingerprint,
+            yosys_runtime_fingerprint(&changed_yosys).expect("changed yosys fingerprint")
+        );
+    }
+
+    #[test]
+    fn yosys_build_args_pass_exact_declared_commit_and_fingerprint() {
+        let runtime = fake_yosys_runtime("yosys:test".to_string());
+        let fingerprint = yosys_runtime_fingerprint(&runtime).expect("yosys fingerprint");
+        let args =
+            yosys_image_build_args(&runtime, PathBuf::from(&runtime.dockerfile), &fingerprint)
+                .expect("yosys build args")
+                .into_iter()
+                .map(|value| value.to_string_lossy().to_string())
+                .collect::<Vec<_>>();
+        let commit = runtime.upstream_commit.as_deref().expect("commit");
+        assert!(args.contains(&format!("YOSYS_COMMIT={commit}")));
+        assert!(args.contains(&format!("YOSYS_COMMIT_PREFIX={}", &commit[..8])));
+        assert!(args.contains(&format!("BVC_RUNTIME_FINGERPRINT={fingerprint}")));
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        checked_runtime_dockerfile(root, &runtime.dockerfile, &runtime.dockerfile_sha256)
+            .expect("matching Dockerfile digest");
+        let error = checked_runtime_dockerfile(root, &runtime.dockerfile, &"0".repeat(64))
+            .expect_err("mismatched Dockerfile digest must fail");
+        assert!(error.to_string().contains("Dockerfile digest mismatch"));
     }
 
     fn docker_available() -> bool {

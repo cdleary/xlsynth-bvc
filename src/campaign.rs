@@ -1173,6 +1173,21 @@ mod tests {
             .expect("create resource directories");
         fs::copy(source_root.join(crate::VERSION_COMPAT_PATH), &compat_path)
             .expect("copy compatibility map");
+        let dockerfile_path = root.join(crate::DEFAULT_DOCKERFILE);
+        fs::create_dir_all(dockerfile_path.parent().expect("Dockerfile parent"))
+            .expect("create Dockerfile directory");
+        fs::copy(
+            source_root.join(crate::DEFAULT_DOCKERFILE),
+            &dockerfile_path,
+        )
+        .expect("copy runtime Dockerfile");
+        fs::set_permissions(&dockerfile_path, fs::Permissions::from_mode(0o444))
+            .expect("make runtime Dockerfile read-only");
+        fs::set_permissions(
+            dockerfile_path.parent().expect("Dockerfile parent"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .expect("make Dockerfile directory read-only");
         fs::set_permissions(&compat_path, fs::Permissions::from_mode(0o444))
             .expect("make compatibility map read-only");
         let mut current = compat_path.parent();
@@ -1209,6 +1224,14 @@ mod tests {
         }
         fs::set_permissions(&compat_path, fs::Permissions::from_mode(0o644))
             .expect("restore compatibility map permissions");
+        let dockerfile_path = root.join(crate::DEFAULT_DOCKERFILE);
+        fs::set_permissions(
+            dockerfile_path.parent().expect("Dockerfile parent"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("restore Dockerfile directory permissions");
+        fs::set_permissions(&dockerfile_path, fs::Permissions::from_mode(0o644))
+            .expect("restore Dockerfile permissions");
         fs::remove_dir_all(root).expect("remove resource root");
     }
 

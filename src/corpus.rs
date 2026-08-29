@@ -302,7 +302,7 @@ pub(crate) fn run_ir_dir_corpus(
     let driver_runtime = driver.into_runtime(repo_root, version)?;
     let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &driver_runtime)
         .unwrap_or_else(|_| driver_runtime.clone());
-    let yosys_runtime = yosys.into_runtime();
+    let yosys_runtime = yosys.into_runtime(repo_root)?;
     let recipe_preset_name = recipe_preset_label(recipe_preset);
     let yosys_script = resolve_recipe_preset_yosys_script(recipe_preset, yosys_script)?;
     let yosys_script_ref = make_script_ref(repo_root, yosys_script)?;
@@ -2057,6 +2057,7 @@ mod tests {
             release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: crate::runtime::default_driver_image("0.34.0"),
             dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+            dockerfile_sha256: "d".repeat(64),
         }
     }
 
@@ -2068,6 +2069,7 @@ mod tests {
         YosysRuntimeSpec {
             docker_image: crate::DEFAULT_YOSYS_DOCKER_IMAGE.to_string(),
             dockerfile: crate::DEFAULT_YOSYS_DOCKERFILE.to_string(),
+            dockerfile_sha256: "d".repeat(64),
             upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
         }
     }

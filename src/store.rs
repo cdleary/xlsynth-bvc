@@ -3883,6 +3883,7 @@ mod tests {
             release_platform: "linux-x64".to_string(),
             docker_image: "xlsynth-driver:test".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
         };
         let queue_item = QueueItem {
             schema_version: crate::ACTION_SCHEMA_VERSION,

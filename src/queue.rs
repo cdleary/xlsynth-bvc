@@ -1434,6 +1434,7 @@ mod tests {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
         }
     }
 
@@ -1848,7 +1849,8 @@ mod tests {
         let yosys_runtime = crate::model::YosysRuntimeSpec {
             docker_image: "xlsynth-bvc-yosys:latest".to_string(),
             dockerfile: "docker/yosys-abc.Dockerfile".to_string(),
-            upstream_commit: None,
+            dockerfile_sha256: "d".repeat(64),
+            upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
         };
         let diff = ActionSpec::AigStatDiff {
             opt_ir_action_id: "a".repeat(64),

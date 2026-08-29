@@ -226,6 +226,10 @@ pub(crate) fn driver_runtime_to_proto(
         release_platform: value.release_platform.clone(),
         docker_image: value.docker_image.clone(),
         dockerfile: Some(relpath(&value.dockerfile, &format!("{field}.dockerfile"))?),
+        dockerfile_sha256: Some(digest_from_hex(
+            &value.dockerfile_sha256,
+            &format!("{field}.dockerfile_sha256"),
+        )?),
     })
 }
 
@@ -237,6 +241,10 @@ pub(crate) fn yosys_runtime_to_proto(
         docker_image: value.docker_image.clone(),
         dockerfile: Some(relpath(&value.dockerfile, &format!("{field}.dockerfile"))?),
         upstream_commit: value.upstream_commit.clone(),
+        dockerfile_sha256: Some(digest_from_hex(
+            &value.dockerfile_sha256,
+            &format!("{field}.dockerfile_sha256"),
+        )?),
     })
 }
 
@@ -264,6 +272,13 @@ fn validate_driver_runtime(value: &pb::DriverRuntimeSpec, field: &str) -> Result
     validate_canonical_relpath(
         required(&value.dockerfile, &format!("{field}.dockerfile"))?,
         &format!("{field}.dockerfile.value"),
+    )?;
+    validate_digest(
+        required(
+            &value.dockerfile_sha256,
+            &format!("{field}.dockerfile_sha256"),
+        )?,
+        &format!("{field}.dockerfile_sha256"),
     )
 }
 
@@ -273,7 +288,18 @@ fn validate_yosys_runtime(value: &pb::YosysRuntimeSpec, field: &str) -> Result<(
         required(&value.dockerfile, &format!("{field}.dockerfile"))?,
         &format!("{field}.dockerfile.value"),
     )?;
-    validate_optional_identifier(&value.upstream_commit, &format!("{field}.upstream_commit"))
+    validate_digest(
+        required(
+            &value.dockerfile_sha256,
+            &format!("{field}.dockerfile_sha256"),
+        )?,
+        &format!("{field}.dockerfile_sha256"),
+    )?;
+    let commit = required(&value.upstream_commit, &format!("{field}.upstream_commit"))?;
+    if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{field}.upstream_commit must be a full 40-character hexadecimal commit");
+    }
+    Ok(())
 }
 
 fn validate_dso_version(value: &Option<pb::DsoVersion>, field: &str) -> Result<()> {
@@ -903,6 +929,13 @@ pub(crate) fn driver_runtime_from_proto(
         release_platform: value.release_platform.clone(),
         docker_image: value.docker_image.clone(),
         dockerfile: relpath_value(&value.dockerfile, &format!("{field}.dockerfile"))?,
+        dockerfile_sha256: digest_to_hex(
+            required(
+                &value.dockerfile_sha256,
+                &format!("{field}.dockerfile_sha256"),
+            )?,
+            &format!("{field}.dockerfile_sha256"),
+        )?,
     })
 }
 
@@ -915,6 +948,13 @@ pub(crate) fn yosys_runtime_from_proto(
         docker_image: value.docker_image.clone(),
         dockerfile: relpath_value(&value.dockerfile, &format!("{field}.dockerfile"))?,
         upstream_commit: value.upstream_commit.clone(),
+        dockerfile_sha256: digest_to_hex(
+            required(
+                &value.dockerfile_sha256,
+                &format!("{field}.dockerfile_sha256"),
+            )?,
+            &format!("{field}.dockerfile_sha256"),
+        )?,
     })
 }
 
@@ -1205,6 +1245,7 @@ mod tests {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.47.0".to_string(),
             dockerfile: "docker\\xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
         }
     }
 
@@ -1212,7 +1253,8 @@ mod tests {
         model::YosysRuntimeSpec {
             docker_image: "xlsynth-bvc-yosys-abc:test".to_string(),
             dockerfile: "docker/yosys-abc.Dockerfile".to_string(),
-            upstream_commit: Some("0123456789abcdef".to_string()),
+            dockerfile_sha256: "d".repeat(64),
+            upstream_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
         }
     }
 
@@ -1465,59 +1507,59 @@ mod tests {
             ),
             (
                 "download_release_stdlib",
-                "e19dcb3a5ff12ce44ad3c3f9d245f3e13266a75c05797cdf422aabd52b7c238b",
+                "9a01c73e1535d69a4a60bcdea14a1a2f550c674f14cafdde7be90aafdc181325",
             ),
             (
                 "download_source_subtree",
-                "cfdb3ee48d89984a1b7b4b6e3381405d58f4891f607596680cdf91e1aeb11371",
+                "6ebe4cea3212e8eb4599604edb1442e9104788be94798fa7339e41aaccce39a1",
             ),
             (
                 "driver_dslx_fn_to_ir",
-                "a9aac7da05aff611289ce4017d2cfc46c89318a10e98ae9d7483de1e4a186cf5",
+                "d4b843b0c8c5259b36e778cec5364b694250da81d0231c0b0646e691da6ea81c",
             ),
             (
                 "driver_ir_to_opt",
-                "6e0b602d7583465403dfea0b593e87a5987b9a422bb775927affa6950c8a0510",
+                "fd3abb9549940145a72ec32868568523fd4f4865ff2a7befb6c5b08e6d96450a",
             ),
             (
                 "driver_ir_to_delay_info",
-                "b038cc06a447e6d1c7be281353bd8ba1b79302202f5853f342b970502b629f25",
+                "14eeb8d4442006fa3d8aa13dc5b5f40be67b87396e12486425b94d1faa566767",
             ),
             (
                 "driver_ir_equiv",
-                "58ebc7c48b25b9b3e031a75dceccb2c762cc90297e63f36330a96e5243c3e7fe",
+                "5e522be978792a3b62b672d601fa79c1ee41da426acfe7b33357c4c6b147878d",
             ),
             (
                 "driver_ir_aig_equiv",
-                "b56ef8af5a22b26284bda1c4359a34773662b19ef16b0c672d6da0e6de1050d4",
+                "a88665ccfec9f8e5a7b6ba02d87d95e2825f56445a700e89a62adbad19d21c06",
             ),
             (
                 "driver_ir_to_g8r_aig",
-                "83674478504fd3419d6e2b2f1e2beba242ae2c49d8a9ecb2d926bfcdc5ef8081",
+                "f213f3d1c9073a934c96e898ef687fd1869863c6f068631508909294b4485b22",
             ),
             (
                 "ir_fn_to_combinational_verilog",
-                "21c610d24f6c9f7b91146ef3a8a6460d00ac2bb422a12611e6c1b2123b22a7b4",
+                "411f21d2734f178e82663098ae2f41a4dd94ef18a8203de3ca70782fea96b386",
             ),
             (
                 "ir_fn_to_k_bool_cone_corpus",
-                "e4d05911f763778a00533cd82bcf42da65ede2084bd25a623fe7c5364f79b98d",
+                "48827791cecf3219dbc6634670f97fc9eaa87981a0ca507c142078d2a15e0fb6",
             ),
             (
                 "ir_fn_to_mffc_corpus",
-                "789023e8db0215ad71f5974898076144aefd839b42b885f3b4403056b899ecbd",
+                "280e9966fc4055b167178c248567896b65d98ead2fcb1f36eceeb6040861230b",
             ),
             (
                 "combo_verilog_to_yosys_abc_aig",
-                "4dc4aa9c756f75d62ef1eb5b0753e9c885ef45dc93c983e521b7902716564476",
+                "cb49a255fd3204160219a8807ecdbe4716d10b6181a42e5b69759b910fdcaa8b",
             ),
             (
                 "aig_to_yosys_abc_aig",
-                "9ec451fc42cf3fd674c391ee5ec5740d38d4dc9dd379b72c457a2528c4eda348",
+                "6d89d8136298e40053c27ac29b836518d751e6e309ec23e60777d2687c6b10ca",
             ),
             (
                 "driver_aig_to_stats",
-                "3d4b27b7239735c825a298ee87eac1e111a81264bfbd205aa8ad58b200f5f4e6",
+                "03c0cc2b0b071108420d02511c4bf857d19a513b27afa9627b7486cb06c1d45d",
             ),
             (
                 "aig_stat_diff",

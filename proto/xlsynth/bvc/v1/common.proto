@@ -35,6 +35,7 @@ message DriverRuntimeSpec {
   string release_platform = 2;
   string docker_image = 3;
   NormalizedRelpath dockerfile = 4;
+  Sha256Digest dockerfile_sha256 = 5;
 }
 
 // Runtime identity for Yosys/ABC-backed actions.
@@ -42,6 +43,7 @@ message YosysRuntimeSpec {
   string docker_image = 1;
   NormalizedRelpath dockerfile = 2;
   optional string upstream_commit = 3;
+  Sha256Digest dockerfile_sha256 = 4;
 }
 
 // A checked-in script and the digest captured when the action is created.

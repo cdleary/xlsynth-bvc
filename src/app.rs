@@ -1120,7 +1120,7 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
             verilog_action_id,
             verilog_top_module_name,
             yosys_script_ref: make_script_ref(repo_root, &yosys_script)?,
-            runtime: yosys.into_runtime(),
+            runtime: yosys.into_runtime(repo_root)?,
         }),
         RunAction::AigToYosysAbcAig {
             aig_action_id,
@@ -1129,7 +1129,7 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
         } => Ok(ActionSpec::AigToYosysAbcAig {
             aig_action_id,
             yosys_script_ref: make_script_ref(repo_root, &yosys_script)?,
-            runtime: yosys.into_runtime(),
+            runtime: yosys.into_runtime(repo_root)?,
         }),
         RunAction::AigToStats {
             aig_action_id,
@@ -2658,6 +2658,7 @@ pub(crate) fn enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
     dry_run: bool,
 ) -> Result<serde_json::Value> {
     let crate_version = normalize_tag_version(requested_crate_version).to_string();
+    let dockerfile_sha256 = runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?;
     let state = build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed(
         store, repo_root, None,
     )?;
@@ -2710,6 +2711,7 @@ pub(crate) fn enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
                     release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
                     docker_image: default_driver_image(&point.crate_version),
                     dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+                    dockerfile_sha256: dockerfile_sha256.clone(),
                 };
                 ActionSpec::IrFnToCombinationalVerilog {
                     ir_action_id: point.ir_action_id.clone(),
@@ -2726,6 +2728,7 @@ pub(crate) fn enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
                     release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
                     docker_image: default_driver_image(&point.crate_version),
                     dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+                    dockerfile_sha256: dockerfile_sha256.clone(),
                 };
                 ActionSpec::DriverIrToG8rAig {
                     ir_action_id: point.ir_action_id.clone(),
@@ -3336,6 +3339,7 @@ mod tests {
             release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: default_driver_image("0.34.0"),
             dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+            dockerfile_sha256: "d".repeat(64),
         }
     }
 

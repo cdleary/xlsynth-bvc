@@ -61,6 +61,7 @@ pub(crate) fn same_driver_runtime(lhs: &DriverRuntimeSpec, rhs: &DriverRuntimeSp
         && lhs.release_platform == rhs.release_platform
         && lhs.docker_image == rhs.docker_image
         && lhs.dockerfile == rhs.dockerfile
+        && lhs.dockerfile_sha256 == rhs.dockerfile_sha256
 }
 
 pub(crate) fn details_input_ir_structural_hash(details: &serde_json::Value) -> Option<&str> {
@@ -972,6 +973,7 @@ mod tests {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.39.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
         }
     }
 

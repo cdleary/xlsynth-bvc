@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest, Sha256};
+use std::fs;
 use std::path::Path;
 use std::thread;
 
@@ -17,10 +19,27 @@ pub(crate) fn default_driver_image(driver_version: &str) -> String {
     format!("{}:{}", crate::DEFAULT_DOCKER_IMAGE_PREFIX, tag)
 }
 
+fn sha256_bytes(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+pub(crate) fn runtime_dockerfile_sha256(repo_root: &Path, dockerfile: &str) -> Result<String> {
+    let path = Path::new(dockerfile);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    };
+    let bytes = fs::read(&path)
+        .with_context(|| format!("reading runtime Dockerfile: {}", path.display()))?;
+    Ok(sha256_bytes(&bytes))
+}
+
 pub(crate) fn default_yosys_runtime() -> YosysRuntimeSpec {
     YosysRuntimeSpec {
         docker_image: crate::DEFAULT_YOSYS_DOCKER_IMAGE.to_string(),
         dockerfile: crate::DEFAULT_YOSYS_DOCKERFILE.to_string(),
+        dockerfile_sha256: sha256_bytes(include_bytes!("../docker/yosys-abc.Dockerfile")),
         upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
     }
 }
@@ -61,6 +80,7 @@ pub(crate) fn resolve_driver_runtime_for_aig_stats(
         release_platform: source_runtime.release_platform.clone(),
         docker_image: default_driver_image(&latest_driver_version),
         dockerfile: source_runtime.dockerfile.clone(),
+        dockerfile_sha256: source_runtime.dockerfile_sha256.clone(),
     })
 }
 
@@ -90,6 +110,7 @@ pub(crate) fn resolve_driver_runtime_for_dslx_list_fns(
         release_platform: source_runtime.release_platform.clone(),
         docker_image: default_driver_image(&latest_driver_version),
         dockerfile: source_runtime.dockerfile.clone(),
+        dockerfile_sha256: source_runtime.dockerfile_sha256.clone(),
     })
 }
 
@@ -108,6 +129,7 @@ pub(crate) fn canonical_stdlib_discovery_runtime_for_version(
                 release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
                 docker_image: default_driver_image(&latest_driver_version),
                 dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+                dockerfile_sha256: runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?,
             })
         }
     }
@@ -167,6 +189,7 @@ pub(crate) fn default_driver_runtime_for_version(
         release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
         docker_image: default_driver_image(&driver_version),
         dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+        dockerfile_sha256: runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?,
     };
     ensure_driver_runtime_compatibility(repo_root, &runtime, requested_xlsynth_version)?;
     Ok(runtime)
@@ -183,6 +206,7 @@ pub(crate) fn explicit_driver_runtime_for_crate_version(
         release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
         docker_image: default_driver_image(&driver_version),
         dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+        dockerfile_sha256: runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?,
     };
     ensure_driver_runtime_compatibility(repo_root, &runtime, requested_xlsynth_version)?;
     Ok(runtime)

@@ -1396,6 +1396,7 @@ mod tests {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
         }
     }
 

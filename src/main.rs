@@ -45,6 +45,7 @@ use crate::model::*;
 use crate::model::{DriverRuntimeSpec, YosysRuntimeSpec};
 use crate::runtime::{
     default_driver_image, ensure_driver_runtime_compatibility, resolve_driver_version,
+    runtime_dockerfile_sha256,
 };
 #[cfg(test)]
 use crate::store::ArtifactStore;
@@ -209,11 +210,13 @@ impl DriverCli {
         let docker_image = self
             .docker_image
             .unwrap_or_else(|| default_driver_image(&resolved_driver_version));
+        let dockerfile = self.dockerfile.to_string_lossy().to_string();
         let runtime = DriverRuntimeSpec {
             driver_version: resolved_driver_version,
             release_platform: self.release_platform,
             docker_image,
-            dockerfile: self.dockerfile.to_string_lossy().to_string(),
+            dockerfile_sha256: runtime_dockerfile_sha256(repo_root, &dockerfile)?,
+            dockerfile,
         };
         ensure_driver_runtime_compatibility(repo_root, &runtime, xlsynth_version)?;
         Ok(runtime)
@@ -221,12 +224,14 @@ impl DriverCli {
 }
 
 impl YosysCli {
-    pub(crate) fn into_runtime(self) -> YosysRuntimeSpec {
-        YosysRuntimeSpec {
+    pub(crate) fn into_runtime(self, repo_root: &Path) -> Result<YosysRuntimeSpec> {
+        let dockerfile = self.yosys_dockerfile.to_string_lossy().to_string();
+        Ok(YosysRuntimeSpec {
             docker_image: self.yosys_docker_image,
-            dockerfile: self.yosys_dockerfile.to_string_lossy().to_string(),
+            dockerfile_sha256: runtime_dockerfile_sha256(repo_root, &dockerfile)?,
+            dockerfile,
             upstream_commit: self.yosys_upstream_commit,
-        }
+        })
     }
 }
 
@@ -293,6 +298,14 @@ mod tests {
             serde_json::to_string_pretty(compat_json).expect("serialize compat"),
         )
         .expect("write compat json");
+        let dockerfile = root.join(DEFAULT_DOCKERFILE);
+        fs::create_dir_all(dockerfile.parent().expect("Dockerfile parent"))
+            .expect("create Dockerfile parent");
+        fs::write(
+            &dockerfile,
+            include_bytes!("../docker/xlsynth-driver.Dockerfile"),
+        )
+        .expect("write test runtime Dockerfile");
         root
     }
 
@@ -562,6 +575,7 @@ mod tests {
             release_platform: DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: default_driver_image("0.31.0"),
             dockerfile: DEFAULT_DOCKERFILE.to_string(),
+            dockerfile_sha256: "d".repeat(64),
         };
         let action = ActionSpec::DriverIrToG8rAig {
             ir_action_id: "opt-ir-action".to_string(),

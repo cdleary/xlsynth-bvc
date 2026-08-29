@@ -7,6 +7,7 @@ mod queue;
 pub(crate) use action::{
     action_id_to_hex, action_id_to_proto, action_spec_from_proto, action_spec_to_proto,
     compute_model_action_id_v2, driver_runtime_from_proto, driver_runtime_to_proto,
+    yosys_runtime_to_proto,
 };
 pub(crate) use provenance::{decode_provenance, encode_provenance};
 pub(crate) use queue::*;

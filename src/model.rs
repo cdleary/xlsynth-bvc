@@ -11,12 +11,14 @@ pub(crate) struct DriverRuntimeSpec {
     pub(crate) release_platform: String,
     pub(crate) docker_image: String,
     pub(crate) dockerfile: String,
+    pub(crate) dockerfile_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) struct YosysRuntimeSpec {
     pub(crate) docker_image: String,
     pub(crate) dockerfile: String,
+    pub(crate) dockerfile_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) upstream_commit: Option<String>,
 }
@@ -859,6 +861,7 @@ mod tests {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
         }
     }
 

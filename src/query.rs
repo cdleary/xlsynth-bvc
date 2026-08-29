@@ -7684,6 +7684,7 @@ mod tests {
             release_platform: "x64-linux".to_string(),
             docker_image: "ubuntu:24.04".to_string(),
             dockerfile: "FROM ubuntu:24.04".to_string(),
+            dockerfile_sha256: "d".repeat(64),
         }
     }
 
@@ -8206,6 +8207,7 @@ mod tests {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.33.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
         };
 
         let expander_item = QueueItem {
