@@ -266,6 +266,19 @@ impl SledArtifactBackend {
     const ACTION_FILE_COMPRESS_LEVEL_DEFAULT: i32 = 3;
     const ACTION_FILE_COMPRESS_LEVEL_LARGE_DEFAULT: i32 = 12;
 
+    fn decode_keyed_provenance(key: &[u8], value: &[u8]) -> Result<Provenance> {
+        let provenance = crate::proto::decode_provenance(value)
+            .context("decoding sled protobuf provenance row")?;
+        if key != provenance.action_id.as_bytes() {
+            bail!(
+                "sled provenance key {} disagrees with decoded action id {}",
+                String::from_utf8_lossy(key),
+                provenance.action_id
+            );
+        }
+        Ok(provenance)
+    }
+
     fn action_file_compress_min_bytes() -> usize {
         static VALUE: OnceLock<usize> = OnceLock::new();
         *VALUE.get_or_init(|| {
@@ -491,6 +504,8 @@ impl SledArtifactBackend {
             Some(bytes) => bytes.to_vec(),
             None => return Ok(final_dir),
         };
+        Self::decode_keyed_provenance(action_id.as_bytes(), &provenance_bytes)
+            .context("validating materialized provenance row identity")?;
 
         let staging_root = store_root.join(".staging");
         fs::create_dir_all(&staging_root).with_context(|| {
@@ -2006,7 +2021,11 @@ impl ArtifactBackend for SledArtifactBackend {
         let Ok(tree) = db.open_tree(Self::TREE_PROVENANCE_BY_ACTION) else {
             return false;
         };
-        matches!(tree.get(action_id.as_bytes()), Ok(Some(_)))
+        matches!(
+            tree.get(action_id.as_bytes()),
+            Ok(Some(value))
+                if Self::decode_keyed_provenance(action_id.as_bytes(), value.as_ref()).is_ok()
+        )
     }
 
     fn load_provenance(&self, _store_root: &Path, action_id: &str) -> Result<Provenance> {
@@ -2018,9 +2037,8 @@ impl ArtifactBackend for SledArtifactBackend {
             .get(action_id.as_bytes())
             .context("loading provenance row from sled")?
             .ok_or_else(|| anyhow::anyhow!("provenance not found for action {}", action_id))?;
-        let parsed = crate::proto::decode_provenance(bytes.as_ref())
-            .context("decoding protobuf provenance row from sled")?;
-        Ok(parsed)
+        Self::decode_keyed_provenance(action_id.as_bytes(), bytes.as_ref())
+            .context("validating loaded provenance row identity")
     }
 
     fn write_provenance(&self, store_root: &Path, provenance: &Provenance) -> Result<()> {
@@ -2092,9 +2110,9 @@ impl ArtifactBackend for SledArtifactBackend {
             .open_tree(Self::TREE_PROVENANCE_BY_ACTION)
             .context("opening sled tree provenance_by_action")?;
         for row in tree.iter() {
-            let (_, value) = row.context("iterating sled provenance rows")?;
-            let provenance = crate::proto::decode_provenance(value.as_ref())
-                .context("decoding sled protobuf provenance row")?;
+            let (key, value) = row.context("iterating sled provenance rows")?;
+            let provenance = Self::decode_keyed_provenance(key.as_ref(), value.as_ref())
+                .context("validating iterated provenance row identity")?;
             match visitor(provenance)? {
                 ControlFlow::Continue(()) => {}
                 ControlFlow::Break(()) => break,
@@ -3215,6 +3233,62 @@ mod tests {
             std::fs::read_to_string(action_dir.join("payload/result.txt")).expect("read payload");
         assert_eq!(payload_text, "hello sled");
 
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn sled_provenance_reads_reject_miskeyed_rows() {
+        let root = make_test_root("xlsynth-bvc-store-sled-miskeyed-provenance");
+        let db_path = root.join("store.sled");
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path.clone());
+        store.ensure_layout().expect("ensure sled layout");
+        drop(store);
+
+        let stored_key = "a".repeat(64);
+        let provenance = make_test_provenance(&"b".repeat(64), "payload/result.txt", 10);
+        let db = sled::Config::new()
+            .path(&db_path)
+            .cache_capacity(16 * 1024 * 1024)
+            .open()
+            .expect("open raw sled db");
+        let tree = db
+            .open_tree(SledArtifactBackend::TREE_PROVENANCE_BY_ACTION)
+            .expect("open provenance tree");
+        tree.insert(
+            stored_key.as_bytes(),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
+        )
+        .expect("insert mis-keyed provenance");
+        db.flush().expect("flush mis-keyed provenance");
+        drop(tree);
+        drop(db);
+
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path);
+        store.ensure_layout().expect("reopen sled layout");
+        assert!(
+            !store.action_exists(&stored_key),
+            "a mis-keyed provenance row must not count as a completed action"
+        );
+        for error in [
+            store
+                .load_provenance(&stored_key)
+                .expect_err("keyed load must reject a mis-keyed provenance"),
+            store
+                .list_provenances()
+                .expect_err("iteration must reject a mis-keyed provenance"),
+            store
+                .materialize_action_dir(&stored_key)
+                .expect_err("materialization must reject a mis-keyed provenance"),
+            crate::store_validation::validate_store(&store, false)
+                .expect_err("store validation must reject a mis-keyed provenance"),
+        ] {
+            assert!(
+                format!("{error:#}").contains("disagrees with decoded action id"),
+                "unexpected error: {error:#}"
+            );
+        }
+
+        drop(store);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
