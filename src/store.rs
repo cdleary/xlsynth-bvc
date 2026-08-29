@@ -5,6 +5,7 @@ use log::{info, warn};
 use prost::Message;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use sled::transaction::{ConflictableTransactionResult, Transactional};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::Cursor;
@@ -1756,33 +1757,63 @@ impl ArtifactBackend for SledArtifactBackend {
             )
         })?;
 
-        let prefix = Self::action_files_prefix(action_id);
-        let mut existing_keys = Vec::new();
-        for row in file_tree.scan_prefix(prefix) {
-            let (key, _) = row.context("iterating existing sled action-file rows")?;
-            existing_keys.push(key);
-        }
-        for key in existing_keys {
-            file_tree
-                .remove(key)
-                .context("removing existing sled action-file row")?;
-        }
-
+        let mut encoded_staged_files = Vec::with_capacity(staged_files.len());
         for (relpath, bytes) in &staged_files {
             let key = Self::action_file_key(action_id, relpath);
             let encoded = Self::maybe_encode_action_file_value(bytes)
                 .with_context(|| format!("encoding action-file row relpath={relpath}"))?;
-            file_tree
-                .insert(key, encoded)
-                .context("writing sled action-file row")?;
+            encoded_staged_files.push((key, encoded));
         }
-        provenance_tree
-            .insert(action_id.as_bytes(), provenance_bytes)
-            .context("writing sled provenance row")?;
+
+        let prefix = Self::action_files_prefix(action_id);
+        let mut existing_keys = Vec::new();
+        for row in file_tree.scan_prefix(prefix) {
+            let (key, _) = row.context("iterating existing sled action-file rows")?;
+            existing_keys.push(key.to_vec());
+        }
+
+        let inserted = (&provenance_tree, &file_tree)
+            .transaction(
+                |(transactional_provenance, transactional_files)|
+                 -> ConflictableTransactionResult<bool, sled::Error> {
+                    if transactional_provenance
+                        .get(action_id.as_bytes())?
+                        .is_some()
+                    {
+                        return Ok(false);
+                    }
+                    for key in &existing_keys {
+                        transactional_files.remove(key.clone())?;
+                    }
+                    for (key, encoded) in &encoded_staged_files {
+                        transactional_files.insert(key.clone(), encoded.clone())?;
+                    }
+                    transactional_provenance
+                        .insert(action_id.as_bytes().to_vec(), provenance_bytes.clone())?;
+                    Ok(true)
+                },
+            )
+            .context("atomically promoting immutable sled action")?;
         db.flush().context("flushing sled artifact database")?;
 
+        if !inserted {
+            let existing = provenance_tree
+                .get(action_id.as_bytes())
+                .context("loading existing sled provenance after promotion race")?
+                .context("existing sled action disappeared after promotion race")?;
+            let parsed = crate::proto::decode_provenance(existing.as_ref())
+                .context("decoding existing sled provenance after promotion race")?;
+            if parsed.action_id != action_id {
+                bail!(
+                    "existing sled provenance action id mismatch: expected {} got {}",
+                    action_id,
+                    parsed.action_id
+                );
+            }
+        }
+
         let materialized_dir = self.materialized_action_dir_for(store_root, action_id);
-        if materialized_dir.exists() {
+        if inserted && materialized_dir.exists() {
             fs::remove_dir_all(&materialized_dir).ok();
         }
         fs::remove_dir_all(staging_dir).ok();
@@ -2815,6 +2846,7 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use std::ops::ControlFlow;
+    use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_test_root(prefix: &str) -> PathBuf {
@@ -2854,6 +2886,34 @@ mod tests {
             details: json!({"test": "sled-roundtrip"}),
             suggested_next_actions: Vec::new(),
         }
+    }
+
+    fn stage_test_sled_action(
+        store: &ArtifactStore,
+        provenance: &Provenance,
+        label: &str,
+        payload: &[u8],
+    ) -> PathBuf {
+        let staging_dir = store
+            .staging_dir()
+            .join(format!("{}-{label}-staged", provenance.action_id));
+        let payload_path = staging_dir.join("payload/result.txt");
+        std::fs::create_dir_all(payload_path.parent().expect("payload parent"))
+            .expect("create staged payload");
+        std::fs::write(&payload_path, payload).expect("write staged payload");
+        let mut staged_provenance = provenance.clone();
+        staged_provenance.details = json!({"source_path": label});
+        staged_provenance.output_files = vec![OutputFile {
+            path: "payload/result.txt".to_string(),
+            bytes: payload.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(payload)),
+        }];
+        std::fs::write(
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&staged_provenance).expect("encode provenance"),
+        )
+        .expect("write staged provenance");
+        staging_dir
     }
 
     #[test]
@@ -2966,6 +3026,90 @@ mod tests {
             std::fs::read_to_string(action_dir.join("payload/result.txt")).expect("read payload");
         assert_eq!(payload_text, "hello sled");
 
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn sled_promotion_preserves_first_writer_on_conflict() {
+        let root = make_test_root("xlsynth-bvc-store-sled-first-writer");
+        let db_path = root.join("store.sled");
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path);
+        store.ensure_layout().expect("ensure sled layout");
+        let provenance = make_test_provenance(&"e".repeat(64), "payload/result.txt", 5);
+        let first = stage_test_sled_action(&store, &provenance, "first", b"first");
+        let second = stage_test_sled_action(&store, &provenance, "second", b"second");
+
+        store
+            .promote_staging_action_dir(&provenance.action_id, &first)
+            .expect("promote first writer");
+        store
+            .promote_staging_action_dir(&provenance.action_id, &second)
+            .expect("ignore conflicting second writer");
+
+        let loaded = store
+            .load_provenance(&provenance.action_id)
+            .expect("load winning provenance");
+        assert_eq!(loaded.details["source_path"], "first");
+        let action_dir = store
+            .materialize_action_dir(&provenance.action_id)
+            .expect("materialize winning action");
+        assert_eq!(
+            std::fs::read(action_dir.join("payload/result.txt")).expect("read winning payload"),
+            b"first"
+        );
+        assert!(!second.exists());
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn concurrent_sled_promotions_commit_one_complete_action() {
+        let root = make_test_root("xlsynth-bvc-store-sled-concurrent-first-writer");
+        let db_path = root.join("store.sled");
+        let store = Arc::new(ArtifactStore::new_with_sled(root.clone(), db_path));
+        store.ensure_layout().expect("ensure sled layout");
+        let provenance = make_test_provenance(&"c".repeat(64), "payload/result.txt", 5);
+        let first = stage_test_sled_action(&store, &provenance, "first", b"first");
+        let second = stage_test_sled_action(&store, &provenance, "second", b"second");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let first_store = store.clone();
+        let first_id = provenance.action_id.clone();
+        let first_barrier = barrier.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_store.promote_staging_action_dir(&first_id, &first)
+        });
+        let second_store = store.clone();
+        let second_id = provenance.action_id.clone();
+        let second_thread = std::thread::spawn(move || {
+            barrier.wait();
+            second_store.promote_staging_action_dir(&second_id, &second)
+        });
+        first_thread
+            .join()
+            .expect("first promotion thread")
+            .expect("first promotion result");
+        second_thread
+            .join()
+            .expect("second promotion thread")
+            .expect("second promotion result");
+
+        let loaded = store
+            .load_provenance(&provenance.action_id)
+            .expect("load winning provenance");
+        let winner = loaded.details["source_path"]
+            .as_str()
+            .expect("winner label");
+        let action_dir = store
+            .materialize_action_dir(&provenance.action_id)
+            .expect("materialize winning action");
+        let payload =
+            std::fs::read(action_dir.join("payload/result.txt")).expect("read winning payload");
+        assert!(matches!(winner, "first" | "second"));
+        assert_eq!(payload, winner.as_bytes());
+
+        drop(store);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
