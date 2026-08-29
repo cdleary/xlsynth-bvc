@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -148,8 +149,9 @@ fn validate_queue_dir<T>(
     state: &str,
     decode: impl Fn(&[u8]) -> Result<T>,
     validate: impl Fn(&T) -> Result<String>,
-) -> Result<usize> {
+) -> Result<BTreeSet<String>> {
     let paths = list_regular_files(dir)?;
+    let mut action_ids = BTreeSet::new();
     for path in &paths {
         if path.extension().and_then(|value| value.to_str()) != Some("pb") {
             bail!("queue contains a non-protobuf record: {}", path.display());
@@ -166,8 +168,11 @@ fn validate_queue_dir<T>(
         if relative != expected_queue_record_relpath(&action_id) {
             bail!("{state} queue record path does not match its embedded action_id");
         }
+        if !action_ids.insert(action_id.clone()) {
+            bail!("{state} queue contains duplicate action_id {action_id}");
+        }
     }
-    Ok(paths.len())
+    Ok(action_ids)
 }
 
 fn validate_campaign_records(root: &Path) -> Result<(usize, usize)> {
@@ -226,7 +231,15 @@ pub(crate) fn validate_store(
     for failed in &failed_records {
         validate_action_record_identity("failed", &failed.action_id, &failed.action)?;
     }
-    let pending_records = validate_queue_dir(
+    let failed_ids = failed_records
+        .iter()
+        .map(|record| record.action_id.clone())
+        .collect::<BTreeSet<_>>();
+    let provenance_ids = provenances
+        .iter()
+        .map(|record| record.action_id.clone())
+        .collect::<BTreeSet<_>>();
+    let pending_ids = validate_queue_dir(
         &store.queue_pending_dir(),
         "pending",
         decode_queue_item,
@@ -235,7 +248,7 @@ pub(crate) fn validate_store(
             Ok(record.action_id.clone())
         },
     )?;
-    let running_records = validate_queue_dir(
+    let running_ids = validate_queue_dir(
         &store.queue_running_dir(),
         "running",
         decode_queue_running,
@@ -244,7 +257,7 @@ pub(crate) fn validate_store(
             Ok(record.action_id.clone())
         },
     )?;
-    let done_records = validate_queue_dir(
+    let done_ids = validate_queue_dir(
         &store.queue_done_dir(),
         "done",
         decode_queue_done,
@@ -253,7 +266,7 @@ pub(crate) fn validate_store(
             Ok(record.action_id.clone())
         },
     )?;
-    let canceled_records = validate_queue_dir(
+    let canceled_ids = validate_queue_dir(
         &store.queue_canceled_dir(),
         "canceled",
         decode_queue_canceled,
@@ -262,6 +275,47 @@ pub(crate) fn validate_store(
             Ok(record.action_id.clone())
         },
     )?;
+    let mut states_by_action: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (state, ids) in [
+        ("pending", &pending_ids),
+        ("running", &running_ids),
+        ("done", &done_ids),
+        ("failed", &failed_ids),
+        ("canceled", &canceled_ids),
+    ] {
+        for action_id in ids {
+            states_by_action.entry(action_id).or_default().push(state);
+        }
+    }
+    for (action_id, states) in states_by_action {
+        if states.len() > 1 {
+            bail!(
+                "action has conflicting queue states: action_id={} states={}",
+                action_id,
+                states.join(",")
+            );
+        }
+    }
+    for action_id in &done_ids {
+        if !provenance_ids.contains(action_id) {
+            bail!("done queue action is missing committed provenance: action_id={action_id}");
+        }
+    }
+    for (state, ids) in [
+        ("pending", &pending_ids),
+        ("running", &running_ids),
+        ("failed", &failed_ids),
+        ("canceled", &canceled_ids),
+    ] {
+        if let Some(action_id) = ids.iter().find(|id| provenance_ids.contains(*id)) {
+            bail!(
+                "committed action has conflicting {} queue state: action_id={}",
+                state,
+                action_id
+            );
+        }
+    }
+
     let (campaign_run_records, analysis_records) =
         validate_campaign_records(&store.campaign_runs_dir())?;
     let coordinator_records = validate_coordinator_records(&store.coordinator_dir())?;
@@ -308,11 +362,11 @@ pub(crate) fn validate_store(
     store.flush_durable()?;
     Ok(ValidateStoreSummary {
         provenance_records: provenances.len(),
-        failed_records: failed_records.len(),
-        pending_records,
-        running_records,
-        done_records,
-        canceled_records,
+        failed_records: failed_ids.len(),
+        pending_records: pending_ids.len(),
+        running_records: running_ids.len(),
+        done_records: done_ids.len(),
+        canceled_records: canceled_ids.len(),
         campaign_run_records,
         analysis_records,
         coordinator_records,
@@ -477,6 +531,35 @@ mod tests {
             validate_store(&store, false).expect_err("mismatched Sled key must fail validation");
         assert!(
             format!("{error:#}").contains("Sled key does not match"),
+            "unexpected error: {error:#}"
+        );
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn validate_store_rejects_conflicting_active_and_terminal_states() {
+        let root = temp_path();
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let action = identity_test_action();
+        let action_id = crate::queue::enqueue_action(&store, action.clone()).expect("enqueue");
+        let now = Utc::now();
+        store
+            .write_failed_action_record(&QueueFailed {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id,
+                enqueued_utc: now,
+                failed_utc: now,
+                failed_by: "test-worker".to_string(),
+                action,
+                error: "test failure".to_string(),
+            })
+            .expect("write failed");
+
+        let error = validate_store(&store, false).expect_err("conflict must fail");
+        assert!(
+            format!("{error:#}").contains("conflicting queue states"),
             "unexpected error: {error:#}"
         );
         drop(store);

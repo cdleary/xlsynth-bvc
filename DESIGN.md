@@ -71,6 +71,16 @@ This non-goal is limited to host/storage failure. It does not relax fail-closed
 public-data validation, ordinary concurrent-execution correctness, process-
 restart recovery, or the read-only resource invariant.
 
+Queue terminal evidence follows a terminal-first transition protocol. A pending
+action is reserved through its unique running path before cancellation is
+written; after the durable canceled record exists, pending and reservation
+records are removed. Failure is likewise written before its running lease is
+removed, and success clears stale failure/cancellation evidence before marking
+done. Lease recovery never requeues an action with terminal evidence, while
+validate-store rejects unresolved active/terminal overlaps and incompatible
+terminal states. This protocol covers process interruption without claiming the
+host power-loss durability excluded above.
+
 ## Canonical data and publication boundary
 
 Canonical Rust-side identities and persisted operational records use validated

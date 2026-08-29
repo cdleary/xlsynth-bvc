@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use clap::Parser;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -1392,7 +1393,10 @@ where
     // queue status does not briefly report the worker as idle while it is still
     // expanding follow-up work.
     before_mark_done();
+    store.delete_failed_action_record(running.action_id())?;
+    remove_file_if_exists(&store.canceled_queue_path(running.action_id()))?;
     write_done_record(store, running, output_artifact, worker_id)?;
+    remove_file_if_exists(&store.pending_queue_path(running.action_id()))?;
     remove_file_if_exists(&running.path)?;
     Ok(())
 }
@@ -1592,7 +1596,23 @@ fn enqueue_suggested_actions_with_policy(
                     QueueState::Failed => already_failed_count += 1,
                     QueueState::Canceled => already_canceled_count += 1,
                     QueueState::None => match classify_action_readiness(store, &action)? {
-                        ActionReadiness::Blocked { .. } => skipped_blocked_count += 1,
+                        ActionReadiness::Blocked {
+                            dependency_action_id,
+                            root_failed_action_id,
+                            reason,
+                        } => {
+                            write_canceled_record(
+                                store,
+                                &action_id,
+                                Utc::now(),
+                                action.clone(),
+                                "suggestion-reconcile",
+                                &dependency_action_id,
+                                &root_failed_action_id,
+                                &reason,
+                            )?;
+                            skipped_blocked_count += 1;
+                        }
                         ActionReadiness::Ready | ActionReadiness::NotReady => {
                             enqueue_action_with_priority(store, action, suggested_priority)?;
                             enqueued_count += 1;
@@ -1740,7 +1760,23 @@ fn enqueue_missing_suggested_actions_with_policy(
                 already_canceled_count += 1;
             }
             QueueState::None => match classify_action_readiness(store, &action)? {
-                ActionReadiness::Blocked { .. } => {
+                ActionReadiness::Blocked {
+                    dependency_action_id,
+                    root_failed_action_id,
+                    reason,
+                } => {
+                    if !dry_run {
+                        write_canceled_record(
+                            store,
+                            &action_id,
+                            Utc::now(),
+                            action.clone(),
+                            "suggestion-reconcile",
+                            &dependency_action_id,
+                            &root_failed_action_id,
+                            &reason,
+                        )?;
+                    }
                     skipped_blocked_count += 1;
                 }
                 ActionReadiness::Ready | ActionReadiness::NotReady => {
@@ -3589,6 +3625,7 @@ mod tests {
         let action = make_opt_action(&test_action_id("finalize-success-order-ir"), &runtime);
         let action_id = compute_action_id(&action).expect("compute queue action id");
         let now = Utc::now();
+        let stale_terminal_action = action.clone();
         let running = QueueRunningWithPath {
             running: QueueRunning {
                 schema_version: crate::ACTION_SCHEMA_VERSION,
@@ -3611,6 +3648,28 @@ mod tests {
                 .expect("encode running queue record"),
         )
         .expect("write running queue record");
+        store
+            .write_failed_action_record(&QueueFailed {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: action_id.clone(),
+                enqueued_utc: now,
+                failed_utc: now,
+                failed_by: "stale-worker".to_string(),
+                action: stale_terminal_action.clone(),
+                error: "stale failure".to_string(),
+            })
+            .expect("write stale failure");
+        write_canceled_record(
+            &store,
+            &action_id,
+            now,
+            stale_terminal_action,
+            "stale-worker",
+            &action_id,
+            &action_id,
+            "stale cancellation",
+        )
+        .expect("write stale cancellation");
 
         let mut before_mark_done_called = false;
         finalize_successful_queue_action(
@@ -3632,6 +3691,8 @@ mod tests {
 
         assert!(before_mark_done_called);
         assert!(!running.path.exists());
+        assert!(!store.failed_action_record_exists(&action_id));
+        assert!(!store.canceled_queue_path(&action_id).exists());
         let done = load_queue_done_record(&store, &action_id)
             .expect("load done queue record")
             .expect("done queue record exists");

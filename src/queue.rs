@@ -199,9 +199,22 @@ pub(crate) fn queue_state_display_label(state: &QueueState) -> &'static str {
     state.display_label()
 }
 
+fn terminal_queue_state_for_action(store: &ArtifactStore, action_id: &str) -> Option<QueueState> {
+    if store.action_exists(action_id) || store.done_queue_path(action_id).exists() {
+        return Some(QueueState::Done);
+    }
+    if store.failed_action_record_exists(action_id) {
+        return Some(QueueState::Failed);
+    }
+    if store.canceled_queue_path(action_id).exists() {
+        return Some(QueueState::Canceled);
+    }
+    None
+}
+
 pub(crate) fn queue_state_for_action(store: &ArtifactStore, action_id: &str) -> QueueState {
-    if store.pending_queue_path(action_id).exists() {
-        return QueueState::Pending;
+    if let Some(terminal) = terminal_queue_state_for_action(store, action_id) {
+        return terminal;
     }
     let running_path = store.running_queue_path(action_id);
     if running_path.exists() {
@@ -218,14 +231,8 @@ pub(crate) fn queue_state_for_action(store: &ArtifactStore, action_id: &str) -> 
             expires_utc: None,
         };
     }
-    if store.done_queue_path(action_id).exists() {
-        return QueueState::Done;
-    }
-    if store.failed_action_record_exists(action_id) {
-        return QueueState::Failed;
-    }
-    if store.canceled_queue_path(action_id).exists() {
-        return QueueState::Canceled;
+    if store.pending_queue_path(action_id).exists() {
+        return QueueState::Pending;
     }
     QueueState::None
 }
@@ -379,30 +386,17 @@ pub(crate) fn claim_next_pending_item(
                 root_failed_action_id,
                 reason,
             } => {
-                // Attempt to cancel only while this item is still pending.
-                match fs::remove_file(&pending_path) {
-                    Ok(()) => {
-                        write_canceled_record(
-                            store,
-                            &action_id,
-                            enqueued_utc,
-                            action,
-                            worker_id,
-                            &dependency_action_id,
-                            &root_failed_action_id,
-                            &reason,
-                        )?;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        return Err(e).with_context(|| {
-                            format!(
-                                "removing blocked pending queue item: {}",
-                                pending_path.display()
-                            )
-                        });
-                    }
-                }
+                try_write_dependency_canceled_for_pending(
+                    store,
+                    &pending_path,
+                    &action_id,
+                    enqueued_utc,
+                    action,
+                    worker_id,
+                    &dependency_action_id,
+                    &root_failed_action_id,
+                    &reason,
+                )?;
                 continue;
             }
         }
@@ -516,29 +510,19 @@ pub(crate) fn claim_compatible_pending_items(
                 dependency_action_id,
                 root_failed_action_id,
                 reason,
-            } => match fs::remove_file(&pending_path) {
-                Ok(()) => {
-                    write_canceled_record(
-                        store,
-                        &action_id,
-                        enqueued_utc,
-                        action,
-                        worker_id,
-                        &dependency_action_id,
-                        &root_failed_action_id,
-                        &reason,
-                    )?;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "removing blocked pending queue item: {}",
-                            pending_path.display()
-                        )
-                    });
-                }
-            },
+            } => {
+                try_write_dependency_canceled_for_pending(
+                    store,
+                    &pending_path,
+                    &action_id,
+                    enqueued_utc,
+                    action,
+                    worker_id,
+                    &dependency_action_id,
+                    &root_failed_action_id,
+                    &reason,
+                )?;
+            }
         }
     }
 
@@ -683,6 +667,10 @@ pub(crate) fn try_claim_pending_item(
         Some(v) => v,
         None => return Ok(None),
     };
+    if terminal_queue_state_for_action(store, &action_id).is_some() {
+        remove_file_if_exists(pending_path)?;
+        return Ok(None);
+    }
     let running_path = store.running_queue_path(&action_id);
     if let Some(parent) = running_path.parent() {
         fs::create_dir_all(parent)
@@ -701,6 +689,11 @@ pub(crate) fn try_claim_pending_item(
                 )
             });
         }
+    }
+    if terminal_queue_state_for_action(store, &action_id).is_some() {
+        remove_file_if_exists(pending_path)?;
+        remove_file_if_exists(&running_path)?;
+        return Ok(None);
     }
     match fs::remove_file(pending_path) {
         Ok(()) => {}
@@ -782,6 +775,9 @@ pub(crate) fn write_failed_record(
     worker_id: &str,
     error: &str,
 ) -> Result<()> {
+    if store.action_exists(running.action_id()) {
+        return Ok(());
+    }
     let failed = QueueFailed {
         schema_version: crate::ACTION_SCHEMA_VERSION,
         action_id: running.action_id().to_string(),
@@ -793,6 +789,9 @@ pub(crate) fn write_failed_record(
     };
     // Queue records are ephemeral; persist terminal failures only in the durable store.
     write_failed_action_record(store, &failed)?;
+    if store.action_exists(running.action_id()) {
+        store.delete_failed_action_record(running.action_id())?;
+    }
     Ok(())
 }
 
@@ -909,6 +908,70 @@ pub(crate) fn write_canceled_record(
     Ok(())
 }
 
+fn reserve_pending_for_terminal_transition(
+    store: &ArtifactStore,
+    pending_path: &Path,
+    action_id: &str,
+) -> Result<Option<PathBuf>> {
+    let running_path = store.running_queue_path(action_id);
+    if let Some(parent) = running_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating terminal-transition reservation dir: {}",
+                parent.display()
+            )
+        })?;
+    }
+    match fs::hard_link(pending_path, &running_path) {
+        Ok(()) => Ok(Some(running_path)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "reserving pending action for terminal transition: {} -> {}",
+                pending_path.display(),
+                running_path.display()
+            )
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_write_dependency_canceled_for_pending(
+    store: &ArtifactStore,
+    pending_path: &Path,
+    action_id: &str,
+    enqueued_utc: DateTime<Utc>,
+    action: ActionSpec,
+    worker_id: &str,
+    canceled_due_to_action_id: &str,
+    root_failed_action_id: &str,
+    reason: &str,
+) -> Result<bool> {
+    let Some(reservation_path) =
+        reserve_pending_for_terminal_transition(store, pending_path, action_id)?
+    else {
+        return Ok(false);
+    };
+    write_canceled_record(
+        store,
+        action_id,
+        enqueued_utc,
+        action,
+        worker_id,
+        canceled_due_to_action_id,
+        root_failed_action_id,
+        reason,
+    )?;
+    remove_file_if_exists(pending_path)?;
+    remove_file_if_exists(&reservation_path)?;
+    Ok(true)
+}
+
 pub(crate) fn write_work_policy_excluded_record(
     store: &ArtifactStore,
     action_id: &str,
@@ -945,8 +1008,16 @@ pub(crate) fn write_work_policy_excluded_record(
         }
     }
 
-    remove_file_if_exists(&store.pending_queue_path(action_id))?;
-    store.delete_failed_action_record(action_id)?;
+    let pending_path = store.pending_queue_path(action_id);
+    let reservation_path = if pending_path.exists() {
+        let Some(path) = reserve_pending_for_terminal_transition(store, &pending_path, action_id)?
+        else {
+            return Ok(false);
+        };
+        Some(path)
+    } else {
+        None
+    };
 
     let now = Utc::now();
     let canceled = QueueCanceled {
@@ -970,6 +1041,11 @@ pub(crate) fn write_work_policy_excluded_record(
     }
 
     write_bytes_atomic(&canceled_path, &encode_queue_canceled(&canceled)?)?;
+    store.delete_failed_action_record(action_id)?;
+    if let Some(reservation_path) = reservation_path {
+        remove_file_if_exists(&pending_path)?;
+        remove_file_if_exists(&reservation_path)?;
+    }
     Ok(true)
 }
 
@@ -1023,21 +1099,9 @@ pub(crate) fn cancel_downstream_pending_actions(
                 continue;
             };
 
-            // Only emit a canceled record if we can still remove the pending item.
-            match fs::remove_file(&pending_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "removing blocked pending queue item during cancellation: {}",
-                            pending_path.display()
-                        )
-                    });
-                }
-            }
-            write_canceled_record(
+            if try_write_dependency_canceled_for_pending(
                 store,
+                &pending_path,
                 &action_id,
                 enqueued_utc,
                 action,
@@ -1045,10 +1109,11 @@ pub(crate) fn cancel_downstream_pending_actions(
                 &dep,
                 root_failed_action_id,
                 "dependency failed or was canceled",
-            )?;
-            blocked_ids.insert(action_id);
-            canceled += 1;
-            changed = true;
+            )? {
+                blocked_ids.insert(action_id);
+                canceled += 1;
+                changed = true;
+            }
         }
         if !changed {
             break;
@@ -1064,6 +1129,18 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
     let mut running_paths = list_queue_files(&store.queue_running_dir())?;
     running_paths.sort();
     for running_path in running_paths {
+        if let Some(action_id) = queue_action_id_from_path(&running_path)
+            && terminal_queue_state_for_action(store, &action_id).is_some()
+        {
+            remove_file_if_exists(&store.pending_queue_path(&action_id))?;
+            remove_file_if_exists(&running_path)?;
+            if store.action_exists(&action_id) {
+                store.delete_failed_action_record(&action_id)?;
+                remove_file_if_exists(&store.canceled_queue_path(&action_id))?;
+            }
+            reclaimed += 1;
+            continue;
+        }
         let bytes = match fs::read(&running_path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1103,6 +1180,16 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
             priority,
             action,
         };
+        if terminal_queue_state_for_action(store, &action_id).is_some() {
+            remove_file_if_exists(&store.pending_queue_path(&action_id))?;
+            remove_file_if_exists(&running_path)?;
+            if store.action_exists(&action_id) {
+                store.delete_failed_action_record(&action_id)?;
+                remove_file_if_exists(&store.canceled_queue_path(&action_id))?;
+            }
+            reclaimed += 1;
+            continue;
+        }
         let pending_path = store.pending_queue_path(&action_id);
         if let Some(parent) = pending_path.parent() {
             fs::create_dir_all(parent)
@@ -2003,6 +2090,106 @@ mod tests {
         assert!(!pending_path.exists());
 
         fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    fn terminal_test_action() -> ActionSpec {
+        ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+            version: "v0.37.0".to_string(),
+            discovery_runtime: None,
+            stdlib_tarball_sha256: "11".repeat(32),
+        }
+    }
+
+    #[test]
+    fn reclaim_keeps_failed_action_terminal_instead_of_requeueing() {
+        let (store, root) = make_test_store();
+        let action_id = enqueue_action(&store, terminal_test_action()).expect("enqueue");
+        let running = claim_next_pending_item(&store, "worker-failed", 900)
+            .expect("claim")
+            .expect("running");
+        write_failed_record(&store, &running, "worker-failed", "boom").expect("write failed");
+
+        assert!(running.path.exists());
+        assert_eq!(
+            queue_state_for_action(&store, &action_id),
+            QueueState::Failed
+        );
+        assert_eq!(reclaim_expired_running_leases(&store).expect("reclaim"), 1);
+        assert!(!running.path.exists());
+        assert!(!store.pending_queue_path(&action_id).exists());
+        assert!(store.failed_action_record_exists(&action_id));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reclaim_finishes_interrupted_terminal_first_cancellation() {
+        let (store, root) = make_test_store();
+        let action = terminal_test_action();
+        let action_id = enqueue_action(&store, action.clone()).expect("enqueue");
+        let pending_path = store.pending_queue_path(&action_id);
+        let running_path = store.running_queue_path(&action_id);
+        fs::create_dir_all(running_path.parent().expect("running parent"))
+            .expect("create running parent");
+        fs::hard_link(&pending_path, &running_path).expect("reserve cancellation");
+        write_canceled_record(
+            &store,
+            &action_id,
+            Utc::now(),
+            action,
+            "worker-cancel",
+            &action_id,
+            &action_id,
+            "test cancellation",
+        )
+        .expect("write cancellation");
+
+        assert_eq!(
+            queue_state_for_action(&store, &action_id),
+            QueueState::Canceled
+        );
+        assert!(pending_path.exists());
+        assert!(running_path.exists());
+        assert_eq!(reclaim_expired_running_leases(&store).expect("reclaim"), 1);
+        assert!(!pending_path.exists());
+        assert!(!running_path.exists());
+        assert!(store.canceled_queue_path(&action_id).exists());
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn claim_discards_pending_record_when_terminal_evidence_exists() {
+        let (store, root) = make_test_store();
+        let action = terminal_test_action();
+        let action_id = enqueue_action(&store, action.clone()).expect("enqueue");
+        write_canceled_record(
+            &store,
+            &action_id,
+            Utc::now(),
+            action,
+            "worker-cancel",
+            &action_id,
+            &action_id,
+            "test cancellation",
+        )
+        .expect("write cancellation");
+
+        assert!(
+            claim_next_pending_item(&store, "worker-claim", 60)
+                .expect("claim scan")
+                .is_none()
+        );
+        assert!(!store.pending_queue_path(&action_id).exists());
+        assert_eq!(
+            queue_state_for_action(&store, &action_id),
+            QueueState::Canceled
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
