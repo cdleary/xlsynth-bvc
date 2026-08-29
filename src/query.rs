@@ -6743,18 +6743,9 @@ pub(crate) fn maybe_refresh_dslx_root_for_suggestion_discovery(
         }),
     );
     provenance.details = serde_json::Value::Object(details);
-    let provenance_path = store.provenance_path(root_action_id);
-    fs::write(
-        &provenance_path,
-        crate::proto::encode_provenance(&provenance)
-            .context("encoding refreshed protobuf provenance")?,
-    )
-    .with_context(|| {
-        format!(
-            "writing refreshed provenance: {}",
-            provenance_path.display()
-        )
-    })?;
+    store
+        .write_provenance(&provenance)
+        .context("persisting refreshed canonical DSLX discovery provenance")?;
 
     provenance = store.load_provenance(root_action_id)?;
     if dslx_root_provenance_needs_discovery_refresh(&provenance) {

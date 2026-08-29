@@ -5,7 +5,9 @@ use log::{info, warn};
 use prost::Message;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sled::transaction::{ConflictableTransactionResult, Transactional};
+use sled::transaction::{
+    ConflictableTransactionError, ConflictableTransactionResult, Transactional,
+};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::Cursor;
@@ -41,7 +43,6 @@ trait ArtifactBackend: std::fmt::Debug + Send + Sync {
         action_id: &str,
         staging_dir: &Path,
     ) -> Result<()>;
-    fn provenance_path(&self, store_root: &Path, action_id: &str) -> PathBuf;
     fn failed_action_record_exists(&self, store_root: &Path, action_id: &str) -> bool;
     fn load_failed_action_record(
         &self,
@@ -280,6 +281,28 @@ impl SledArtifactBackend {
             return Ok(stored_bytes.to_vec());
         };
         zstd::stream::decode_all(Cursor::new(payload)).context("zstd decoding action-file row")
+    }
+
+    fn validate_provenance_replacement(
+        existing_bytes: &[u8],
+        replacement_bytes: &[u8],
+    ) -> Result<()> {
+        let existing = pb::Provenance::decode(existing_bytes)
+            .context("decoding existing provenance before replacement")?;
+        let replacement =
+            pb::Provenance::decode(replacement_bytes).context("decoding replacement provenance")?;
+        if existing.record_version != replacement.record_version
+            || existing.action_id != replacement.action_id
+            || existing.action != replacement.action
+            || existing.dependencies != replacement.dependencies
+            || existing.output_artifact != replacement.output_artifact
+            || existing.output_files != replacement.output_files
+        {
+            bail!(
+                "provenance replacement may update discovery metadata only; action identity and output contract must remain unchanged"
+            );
+        }
+        Ok(())
     }
 
     fn cache_capacity_bytes() -> u64 {
@@ -1820,11 +1843,6 @@ impl ArtifactBackend for SledArtifactBackend {
         Ok(())
     }
 
-    fn provenance_path(&self, store_root: &Path, action_id: &str) -> PathBuf {
-        self.materialized_action_dir_for(store_root, action_id)
-            .join("provenance.pb")
-    }
-
     fn failed_action_record_exists(&self, store_root: &Path, action_id: &str) -> bool {
         if failed_action_record_path(store_root, action_id).exists() {
             return true;
@@ -1926,17 +1944,55 @@ impl ArtifactBackend for SledArtifactBackend {
 
     fn write_provenance(&self, store_root: &Path, provenance: &Provenance) -> Result<()> {
         let db = self.open_db()?;
-        let tree = db
+        let provenance_tree = db
             .open_tree(Self::TREE_PROVENANCE_BY_ACTION)
             .context("opening sled tree provenance_by_action")?;
+        let file_tree = db
+            .open_tree(Self::TREE_ACTION_FILE_BYTES)
+            .context("opening sled tree action_file_bytes")?;
         let bytes = crate::proto::encode_provenance(provenance)
             .context("encoding protobuf provenance row")?;
-        tree.insert(provenance.action_id.as_bytes(), bytes)
-            .context("writing provenance row to sled")?;
+        let existing_bytes = provenance_tree
+            .get(provenance.action_id.as_bytes())
+            .context("loading existing provenance before replacement")?
+            .map(|value| value.to_vec());
+        if let Some(existing) = &existing_bytes {
+            Self::validate_provenance_replacement(existing, &bytes)?;
+        }
+        let encoded_file = Self::maybe_encode_action_file_value(&bytes)
+            .context("encoding provenance action-file row")?;
+        let provenance_file_key = Self::action_file_key(&provenance.action_id, "provenance.pb");
+        (&provenance_tree, &file_tree)
+            .transaction(
+                |(transactional_provenance, transactional_files)|
+                 -> ConflictableTransactionResult<(), sled::Error> {
+                    let current = transactional_provenance
+                        .get(provenance.action_id.as_bytes())?
+                        .map(|value| value.to_vec());
+                    if current != existing_bytes {
+                        return Err(ConflictableTransactionError::Abort(
+                            sled::Error::Unsupported(
+                                "provenance changed during replacement".to_string(),
+                            ),
+                        ));
+                    }
+                    transactional_files
+                        .insert(provenance_file_key.clone(), encoded_file.clone())?;
+                    transactional_provenance
+                        .insert(provenance.action_id.as_bytes().to_vec(), bytes.clone())?;
+                    Ok(())
+                },
+            )
+            .context("atomically replacing canonical sled provenance")?;
         db.flush().context("flushing sled artifact database")?;
         let materialized_dir = self.materialized_action_dir_for(store_root, &provenance.action_id);
         if materialized_dir.exists() {
-            fs::remove_dir_all(&materialized_dir).ok();
+            fs::remove_dir_all(&materialized_dir).with_context(|| {
+                format!(
+                    "invalidating materialized action after provenance replacement: {}",
+                    materialized_dir.display()
+                )
+            })?;
         }
         Ok(())
     }
@@ -2158,11 +2214,6 @@ impl ArtifactBackend for SnapshotArtifactBackend {
             "promote_staging_action_dir is unavailable in snapshot read-only backend (action_id={})",
             action_id
         )
-    }
-
-    fn provenance_path(&self, _store_root: &Path, action_id: &str) -> PathBuf {
-        shard_dir(&self.snapshot_dir.join("provenance"), action_id)
-            .join(format!("{action_id}.json"))
     }
 
     fn failed_action_record_exists(&self, _store_root: &Path, _action_id: &str) -> bool {
@@ -2520,10 +2571,6 @@ impl ArtifactStore {
         Ok(())
     }
 
-    pub(crate) fn provenance_path(&self, action_id: &str) -> PathBuf {
-        self.artifact_backend.provenance_path(&self.root, action_id)
-    }
-
     pub(crate) fn action_exists(&self, action_id: &str) -> bool {
         self.artifact_backend.action_exists(&self.root, action_id)
     }
@@ -2841,7 +2888,7 @@ mod tests {
     use super::*;
     use crate::model::{
         ActionSpec, ArtifactRef, ArtifactType, CommandTrace, DriverRuntimeSpec, OutputFile,
-        Provenance, QueueFailed, QueueItem,
+        Provenance, QueueFailed, QueueItem, SuggestedAction,
     };
     use chrono::Utc;
     use serde_json::json;
@@ -3026,6 +3073,85 @@ mod tests {
             std::fs::read_to_string(action_dir.join("payload/result.txt")).expect("read payload");
         assert_eq!(payload_text, "hello sled");
 
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn sled_provenance_replacement_updates_canonical_and_materialized_copies() {
+        let root = make_test_root("xlsynth-bvc-store-sled-provenance-replacement");
+        let db_path = root.join("store.sled");
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path);
+        store.ensure_layout().expect("ensure sled layout");
+        let provenance = make_test_provenance(&"d".repeat(64), "payload/result.txt", 5);
+        let staging = stage_test_sled_action(&store, &provenance, "initial", b"first");
+        store
+            .promote_staging_action_dir(&provenance.action_id, &staging)
+            .expect("promote initial action");
+        let materialized = store
+            .materialize_action_dir(&provenance.action_id)
+            .expect("materialize initial action");
+        assert!(materialized.join("provenance.pb").exists());
+
+        let mut replacement = store
+            .load_provenance(&provenance.action_id)
+            .expect("load initial canonical provenance");
+        let suggested_action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "e".repeat(64),
+            top_fn_name: Some("suggested".to_string()),
+        };
+        let suggested_action_id =
+            crate::executor::compute_action_id(&suggested_action).expect("suggested action id");
+        replacement.created_utc = Utc::now();
+        replacement.commands = vec![CommandTrace {
+            argv: vec!["discovery".to_string(), "--retry".to_string()],
+            exit_code: 0,
+        }];
+        replacement.details = json!({"dslx_list_fns_discovery": {"suggested_actions": 1}});
+        replacement.suggested_next_actions = vec![SuggestedAction {
+            reason: "recovered discovery".to_string(),
+            action_id: suggested_action_id,
+            action: suggested_action,
+        }];
+        store
+            .write_provenance(&replacement)
+            .expect("replace canonical provenance");
+
+        let canonical = store
+            .load_provenance(&provenance.action_id)
+            .expect("reload canonical provenance");
+        assert_eq!(canonical.suggested_next_actions.len(), 1);
+        assert_eq!(canonical.commands[0].argv[0], "discovery");
+        let rematerialized = store
+            .materialize_action_dir(&provenance.action_id)
+            .expect("rematerialize updated action");
+        let materialized_provenance = crate::proto::decode_provenance(
+            &std::fs::read(rematerialized.join("provenance.pb"))
+                .expect("read rematerialized provenance"),
+        )
+        .expect("decode rematerialized provenance");
+        assert_eq!(materialized_provenance.suggested_next_actions.len(), 1);
+        assert_eq!(
+            std::fs::read(rematerialized.join("payload/result.txt"))
+                .expect("read unchanged payload"),
+            b"first"
+        );
+
+        let mut invalid = replacement;
+        invalid.output_artifact.relpath = "different-output".to_string();
+        let error = store
+            .write_provenance(&invalid)
+            .expect_err("output contract replacement must fail");
+        assert!(error.to_string().contains("output contract"));
+        assert_eq!(
+            store
+                .load_provenance(&provenance.action_id)
+                .expect("canonical provenance remains")
+                .output_artifact
+                .relpath,
+            "payload"
+        );
+
+        drop(store);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
