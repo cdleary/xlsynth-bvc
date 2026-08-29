@@ -1793,6 +1793,15 @@ impl ArtifactBackend for SledArtifactBackend {
             encoded_staged_files.push((key, encoded));
         }
 
+        // A materializer must not observe the canonical transaction until the
+        // promotion has flushed and invalidated any cache directory left by a
+        // prior incarnation of this action. Provenance replacement takes this
+        // same lock for the same reason.
+        let _materialization_guard = self
+            .materialization_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("acquiring sled materialization lock for promotion"))?;
+
         let prefix = Self::action_files_prefix(action_id);
         let mut existing_keys = Vec::new();
         for row in file_tree.scan_prefix(prefix) {
@@ -3195,6 +3204,52 @@ mod tests {
         );
         assert!(!second.exists());
 
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn sled_promotion_requires_materialization_lock_before_commit() {
+        let root = make_test_root("xlsynth-bvc-store-sled-promotion-materialization-lock");
+        let db_path = root.join("store.sled");
+        let backend = SledArtifactBackend {
+            db_path,
+            db: Mutex::new(None),
+            materialization_lock: Mutex::new(()),
+        };
+        backend.ensure_layout(&root).expect("ensure sled layout");
+
+        let provenance = make_test_provenance(&"b".repeat(64), "payload/result.txt", 5);
+        let action_id = provenance.action_id.clone();
+        let staging = root.join("staging-action");
+        std::fs::create_dir_all(staging.join("payload")).expect("create staged payload");
+        std::fs::write(staging.join("payload/result.txt"), b"first").expect("write staged payload");
+        std::fs::write(
+            staging.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
+        )
+        .expect("write staged provenance");
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend
+                .materialization_lock
+                .lock()
+                .expect("acquire materialization lock for poisoning");
+            panic!("poison materialization lock");
+        }));
+        assert!(poison.is_err());
+
+        let error = backend
+            .promote_staging_action_dir(&root, &action_id, &staging)
+            .expect_err("promotion must acquire the materialization lock");
+        assert!(
+            error
+                .to_string()
+                .contains("acquiring sled materialization lock for promotion"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!backend.action_exists(&root, &action_id));
+
+        drop(backend);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
