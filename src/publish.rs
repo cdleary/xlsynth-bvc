@@ -2,10 +2,11 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
+use fs2::FileExt;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,6 +22,7 @@ const CURRENT_SITE_RECORD_VERSION: u32 = 1;
 const PUBLISHED_SITE_ID_DOMAIN: &[u8] = b"xlsynth-bvc/published-site/v1\0";
 const CURRENT_POINTER_PROTO: &str = "current.pb";
 const CURRENT_POINTER_JSON: &str = "current.json";
+pub(crate) const PUBLICATION_LOCK_FILENAME: &str = ".publication.lock";
 const PUBLISHED_ROOT_INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>xlsynth-bvc results</title></head>
 <body><p id="status">Loading current xlsynth-bvc results…</p><script>
@@ -54,6 +56,37 @@ struct BrowserCurrentPointer {
     site_id: String,
     catalog_url: String,
     site_url: String,
+}
+
+struct PublicationLock {
+    file: File,
+}
+
+impl PublicationLock {
+    fn acquire(publish_root: &Path) -> Result<Self> {
+        fs::create_dir_all(publish_root)
+            .with_context(|| format!("creating publish root: {}", publish_root.display()))?;
+        let path = publish_root.join(PUBLICATION_LOCK_FILENAME);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening publication lock: {}", path.display()))?;
+        file.try_lock_exclusive().with_context(|| {
+            format!(
+                "another xlsynth-bvc publisher holds the publication-root lock {}",
+                path.display()
+            )
+        })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for PublicationLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 fn digest(bytes: &[u8]) -> pb::Sha256Digest {
@@ -236,14 +269,13 @@ pub(crate) fn publish_static_site(
     site_dir: &Path,
     publish_root: &Path,
 ) -> Result<PublishStaticSiteSummary> {
+    let _lock = PublicationLock::acquire(publish_root)?;
     let (site_manifest, manifest_bytes, site_id_digest) = site_identity(site_dir)?;
     let site_id = digest_hex(&site_id_digest, "site_id")?;
     let snapshot_id = digest_hex(
         required(&site_manifest.source_snapshot_id, "site.source_snapshot_id")?,
         "site.source_snapshot_id",
     )?;
-    fs::create_dir_all(publish_root)
-        .with_context(|| format!("creating publish root: {}", publish_root.display()))?;
     atomic_write(
         &publish_root.join("index.html"),
         PUBLISHED_ROOT_INDEX_HTML.as_bytes(),
@@ -483,6 +515,17 @@ mod tests {
         })
         .expect("site");
         let publish_root = root.join("published");
+        let held_lock = PublicationLock::acquire(&publish_root).expect("hold publication lock");
+        let error = publish_static_site(&site_dir, &publish_root)
+            .expect_err("overlapping publication must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("another xlsynth-bvc publisher holds")
+        );
+        assert!(!publish_root.join("index.html").exists());
+        drop(held_lock);
+
         let first = publish_static_site(&site_dir, &publish_root).expect("first publish");
         assert!(!first.reused_immutable_site);
         let catalog_path = publish_root.join(&first.catalog_relpath);

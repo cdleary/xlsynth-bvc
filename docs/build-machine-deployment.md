@@ -13,7 +13,8 @@ The coordinator holds an advisory lock for the store, checkpoints each stage in
 plans/reconciles roots, drains workers, rebuilds datasets, finalizes the declared
 completion contract, writes deterministic findings, verifies a protobuf
 publication snapshot, verifies the static site, and only then promotes the
-site. A completed dataset-index checkpoint is reused on retry; the remaining
+site. A completed dataset-index checkpoint is reused on retry only when its
+fingerprint still matches the exact current provenance inputs; the remaining
 content-producing stages preserve or derive stable timestamps when their inputs
 are unchanged.
 
@@ -26,7 +27,8 @@ contains immutable `sites/<site-id>/` trees, immutable
 so the same files work below the configured base URL without rewriting. Serve or
 synchronize `PUBLIC` with any ordinary static host. Files below `sites/` and
 `catalogs/` should receive long immutable cache lifetimes; `current.json` should
-use no-cache or a short TTL.
+use no-cache or a short TTL. `.publication.lock` is an advisory lock file for
+writers and need not be served.
 
 ## Fresh machine
 
@@ -49,8 +51,9 @@ use no-cache or a short TTL.
 
 The runtime account needs read access to `RESOURCE_ROOT` and read-write access
 only to the configured store, sled database, work directory, publication root,
-and Docker resources. The Rust-side file lock is authoritative, so overlapping
-invocations for one store fail cleanly.
+and Docker resources. The Rust-side locks are authoritative: overlapping
+coordinators for one store fail cleanly, and overlapping publishers for one
+publication root fail even when they originate from different stores.
 
 Compatibility-map updates are out-of-band repository maintenance. A maintainer
 runs `scripts/sync-version-compat.sh`, reviews the source change, and deploys a

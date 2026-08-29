@@ -9,7 +9,8 @@ protobuf coordinator state. Advisory locks disappear when the process exits;
 there is no stale PID lock to remove.
 
 A successful dataset-index checkpoint is reused instead of regenerating
-timestamped browser projections. Campaign and analysis records retain their
+timestamped browser projections only when its recorded provenance fingerprint
+matches the current store. Campaign and analysis records retain their
 timestamps when their semantic content is unchanged, and snapshot
 `generated_at` is the deterministic newest-source watermark described in
 `DESIGN.md`. Consequently, rebuilding a lost work directory from unchanged
@@ -22,11 +23,15 @@ Immutable sites are never replaced. To roll back, select the previous
 `catalogs/<site-id>.pb`, construct a matching `CurrentSitePointer`, and replace
 `current.pb`, then replace the browser `current.json` pointer last. Keep at
 least the two most recent immutable site trees and catalogs. Do not delete the
-currently referenced site.
+currently referenced site. Stop coordinators and standalone publishers that
+target this publication root before a manual rollback; normal publication holds
+`.publication.lock` across both pointer updates and verification.
 
 An interrupted upload cannot damage the prior browser publication because the
 new immutable site is fully copied and verified before either current pointer
-is changed. `verify-published-site` confirms the pointers, catalog, site
+is changed. If interruption occurs between the protobuf and JSON pointer
+updates, the browser continues using the prior JSON pointer; rerun publication
+to finish the pair. `verify-published-site` confirms the pointers, catalog, site
 manifest, every declared file digest, local links, base URL, and absence of API
 requests.
 
