@@ -5435,7 +5435,7 @@ pub(crate) fn load_stdlib_g8r_vs_yosys_dataset_index(
     Ok(Some(index_file.dataset))
 }
 
-fn write_stdlib_g8r_vs_yosys_dataset_index(
+pub(crate) fn write_stdlib_g8r_vs_yosys_dataset_index(
     store: &ArtifactStore,
     dataset: &StdlibG8rVsYosysDataset,
 ) -> Result<(String, u64, DateTime<Utc>)> {

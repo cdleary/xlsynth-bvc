@@ -2577,9 +2577,6 @@ fn execute_persistent_runner_script_with_timeout_and_family(
         );
     }
 
-    let writeback_result = writebacks.iter().try_for_each(sync_external_writeback);
-    cleanup_request_files();
-    writeback_result?;
     if result.status != "completed" || result.exit_code.unwrap_or(1) != 0 || result.timed_out {
         let stderr_first = first_line(&result.stderr_tail).trim();
         let stdout_first = first_line(&result.stdout_tail).trim();
@@ -2602,15 +2599,22 @@ fn execute_persistent_runner_script_with_timeout_and_family(
                 }
             })
             .unwrap_or("no stderr/stdout details");
+        let cleanup_summary = cleanup_timed_out_container(&runner.container_name);
+        cleanup_request_files();
         bail!(
-            "persistent runner request failed (exit={:?}): {}\ncommand:\n{}\nstdout:\n{}\nstderr:\n{}",
+            "persistent runner request failed (exit={:?}): {}\ncontainer cleanup: {}\ncommand:\n{}\nstdout:\n{}\nstderr:\n{}",
             result.exit_code,
             root_cause,
+            cleanup_summary,
             result.command_argv.join(" "),
             result.stdout_tail,
             result.stderr_tail
         );
     }
+
+    let writeback_result = writebacks.iter().try_for_each(sync_external_writeback);
+    cleanup_request_files();
+    writeback_result?;
 
     Ok(CommandTrace {
         argv: command_argv,
@@ -3659,6 +3663,36 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
         assert_eq!(docker_container_id(&container_b)?, container_b_id_before);
         assert!(store.action_exists(&delay_b_id));
         assert!(store.action_exists(&stats_g8r_c_id));
+
+        let timeout_output = store.staging_dir().join("persistent-timeout-output");
+        fs::create_dir_all(&timeout_output)?;
+        let timeout_error = execute_persistent_runner_script_with_timeout(
+            &image_a,
+            &[DockerMount::read_write(&timeout_output, "/outputs")?],
+            &BTreeMap::new(),
+            "(sleep 30; printf orphan > /outputs/orphan.txt) & wait",
+            "timeout-orphan-regression",
+            1,
+        )
+        .expect_err("timed-out persistent request must fail");
+        assert!(format!("{timeout_error:#}").contains("TIMEOUT(1)"));
+        assert!(!docker_container_is_running(&container_a)?);
+        assert!(!timeout_output.join("orphan.txt").exists());
+
+        execute_persistent_runner_script_with_timeout(
+            &image_a,
+            &[DockerMount::read_write(&timeout_output, "/outputs")?],
+            &BTreeMap::new(),
+            "printf clean > /outputs/clean.txt",
+            "post-timeout-replacement",
+            30,
+        )?;
+        assert_eq!(
+            fs::read_to_string(timeout_output.join("clean.txt"))?,
+            "clean"
+        );
+        assert!(docker_container_is_running(&container_a)?);
+        assert_ne!(docker_container_id(&container_a)?, container_a_id_before);
 
         let delayed_text = fs::read_to_string(
             store.resolve_artifact_ref_path(&store.load_provenance(&delay_a_id)?.output_artifact),

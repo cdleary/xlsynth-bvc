@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import re
+import signal
 import shutil
 import socket
 import subprocess
@@ -202,7 +203,7 @@ def process_request(
     results_dir: Path,
     archive_dir: Path,
     heartbeat_state,
-) -> None:
+) -> bool:
     request = json.loads(request_path.read_text(encoding="utf-8"))
     if request.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(
@@ -244,6 +245,7 @@ def process_request(
                 stderr=stderr_file,
                 env=env,
                 cwd="/",
+                start_new_session=True,
             )
             stop_event = threading.Event()
 
@@ -268,7 +270,10 @@ def process_request(
                 exit_code = proc.returncode
             except subprocess.TimeoutExpired:
                 timed_out = True
-                proc.kill()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 exit_code = proc.wait()
             finally:
                 stop_event.set()
@@ -319,8 +324,10 @@ def process_request(
         os.replace(request_path, archived_request)
     except OSError:
         pass
-    heartbeat_state["state"] = "idle"
+    retire = error is not None
+    heartbeat_state["state"] = "retired" if retire else "idle"
     heartbeat_state["current_request_id"] = None
+    return not retire
 
 
 def main() -> int:
@@ -399,7 +406,8 @@ def main() -> int:
             if request_path is None:
                 time.sleep(0.2)
                 continue
-            process_request(request_path, results_dir, archive_dir, heartbeat_state)
+            if not process_request(request_path, results_dir, archive_dir, heartbeat_state):
+                break
     finally:
         stop_event.set()
         heartbeat_thread.join(timeout=2.0)

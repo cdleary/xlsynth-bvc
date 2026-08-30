@@ -911,6 +911,38 @@ where
     operation().map(Some)
 }
 
+pub(crate) fn requeue_running_lease_if_current(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+) -> Result<bool> {
+    Ok(with_current_running_lease(store, running, || {
+        if terminal_queue_state_for_action(store, running.action_id()).is_some() {
+            remove_file_if_exists(&store.pending_queue_path(running.action_id()))?;
+            remove_file_if_exists(&running.path)?;
+            return Ok(false);
+        }
+        let pending_path = store.pending_queue_path(running.action_id());
+        if let Some(parent) = pending_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("creating rollback pending queue dir: {}", parent.display())
+            })?;
+        }
+        if !pending_path.exists() {
+            let pending = QueueItem {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: running.action_id().to_string(),
+                enqueued_utc: *running.enqueued_utc(),
+                priority: running.priority(),
+                action: running.action().clone(),
+            };
+            write_bytes_atomic(&pending_path, &encode_queue_item(&pending)?)?;
+        }
+        remove_file_if_exists(&running.path)?;
+        Ok(true)
+    })?
+    .unwrap_or(false))
+}
+
 pub(crate) fn fail_running_and_cancel_descendants(
     store: &ArtifactStore,
     running: &QueueRunningWithPath,
@@ -1780,6 +1812,30 @@ mod tests {
         assert!(!store.pending_queue_path(&action_id).exists());
         assert!(store.running_queue_path(&action_id).exists());
 
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn claimed_lease_rollback_requeues_only_the_current_token() {
+        let (store, root) = make_test_store();
+        let action = terminal_test_action();
+        let action_id = enqueue_action(&store, action).expect("enqueue action");
+        let first = claim_next_pending_item(&store, "rollback-worker", 60)
+            .expect("claim first lease")
+            .expect("first lease");
+        assert!(requeue_running_lease_if_current(&store, &first).expect("rollback current lease"));
+        assert!(store.pending_queue_path(&action_id).exists());
+        assert!(!store.running_queue_path(&action_id).exists());
+
+        let second = claim_next_pending_item(&store, "rollback-worker", 60)
+            .expect("claim second lease")
+            .expect("second lease");
+        assert_ne!(first.running.lease_token, second.running.lease_token);
+        assert!(!requeue_running_lease_if_current(&store, &first).expect("fence stale rollback"));
+        assert!(store.running_queue_path(&action_id).exists());
+        assert!(!store.pending_queue_path(&action_id).exists());
+
+        remove_file_if_exists(&second.path).expect("clear second lease");
         fs::remove_dir_all(root).expect("cleanup temp store");
     }
 

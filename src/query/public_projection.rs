@@ -9,7 +9,7 @@ use std::path::{Component, Path};
 const MAX_PUBLIC_LABEL_BYTES: usize = 512;
 const MAX_PUBLIC_SIGNATURE_BYTES: usize = 4096;
 
-fn validate_safe_public_text(field: &str, value: &str, max_bytes: usize) -> Result<()> {
+pub(crate) fn validate_safe_public_text(field: &str, value: &str, max_bytes: usize) -> Result<()> {
     if value.is_empty() || value.trim() != value || value.len() > max_bytes {
         bail!("{field} must be nonempty, trimmed, and at most {max_bytes} bytes");
     }

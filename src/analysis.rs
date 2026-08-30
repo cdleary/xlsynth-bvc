@@ -315,6 +315,98 @@ fn samples_for_exact_run<'a>(
     Ok(selected)
 }
 
+fn build_analysis_report(
+    store: &ArtifactStore,
+    current: &pb::CampaignRunManifest,
+    baseline: Option<&pb::CampaignRunManifest>,
+    samples: &[StdlibG8rVsYosysSample],
+    generated_at: prost_types::Timestamp,
+) -> Result<pb::AnalysisReport> {
+    let current_by_subject = samples_for_exact_run(store, current, samples)?;
+    let baseline_by_subject = baseline
+        .map(|manifest| samples_for_exact_run(store, manifest, samples))
+        .transpose()?
+        .unwrap_or_default();
+    let campaign = required(&current.campaign, "campaign_run.campaign")?;
+    let algorithm_version = campaign.analysis_algorithm_version;
+    let campaign_id = required(&current.campaign_id, "campaign_run.campaign_id")?;
+    let run_id = required(&current.run_id, "campaign_run.run_id")?;
+    let baseline_run_id = baseline.and_then(|manifest| manifest.run_id.as_ref());
+    let mut findings = Vec::new();
+    for (key, current_sample) in current_by_subject {
+        let current_loss = fixed_metric(current_sample.g8r_product_loss, "current product loss")?;
+        if let Some(baseline_sample) = baseline_by_subject.get(&key) {
+            let baseline_loss =
+                fixed_metric(baseline_sample.g8r_product_loss, "baseline product loss")?;
+            let delta = current_loss.saturating_sub(baseline_loss);
+            if delta > CHANGE_THRESHOLD_MICRO {
+                findings.push(make_finding(
+                    store,
+                    campaign_id,
+                    run_id,
+                    baseline_run_id,
+                    algorithm_version,
+                    pb::FindingKind::Regression,
+                    current_sample,
+                    Some(baseline_sample),
+                )?);
+            } else if delta < -CHANGE_THRESHOLD_MICRO {
+                findings.push(make_finding(
+                    store,
+                    campaign_id,
+                    run_id,
+                    baseline_run_id,
+                    algorithm_version,
+                    pb::FindingKind::Improvement,
+                    current_sample,
+                    Some(baseline_sample),
+                )?);
+            }
+            if current_loss > OUTLIER_THRESHOLD_MICRO && baseline_loss > OUTLIER_THRESHOLD_MICRO {
+                findings.push(make_finding(
+                    store,
+                    campaign_id,
+                    run_id,
+                    baseline_run_id,
+                    algorithm_version,
+                    pb::FindingKind::PersistentOutlier,
+                    current_sample,
+                    Some(baseline_sample),
+                )?);
+            }
+        }
+        if current_loss > OUTLIER_THRESHOLD_MICRO && current_sample.structural_hash.is_some() {
+            findings.push(make_finding(
+                store,
+                campaign_id,
+                run_id,
+                baseline_run_id,
+                algorithm_version,
+                pb::FindingKind::StructuralHashLoss,
+                current_sample,
+                baseline_by_subject.get(&key).copied(),
+            )?);
+        }
+    }
+    findings.sort_by(|a, b| {
+        a.finding_id
+            .as_ref()
+            .map(|id| id.value.as_slice())
+            .cmp(&b.finding_id.as_ref().map(|id| id.value.as_slice()))
+    });
+    Ok(pb::AnalysisReport {
+        record_version: ANALYSIS_RECORD_VERSION,
+        campaign_id: Some(campaign_id.clone()),
+        run_id: Some(run_id.clone()),
+        baseline_run_id: baseline_run_id.cloned(),
+        crate_version: current.crate_version.clone(),
+        baseline_crate_version: baseline.and_then(|manifest| manifest.crate_version.clone()),
+        analysis_algorithm_version: algorithm_version,
+        generated_at: Some(generated_at),
+        findings,
+    })
+}
+
 fn validate_report(report: &pb::AnalysisReport) -> Result<()> {
     if report.record_version != ANALYSIS_RECORD_VERSION || report.analysis_algorithm_version == 0 {
         bail!("unsupported or incomplete analysis report version");
@@ -343,6 +435,11 @@ fn validate_report(report: &pb::AnalysisReport) -> Result<()> {
     let mut previous: Option<Vec<u8>> = None;
     for finding in &report.findings {
         let identity = required(&finding.identity, "analysis.finding.identity")?;
+        crate::query::validate_safe_public_text(
+            "analysis.finding.subject_key",
+            &identity.subject_key,
+            512,
+        )?;
         if identity.campaign_id != report.campaign_id
             || identity.run_id != report.run_id
             || identity.baseline_run_id != report.baseline_run_id
@@ -358,8 +455,16 @@ fn validate_report(report: &pb::AnalysisReport) -> Result<()> {
         if let Some(hash) = &finding.structural_hash {
             validate_digest(hash, "analysis.finding.structural_hash")?;
         }
+        let metric = required(&identity.metric, "analysis.finding.metric")?;
+        crate::query::validate_safe_public_text("analysis.finding.metric.name", &metric.name, 128)?;
+        crate::query::validate_safe_public_text("analysis.finding.metric.unit", &metric.unit, 128)?;
         let mut prior_role: Option<&str> = None;
         for evidence in &finding.evidence {
+            crate::query::validate_safe_public_text(
+                "analysis.finding.evidence.role",
+                &evidence.role,
+                128,
+            )?;
             if evidence.role.trim().is_empty()
                 || prior_role.is_some_and(|prior| prior >= evidence.role.as_str())
             {
@@ -568,6 +673,18 @@ pub(crate) fn validate_analysis_report_against_store(
             bail!("comparative analysis finding is missing baseline evidence");
         }
     }
+    let dataset = load_stdlib_g8r_vs_yosys_dataset_index(store, false)?
+        .context("stdlib g8r-vs-yosys dataset is required to validate analysis semantics")?;
+    let expected = build_analysis_report(
+        store,
+        &current,
+        baseline.as_ref(),
+        &dataset.samples,
+        *required(&report.generated_at, "analysis.generated_at")?,
+    )?;
+    if &expected != report {
+        bail!("analysis report semantics do not match exact campaign datasets and manifests");
+    }
     Ok(())
 }
 
@@ -632,95 +749,17 @@ pub(crate) fn analyze_campaign_run(
         .map(|version| version.value.clone());
     let dataset = load_stdlib_g8r_vs_yosys_dataset_index(store, false)?
         .context("stdlib g8r-vs-yosys dataset must be rebuilt before analysis")?;
-    let current_by_subject = samples_for_exact_run(store, &current, &dataset.samples)?;
-    let baseline_by_subject = baseline
-        .as_ref()
-        .map(|manifest| samples_for_exact_run(store, manifest, &dataset.samples))
-        .transpose()?
-        .unwrap_or_default();
-    let campaign = required(&current.campaign, "campaign_run.campaign")?;
-    let algorithm_version = campaign.analysis_algorithm_version;
     let run_id = required(&current.run_id, "campaign_run.run_id")?;
     let baseline_run_id = baseline
         .as_ref()
         .and_then(|manifest| manifest.run_id.as_ref());
-    let mut findings = Vec::new();
-    for (key, current_sample) in current_by_subject {
-        let current_loss = fixed_metric(current_sample.g8r_product_loss, "current product loss")?;
-        if let Some(baseline_sample) = baseline_by_subject.get(&key) {
-            let baseline_loss =
-                fixed_metric(baseline_sample.g8r_product_loss, "baseline product loss")?;
-            let delta = current_loss.saturating_sub(baseline_loss);
-            if delta > CHANGE_THRESHOLD_MICRO {
-                findings.push(make_finding(
-                    store,
-                    campaign_id,
-                    run_id,
-                    baseline_run_id,
-                    algorithm_version,
-                    pb::FindingKind::Regression,
-                    current_sample,
-                    Some(baseline_sample),
-                )?);
-            } else if delta < -CHANGE_THRESHOLD_MICRO {
-                findings.push(make_finding(
-                    store,
-                    campaign_id,
-                    run_id,
-                    baseline_run_id,
-                    algorithm_version,
-                    pb::FindingKind::Improvement,
-                    current_sample,
-                    Some(baseline_sample),
-                )?);
-            }
-            if current_loss > OUTLIER_THRESHOLD_MICRO && baseline_loss > OUTLIER_THRESHOLD_MICRO {
-                findings.push(make_finding(
-                    store,
-                    campaign_id,
-                    run_id,
-                    baseline_run_id,
-                    algorithm_version,
-                    pb::FindingKind::PersistentOutlier,
-                    current_sample,
-                    Some(baseline_sample),
-                )?);
-            }
-        }
-        if current_loss > OUTLIER_THRESHOLD_MICRO && current_sample.structural_hash.is_some() {
-            findings.push(make_finding(
-                store,
-                campaign_id,
-                run_id,
-                baseline_run_id,
-                algorithm_version,
-                pb::FindingKind::StructuralHashLoss,
-                current_sample,
-                baseline_by_subject.get(&key).copied(),
-            )?);
-        }
-    }
-    findings.sort_by(|a, b| {
-        a.finding_id
-            .as_ref()
-            .map(|id| id.value.as_slice())
-            .cmp(&b.finding_id.as_ref().map(|id| id.value.as_slice()))
-    });
-    let mut report = pb::AnalysisReport {
-        record_version: ANALYSIS_RECORD_VERSION,
-        campaign_id: Some(campaign_id.clone()),
-        run_id: Some(run_id.clone()),
-        baseline_run_id: baseline_run_id.cloned(),
-        crate_version: Some(pb::CrateVersion {
-            value: current_version.clone(),
-        }),
-        baseline_crate_version: baseline_version
-            .clone()
-            .map(|value| pb::CrateVersion { value }),
-        analysis_algorithm_version: algorithm_version,
-        generated_at: Some(timestamp_to_proto(&Utc::now())),
-        findings,
-    };
+    let mut report = build_analysis_report(
+        store,
+        &current,
+        baseline.as_ref(),
+        &dataset.samples,
+        timestamp_to_proto(&Utc::now()),
+    )?;
     let path = campaign_analysis_path(store, run_id)?;
     if path.exists() {
         let bytes = fs::read(&path)
@@ -1018,6 +1057,19 @@ mod tests {
             g8r_stats_action_id: g8r_action_id,
             yosys_abc_stats_action_id: yosys_action_id,
         };
+        crate::query::write_stdlib_g8r_vs_yosys_dataset_index(
+            &store,
+            &crate::view::StdlibG8rVsYosysDataset {
+                fraig: false,
+                samples: vec![sample.clone()],
+                min_ir_nodes: 1,
+                max_ir_nodes: 1,
+                g8r_only_count: 0,
+                yosys_only_count: 0,
+                available_crate_versions: vec![version.clone()],
+            },
+        )
+        .expect("write semantic validation dataset");
 
         manifest.status = pb::CampaignRunStatus::Complete as i32;
         let root_count = manifest.root_actions.len() as u64;
@@ -1078,7 +1130,7 @@ mod tests {
             .expect_err("foreign lineage must fail");
         assert!(format!("{error:#}").contains("outside exact run lineage"));
 
-        let mut wrong_digest = report;
+        let mut wrong_digest = report.clone();
         wrong_digest.findings[0].evidence[0]
             .artifact_sha256
             .as_mut()
@@ -1087,6 +1139,34 @@ mod tests {
         let error = validate_analysis_report_against_store(&store, &wrong_digest)
             .expect_err("wrong evidence digest must fail");
         assert!(format!("{error:#}").contains("disagrees with stored provenance"));
+
+        let mut fabricated_metric = report.clone();
+        let identity = fabricated_metric.findings[0]
+            .identity
+            .as_mut()
+            .expect("finding identity");
+        identity
+            .metric
+            .as_mut()
+            .expect("finding metric")
+            .current_microunits = Some(123);
+        fabricated_metric.findings[0].finding_id =
+            Some(finding_id(identity).expect("recompute self-consistent finding id"));
+        let error = validate_analysis_report_against_store(&store, &fabricated_metric)
+            .expect_err("fabricated metric must fail semantic recomputation");
+        assert!(format!("{error:#}").contains("semantics do not match"));
+
+        let mut private_subject = report;
+        let identity = private_subject.findings[0]
+            .identity
+            .as_mut()
+            .expect("finding identity");
+        identity.subject_key = "/srv/private/build/input.ir#main".to_string();
+        private_subject.findings[0].finding_id =
+            Some(finding_id(identity).expect("recompute private finding id"));
+        let error = validate_analysis_report_against_store(&store, &private_subject)
+            .expect_err("private absolute path must fail public-text validation");
+        assert!(format!("{error:#}").contains("absolute host path"));
 
         fs::remove_dir_all(root).expect("cleanup");
     }

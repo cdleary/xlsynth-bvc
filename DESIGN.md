@@ -109,6 +109,11 @@ compare the exact token with the current running record before changing
 terminal state, removing the lease, or enqueuing/canceling descendants. An
 expired worker therefore cannot commit against a reclaimed incarnation of the
 same action, and policy reconciliation cannot create active/terminal overlap.
+After claiming, the drain loop keeps a token-fenced rollback guard over the
+whole claimed batch. Any early return before a success, failure, or
+cancellation becomes authoritative requeues only the still-current lease
+incarnations. A live worker error therefore cannot strand an unreclaimable
+lease, while an old guard cannot disturb a replacement claim.
 The operating system releases the transition lock when a process dies,
 preserving process-restart recovery.
 
@@ -154,7 +159,9 @@ version, and the checked-in worker script bytes. A named container is reused
 only if Docker reports the expected image ID. Requests carry a process-
 incarnation-qualified ID and a full request token, and results are validated
 against both before writeback; failed results are cleaned up as well as
-successful ones.
+successful ones. Each request runs in a new process group. A timeout kills and
+reaps that whole group, and any failed request retires and force-removes its
+container before the host accepts writebacks or permits later reuse.
 
 ## Canonical data and publication boundary
 
@@ -208,9 +215,13 @@ canonical. Before persistence, store validation, and snapshot construction,
 the report is rebound to its exact finalized current and baseline manifests.
 Every evidence action must exist, match the artifact digest declared by its
 stored provenance, and transitively descend from the corresponding manifest's
-exact stdlib root. Offline snapshot verification cannot traverse private
-provenance, so it requires the report's current run and any baseline run to be
-present as campaign-compatible public run records in the same snapshot.
+exact stdlib root. The validator reloads the canonical dataset and recomputes
+the complete finding set, identities, metric values, kinds, structural hashes,
+and evidence before accepting the report; public-facing analysis text also
+passes the same path and control-character rejection used by other public
+projections. Offline snapshot verification cannot traverse private provenance,
+so it requires the report's current run and any baseline run to be present as
+campaign-compatible public run records in the same snapshot.
 
 Snapshot and site closure verification reject symlinks and special filesystem
 nodes. Destructive overwrite is rejected before deletion when the output

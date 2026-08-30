@@ -1183,6 +1183,24 @@ fn record_queue_failure_and_cancel(
     fail_running_and_cancel_descendants(store, running, worker_id, error_text)
 }
 
+struct RunningBatchRollback<'a> {
+    store: &'a ArtifactStore,
+    running: &'a [QueueRunningWithPath],
+}
+
+impl Drop for RunningBatchRollback<'_> {
+    fn drop(&mut self) {
+        for running in self.running {
+            if let Err(error) = requeue_running_lease_if_current(self.store, running) {
+                eprintln!(
+                    "failed to roll back unfinalized queue lease for {}: {error:#}",
+                    running.action_id()
+                );
+            }
+        }
+    }
+}
+
 pub(crate) fn drain_queue(
     store: &ArtifactStore,
     repo_root: &Path,
@@ -1227,16 +1245,33 @@ pub(crate) fn drain_queue(
                 .unwrap_or(0);
             let compatible_limit = compatible_batch_claim_limit(max_extra);
             if compatible_limit > 0 {
-                running_batch.extend(claim_compatible_pending_items(
+                let compatible = match claim_compatible_pending_items(
                     store,
                     worker_id,
                     lease_seconds,
                     &batch_key,
                     running_batch[0].priority(),
                     compatible_limit,
-                )?);
+                ) {
+                    Ok(compatible) => compatible,
+                    Err(error) => {
+                        requeue_running_lease_if_current(store, &running_batch[0]).with_context(
+                            || {
+                                format!(
+                                    "rolling back initial claim after compatible-batch scan failed: {error:#}"
+                                )
+                            },
+                        )?;
+                        return Err(error);
+                    }
+                };
+                running_batch.extend(compatible);
             }
         }
+        let _rollback = RunningBatchRollback {
+            store,
+            running: &running_batch,
+        };
 
         if running_batch.len() > 1 {
             let batch_actions = running_batch
@@ -1262,7 +1297,7 @@ pub(crate) fn drain_queue(
                 .into_iter()
                 .map(|result| (result.action_id.clone(), result))
                 .collect();
-            for running in running_batch {
+            for running in &running_batch {
                 let Some(result) = result_by_action_id.get(running.action_id()) else {
                     let error_text = format!(
                         "batch execution omitted result for action {}",
