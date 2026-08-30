@@ -7717,6 +7717,7 @@ mod tests {
             docker_image: "ubuntu:24.04".to_string(),
             dockerfile: "FROM ubuntu:24.04".to_string(),
             dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
         }
     }
 
@@ -8242,6 +8243,7 @@ mod tests {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.33.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            docker_image_id: "e".repeat(64),
             dockerfile_sha256: "d".repeat(64),
         };
 
@@ -8301,7 +8303,7 @@ mod tests {
                 path: "flows/yosys_to_aig.ys".to_string(),
                 sha256: "0".repeat(64),
             },
-            runtime: crate::runtime::default_yosys_runtime(),
+            runtime: crate::runtime::test_yosys_runtime(),
         };
         assert_eq!(
             action_subject(&action),
@@ -8318,7 +8320,7 @@ mod tests {
                 path: "flows/ablate_abc_fast.ys".to_string(),
                 sha256: "0".repeat(64),
             },
-            runtime: crate::runtime::default_yosys_runtime(),
+            runtime: crate::runtime::test_yosys_runtime(),
         };
         assert_eq!(
             action_graph_node_label(&action),
@@ -8358,7 +8360,7 @@ mod tests {
                         path: "flows/ablate_abc_fast.ys".to_string(),
                         sha256: "0".repeat(64),
                     },
-                    runtime: crate::runtime::default_yosys_runtime(),
+                    runtime: crate::runtime::test_yosys_runtime(),
                 },
                 ArtifactType::AigFile,
             ),
@@ -8405,7 +8407,7 @@ mod tests {
                         path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
                         sha256: "0".repeat(64),
                     },
-                    runtime: crate::runtime::default_yosys_runtime(),
+                    runtime: crate::runtime::test_yosys_runtime(),
                 },
                 ArtifactType::AigFile,
             ),
@@ -8625,7 +8627,7 @@ mod tests {
     fn stdlib_fn_timeline_index_roundtrip_supports_fraig_toggle() {
         let (store, root) = make_test_store("timeline-index");
         let runtime = test_runtime();
-        let yosys_runtime = default_yosys_runtime();
+        let yosys_runtime = crate::runtime::test_yosys_runtime();
         let dslx_id = "1".repeat(64);
         let opt_id = "2".repeat(64);
         let g8r_aig_false_id = "3".repeat(64);

@@ -81,6 +81,41 @@ validate-store rejects unresolved active/terminal overlaps and incompatible
 terminal states. This protocol covers process interruption without claiming the
 host power-loss durability excluded above.
 
+Lease expiry is a recovery signal, not permission to duplicate live local work. A
+local lease owner includes its PID and Linux process-start ticks; reclamation
+keeps the lease while that exact process incarnation exists, even after the
+nominal expiry time, and immediately recovers it after the owner dies. Foreign
+or legacy owners remain expiry-based. If duplicate execution nevertheless
+occurs, a worker cancels descendants only when its failed terminal transition
+remains authoritative; a failure that loses to committed success performs no
+downstream cancellation.
+
+Driver release caches are built entirely in a unique private-state staging
+directory. The downloader may create partial files there, but consumers never
+mount that directory. Setup inventories the exact regular-file closure and
+content hashes in a protobuf manifest, validates required binaries, DSO,
+stdlib archive, and schema files, then atomically renames the complete directory
+into its final cache path. A parsed and fully validated manifest, not marker
+existence, is readiness evidence. Cache setup locks contain protobuf owner
+identity and do not age out while the exact local process incarnation is alive.
+
+## Executable runtime identity
+
+Docker image tags are build inputs and operator-facing names; they are not
+execution identities. Before an action is created, the declared Dockerfile
+recipe is built or verified and the resolved 256-bit OCI image ID is stored in
+the runtime protobuf. That immutable image ID participates in the action ID.
+Execution revalidates the tag-to-ID relationship and invokes Docker by
+`sha256:<image-id>`, so rebuilding a mutable tag cannot silently change an
+existing action.
+
+Persistent runners are keyed by immutable image ID, store root, protocol
+version, and the checked-in worker script bytes. A named container is reused
+only if Docker reports the expected image ID. Requests carry a process-
+incarnation-qualified ID and a full request token, and results are validated
+against both before writeback; failed results are cleaned up as well as
+successful ones.
+
 ## Canonical data and publication boundary
 
 Canonical Rust-side identities and persisted operational records use validated

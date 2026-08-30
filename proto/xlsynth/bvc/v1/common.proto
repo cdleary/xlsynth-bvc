@@ -36,6 +36,8 @@ message DriverRuntimeSpec {
   string docker_image = 3;
   NormalizedRelpath dockerfile = 4;
   Sha256Digest dockerfile_sha256 = 5;
+  // Immutable local OCI image config digest resolved when the action is planned.
+  Sha256Digest docker_image_id = 6;
 }
 
 // Runtime identity for Yosys/ABC-backed actions.
@@ -44,6 +46,28 @@ message YosysRuntimeSpec {
   NormalizedRelpath dockerfile = 2;
   optional string upstream_commit = 3;
   Sha256Digest dockerfile_sha256 = 4;
+  // Immutable local OCI image config digest resolved when the action is planned.
+  Sha256Digest docker_image_id = 5;
+}
+
+message DriverReleaseCacheFile {
+  NormalizedRelpath relpath = 1;
+  uint64 bytes = 2;
+  Sha256Digest sha256 = 3;
+}
+
+message DriverReleaseCacheManifest {
+  uint32 record_version = 1;
+  DsoVersion dso_version = 2;
+  string platform = 3;
+  repeated DriverReleaseCacheFile files = 4;
+}
+
+message DriverReleaseCacheSetupLock {
+  uint32 record_version = 1;
+  string hostname = 2;
+  uint32 pid = 3;
+  uint64 process_start_ticks = 4;
 }
 
 // A checked-in script and the digest captured when the action is created.

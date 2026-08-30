@@ -102,6 +102,8 @@ Those pieces were not needed for the current single-host dispatcher model.
 The implemented request schema is intentionally generic:
 
 - `request_id`
+- `request_token`
+- `schema_version`
 - `runner_key`
 - `runner_instance_id`
 - `container_name`
@@ -120,7 +122,7 @@ simply executes it.
 
 The worker writes a single result record containing:
 
-- request identity
+- request ID and full request token
 - runner identity
 - timestamps
 - command argv
@@ -133,15 +135,20 @@ The host still validates artifacts and writes provenance using the normal finali
 
 ## Runner Keys
 
-The implemented runner key is:
+The implemented runner key is the first 24 hex digits of a domain-separated SHA-256 over:
 
-`sha256(docker_image + store_root)[0:24]`
+- the runner protocol schema version
+- the checked-in worker script bytes
+- the immutable OCI image ID
+- the store root
 
-This is simpler than the richer semantic key from the original plan. In practice it works because:
+The image tag remains an operator-facing build name. Action execution and runner reuse use the
+resolved `sha256:<image-id>` content reference. Before reusing a named container, the host verifies
+that Docker reports the same immutable image ID.
 
-- the Docker image already encodes the executable environment
-- the store root scopes the mounted artifact/cache world
-- runners are intentionally local to one store
+Request IDs include a restart-unique host-process incarnation. A separate full-length request token
+is echoed by the worker and checked by the host, preventing an old result from a previous process
+incarnation from being accepted after request sequence numbers restart.
 
 If runner sharing across stores becomes important later, the key can be widened then.
 

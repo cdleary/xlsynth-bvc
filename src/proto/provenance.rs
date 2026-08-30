@@ -1332,12 +1332,14 @@ mod tests {
             docker_image: "xlsynth-bvc-driver:0.47.0".into(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".into(),
             dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
         };
         let enumeration_runtime = model::DriverRuntimeSpec {
             driver_version: "0.48.0".into(),
             release_platform: "ubuntu2004".into(),
             docker_image: "xlsynth-bvc-driver:0.48.0".into(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".into(),
+            docker_image_id: "e".repeat(64),
             dockerfile_sha256: "d".repeat(64),
         };
         let failed_dslx_files = if failed_file {

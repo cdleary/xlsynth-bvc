@@ -1393,7 +1393,7 @@ mod tests {
                 path: "flows/yosys_to_aig.ys".to_string(),
                 sha256: "b".repeat(64),
             },
-            runtime: crate::runtime::default_yosys_runtime(),
+            runtime: crate::runtime::test_yosys_runtime(),
         };
         let action_id = compute_model_action_id_v2(&action)
             .expect("action id")

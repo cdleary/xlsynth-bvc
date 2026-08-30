@@ -1162,6 +1162,24 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
     }
 }
 
+fn record_queue_failure_and_cancel(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+    worker_id: &str,
+    error_text: &str,
+) -> Result<Option<usize>> {
+    let failure_won = write_failed_record(store, running, worker_id, error_text)?;
+    remove_file_if_exists(&running.path)?;
+    if !failure_won {
+        return Ok(None);
+    }
+    Ok(Some(cancel_downstream_pending_actions(
+        store,
+        running.action_id(),
+        worker_id,
+    )?))
+}
+
 pub(crate) fn drain_queue(
     store: &ArtifactStore,
     repo_root: &Path,
@@ -1227,15 +1245,12 @@ pub(crate) fn drain_queue(
                 Err(err) => {
                     let error_text = format!("{:#}", err);
                     for running in &running_batch {
-                        write_failed_record(store, running, worker_id, &error_text)?;
-                        remove_file_if_exists(&running.path)?;
-                        let canceled_now = cancel_downstream_pending_actions(
-                            store,
-                            running.action_id(),
-                            worker_id,
-                        )?;
-                        failed += 1;
-                        canceled += canceled_now;
+                        if let Some(canceled_now) =
+                            record_queue_failure_and_cancel(store, running, worker_id, &error_text)?
+                        {
+                            failed += 1;
+                            canceled += canceled_now;
+                        }
                     }
                     continue;
                 }
@@ -1250,12 +1265,12 @@ pub(crate) fn drain_queue(
                         "batch execution omitted result for action {}",
                         running.action_id()
                     );
-                    write_failed_record(store, &running, worker_id, &error_text)?;
-                    remove_file_if_exists(&running.path)?;
-                    let canceled_now =
-                        cancel_downstream_pending_actions(store, running.action_id(), worker_id)?;
-                    failed += 1;
-                    canceled += canceled_now;
+                    if let Some(canceled_now) =
+                        record_queue_failure_and_cancel(store, &running, worker_id, &error_text)?
+                    {
+                        failed += 1;
+                        canceled += canceled_now;
+                    }
                     continue;
                 };
                 if let Some(output_artifact) = result.output_artifact.clone() {
@@ -1300,12 +1315,12 @@ pub(crate) fn drain_queue(
                         .as_deref()
                         .unwrap_or("batched execution failed without an error payload")
                         .to_string();
-                    write_failed_record(store, &running, worker_id, &error_text)?;
-                    remove_file_if_exists(&running.path)?;
-                    let canceled_now =
-                        cancel_downstream_pending_actions(store, running.action_id(), worker_id)?;
-                    failed += 1;
-                    canceled += canceled_now;
+                    if let Some(canceled_now) =
+                        record_queue_failure_and_cancel(store, &running, worker_id, &error_text)?
+                    {
+                        failed += 1;
+                        canceled += canceled_now;
+                    }
                 }
             }
             continue;
@@ -1352,20 +1367,20 @@ pub(crate) fn drain_queue(
             }
             Err(err) => {
                 let error_text = format!("{:#}", err);
-                write_failed_record(store, &running_batch[0], worker_id, &error_text)?;
-                remove_file_if_exists(&running_batch[0].path)?;
-                let canceled_now = cancel_downstream_pending_actions(
+                if let Some(canceled_now) = record_queue_failure_and_cancel(
                     store,
-                    running_batch[0].action_id(),
+                    &running_batch[0],
                     worker_id,
-                )?;
-                failed += 1;
-                canceled += canceled_now;
-                eprintln!(
-                    "queue action {} failed; marked failed and canceled {} downstream action(s)",
-                    running_batch[0].action_id(),
-                    canceled_now
-                );
+                    &error_text,
+                )? {
+                    failed += 1;
+                    canceled += canceled_now;
+                    eprintln!(
+                        "queue action {} failed; marked failed and canceled {} downstream action(s)",
+                        running_batch[0].action_id(),
+                        canceled_now
+                    );
+                }
             }
         }
     }
@@ -2698,7 +2713,6 @@ pub(crate) fn enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
     dry_run: bool,
 ) -> Result<serde_json::Value> {
     let crate_version = normalize_tag_version(requested_crate_version).to_string();
-    let dockerfile_sha256 = runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?;
     let state = build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed(
         store, repo_root, None,
     )?;
@@ -2746,13 +2760,11 @@ pub(crate) fn enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
             }
             (Some(point), None) => {
                 missing_yosys += 1;
-                let runtime = DriverRuntimeSpec {
-                    driver_version: point.crate_version.clone(),
-                    release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
-                    docker_image: default_driver_image(&point.crate_version),
-                    dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
-                    dockerfile_sha256: dockerfile_sha256.clone(),
-                };
+                let runtime = explicit_driver_runtime_for_crate_version(
+                    repo_root,
+                    &point.crate_version,
+                    &point.dso_version,
+                )?;
                 ActionSpec::IrFnToCombinationalVerilog {
                     ir_action_id: point.ir_action_id.clone(),
                     top_fn_name: point.ir_top.clone(),
@@ -2763,13 +2775,11 @@ pub(crate) fn enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
             }
             (None, Some(point)) => {
                 missing_g8r += 1;
-                let runtime = DriverRuntimeSpec {
-                    driver_version: point.crate_version.clone(),
-                    release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
-                    docker_image: default_driver_image(&point.crate_version),
-                    dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
-                    dockerfile_sha256: dockerfile_sha256.clone(),
-                };
+                let runtime = explicit_driver_runtime_for_crate_version(
+                    repo_root,
+                    &point.crate_version,
+                    &point.dso_version,
+                )?;
                 ActionSpec::DriverIrToG8rAig {
                     ir_action_id: point.ir_action_id.clone(),
                     top_fn_name: point.ir_top.clone(),
@@ -3380,6 +3390,7 @@ mod tests {
             docker_image: default_driver_image("0.34.0"),
             dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
             dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
         }
     }
 
@@ -3732,7 +3743,7 @@ mod tests {
                 path: "flows/yosys_to_aig.ys".to_string(),
                 sha256: "a".repeat(64),
             },
-            runtime: default_yosys_runtime(),
+            runtime: crate::runtime::test_yosys_runtime(),
         };
         let excluded_action_id =
             compute_action_id(&excluded_action).expect("compute excluded action id");

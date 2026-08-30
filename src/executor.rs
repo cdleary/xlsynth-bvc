@@ -1047,7 +1047,7 @@ test -f /scratch/dslx_list_fns_errors.jsonl
             driver_cache_mount(store)?,
         ];
         let run_trace = execute_persistent_runner_script(
-            &discovery_runtime.docker_image,
+            &docker_image_content_ref(&discovery_runtime.docker_image_id)?,
             &mounts,
             &env,
             &script,
@@ -1404,8 +1404,13 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml dslx2ir \
         driver_cache_mount(store)?,
     ];
 
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace = execute_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        &script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     let ir_output_path = payload_dir.join("package.ir");
@@ -1699,7 +1704,7 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir2opt /inputs/input.ir -
         ];
 
         let run_trace = execute_persistent_runner_script(
-            &runtime.docker_image,
+            &docker_image_content_ref(&runtime.docker_image_id)?,
             &mounts,
             &env,
             &script,
@@ -2068,8 +2073,13 @@ test -s /outputs/delay_info.textproto
         driver_cache_mount(store)?,
     ];
 
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace = execute_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        &script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     Ok(ActionOutcome {
@@ -2154,7 +2164,7 @@ test -s /outputs/ir_equiv.json
         driver_cache_mount(store)?,
     ];
     let run_trace = execute_persistent_runner_script_with_timeout(
-        &runtime.docker_image,
+        &docker_image_content_ref(&runtime.docker_image_id)?,
         &mounts,
         &env,
         &script,
@@ -2358,7 +2368,7 @@ test -s /outputs/ir_aig_equiv.json
         driver_cache_mount(store)?,
     ];
     let run_trace = execute_persistent_runner_script_with_timeout(
-        &runtime.docker_image,
+        &docker_image_content_ref(&runtime.docker_image_id)?,
         &mounts,
         &env,
         &script,
@@ -2536,7 +2546,7 @@ fn prepare_driver_ir_to_g8r_batch_action(
             ActionSpec::AigToYosysAbcAig {
                 aig_action_id: action_id.to_string(),
                 yosys_script_ref,
-                runtime: default_yosys_runtime(),
+                runtime: default_yosys_runtime(repo_root)?,
             },
         )
     {
@@ -2858,7 +2868,7 @@ fn run_driver_ir_to_g8r_batch_runnable(
             driver_cache_mount(store)?,
         ];
         let run_trace = execute_persistent_runner_script(
-            &runtime.docker_image,
+            &docker_image_content_ref(&runtime.docker_image_id)?,
             &mounts,
             &env,
             &driver_script(&script_body),
@@ -2978,7 +2988,7 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
             ActionSpec::AigToYosysAbcAig {
                 aig_action_id: action_id.to_string(),
                 yosys_script_ref,
-                runtime: default_yosys_runtime(),
+                runtime: default_yosys_runtime(repo_root)?,
             },
         )
     {
@@ -3243,8 +3253,13 @@ xlsynth-driver ir2g8r ${G8R_EXTRA_FLAGS} /inputs/input.ir --fraig="${FRAIG}" --a
         driver_cache_mount(store)?,
     ];
 
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace = execute_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        &script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     Ok(ActionOutcome {
@@ -3302,7 +3317,7 @@ pub(crate) fn run_ir_fn_to_combinational_verilog_action(
                 verilog_action_id: action_id.to_string(),
                 verilog_top_module_name: ir_top.clone(),
                 yosys_script_ref,
-                runtime: default_yosys_runtime(),
+                runtime: default_yosys_runtime(repo_root)?,
             },
         )
     {
@@ -3459,7 +3474,13 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir2combo /inputs/input.ir
     ];
 
     let run_trace = (|| {
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)
+        execute_persistent_runner_script(
+            &docker_image_content_ref(&runtime.docker_image_id)?,
+            &mounts,
+            &env,
+            &script,
+            action_id,
+        )
     })();
     if let Some(dir) = rewrite_work_dir {
         fs::remove_dir_all(&dir).ok();
@@ -4445,8 +4466,13 @@ test -f /outputs/raw/manifest.jsonl
         DockerMount::read_write(&raw_output_dir, "/outputs/raw")?,
         driver_cache_mount(store)?,
     ];
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace = execute_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        &script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     let manifest = build_k_bool_cone_corpus_outputs(
@@ -4698,8 +4724,13 @@ test -f /outputs/raw/manifest.jsonl
         DockerMount::read_write(&raw_output_dir, "/outputs/raw")?,
         driver_cache_mount(store)?,
     ];
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace = execute_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        &script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     let manifest = build_mffc_corpus_outputs(
@@ -4866,8 +4897,13 @@ test -s /outputs/result.aig
         DockerMount::read_write(payload_dir, "/outputs")?,
     ];
 
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, script, action_id)?;
+    let run_trace = execute_yosys_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     let output_artifact = ArtifactRef {
@@ -4954,8 +4990,13 @@ test -s /outputs/result.aig
         DockerMount::read_write(payload_dir, "/outputs")?,
     ];
     let env = BTreeMap::new();
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, script, action_id)?;
+    let run_trace = execute_yosys_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     let output_artifact = ArtifactRef {
@@ -5110,7 +5151,7 @@ test -s /outputs/stats.raw.json
                 driver_cache_mount(store)?,
             ];
             let run_trace = execute_persistent_runner_script(
-                &legacy_ctx.runtime.docker_image,
+                &docker_image_content_ref(&legacy_ctx.runtime.docker_image_id)?,
                 &mounts,
                 &env,
                 &script,
@@ -5161,7 +5202,7 @@ test -s /outputs/stats.json
             driver_cache_mount(store)?,
         ];
         let run_trace = execute_persistent_runner_script(
-            &runtime.docker_image,
+            &docker_image_content_ref(&runtime.docker_image_id)?,
             &mounts,
             &env,
             &script,
@@ -5754,6 +5795,7 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
             dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
         };
 
         let suggestions = build_k_bool_cone_corpus_suggested_actions(
@@ -5833,6 +5875,7 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.46.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            docker_image_id: "e".repeat(64),
             dockerfile_sha256: "d".repeat(64),
         };
 
@@ -5883,6 +5926,7 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
             driver_version: "0.31.0".to_string(),
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
+            docker_image_id: "e".repeat(64),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
             dockerfile_sha256: "d".repeat(64),
         };

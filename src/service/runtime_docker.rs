@@ -5,23 +5,38 @@ use prost::Message;
 
 const RUNTIME_FINGERPRINT_LABEL: &str = "org.xlsynth-bvc.runtime-fingerprint";
 
-fn runtime_fingerprint(kind: &str, encoded: &[u8]) -> String {
+fn runtime_fingerprint(kind: &str, fields: &[&str]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"xlsynth-bvc/runtime-image/v1\0");
+    hasher.update(b"xlsynth-bvc/runtime-build/v2\0");
     hasher.update(kind.as_bytes());
-    hasher.update([0]);
-    hasher.update(encoded);
+    for field in fields {
+        hasher.update([0]);
+        hasher.update(field.as_bytes());
+    }
     hex::encode(hasher.finalize())
 }
 
 fn driver_runtime_fingerprint(runtime: &DriverRuntimeSpec) -> Result<String> {
-    let runtime = crate::proto::driver_runtime_to_proto(runtime, "driver_runtime")?;
-    Ok(runtime_fingerprint("driver", &runtime.encode_to_vec()))
+    Ok(runtime_fingerprint(
+        "driver",
+        &[
+            &runtime.driver_version,
+            &runtime.release_platform,
+            &runtime.dockerfile,
+            &runtime.dockerfile_sha256,
+        ],
+    ))
 }
 
 fn yosys_runtime_fingerprint(runtime: &YosysRuntimeSpec) -> Result<String> {
-    let runtime = crate::proto::yosys_runtime_to_proto(runtime, "yosys_runtime")?;
-    Ok(runtime_fingerprint("yosys", &runtime.encode_to_vec()))
+    Ok(runtime_fingerprint(
+        "yosys",
+        &[
+            &runtime.dockerfile,
+            &runtime.dockerfile_sha256,
+            runtime.upstream_commit.as_deref().unwrap_or(""),
+        ],
+    ))
 }
 
 pub(crate) fn driver_cache_mount(store: &ArtifactStore) -> Result<DockerMount> {
@@ -56,6 +71,236 @@ pub(crate) fn ensure_driver_runtime_prepared(
     Ok(())
 }
 
+const DRIVER_RELEASE_CACHE_MANIFEST_VERSION: u32 = 1;
+
+fn driver_release_cache_validation_set() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+fn cache_file_sha256(path: &Path) -> Result<Vec<u8>> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("opening cache file for hashing: {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .with_context(|| format!("hashing cache file: {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().to_vec())
+}
+
+fn driver_release_cache_required_relpaths(platform: &str) -> Result<BTreeSet<String>> {
+    let dso_suffix = match platform {
+        "ubuntu2004" | "ubuntu2204" | "rocky8" | "x64" => ".so",
+        "arm64" => ".dylib",
+        _ => bail!("unsupported xlsynth release platform: {platform}"),
+    };
+    let mut required: BTreeSet<String> = DRIVER_RELEASE_CACHE_BINARIES
+        .split(',')
+        .map(ToOwned::to_owned)
+        .collect();
+    required.insert(format!("libxls-{platform}{dso_suffix}"));
+    required.insert("dslx_stdlib.tar.gz".to_string());
+    required.insert("protos/xls/estimators/delay_model/delay_info.proto".to_string());
+    required.insert("protos/xls/ir/op.proto".to_string());
+    Ok(required)
+}
+
+fn build_driver_release_cache_manifest(
+    cache_dir: &Path,
+    version: &str,
+    platform: &str,
+) -> Result<crate::proto::v1::DriverReleaseCacheManifest> {
+    let mut files = Vec::new();
+    for entry in WalkDir::new(cache_dir).sort_by_file_name() {
+        let entry =
+            entry.with_context(|| format!("walking release cache: {}", cache_dir.display()))?;
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            bail!(
+                "release cache contains non-regular entry: {}",
+                entry.path().display()
+            );
+        }
+        let relpath = path_to_forward_slashes(
+            entry
+                .path()
+                .strip_prefix(cache_dir)
+                .context("computing release cache relpath")?,
+        );
+        if relpath == DRIVER_RELEASE_CACHE_READY_FILE {
+            continue;
+        }
+        validate_relative_subpath(&relpath)?;
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("reading cache metadata: {}", entry.path().display()))?;
+        files.push(crate::proto::v1::DriverReleaseCacheFile {
+            relpath: Some(crate::proto::v1::NormalizedRelpath { value: relpath }),
+            bytes: metadata.len(),
+            sha256: Some(crate::proto::v1::Sha256Digest {
+                value: cache_file_sha256(entry.path())?,
+            }),
+        });
+    }
+    files.sort_by(|a, b| {
+        a.relpath
+            .as_ref()
+            .map(|p| p.value.as_str())
+            .cmp(&b.relpath.as_ref().map(|p| p.value.as_str()))
+    });
+    Ok(crate::proto::v1::DriverReleaseCacheManifest {
+        record_version: DRIVER_RELEASE_CACHE_MANIFEST_VERSION,
+        dso_version: Some(crate::proto::v1::DsoVersion {
+            value: normalize_tag_version(version).to_string(),
+        }),
+        platform: platform.to_string(),
+        files,
+    })
+}
+
+fn validate_driver_release_cache(cache_dir: &Path, version: &str, platform: &str) -> Result<()> {
+    let ready_path = cache_dir.join(DRIVER_RELEASE_CACHE_READY_FILE);
+    let bytes = fs::read(&ready_path)
+        .with_context(|| format!("reading cache manifest: {}", ready_path.display()))?;
+    let manifest = crate::proto::v1::DriverReleaseCacheManifest::decode(bytes.as_slice())
+        .with_context(|| format!("decoding cache manifest: {}", ready_path.display()))?;
+    if manifest.record_version != DRIVER_RELEASE_CACHE_MANIFEST_VERSION {
+        bail!("unsupported driver release cache manifest version");
+    }
+    if manifest.dso_version.as_ref().map(|v| v.value.as_str())
+        != Some(normalize_tag_version(version))
+        || manifest.platform != platform
+    {
+        bail!("driver release cache manifest identity mismatch");
+    }
+
+    let mut declared = BTreeMap::new();
+    let mut previous: Option<String> = None;
+    for file in &manifest.files {
+        let relpath = file
+            .relpath
+            .as_ref()
+            .context("cache manifest file missing relpath")?
+            .value
+            .clone();
+        validate_relative_subpath(&relpath)?;
+        if previous.as_deref().is_some_and(|p| p >= relpath.as_str()) {
+            bail!("cache manifest files are not strictly sorted");
+        }
+        previous = Some(relpath.clone());
+        let digest = file
+            .sha256
+            .as_ref()
+            .context("cache manifest file missing sha256")?;
+        if digest.value.len() != 32 {
+            bail!("cache manifest file has invalid sha256 length: {relpath}");
+        }
+        declared.insert(relpath, (file.bytes, digest.value.clone()));
+    }
+
+    let required = driver_release_cache_required_relpaths(platform)?;
+    for relpath in &required {
+        let Some((bytes, _)) = declared.get(relpath) else {
+            bail!("cache manifest is missing required file: {relpath}");
+        };
+        if *bytes == 0 {
+            bail!("required cache file is empty: {relpath}");
+        }
+    }
+
+    let mut actual = BTreeMap::new();
+    for entry in WalkDir::new(cache_dir).sort_by_file_name() {
+        let entry =
+            entry.with_context(|| format!("walking release cache: {}", cache_dir.display()))?;
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            bail!(
+                "release cache contains non-regular entry: {}",
+                entry.path().display()
+            );
+        }
+        let relpath = path_to_forward_slashes(
+            entry
+                .path()
+                .strip_prefix(cache_dir)
+                .context("computing release cache relpath")?,
+        );
+        if relpath == DRIVER_RELEASE_CACHE_READY_FILE {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("reading cache metadata: {}", entry.path().display()))?;
+        actual.insert(relpath, (metadata.len(), cache_file_sha256(entry.path())?));
+    }
+    if actual != declared {
+        bail!("driver release cache contents do not match its protobuf manifest");
+    }
+    Ok(())
+}
+
+fn driver_release_cache_is_ready(cache_dir: &Path, version: &str, platform: &str) -> bool {
+    if !cache_dir.join(DRIVER_RELEASE_CACHE_READY_FILE).is_file() {
+        return false;
+    }
+    if driver_release_cache_validation_set()
+        .lock()
+        .map(|set| set.contains(cache_dir))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    match validate_driver_release_cache(cache_dir, version, platform) {
+        Ok(()) => {
+            if let Ok(mut set) = driver_release_cache_validation_set().lock() {
+                set.insert(cache_dir.to_path_buf());
+            }
+            true
+        }
+        Err(err) => {
+            eprintln!(
+                "ignoring invalid driver release cache {}: {:#}",
+                cache_dir.display(),
+                err
+            );
+            false
+        }
+    }
+}
+
+fn write_cache_manifest_atomic(
+    path: &Path,
+    manifest: &crate::proto::v1::DriverReleaseCacheManifest,
+) -> Result<()> {
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp-{}-{}",
+        DRIVER_RELEASE_CACHE_READY_FILE,
+        std::process::id(),
+        DOCKER_RUN_NAME_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&tmp, manifest.encode_to_vec())
+        .with_context(|| format!("writing staged cache manifest: {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "publishing staged cache manifest: {} -> {}",
+            tmp.display(),
+            path.display()
+        )
+    })
+}
+
 pub(crate) fn ensure_driver_release_cache(
     store: &ArtifactStore,
     repo_root: &Path,
@@ -63,17 +308,22 @@ pub(crate) fn ensure_driver_release_cache(
     platform: &str,
 ) -> Result<Option<CommandTrace>> {
     let cache_dir = store.driver_release_cache_dir(version, platform);
-    let ready_path = cache_dir.join(DRIVER_RELEASE_CACHE_READY_FILE);
-    if ready_path.exists() {
+    if driver_release_cache_is_ready(&cache_dir, version, platform) {
         return Ok(None);
     }
-    fs::create_dir_all(&cache_dir)
-        .with_context(|| format!("creating driver release cache dir: {}", cache_dir.display()))?;
 
-    let lock_path = cache_dir.join(DRIVER_RELEASE_CACHE_LOCK_FILE);
-    let start = std::time::Instant::now();
+    let cache_root = store.driver_release_cache_root();
+    fs::create_dir_all(&cache_root).with_context(|| {
+        format!(
+            "creating driver release cache root: {}",
+            cache_root.display()
+        )
+    })?;
+    let lock_key = hex::encode(Sha256::digest(format!("{version}\0{platform}")))[..24].to_string();
+    let lock_path = cache_root.join(format!("{DRIVER_RELEASE_CACHE_LOCK_FILE}-{lock_key}"));
+    let start = Instant::now();
     loop {
-        if ready_path.exists() {
+        if driver_release_cache_is_ready(&cache_dir, version, platform) {
             return Ok(None);
         }
         match fs::OpenOptions::new()
@@ -81,7 +331,31 @@ pub(crate) fn ensure_driver_release_cache(
             .write(true)
             .open(&lock_path)
         {
-            Ok(_) => break,
+            Ok(mut lock_file) => {
+                let write_result = (|| -> Result<()> {
+                    let lock = crate::proto::v1::DriverReleaseCacheSetupLock {
+                        record_version: 1,
+                        hostname: std::env::var("HOSTNAME")
+                            .unwrap_or_else(|_| "unknown-host".to_string()),
+                        pid: std::process::id(),
+                        process_start_ticks: process_start_ticks(std::process::id()).unwrap_or(0),
+                    };
+                    lock_file
+                        .write_all(&lock.encode_to_vec())
+                        .with_context(|| {
+                            format!("writing cache setup lock: {}", lock_path.display())
+                        })?;
+                    lock_file.sync_all().with_context(|| {
+                        format!("syncing cache setup lock: {}", lock_path.display())
+                    })
+                })();
+                if let Err(error) = write_result {
+                    drop(lock_file);
+                    let _ = fs::remove_file(&lock_path);
+                    return Err(error);
+                }
+                break;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if is_stale_cache_setup_lock(&lock_path, DRIVER_RELEASE_CACHE_SETUP_TIMEOUT_SECS) {
                     eprintln!(
@@ -112,13 +386,21 @@ pub(crate) fn ensure_driver_release_cache(
         }
     }
 
+    let staging_dir = cache_root.join(format!(
+        ".staging-{lock_key}-{}-{}",
+        std::process::id(),
+        DOCKER_RUN_NAME_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let setup_result = (|| -> Result<Option<CommandTrace>> {
-        if ready_path.exists() {
+        if driver_release_cache_is_ready(&cache_dir, version, platform) {
             return Ok(None);
         }
+        remove_path_if_exists(&staging_dir)?;
+        fs::create_dir_all(&staging_dir)
+            .with_context(|| format!("creating staged release cache: {}", staging_dir.display()))?;
 
         let script_path = repo_root.join(VENDORED_DOWNLOAD_RELEASE_SCRIPT);
-        if !script_path.exists() {
+        if !script_path.is_file() {
             bail!(
                 "vendored download_release.py not found: {}",
                 script_path.display()
@@ -130,7 +412,7 @@ pub(crate) fn ensure_driver_release_cache(
             OsString::from("-v"),
             OsString::from(&release_tag),
             OsString::from("-o"),
-            cache_dir.clone().into_os_string(),
+            staging_dir.clone().into_os_string(),
             OsString::from("-p"),
             OsString::from(platform),
             OsString::from("-d"),
@@ -155,8 +437,9 @@ pub(crate) fn ensure_driver_release_cache(
         let client = Client::builder()
             .build()
             .context("creating reqwest client for delay-info proto cache")?;
-        let delay_info_proto = cache_dir.join("protos/xls/estimators/delay_model/delay_info.proto");
-        let op_proto = cache_dir.join("protos/xls/ir/op.proto");
+        let delay_info_proto =
+            staging_dir.join("protos/xls/estimators/delay_model/delay_info.proto");
+        let op_proto = staging_dir.join("protos/xls/ir/op.proto");
         let delay_info_url = format!(
             "https://raw.githubusercontent.com/xlsynth/xlsynth/{}/xls/estimators/delay_model/delay_info.proto",
             release_tag
@@ -165,30 +448,38 @@ pub(crate) fn ensure_driver_release_cache(
             "https://raw.githubusercontent.com/xlsynth/xlsynth/{}/xls/ir/op.proto",
             release_tag
         );
-        if let Some(parent) = delay_info_proto.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating proto cache directory: {}", parent.display()))?;
-        }
-        if let Some(parent) = op_proto.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating proto cache directory: {}", parent.display()))?;
+        for path in [&delay_info_proto, &op_proto] {
+            fs::create_dir_all(path.parent().context("cache proto path missing parent")?)
+                .with_context(|| {
+                    format!("creating proto cache directory for {}", path.display())
+                })?;
         }
         download_to_file(&client, &delay_info_url, &delay_info_proto)?;
         download_to_file(&client, &op_url, &op_proto)?;
 
-        let ready = json!({
-            "schema_version": 1,
-            "version": version,
-            "platform": platform,
-            "prepared_utc": Utc::now().to_rfc3339(),
-            "download_release_script": VENDORED_DOWNLOAD_RELEASE_SCRIPT,
-            "binaries": DRIVER_RELEASE_CACHE_BINARIES,
-        });
-        fs::write(
-            &ready_path,
-            serde_json::to_string_pretty(&ready).context("serializing cache ready marker")?,
-        )
-        .with_context(|| format!("writing cache ready marker: {}", ready_path.display()))?;
+        let manifest = build_driver_release_cache_manifest(&staging_dir, version, platform)?;
+        write_cache_manifest_atomic(
+            &staging_dir.join(DRIVER_RELEASE_CACHE_READY_FILE),
+            &manifest,
+        )?;
+        validate_driver_release_cache(&staging_dir, version, platform)?;
+
+        if let Some(parent) = cache_dir.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("creating cache promotion parent: {}", parent.display())
+            })?;
+        }
+        remove_path_if_exists(&cache_dir)?;
+        fs::rename(&staging_dir, &cache_dir).with_context(|| {
+            format!(
+                "atomically promoting driver release cache: {} -> {}",
+                staging_dir.display(),
+                cache_dir.display()
+            )
+        })?;
+        if let Ok(mut set) = driver_release_cache_validation_set().lock() {
+            set.insert(cache_dir.clone());
+        }
 
         Ok(Some(CommandTrace {
             argv: os_args_to_string("python3", &args),
@@ -196,11 +487,24 @@ pub(crate) fn ensure_driver_release_cache(
         }))
     })();
 
+    if setup_result.is_err() {
+        remove_path_if_exists(&staging_dir).ok();
+    }
     fs::remove_file(&lock_path).ok();
     setup_result
 }
 
 pub(crate) fn is_stale_cache_setup_lock(lock_path: &Path, stale_after_secs: u64) -> bool {
+    if let Ok(bytes) = fs::read(lock_path)
+        && let Ok(lock) = crate::proto::v1::DriverReleaseCacheSetupLock::decode(bytes.as_slice())
+        && lock.record_version == 1
+    {
+        let local_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
+        if lock.hostname == local_host {
+            return process_start_ticks(lock.pid) != Some(lock.process_start_ticks);
+        }
+    }
+
     let metadata = match fs::metadata(lock_path) {
         Ok(m) => m,
         Err(_) => return false,
@@ -395,6 +699,50 @@ fn inspect_image_runtime_fingerprint(image: &str) -> Result<Option<String>> {
             .to_string(),
     ))
 }
+fn normalize_docker_image_id(value: &str) -> Result<String> {
+    let value = value.strip_prefix("sha256:").unwrap_or(value);
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("docker image ID must be sha256:<64 hexadecimal digits>; got {value}");
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn inspect_image_id(image: &str) -> Result<Option<String>> {
+    let output = Command::new("docker")
+        .args(["image", "inspect", "--format", "{{.Id}}", image])
+        .output()
+        .context("running `docker image inspect` for immutable image ID")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(normalize_docker_image_id(
+        String::from_utf8(output.stdout)
+            .context("decoding docker image ID")?
+            .trim(),
+    )?))
+}
+
+fn require_runtime_image_id(image: &str, expected: &str) -> Result<()> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let expected = normalize_docker_image_id(expected)?;
+    let actual =
+        inspect_image_id(image)?.with_context(|| format!("docker image `{image}` is missing"))?;
+    if actual != expected {
+        bail!(
+            "docker image `{}` immutable ID mismatch: expected sha256:{} got sha256:{}",
+            image,
+            expected,
+            actual
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn docker_image_content_ref(image_id: &str) -> Result<String> {
+    Ok(format!("sha256:{}", normalize_docker_image_id(image_id)?))
+}
 
 fn require_image_runtime_fingerprint(image: &str, expected: &str) -> Result<()> {
     let actual = inspect_image_runtime_fingerprint(image)?
@@ -473,6 +821,7 @@ pub(crate) fn ensure_driver_image(
                 runtime.docker_image
             );
         }
+        require_runtime_image_id(&runtime.docker_image, &runtime.docker_image_id)?;
         return Ok(None);
     }
 
@@ -493,6 +842,7 @@ pub(crate) fn ensure_driver_image(
     }
 
     require_image_runtime_fingerprint(&runtime.docker_image, &fingerprint)?;
+    require_runtime_image_id(&runtime.docker_image, &runtime.docker_image_id)?;
     Ok(Some(CommandTrace {
         argv: os_args_to_string("docker", &build_args),
         exit_code: status.code().unwrap_or(1),
@@ -519,6 +869,7 @@ pub(crate) fn ensure_yosys_image(
                 runtime.docker_image
             );
         }
+        require_runtime_image_id(&runtime.docker_image, &runtime.docker_image_id)?;
         return Ok(None);
     }
 
@@ -539,6 +890,7 @@ pub(crate) fn ensure_yosys_image(
     }
 
     require_image_runtime_fingerprint(&runtime.docker_image, &fingerprint)?;
+    require_runtime_image_id(&runtime.docker_image, &runtime.docker_image_id)?;
     if !image_has_python3(&runtime.docker_image)? {
         bail!("built Yosys image `{}` lacks python3", runtime.docker_image);
     }
@@ -548,6 +900,73 @@ pub(crate) fn ensure_yosys_image(
     }))
 }
 
+#[cfg(test)]
+fn test_runtime_image_id(kind: &str, image: &str, fingerprint: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"xlsynth-bvc/test-runtime-image/v1\0");
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(image.as_bytes());
+    hasher.update([0]);
+    hasher.update(fingerprint.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+pub(crate) fn bind_driver_runtime_image(
+    repo_root: &Path,
+    mut runtime: DriverRuntimeSpec,
+) -> Result<DriverRuntimeSpec> {
+    runtime.docker_image_id.clear();
+    #[cfg(test)]
+    {
+        runtime.docker_image_id = test_runtime_image_id(
+            "driver",
+            &runtime.docker_image,
+            &driver_runtime_fingerprint(&runtime)?,
+        );
+        let _ = repo_root;
+        return Ok(runtime);
+    }
+    #[cfg(not(test))]
+    {
+        ensure_driver_image(repo_root, &runtime)?;
+        runtime.docker_image_id = inspect_image_id(&runtime.docker_image)?.with_context(|| {
+            format!(
+                "driver image `{}` disappeared after preparation",
+                runtime.docker_image
+            )
+        })?;
+        Ok(runtime)
+    }
+}
+
+pub(crate) fn bind_yosys_runtime_image(
+    repo_root: &Path,
+    mut runtime: YosysRuntimeSpec,
+) -> Result<YosysRuntimeSpec> {
+    runtime.docker_image_id.clear();
+    #[cfg(test)]
+    {
+        runtime.docker_image_id = test_runtime_image_id(
+            "yosys",
+            &runtime.docker_image,
+            &yosys_runtime_fingerprint(&runtime)?,
+        );
+        let _ = repo_root;
+        return Ok(runtime);
+    }
+    #[cfg(not(test))]
+    {
+        ensure_yosys_image(repo_root, &runtime)?;
+        runtime.docker_image_id = inspect_image_id(&runtime.docker_image)?.with_context(|| {
+            format!(
+                "Yosys image `{}` disappeared after preparation",
+                runtime.docker_image
+            )
+        })?;
+        Ok(runtime)
+    }
+}
 fn image_has_python3(image: &str) -> Result<bool> {
     let output = Command::new("docker")
         .args([
@@ -564,7 +983,7 @@ fn image_has_python3(image: &str) -> Result<bool> {
     Ok(output.status.success())
 }
 
-const PERSISTENT_RUNNER_SCHEMA_VERSION: u32 = 1;
+const PERSISTENT_RUNNER_SCHEMA_VERSION: u32 = 2;
 const PERSISTENT_RUNNER_ROOT_DIR: &str = "persistent-runners";
 const PERSISTENT_RUNNER_RUNNERS_DIR: &str = "runners";
 const PERSISTENT_RUNNER_REQUEST_TIMEOUT_GRACE_SECS: u64 = 15;
@@ -578,6 +997,12 @@ const PERSISTENT_RUNNER_DEFAULT_IDLE_TTL_SECS: u64 = 15 * 60;
 const PERSISTENT_RUNNER_WORKER_SCRIPT: &str = "scripts/persistent_runner_worker.py";
 static PERSISTENT_RUNNER_START_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
+
+#[derive(Clone, Copy)]
+enum PersistentRunnerFamily {
+    Driver,
+    Yosys,
+}
 
 #[derive(Debug, Clone)]
 struct PersistentRunnerPaths {
@@ -656,6 +1081,7 @@ struct PersistentRunnerMountRequest {
 struct PersistentRunnerRequest {
     schema_version: u32,
     request_id: String,
+    request_token: String,
     runner_key: String,
     runner_instance_id: String,
     container_name: String,
@@ -671,6 +1097,7 @@ struct PersistentRunnerRequest {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct PersistentRunnerResult {
     request_id: String,
+    request_token: String,
     status: String,
     exit_code: Option<i32>,
     timed_out: bool,
@@ -743,8 +1170,24 @@ fn sanitize_container_name_component(value: &str) -> String {
 }
 
 fn persistent_runner_key(image: &str, store_root: &Path) -> String {
-    let digest = Sha256::digest(format!("{}|{}", image, store_root.display()));
-    hex::encode(digest)[..24].to_string()
+    let mut hasher = Sha256::new();
+    hasher.update(b"xlsynth-bvc/persistent-runner/v2\0");
+    hasher.update(PERSISTENT_RUNNER_SCHEMA_VERSION.to_le_bytes());
+    hasher.update(include_bytes!("../../scripts/persistent_runner_worker.py"));
+    hasher.update([0]);
+    hasher.update(image.as_bytes());
+    hasher.update([0]);
+    hasher.update(store_root.as_os_str().as_encoded_bytes());
+    hex::encode(hasher.finalize())[..24].to_string()
+}
+
+fn persistent_runner_request_identity(incarnation: &str, request_seq: u64) -> (String, String) {
+    let request_id = format!("req-{}-{}", &incarnation[..16], request_seq);
+    let mut token_hasher = Sha256::new();
+    token_hasher.update(b"xlsynth-bvc/persistent-runner-request/v1\0");
+    token_hasher.update(incarnation.as_bytes());
+    token_hasher.update(request_id.as_bytes());
+    (request_id, hex::encode(token_hasher.finalize()))
 }
 
 fn persistent_runner_container_name(image: &str, runner_key: &str) -> String {
@@ -781,9 +1224,8 @@ fn env_u64(name: &str) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
-fn persistent_runner_pool_size(image: &str) -> usize {
-    let image_lower = image.to_ascii_lowercase();
-    let image_default = if image_lower.contains("yosys") {
+fn persistent_runner_pool_size(family: PersistentRunnerFamily) -> usize {
+    let image_default = if matches!(family, PersistentRunnerFamily::Yosys) {
         std::thread::available_parallelism()
             .map(|n| n.get().clamp(1, 8))
             .unwrap_or(8)
@@ -792,7 +1234,7 @@ fn persistent_runner_pool_size(image: &str) -> usize {
             .map(|n| n.get().clamp(1, 4))
             .unwrap_or(4)
     };
-    let family_override = if image_lower.contains("yosys") {
+    let family_override = if matches!(family, PersistentRunnerFamily::Yosys) {
         env_usize(PERSISTENT_RUNNER_YOSYS_POOL_SIZE_ENV)
     } else {
         env_usize(PERSISTENT_RUNNER_DRIVER_POOL_SIZE_ENV)
@@ -880,15 +1322,16 @@ fn load_driver_runner_capabilities(
     runtime: &DriverRuntimeSpec,
 ) -> Result<PersistentRunnerCapabilities> {
     ensure_driver_image(repo_root, runtime)?;
-    let base_runner_key = persistent_runner_key(&runtime.docker_image, &store.root);
-    let pool_size = persistent_runner_pool_size(&runtime.docker_image);
+    let image = docker_image_content_ref(&runtime.docker_image_id)?;
+    let base_runner_key = persistent_runner_key(&image, &store.root);
+    let pool_size = persistent_runner_pool_size(PersistentRunnerFamily::Driver);
     let runner_key = persistent_runner_slot_key(&base_runner_key, pool_size, 0);
-    let container_name = persistent_runner_container_name(&runtime.docker_image, &runner_key);
+    let container_name = persistent_runner_container_name(&image, &runner_key);
     let runner_paths = PersistentRunnerPaths::new(&store.root, &runner_key);
     ensure_persistent_runner_started(
         repo_root,
         &store.root,
-        &runtime.docker_image,
+        &image,
         &runner_key,
         &container_name,
         &runner_paths,
@@ -899,7 +1342,7 @@ fn load_driver_runner_capabilities(
         ensure_persistent_runner_started(
             repo_root,
             &store.root,
-            &runtime.docker_image,
+            &image,
             &runner_key,
             &container_name,
             &runner_paths,
@@ -1133,6 +1576,21 @@ fn docker_container_is_running(container_name: &str) -> Result<bool> {
     Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
 }
 
+fn docker_container_image_id(container_name: &str) -> Result<Option<String>> {
+    let output = Command::new("docker")
+        .args(["inspect", "--format", "{{.Image}}", container_name])
+        .output()
+        .with_context(|| format!("inspecting docker container image: {container_name}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(normalize_docker_image_id(
+        String::from_utf8(output.stdout)
+            .context("decoding docker container image ID")?
+            .trim(),
+    )?))
+}
+
 fn count_json_files(path: &Path) -> Result<usize> {
     if !path.exists() {
         return Ok(0);
@@ -1242,7 +1700,13 @@ fn ensure_persistent_runner_started_locked(
     runner_paths: &PersistentRunnerPaths,
 ) -> Result<()> {
     if docker_container_is_running(container_name)? {
-        return Ok(());
+        let expected_image_id = inspect_image_id(image)?
+            .with_context(|| format!("persistent runner image `{image}` is missing"))?;
+        if docker_container_image_id(container_name)?.as_deref() == Some(expected_image_id.as_str())
+        {
+            return Ok(());
+        }
+        cleanup_persistent_runner_container(container_name)?;
     }
 
     cleanup_persistent_runner_container(container_name).ok();
@@ -1417,9 +1881,10 @@ fn select_persistent_runner_locked(
     repo_root: &Path,
     store_root: &Path,
     image: &str,
+    family: PersistentRunnerFamily,
 ) -> Result<SelectedPersistentRunner> {
     let base_runner_key = persistent_runner_key(image, store_root);
-    let pool_size = persistent_runner_pool_size(image);
+    let pool_size = persistent_runner_pool_size(family);
     cleanup_idle_persistent_runner_pool_slots(store_root, image, &base_runner_key, pool_size)?;
 
     let mut statuses = Vec::with_capacity(pool_size);
@@ -1488,6 +1953,24 @@ pub(crate) fn execute_persistent_runner_script(
     )
 }
 
+pub(crate) fn execute_yosys_persistent_runner_script(
+    image: &str,
+    mounts: &[DockerMount],
+    env: &BTreeMap<String, String>,
+    script: &str,
+    run_hint: &str,
+) -> Result<CommandTrace> {
+    execute_persistent_runner_script_with_timeout_and_family(
+        image,
+        mounts,
+        env,
+        script,
+        run_hint,
+        DEFAULT_ACTION_TIMEOUT_SECONDS,
+        PersistentRunnerFamily::Yosys,
+    )
+}
+
 pub(crate) fn execute_persistent_runner_script_with_timeout(
     image: &str,
     mounts: &[DockerMount],
@@ -1496,16 +1979,37 @@ pub(crate) fn execute_persistent_runner_script_with_timeout(
     run_hint: &str,
     timeout_secs: u64,
 ) -> Result<CommandTrace> {
+    execute_persistent_runner_script_with_timeout_and_family(
+        image,
+        mounts,
+        env,
+        script,
+        run_hint,
+        timeout_secs,
+        PersistentRunnerFamily::Driver,
+    )
+}
+
+fn execute_persistent_runner_script_with_timeout_and_family(
+    image: &str,
+    mounts: &[DockerMount],
+    env: &BTreeMap<String, String>,
+    script: &str,
+    run_hint: &str,
+    timeout_secs: u64,
+    family: PersistentRunnerFamily,
+) -> Result<CommandTrace> {
     let repo_root = std::env::current_dir().context("getting current directory")?;
     let store_root = infer_store_root_from_mounts(mounts)?;
     let request_seq = DOCKER_RUN_NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let request_id = format!("req-{}-{}", std::process::id(), request_seq);
+    let (request_id, request_token) =
+        persistent_runner_request_identity(process_instance_id(), request_seq);
 
     let (runner, result_path, command_argv, writebacks) = {
         let _guard = persistent_runner_start_lock()
             .lock()
             .map_err(|_| anyhow!("persistent runner start lock poisoned"))?;
-        let runner = select_persistent_runner_locked(&repo_root, &store_root, image)?;
+        let runner = select_persistent_runner_locked(&repo_root, &store_root, image, family)?;
         let job_root = runner.paths.jobs_dir.join(&request_id);
         fs::create_dir_all(&job_root).with_context(|| {
             format!("creating persistent runner job dir: {}", job_root.display())
@@ -1524,6 +2028,7 @@ pub(crate) fn execute_persistent_runner_script_with_timeout(
         let request = PersistentRunnerRequest {
             schema_version: PERSISTENT_RUNNER_SCHEMA_VERSION,
             request_id: request_id.clone(),
+            request_token: request_token.clone(),
             runner_key: runner.runner_key.clone(),
             runner_instance_id: runner.runner_instance_id.clone(),
             container_name: runner.container_name.clone(),
@@ -1622,17 +2127,22 @@ pub(crate) fn execute_persistent_runner_script_with_timeout(
         thread::sleep(Duration::from_millis(100));
     };
 
-    for writeback in &writebacks {
-        sync_external_writeback(writeback)?;
-    }
-
-    if result.request_id != request_id {
+    let cleanup_request_files = || {
+        fs::remove_file(&result_path).ok();
+        fs::remove_file(runner.paths.archive_dir.join(format!("{request_id}.json"))).ok();
+        remove_path_if_exists(&runner.paths.jobs_dir.join(&request_id)).ok();
+    };
+    if result.request_id != request_id || result.request_token != request_token {
+        cleanup_request_files();
         bail!(
-            "persistent runner result request id mismatch: expected {} got {}",
-            request_id,
-            result.request_id
+            "persistent runner result identity mismatch for request {}",
+            request_id
         );
     }
+
+    let writeback_result = writebacks.iter().try_for_each(sync_external_writeback);
+    cleanup_request_files();
+    writeback_result?;
     if result.status != "completed" || result.exit_code.unwrap_or(1) != 0 || result.timed_out {
         let stderr_first = first_line(&result.stderr_tail).trim();
         let stdout_first = first_line(&result.stdout_tail).trim();
@@ -1664,10 +2174,6 @@ pub(crate) fn execute_persistent_runner_script_with_timeout(
             result.stderr_tail
         );
     }
-
-    fs::remove_file(&result_path).ok();
-    fs::remove_file(runner.paths.archive_dir.join(format!("{request_id}.json"))).ok();
-    remove_path_if_exists(&runner.paths.jobs_dir.join(&request_id)).ok();
 
     Ok(CommandTrace {
         argv: command_argv,
@@ -1833,8 +2339,6 @@ mod tests {
             std::process::id(),
             nanos
         ));
-        fs::create_dir_all(root.join(".staging")).expect("create staging dir");
-        fs::create_dir_all(root.join("queue")).expect("create queue dir");
         root
     }
 
@@ -1881,6 +2385,55 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    #[test]
+    fn persistent_runner_request_identity_is_process_incarnation_unique() {
+        let (first_id, first_token) = persistent_runner_request_identity(&"a".repeat(64), 0);
+        let (second_id, second_token) = persistent_runner_request_identity(&"b".repeat(64), 0);
+        assert_ne!(first_id, second_id);
+        assert_ne!(first_token, second_token);
+    }
+
+    #[test]
+    fn driver_release_cache_manifest_rejects_truncated_content() {
+        let root = make_temp_store_root("cache-manifest-truncation");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("ensure store");
+        let version = "v0.39.0";
+        let platform = crate::DEFAULT_RELEASE_PLATFORM;
+        seed_fake_driver_release_cache(&store, version, platform).expect("seed cache");
+        let cache_dir = store.driver_release_cache_dir(version, platform);
+        validate_driver_release_cache(&cache_dir, version, platform)
+            .expect("seeded cache validates");
+
+        fs::write(cache_dir.join("delay_info_main"), b"x").expect("truncate cached binary");
+        assert!(
+            validate_driver_release_cache(&cache_dir, version, platform).is_err(),
+            "manifest must reject a same-path truncated cache file"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn live_cache_setup_lock_is_not_reaped_by_age() {
+        let root = make_temp_store_root("cache-lock-owner");
+        fs::create_dir_all(&root).expect("create lock test root");
+        let lock_path = root.join("setup.lock");
+        let start_ticks = process_start_ticks(std::process::id()).expect("process start ticks");
+        let mut lock = crate::proto::v1::DriverReleaseCacheSetupLock {
+            record_version: 1,
+            hostname: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string()),
+            pid: std::process::id(),
+            process_start_ticks: start_ticks,
+        };
+        fs::write(&lock_path, lock.encode_to_vec()).expect("write live lock");
+        assert!(!is_stale_cache_setup_lock(&lock_path, 0));
+
+        lock.process_start_ticks = start_ticks.saturating_add(1);
+        fs::write(&lock_path, lock.encode_to_vec()).expect("write reused-pid lock");
+        assert!(is_stale_cache_setup_lock(&lock_path, u64::MAX));
+        fs::remove_dir_all(root).ok();
+    }
+
     static DOCKER_INTEGRATION_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn docker_integration_test_lock() -> &'static Mutex<()> {
@@ -1904,6 +2457,7 @@ mod tests {
             dockerfile_sha256: hex::encode(Sha256::digest(include_bytes!(
                 "../../testdata/persistent_runners/fake-driver.Dockerfile"
             ))),
+            docker_image_id: String::new(),
         }
     }
 
@@ -1914,6 +2468,7 @@ mod tests {
             dockerfile_sha256: hex::encode(Sha256::digest(include_bytes!(
                 "../../testdata/persistent_runners/fake-yosys.Dockerfile"
             ))),
+            docker_image_id: String::new(),
             upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
         }
     }
@@ -2108,25 +2663,23 @@ mod tests {
             "syntax = \"proto3\";\npackage xls;\nmessage OpProto {}\n",
         )
         .with_context(|| format!("writing fake op.proto: {}", op_proto.display()))?;
-        fs::write(
-            cache_dir.join(crate::DRIVER_RELEASE_CACHE_READY_FILE),
-            serde_json::to_string_pretty(&json!({
-                "schema_version": 1,
-                "version": version,
-                "platform": platform,
-                "prepared_utc": Utc::now().to_rfc3339(),
-                "fake": true,
-            }))
-            .context("serializing fake cache ready marker")?,
-        )
-        .with_context(|| {
-            format!(
-                "writing fake cache ready marker: {}",
-                cache_dir
-                    .join(crate::DRIVER_RELEASE_CACHE_READY_FILE)
-                    .display()
-            )
-        })?;
+        for binary in DRIVER_RELEASE_CACHE_BINARIES.split(',') {
+            let path = cache_dir.join(binary);
+            if path.exists() {
+                continue;
+            }
+            fs::write(&path, "#!/bin/sh\nexit 0\n")
+                .with_context(|| format!("writing fake cached binary: {}", path.display()))?;
+            set_executable(&path)?;
+        }
+        fs::write(cache_dir.join(format!("libxls-{platform}.so")), b"fake-dso")?;
+        fs::write(cache_dir.join("dslx_stdlib.tar.gz"), b"fake-stdlib-archive")?;
+        let manifest = build_driver_release_cache_manifest(&cache_dir, version, platform)?;
+        write_cache_manifest_atomic(
+            &cache_dir.join(crate::DRIVER_RELEASE_CACHE_READY_FILE),
+            &manifest,
+        )?;
+        validate_driver_release_cache(&cache_dir, version, platform)?;
         Ok(())
     }
 
@@ -2318,17 +2871,26 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
 
         let version = "v0.39.0";
         let unique = unique_test_token("persistent-runners");
-        let runtime_a =
+        let mut runtime_a =
             fake_driver_runtime("0.39.0", format!("xlsynth-bvc-fake-driver-a:{unique}"));
-        let runtime_b =
+        let mut runtime_b =
             fake_driver_runtime("0.35.0", format!("xlsynth-bvc-fake-driver-b:{unique}"));
-        let yosys_runtime = fake_yosys_runtime(format!("xlsynth-bvc-fake-yosys:{unique}"));
+        let mut yosys_runtime = fake_yosys_runtime(format!("xlsynth-bvc-fake-yosys:{unique}"));
         let mut cleanup = DockerCleanup::new(vec![
             runtime_a.docker_image.clone(),
             runtime_b.docker_image.clone(),
             yosys_runtime.docker_image.clone(),
         ]);
 
+        ensure_driver_image(&repo_root, &runtime_a)?;
+        runtime_a.docker_image_id = inspect_image_id(&runtime_a.docker_image)?
+            .with_context(|| format!("missing built image {}", runtime_a.docker_image))?;
+        ensure_driver_image(&repo_root, &runtime_b)?;
+        runtime_b.docker_image_id = inspect_image_id(&runtime_b.docker_image)?
+            .with_context(|| format!("missing built image {}", runtime_b.docker_image))?;
+        ensure_yosys_image(&repo_root, &yosys_runtime)?;
+        yosys_runtime.docker_image_id = inspect_image_id(&yosys_runtime.docker_image)?
+            .with_context(|| format!("missing built image {}", yosys_runtime.docker_image))?;
         seed_fake_driver_release_cache(&store, version, &runtime_a.release_platform)?;
 
         let subtree_action_id = seed_subtree_action(
@@ -2505,13 +3067,27 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
         assert!(list_queue_files(&store.queue_running_dir())?.is_empty());
         assert!(store.load_failed_action_records()?.is_empty());
 
-        let runner_key_a = persistent_runner_key(&runtime_a.docker_image, &store.root);
-        let runner_key_b = persistent_runner_key(&runtime_b.docker_image, &store.root);
-        let runner_key_y = persistent_runner_key(&yosys_runtime.docker_image, &store.root);
-        let container_a = persistent_runner_container_name(&runtime_a.docker_image, &runner_key_a);
-        let container_b = persistent_runner_container_name(&runtime_b.docker_image, &runner_key_b);
-        let container_y =
-            persistent_runner_container_name(&yosys_runtime.docker_image, &runner_key_y);
+        let image_a = docker_image_content_ref(&runtime_a.docker_image_id)?;
+        let image_b = docker_image_content_ref(&runtime_b.docker_image_id)?;
+        let image_y = docker_image_content_ref(&yosys_runtime.docker_image_id)?;
+        let runner_key_a = persistent_runner_slot_key(
+            &persistent_runner_key(&image_a, &store.root),
+            persistent_runner_pool_size(PersistentRunnerFamily::Driver),
+            0,
+        );
+        let runner_key_b = persistent_runner_slot_key(
+            &persistent_runner_key(&image_b, &store.root),
+            persistent_runner_pool_size(PersistentRunnerFamily::Driver),
+            0,
+        );
+        let runner_key_y = persistent_runner_slot_key(
+            &persistent_runner_key(&image_y, &store.root),
+            persistent_runner_pool_size(PersistentRunnerFamily::Yosys),
+            0,
+        );
+        let container_a = persistent_runner_container_name(&image_a, &runner_key_a);
+        let container_b = persistent_runner_container_name(&image_b, &runner_key_b);
+        let container_y = persistent_runner_container_name(&image_y, &runner_key_y);
         cleanup.add_container(container_a.clone());
         cleanup.add_container(container_b.clone());
         cleanup.add_container(container_y.clone());

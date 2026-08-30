@@ -15,7 +15,7 @@ models from becoming canonical inside Rust.
 | `model.rs`: `ActionSpec` | action fingerprint and all queue/provenance JSON | `action.proto` | 1 |
 | `model.rs`: `OutputFile`, `CommandTrace`, `Provenance`, `SuggestedAction`, `ActionOutcome`, `DslxFnDiscovery`, `DslxImportContext` | sled/materialized JSON and in-memory dynamic details | `provenance.proto` with typed action-detail oneofs | 2 |
 | `model.rs`: `QueueItem`, `QueueRunning`, `QueueDone`, `QueueFailed`, `QueueCanceled` | queue filesystem JSON and sled failures | `queue.proto` | 2 |
-| `service/runtime_docker.rs`: runner capabilities, heartbeat, request, result, and cache-ready records | persistent-runner and cache-control JSON files | `runner.proto` and `runtime.proto` | 2 |
+| `service/runtime_docker.rs`: release-cache manifest and setup lock | cache-control protobuf files | `common.proto`: `DriverReleaseCacheManifest` and `DriverReleaseCacheSetupLock` | 2 |
 | `model.rs`: k-bool and MFFC corpus manifests/entries | generated action payload JSON | `corpus.proto` | 3 |
 | `model.rs`: structural manifest/group/member/origin | sled web-index JSON | `structural_index.proto` | 3 |
 | `corpus.rs`: IR-directory manifest, sample record, joined row, summary | JSON/JSONL is both resume state and public export | `corpus.proto`; JSON/JSONL/CSV become projections | 3 |
@@ -46,6 +46,7 @@ modules.
 | `executor.rs`: raw bool-cone and MFFC manifest rows | `xlsynth-driver` JSONL | `adapters/driver_json.rs` |
 | `executor.rs` / `service/core.rs`: structural-hash response | `xlsynth-driver` JSON | `adapters/driver_json.rs` |
 | `executor.rs`, `query.rs`, `corpus.rs`, `service/structural_index.rs`: AIG stats JSON | driver-produced evidence artifact | `adapters/driver_json.rs`; convert parsed metrics to protobuf |
+| `service/runtime_docker.rs` and `scripts/persistent_runner_worker.py` | private host/Python runner request, result, heartbeat, and capability JSON | subprocess boundary; schema-versioned and identity-checked JSON remains |
 | `web/types.rs` | Axum query/form extraction | HTTP boundary; serde remains |
 | `web/routes_api.rs` | JSON-RPC requests and responses | HTTP boundary; serde remains until the static site removes runtime API dependence |
 

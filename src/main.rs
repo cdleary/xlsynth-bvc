@@ -102,8 +102,8 @@ const VERSION_COMPAT_PATH: &str = "third_party/xlsynth-crate/generated_version_c
 const VENDORED_DOWNLOAD_RELEASE_SCRIPT: &str =
     "third_party/xlsynth-crate/v0.29.0/scripts/download_release.py";
 const DRIVER_RELEASE_CACHE_DIR: &str = "driver-release-cache";
-const DRIVER_RELEASE_CACHE_READY_FILE: &str = ".ready.json";
-const DRIVER_RELEASE_CACHE_LOCK_FILE: &str = ".setup.lock";
+const DRIVER_RELEASE_CACHE_READY_FILE: &str = ".ready.pb";
+const DRIVER_RELEASE_CACHE_LOCK_FILE: &str = ".driver-release-cache.setup.lock";
 const DRIVER_RELEASE_CACHE_SETUP_TIMEOUT_SECS: u64 = 300;
 const DRIVER_RELEASE_CACHE_SETUP_POLL_MILLIS: u64 = 250;
 const DRIVER_RELEASE_CACHE_BINARIES: &str =
@@ -211,13 +211,17 @@ impl DriverCli {
             .docker_image
             .unwrap_or_else(|| default_driver_image(&resolved_driver_version));
         let dockerfile = self.dockerfile.to_string_lossy().to_string();
-        let runtime = DriverRuntimeSpec {
-            driver_version: resolved_driver_version,
-            release_platform: self.release_platform,
-            docker_image,
-            dockerfile_sha256: runtime_dockerfile_sha256(repo_root, &dockerfile)?,
-            dockerfile,
-        };
+        let runtime = crate::service::bind_driver_runtime_image(
+            repo_root,
+            DriverRuntimeSpec {
+                driver_version: resolved_driver_version,
+                release_platform: self.release_platform,
+                docker_image,
+                dockerfile_sha256: runtime_dockerfile_sha256(repo_root, &dockerfile)?,
+                docker_image_id: String::new(),
+                dockerfile,
+            },
+        )?;
         ensure_driver_runtime_compatibility(repo_root, &runtime, xlsynth_version)?;
         Ok(runtime)
     }
@@ -226,12 +230,16 @@ impl DriverCli {
 impl YosysCli {
     pub(crate) fn into_runtime(self, repo_root: &Path) -> Result<YosysRuntimeSpec> {
         let dockerfile = self.yosys_dockerfile.to_string_lossy().to_string();
-        Ok(YosysRuntimeSpec {
-            docker_image: self.yosys_docker_image,
-            dockerfile_sha256: runtime_dockerfile_sha256(repo_root, &dockerfile)?,
-            dockerfile,
-            upstream_commit: self.yosys_upstream_commit,
-        })
+        crate::service::bind_yosys_runtime_image(
+            repo_root,
+            YosysRuntimeSpec {
+                docker_image: self.yosys_docker_image,
+                dockerfile_sha256: runtime_dockerfile_sha256(repo_root, &dockerfile)?,
+                docker_image_id: String::new(),
+                dockerfile,
+                upstream_commit: self.yosys_upstream_commit,
+            },
+        )
     }
 }
 
@@ -577,6 +585,7 @@ mod tests {
             docker_image: default_driver_image("0.31.0"),
             dockerfile: DEFAULT_DOCKERFILE.to_string(),
             dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
         };
         let action = ActionSpec::DriverIrToG8rAig {
             ir_action_id: "opt-ir-action".to_string(),

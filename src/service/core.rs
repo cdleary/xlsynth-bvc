@@ -2,9 +2,36 @@
 
 use super::*;
 
+pub(crate) fn process_instance_id() -> &'static str {
+    static VALUE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VALUE.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut hasher = Sha256::new();
+        hasher.update(b"xlsynth-bvc/process-instance/v1\0");
+        hasher.update(std::process::id().to_le_bytes());
+        hasher.update(now.to_le_bytes());
+        hex::encode(hasher.finalize())
+    })
+}
+
+pub(crate) fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
 pub(crate) fn default_worker_id() -> String {
     let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
-    format!("{}:{}", host, std::process::id())
+    format!(
+        "{}:{}:{}:{}",
+        host,
+        std::process::id(),
+        process_start_ticks(std::process::id()).unwrap_or(0),
+        &process_instance_id()[..16]
+    )
 }
 
 pub(crate) fn default_completed_by() -> String {
@@ -62,6 +89,7 @@ pub(crate) fn same_driver_runtime(lhs: &DriverRuntimeSpec, rhs: &DriverRuntimeSp
         && lhs.docker_image == rhs.docker_image
         && lhs.dockerfile == rhs.dockerfile
         && lhs.dockerfile_sha256 == rhs.dockerfile_sha256
+        && lhs.docker_image_id == rhs.docker_image_id
 }
 
 pub(crate) fn details_input_ir_structural_hash(details: &serde_json::Value) -> Option<&str> {
@@ -310,7 +338,7 @@ test -s /scratch/structural_hash.json
             driver_cache_mount(store)?,
         ];
         let run_trace = execute_persistent_runner_script(
-            &runtime_for_hash.docker_image,
+            &docker_image_content_ref(&runtime_for_hash.docker_image_id)?,
             &mounts,
             &env,
             &script,
@@ -490,7 +518,7 @@ pub(crate) fn build_aig_stat_diff_suggestion_for_stats_action(
                 verilog_action_id: combo_action_id,
                 verilog_top_module_name: top_fn_name.clone(),
                 yosys_script_ref,
-                runtime: default_yosys_runtime(),
+                runtime: default_yosys_runtime(repo_root)?,
             };
             let yosys_aig_action_id = compute_action_id(&yosys_aig)?;
             let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &runtime)
@@ -974,6 +1002,7 @@ mod tests {
             docker_image: "xlsynth-bvc-driver:0.39.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
             dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
         }
     }
 

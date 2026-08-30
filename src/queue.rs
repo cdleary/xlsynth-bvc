@@ -774,9 +774,9 @@ pub(crate) fn write_failed_record(
     running: &QueueRunningWithPath,
     worker_id: &str,
     error: &str,
-) -> Result<()> {
+) -> Result<bool> {
     if store.action_exists(running.action_id()) {
-        return Ok(());
+        return Ok(false);
     }
     let failed = QueueFailed {
         schema_version: crate::ACTION_SCHEMA_VERSION,
@@ -791,8 +791,9 @@ pub(crate) fn write_failed_record(
     write_failed_action_record(store, &failed)?;
     if store.action_exists(running.action_id()) {
         store.delete_failed_action_record(running.action_id())?;
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn write_failed_action_record(
@@ -1152,8 +1153,11 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
         };
 
         let reclaim = if let Ok(running) = decode_queue_running(&bytes) {
-            running.lease_expires_utc <= now
-                || running_owner_process_missing_on_local_host(&running.lease_owner, &local_host)
+            match running_owner_local_process_exists(&running.lease_owner, &local_host) {
+                Some(true) => false,
+                Some(false) => true,
+                None => running.lease_expires_utc <= now,
+            }
         } else {
             true
         };
@@ -1204,21 +1208,32 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
     Ok(reclaimed)
 }
 
-fn running_owner_process_missing_on_local_host(lease_owner: &str, local_host: &str) -> bool {
+fn queue_process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn running_owner_local_process_exists(lease_owner: &str, local_host: &str) -> Option<bool> {
     let mut parts = lease_owner.split(':');
-    let Some(owner_host) = parts.next() else {
-        return false;
-    };
+    let owner_host = parts.next()?;
     if owner_host != local_host {
-        return false;
+        return None;
     }
-    let Some(owner_pid_raw) = parts.next() else {
-        return false;
+    let owner_pid = parts.next()?.parse::<u32>().ok()?;
+    let proc_path = Path::new("/proc").join(owner_pid.to_string());
+    if !proc_path.exists() {
+        return Some(false);
+    }
+    let Some(recorded_start_ticks) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
+        return Some(true);
     };
-    let Ok(owner_pid) = owner_pid_raw.parse::<u32>() else {
-        return false;
-    };
-    !Path::new("/proc").join(owner_pid.to_string()).exists()
+    Some(queue_process_start_ticks(owner_pid) == Some(recorded_start_ticks))
+}
+
+#[cfg(test)]
+fn running_owner_process_missing_on_local_host(lease_owner: &str, local_host: &str) -> bool {
+    running_owner_local_process_exists(lease_owner, local_host) == Some(false)
 }
 
 pub(crate) fn remove_file_if_exists(path: &Path) -> Result<()> {
@@ -1522,6 +1537,7 @@ mod tests {
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
             dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
         }
     }
 
@@ -1941,6 +1957,7 @@ mod tests {
         let yosys_runtime = crate::model::YosysRuntimeSpec {
             docker_image: "xlsynth-bvc-yosys:latest".to_string(),
             dockerfile: "docker/yosys-abc.Dockerfile".to_string(),
+            docker_image_id: "e".repeat(64),
             dockerfile_sha256: "d".repeat(64),
             upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
         };
@@ -2124,6 +2141,37 @@ mod tests {
     }
 
     #[test]
+    fn failed_transition_reports_loss_when_success_already_exists() {
+        let (store, root) = make_test_store();
+        let action_id = write_completed_provenance(&store, &"ab".repeat(32));
+        let provenance = store.load_provenance(&action_id).expect("load success");
+        let now = Utc::now();
+        let running = QueueRunningWithPath {
+            running: QueueRunning {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: action_id.clone(),
+                enqueued_utc: now,
+                priority: 0,
+                action: provenance.action,
+                lease_owner: "duplicate-worker".to_string(),
+                lease_acquired_utc: now,
+                lease_expires_utc: now,
+            },
+            path: store.running_queue_path(&action_id),
+        };
+
+        assert!(
+            !write_failed_record(&store, &running, "duplicate-worker", "late failure")
+                .expect("write losing failure")
+        );
+        assert!(!store.failed_action_record_exists(&action_id));
+        assert!(store.action_exists(&action_id));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn reclaim_finishes_interrupted_terminal_first_cancellation() {
         let (store, root) = make_test_store();
         let action = terminal_test_action();
@@ -2200,6 +2248,32 @@ mod tests {
             &owner,
             &local_host
         ));
+    }
+
+    #[test]
+    fn expired_lease_is_not_reclaimed_from_live_local_process() {
+        let (store, root) = make_test_store();
+        let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+            version: "v0.37.0".to_string(),
+            discovery_runtime: None,
+            stdlib_tarball_sha256: "11".repeat(32),
+        };
+        let action_id = enqueue_action(&store, action).expect("enqueue action");
+        let local_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
+        let pid = std::process::id();
+        let start_ticks = queue_process_start_ticks(pid).expect("process start ticks");
+        let owner = format!("{local_host}:{pid}:{start_ticks}:test-worker");
+        let claimed = claim_next_pending_item(&store, &owner, -1)
+            .expect("claim pending action")
+            .expect("action should be claimed");
+        assert!(claimed.running.lease_expires_utc < Utc::now());
+
+        assert_eq!(reclaim_expired_running_leases(&store).expect("reclaim"), 0);
+        assert!(store.running_queue_path(&action_id).exists());
+        assert!(!store.pending_queue_path(&action_id).exists());
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup temp store");
     }
 
     #[test]

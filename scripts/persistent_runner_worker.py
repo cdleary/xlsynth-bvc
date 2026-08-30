@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 HEARTBEAT_INTERVAL_SECS = 1.0
 OUTPUT_TAIL_MAX_BYTES = 256 * 1024
 DRIVER_PROBED_SUBCOMMANDS = [
@@ -204,7 +204,13 @@ def process_request(
     heartbeat_state,
 ) -> None:
     request = json.loads(request_path.read_text(encoding="utf-8"))
+    if request.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported request schema {request.get('schema_version')}; "
+            f"expected {SCHEMA_VERSION}"
+        )
     request_id = request["request_id"]
+    request_token = request["request_token"]
     runner_key = request["runner_key"]
     instance_id = request["runner_instance_id"]
     container_name = request["container_name"]
@@ -292,6 +298,7 @@ def process_request(
     result = {
         "schema_version": SCHEMA_VERSION,
         "request_id": request_id,
+        "request_token": request_token,
         "runner_key": runner_key,
         "runner_instance_id": instance_id,
         "container_name": container_name,

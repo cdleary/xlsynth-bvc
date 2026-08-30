@@ -2081,6 +2081,7 @@ mod tests {
             docker_image: crate::runtime::default_driver_image("0.34.0"),
             dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
             dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
         }
     }
 
@@ -2092,6 +2093,7 @@ mod tests {
         YosysRuntimeSpec {
             docker_image: crate::DEFAULT_YOSYS_DOCKER_IMAGE.to_string(),
             dockerfile: crate::DEFAULT_YOSYS_DOCKERFILE.to_string(),
+            docker_image_id: "e".repeat(64),
             dockerfile_sha256: "d".repeat(64),
             upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
         }

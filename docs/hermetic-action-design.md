@@ -42,9 +42,12 @@ Example pattern:
 
 Each action is represented as a typed `ActionSpec` and hashed to an `action_id`:
 
-- Hash input: `{schema_version, action_spec}` JSON.
+- Hash input: a domain-separated, normalized protobuf `ActionFingerprint`.
 - Hash function: SHA-256.
-- Determinism: identical action specs map to identical action IDs.
+- Determinism: identical normalized action specs map to identical action IDs.
+
+The runtime submessage binds both the declared Docker build recipe and the resolved immutable OCI
+image ID. See `docs/action-id-v2.md` for the canonical encoding.
 
 Current action types:
 
@@ -155,7 +158,10 @@ Before queue draining, the executor preflights pending work:
 - prepares a per-version/per-platform release cache at `bvc-artifacts/driver-release-cache/<dso_version>/<platform>/` using vendored `download_release.py`
 - fetches delay-info decode protos into that same cache
 
-Cache setup uses a lock file (`.setup.lock`) and ready marker (`.ready.json`) so parallel workers do not stampede the same GitHub assets.
+Cache setup downloads into a unique staging directory. It validates required files and their exact
+content hashes, writes a protobuf manifest (`.ready.pb`), and atomically promotes the complete
+directory. A protobuf owner lock prevents parallel setup; the lock cannot age out while its exact
+local process incarnation is alive.
 
 At action execution time, driver containers mount that cache read-only at `/cache`, stage tools into `/tmp/xlsynth-release`, and run with:
 
@@ -163,6 +169,8 @@ At action execution time, driver containers mount that cache read-only at `/cach
 - `docker run --network none`
 
 This keeps action execution offline after setup and avoids repeated release-asset pulls from GitHub.
+Docker tags are verified build names only. Planning resolves the tag to an immutable image ID,
+stores that ID in the action protobuf, and execution invokes Docker by `sha256:<image-id>`.
 Driver action creation validates `crate_version <-> dso_version` compatibility against `third_party/xlsynth-crate/generated_version_compat.json`.
 There is no hardcoded default driver crate version in Rust code: actions either use an explicit `--driver-version` or resolve to the latest compatible crate version from `generated_version_compat.json` at action creation time.
 Driver action provenance records both labels explicitly as `crate:vX.Y.Z` and `dso:vX.Y.Z`.
@@ -297,7 +305,7 @@ When migrating away from a legacy action-identity variant, delete the legacy act
 
 ## Schema Evolution Notes
 
-- Action identity is `sha256({schema_version, action_spec})`. If action semantics or key fields change, increment `ACTION_SCHEMA_VERSION`.
+- Action identity uses the domain-separated protobuf encoding in `docs/action-id-v2.md`. If an existing semantic action's canonical bytes change after deployment, advance the identity version and domain.
 - Queue entries whose dependencies are absent from all queue states and absent from artifacts are stale/orphaned; deleting those pending entries is acceptable.
 - Suggested-action IDs may change across schema/spec evolution; regenerate by re-running enqueue/discovery from current provenance instead of preserving old pending IDs.
 - Favor simplicity for this repo: stale queue data can be deleted, and required outputs can be re-materialized from current action specs.
