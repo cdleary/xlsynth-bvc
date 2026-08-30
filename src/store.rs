@@ -2720,6 +2720,10 @@ impl ArtifactStore {
         self.queue_root().join("canceled")
     }
 
+    pub(crate) fn queue_transition_locks_dir(&self) -> PathBuf {
+        self.queue_root().join("transition-locks")
+    }
+
     pub(crate) fn action_dir(&self, action_id: &str) -> PathBuf {
         self.artifact_backend.action_dir(&self.root, action_id)
     }
@@ -2767,6 +2771,11 @@ impl ArtifactStore {
     pub(crate) fn canceled_queue_path(&self, action_id: &str) -> PathBuf {
         self.shard_dir(self.queue_canceled_dir(), action_id)
             .join(format!("{action_id}.pb"))
+    }
+
+    pub(crate) fn queue_transition_lock_path(&self, action_id: &str) -> PathBuf {
+        self.shard_dir(self.queue_transition_locks_dir(), action_id)
+            .join(format!("{action_id}.lock"))
     }
 
     pub(crate) fn load_provenance(&self, action_id: &str) -> Result<Provenance> {
@@ -3960,6 +3969,7 @@ mod tests {
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
             dockerfile_sha256: "d".repeat(64),
             docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         };
         let queue_item = QueueItem {
             schema_version: crate::ACTION_SCHEMA_VERSION,

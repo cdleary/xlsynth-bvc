@@ -40,9 +40,11 @@ Before encoding:
 6. Decode hexadecimal input digests/action IDs to exactly 32 bytes.
 7. Map every semantic enum to a concrete nonzero protobuf value.
 8. Reject an absent action `oneof` or absent required submessage.
-9. Sort repeated fields when their order is declared non-semantic. The initial
+9. Require driver runtimes to carry both a 32-byte immutable OCI image ID and
+   the 32-byte digest of their canonical release-cache input manifest.
+10. Sort repeated fields when their order is declared non-semantic. The initial
    action schema contains no repeated identity fields.
-10. Do not include timestamps, output data, host paths, queue priority, worker
+11. Do not include timestamps, output data, host paths, queue priority, worker
     identity, or publication metadata.
 
 The normalized message is constructed from scratch. Unknown wire fields from an

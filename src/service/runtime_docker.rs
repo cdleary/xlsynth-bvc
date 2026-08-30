@@ -63,18 +63,30 @@ pub(crate) fn ensure_driver_runtime_prepared(
     if let Some(trace) = ensure_driver_image(repo_root, runtime)? {
         commands.push(trace);
     }
-    if let Some(trace) =
-        ensure_driver_release_cache(store, repo_root, version, &runtime.release_platform)?
-    {
+    if let Some(trace) = ensure_driver_release_cache(
+        store,
+        repo_root,
+        version,
+        &runtime.release_platform,
+        &runtime.release_cache_input_sha256,
+    )? {
         commands.push(trace);
     }
     Ok(())
 }
 
-const DRIVER_RELEASE_CACHE_MANIFEST_VERSION: u32 = 1;
+const DRIVER_RELEASE_CACHE_MANIFEST_VERSION: u32 = 2;
+const DRIVER_RELEASE_CACHE_INPUT_MANIFEST_VERSION: u32 = 1;
+const RELEASE_ASSET_INPUT_KIND: i32 = 1;
+const SOURCE_COMMIT_FILE_INPUT_KIND: i32 = 2;
+const LOCAL_RESOURCE_FILE_INPUT_KIND: i32 = 3;
+const DRIVER_RELEASE_CACHE_PROTO_RELPATHS: [&str; 2] = [
+    "xls/estimators/delay_model/delay_info.proto",
+    "xls/ir/op.proto",
+];
 
-fn driver_release_cache_validation_set() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
-    static SET: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
+fn driver_release_cache_validation_set() -> &'static std::sync::Mutex<HashSet<(PathBuf, String)>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<HashSet<(PathBuf, String)>>> =
         std::sync::OnceLock::new();
     SET.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
 }
@@ -113,11 +125,344 @@ fn driver_release_cache_required_relpaths(platform: &str) -> Result<BTreeSet<Str
     Ok(required)
 }
 
+fn driver_release_cache_asset_relpaths(version: &str, platform: &str) -> Result<BTreeSet<String>> {
+    let dso_suffix = match platform {
+        "ubuntu2004" | "ubuntu2204" | "rocky8" | "x64" => ".so",
+        "arm64" => ".dylib",
+        _ => bail!("unsupported xlsynth release platform: {platform}"),
+    };
+    let mut assets: BTreeSet<String> = DRIVER_RELEASE_CACHE_BINARIES
+        .split(',')
+        .map(|binary| format!("{binary}-{platform}"))
+        .collect();
+    let version_without_revision = normalize_tag_version(version)
+        .split('-')
+        .next()
+        .unwrap_or(version);
+    let gzip_suffix = if cmp_dotted_numeric_version(version_without_revision, "0.0.219")
+        != std::cmp::Ordering::Less
+    {
+        ".gz"
+    } else {
+        ""
+    };
+    assets.insert(format!("libxls-{platform}{dso_suffix}{gzip_suffix}"));
+    assets.insert("dslx_stdlib.tar.gz".to_string());
+    Ok(assets)
+}
+
+fn driver_release_cache_input_sha256_bytes(
+    inputs: &crate::proto::v1::DriverReleaseCacheInputManifest,
+) -> Vec<u8> {
+    Sha256::digest(inputs.encode_to_vec()).to_vec()
+}
+
+fn driver_release_cache_input_sha256_hex(
+    inputs: &crate::proto::v1::DriverReleaseCacheInputManifest,
+) -> String {
+    hex::encode(driver_release_cache_input_sha256_bytes(inputs))
+}
+
+fn validate_driver_release_cache_inputs(
+    inputs: &crate::proto::v1::DriverReleaseCacheInputManifest,
+    version: &str,
+    platform: &str,
+) -> Result<()> {
+    if inputs.record_version != DRIVER_RELEASE_CACHE_INPUT_MANIFEST_VERSION {
+        bail!("unsupported driver release cache input manifest version");
+    }
+    if inputs
+        .dso_version
+        .as_ref()
+        .map(|value| value.value.as_str())
+        != Some(normalize_tag_version(version))
+        || inputs.platform != platform
+    {
+        bail!("driver release cache input manifest identity mismatch");
+    }
+    let release_input = crate::proto::release_input_for_dso_version(version)?;
+    if inputs.source_commit != release_input.source_commit {
+        bail!("driver release cache input manifest source commit mismatch");
+    }
+
+    let mut expected = BTreeSet::new();
+    for relpath in driver_release_cache_asset_relpaths(version, platform)? {
+        expected.insert((RELEASE_ASSET_INPUT_KIND, relpath));
+    }
+    for relpath in DRIVER_RELEASE_CACHE_PROTO_RELPATHS {
+        expected.insert((SOURCE_COMMIT_FILE_INPUT_KIND, relpath.to_string()));
+    }
+    expected.insert((
+        LOCAL_RESOURCE_FILE_INPUT_KIND,
+        VENDORED_DOWNLOAD_RELEASE_SCRIPT.to_string(),
+    ));
+
+    let mut declared = BTreeMap::new();
+    let mut previous: Option<(i32, String)> = None;
+    for file in &inputs.files {
+        if file.kind != RELEASE_ASSET_INPUT_KIND
+            && file.kind != SOURCE_COMMIT_FILE_INPUT_KIND
+            && file.kind != LOCAL_RESOURCE_FILE_INPUT_KIND
+        {
+            bail!("driver release cache input has unknown kind {}", file.kind);
+        }
+        let relpath = file
+            .relpath
+            .as_ref()
+            .context("driver release cache input missing relpath")?
+            .value
+            .clone();
+        validate_relative_subpath(&relpath)?;
+        let key = (file.kind, relpath.clone());
+        if previous.as_ref().is_some_and(|value| value >= &key) {
+            bail!("driver release cache inputs are not strictly sorted");
+        }
+        previous = Some(key.clone());
+        let digest = file
+            .sha256
+            .as_ref()
+            .context("driver release cache input missing sha256")?;
+        if digest.value.len() != 32 {
+            bail!("driver release cache input has invalid sha256 length: {relpath}");
+        }
+        declared.insert(key, digest.value.clone());
+    }
+    if declared.keys().cloned().collect::<BTreeSet<_>>() != expected {
+        bail!("driver release cache input manifest does not declare the exact input closure");
+    }
+    let stdlib_digest = declared
+        .get(&(RELEASE_ASSET_INPUT_KIND, "dslx_stdlib.tar.gz".to_string()))
+        .context("driver release cache input manifest missing stdlib checksum")?;
+    if hex::encode(stdlib_digest) != release_input.stdlib_tarball_sha256 {
+        bail!("driver release cache stdlib checksum disagrees with the release-input lock");
+    }
+    Ok(())
+}
+
+fn fetch_release_cache_input_manifest(
+    repo_root: &Path,
+    version: &str,
+    platform: &str,
+) -> Result<crate::proto::v1::DriverReleaseCacheInputManifest> {
+    let release_input = crate::proto::release_input_for_dso_version(version)?;
+    let client = Client::builder()
+        .user_agent("xlsynth-bvc/release-cache-inputs")
+        .build()
+        .context("creating client for driver release cache input resolution")?;
+    let release_tag = xlsynth_release_tag(version);
+    let base_url = format!("https://github.com/xlsynth/xlsynth/releases/download/{release_tag}");
+    let mut files = Vec::new();
+    for relpath in driver_release_cache_asset_relpaths(version, platform)? {
+        let checksum_url = format!("{base_url}/{relpath}.sha256");
+        let checksum_text = client
+            .get(&checksum_url)
+            .send()
+            .with_context(|| format!("downloading release checksum: {checksum_url}"))?
+            .error_for_status()
+            .with_context(|| format!("release checksum request failed: {checksum_url}"))?
+            .text()
+            .with_context(|| format!("reading release checksum: {checksum_url}"))?;
+        let checksum = checksum_text
+            .split_whitespace()
+            .next()
+            .context("release checksum response is empty")?
+            .to_ascii_lowercase();
+        if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("release checksum is not a SHA-256 digest: {checksum_url}");
+        }
+        files.push(crate::proto::v1::DriverReleaseCacheInputFile {
+            kind: RELEASE_ASSET_INPUT_KIND,
+            relpath: Some(crate::proto::v1::NormalizedRelpath { value: relpath }),
+            sha256: Some(crate::proto::v1::Sha256Digest {
+                value: hex::decode(checksum).context("decoding release checksum")?,
+            }),
+        });
+    }
+    for relpath in DRIVER_RELEASE_CACHE_PROTO_RELPATHS {
+        let url = format!(
+            "https://raw.githubusercontent.com/xlsynth/xlsynth/{}/{relpath}",
+            release_input.source_commit
+        );
+        let bytes = client
+            .get(&url)
+            .send()
+            .with_context(|| format!("downloading source-commit cache input: {url}"))?
+            .error_for_status()
+            .with_context(|| format!("source-commit cache input request failed: {url}"))?
+            .bytes()
+            .with_context(|| format!("reading source-commit cache input: {url}"))?;
+        files.push(crate::proto::v1::DriverReleaseCacheInputFile {
+            kind: SOURCE_COMMIT_FILE_INPUT_KIND,
+            relpath: Some(crate::proto::v1::NormalizedRelpath {
+                value: relpath.to_string(),
+            }),
+            sha256: Some(crate::proto::v1::Sha256Digest {
+                value: Sha256::digest(&bytes).to_vec(),
+            }),
+        });
+    }
+    let script_bytes = fs::read(repo_root.join(VENDORED_DOWNLOAD_RELEASE_SCRIPT))
+        .context("reading vendored release-cache setup script")?;
+    files.push(crate::proto::v1::DriverReleaseCacheInputFile {
+        kind: LOCAL_RESOURCE_FILE_INPUT_KIND,
+        relpath: Some(crate::proto::v1::NormalizedRelpath {
+            value: VENDORED_DOWNLOAD_RELEASE_SCRIPT.to_string(),
+        }),
+        sha256: Some(crate::proto::v1::Sha256Digest {
+            value: Sha256::digest(&script_bytes).to_vec(),
+        }),
+    });
+    files.sort_by(|a, b| {
+        (a.kind, a.relpath.as_ref().map(|value| value.value.as_str()))
+            .cmp(&(b.kind, b.relpath.as_ref().map(|value| value.value.as_str())))
+    });
+    let inputs = crate::proto::v1::DriverReleaseCacheInputManifest {
+        record_version: DRIVER_RELEASE_CACHE_INPUT_MANIFEST_VERSION,
+        dso_version: Some(crate::proto::v1::DsoVersion {
+            value: normalize_tag_version(version).to_string(),
+        }),
+        platform: platform.to_string(),
+        source_commit: release_input.source_commit,
+        files,
+    };
+    validate_driver_release_cache_inputs(&inputs, version, platform)?;
+    Ok(inputs)
+}
+
+fn resolve_driver_release_cache_input_manifest(
+    repo_root: &Path,
+    version: &str,
+    platform: &str,
+) -> Result<crate::proto::v1::DriverReleaseCacheInputManifest> {
+    #[cfg(test)]
+    {
+        let release_input = crate::proto::release_input_for_dso_version(version)?;
+        let normalized_version = normalize_tag_version(version);
+        let mut files = Vec::new();
+        for relpath in driver_release_cache_asset_relpaths(version, platform)? {
+            let digest = if relpath == "dslx_stdlib.tar.gz" {
+                hex::decode(&release_input.stdlib_tarball_sha256)
+                    .context("decoding locked stdlib checksum")?
+            } else {
+                Sha256::digest(
+                    format!(
+                        "xlsynth-bvc/test-release-asset/v1\0{normalized_version}\0{platform}\0{relpath}"
+                    )
+                    .as_bytes(),
+                )
+                .to_vec()
+            };
+            files.push(crate::proto::v1::DriverReleaseCacheInputFile {
+                kind: RELEASE_ASSET_INPUT_KIND,
+                relpath: Some(crate::proto::v1::NormalizedRelpath { value: relpath }),
+                sha256: Some(crate::proto::v1::Sha256Digest { value: digest }),
+            });
+        }
+        for relpath in DRIVER_RELEASE_CACHE_PROTO_RELPATHS {
+            files.push(crate::proto::v1::DriverReleaseCacheInputFile {
+                kind: SOURCE_COMMIT_FILE_INPUT_KIND,
+                relpath: Some(crate::proto::v1::NormalizedRelpath {
+                    value: relpath.to_string(),
+                }),
+                sha256: Some(crate::proto::v1::Sha256Digest {
+                    value: Sha256::digest(
+                        format!(
+                            "xlsynth-bvc/test-source-file/v1\0{}\0{relpath}",
+                            release_input.source_commit
+                        )
+                        .as_bytes(),
+                    )
+                    .to_vec(),
+                }),
+            });
+        }
+        let script_bytes = fs::read(repo_root.join(VENDORED_DOWNLOAD_RELEASE_SCRIPT))
+            .context("reading vendored release-cache setup script")?;
+        files.push(crate::proto::v1::DriverReleaseCacheInputFile {
+            kind: LOCAL_RESOURCE_FILE_INPUT_KIND,
+            relpath: Some(crate::proto::v1::NormalizedRelpath {
+                value: VENDORED_DOWNLOAD_RELEASE_SCRIPT.to_string(),
+            }),
+            sha256: Some(crate::proto::v1::Sha256Digest {
+                value: Sha256::digest(&script_bytes).to_vec(),
+            }),
+        });
+        files.sort_by(|a, b| {
+            (a.kind, a.relpath.as_ref().map(|value| value.value.as_str()))
+                .cmp(&(b.kind, b.relpath.as_ref().map(|value| value.value.as_str())))
+        });
+        let inputs = crate::proto::v1::DriverReleaseCacheInputManifest {
+            record_version: DRIVER_RELEASE_CACHE_INPUT_MANIFEST_VERSION,
+            dso_version: Some(crate::proto::v1::DsoVersion {
+                value: normalize_tag_version(version).to_string(),
+            }),
+            platform: platform.to_string(),
+            source_commit: release_input.source_commit,
+            files,
+        };
+        validate_driver_release_cache_inputs(&inputs, version, platform)?;
+        return Ok(inputs);
+    }
+    #[cfg(not(test))]
+    {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<
+                BTreeMap<
+                    (String, String, String),
+                    crate::proto::v1::DriverReleaseCacheInputManifest,
+                >,
+            >,
+        > = std::sync::OnceLock::new();
+        let local_script_sha256 = hex::encode(cache_file_sha256(
+            &repo_root.join(VENDORED_DOWNLOAD_RELEASE_SCRIPT),
+        )?);
+        let key = (
+            normalize_tag_version(version).to_string(),
+            platform.to_string(),
+            local_script_sha256,
+        );
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+        if let Some(value) = cache.lock().expect("cache input lock poisoned").get(&key) {
+            return Ok(value.clone());
+        }
+        let resolved = fetch_release_cache_input_manifest(repo_root, version, platform)?;
+        cache
+            .lock()
+            .expect("cache input lock poisoned")
+            .insert(key, resolved.clone());
+        Ok(resolved)
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) fn driver_release_cache_input_sha256(
+    repo_root: &Path,
+    version: &str,
+    platform: &str,
+) -> Result<String> {
+    Ok(driver_release_cache_input_sha256_hex(
+        &resolve_driver_release_cache_input_manifest(repo_root, version, platform)?,
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn driver_release_cache_input_sha256(
+    repo_root: &Path,
+    version: &str,
+    platform: &str,
+) -> Result<String> {
+    Ok(driver_release_cache_input_sha256_hex(
+        &resolve_driver_release_cache_input_manifest(repo_root, version, platform)?,
+    ))
+}
+
 fn build_driver_release_cache_manifest(
     cache_dir: &Path,
     version: &str,
     platform: &str,
+    inputs: crate::proto::v1::DriverReleaseCacheInputManifest,
 ) -> Result<crate::proto::v1::DriverReleaseCacheManifest> {
+    validate_driver_release_cache_inputs(&inputs, version, platform)?;
     let mut files = Vec::new();
     for entry in WalkDir::new(cache_dir).sort_by_file_name() {
         let entry =
@@ -165,10 +510,16 @@ fn build_driver_release_cache_manifest(
         }),
         platform: platform.to_string(),
         files,
+        inputs: Some(inputs),
     })
 }
 
-fn validate_driver_release_cache(cache_dir: &Path, version: &str, platform: &str) -> Result<()> {
+fn validate_driver_release_cache(
+    cache_dir: &Path,
+    version: &str,
+    platform: &str,
+    expected_input_sha256: &str,
+) -> Result<()> {
     let ready_path = cache_dir.join(DRIVER_RELEASE_CACHE_READY_FILE);
     let bytes = fs::read(&ready_path)
         .with_context(|| format!("reading cache manifest: {}", ready_path.display()))?;
@@ -182,6 +533,14 @@ fn validate_driver_release_cache(cache_dir: &Path, version: &str, platform: &str
         || manifest.platform != platform
     {
         bail!("driver release cache manifest identity mismatch");
+    }
+    let inputs = manifest
+        .inputs
+        .as_ref()
+        .context("driver release cache manifest is missing its input manifest")?;
+    validate_driver_release_cache_inputs(inputs, version, platform)?;
+    if driver_release_cache_input_sha256_hex(inputs) != expected_input_sha256 {
+        bail!("driver release cache input digest does not match the planned runtime");
     }
 
     let mut declared = BTreeMap::new();
@@ -251,21 +610,26 @@ fn validate_driver_release_cache(cache_dir: &Path, version: &str, platform: &str
     Ok(())
 }
 
-fn driver_release_cache_is_ready(cache_dir: &Path, version: &str, platform: &str) -> bool {
+fn driver_release_cache_is_ready(
+    cache_dir: &Path,
+    version: &str,
+    platform: &str,
+    expected_input_sha256: &str,
+) -> bool {
     if !cache_dir.join(DRIVER_RELEASE_CACHE_READY_FILE).is_file() {
         return false;
     }
     if driver_release_cache_validation_set()
         .lock()
-        .map(|set| set.contains(cache_dir))
+        .map(|set| set.contains(&(cache_dir.to_path_buf(), expected_input_sha256.to_string())))
         .unwrap_or(false)
     {
         return true;
     }
-    match validate_driver_release_cache(cache_dir, version, platform) {
+    match validate_driver_release_cache(cache_dir, version, platform, expected_input_sha256) {
         Ok(()) => {
             if let Ok(mut set) = driver_release_cache_validation_set().lock() {
-                set.insert(cache_dir.to_path_buf());
+                set.insert((cache_dir.to_path_buf(), expected_input_sha256.to_string()));
             }
             true
         }
@@ -306,9 +670,10 @@ pub(crate) fn ensure_driver_release_cache(
     repo_root: &Path,
     version: &str,
     platform: &str,
+    expected_input_sha256: &str,
 ) -> Result<Option<CommandTrace>> {
     let cache_dir = store.driver_release_cache_dir(version, platform);
-    if driver_release_cache_is_ready(&cache_dir, version, platform) {
+    if driver_release_cache_is_ready(&cache_dir, version, platform, expected_input_sha256) {
         return Ok(None);
     }
 
@@ -323,7 +688,7 @@ pub(crate) fn ensure_driver_release_cache(
     let lock_path = cache_root.join(format!("{DRIVER_RELEASE_CACHE_LOCK_FILE}-{lock_key}"));
     let start = Instant::now();
     loop {
-        if driver_release_cache_is_ready(&cache_dir, version, platform) {
+        if driver_release_cache_is_ready(&cache_dir, version, platform, expected_input_sha256) {
             return Ok(None);
         }
         match fs::OpenOptions::new()
@@ -392,7 +757,7 @@ pub(crate) fn ensure_driver_release_cache(
         DOCKER_RUN_NAME_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let setup_result = (|| -> Result<Option<CommandTrace>> {
-        if driver_release_cache_is_ready(&cache_dir, version, platform) {
+        if driver_release_cache_is_ready(&cache_dir, version, platform, expected_input_sha256) {
             return Ok(None);
         }
         remove_path_if_exists(&staging_dir)?;
@@ -407,6 +772,15 @@ pub(crate) fn ensure_driver_release_cache(
             );
         }
         let release_tag = xlsynth_release_tag(version);
+        let inputs = resolve_driver_release_cache_input_manifest(repo_root, version, platform)?;
+        let actual_input_sha256 = driver_release_cache_input_sha256_hex(&inputs);
+        if actual_input_sha256 != expected_input_sha256 {
+            bail!(
+                "driver release cache inputs changed after action planning: expected {}, resolved {}",
+                expected_input_sha256,
+                actual_input_sha256
+            );
+        }
         let args: Vec<OsString> = vec![
             script_path.into_os_string(),
             OsString::from("-v"),
@@ -419,6 +793,27 @@ pub(crate) fn ensure_driver_release_cache(
             OsString::from("-b"),
             OsString::from(DRIVER_RELEASE_CACHE_BINARIES),
         ];
+        let mut args = args;
+        for input in &inputs.files {
+            if input.kind != RELEASE_ASSET_INPUT_KIND {
+                continue;
+            }
+            let relpath = &input
+                .relpath
+                .as_ref()
+                .context("release asset input missing relpath")?
+                .value;
+            let digest = input
+                .sha256
+                .as_ref()
+                .context("release asset input missing sha256")?;
+            args.push(OsString::from("--expected_sha256"));
+            args.push(OsString::from(format!(
+                "{}={}",
+                relpath,
+                hex::encode(&digest.value)
+            )));
+        }
         let output = Command::new("python3")
             .args(&args)
             .output()
@@ -442,11 +837,11 @@ pub(crate) fn ensure_driver_release_cache(
         let op_proto = staging_dir.join("protos/xls/ir/op.proto");
         let delay_info_url = format!(
             "https://raw.githubusercontent.com/xlsynth/xlsynth/{}/xls/estimators/delay_model/delay_info.proto",
-            release_tag
+            inputs.source_commit
         );
         let op_url = format!(
             "https://raw.githubusercontent.com/xlsynth/xlsynth/{}/xls/ir/op.proto",
-            release_tag
+            inputs.source_commit
         );
         for path in [&delay_info_proto, &op_proto] {
             fs::create_dir_all(path.parent().context("cache proto path missing parent")?)
@@ -456,13 +851,34 @@ pub(crate) fn ensure_driver_release_cache(
         }
         download_to_file(&client, &delay_info_url, &delay_info_proto)?;
         download_to_file(&client, &op_url, &op_proto)?;
+        for (relpath, path) in [
+            (DRIVER_RELEASE_CACHE_PROTO_RELPATHS[0], &delay_info_proto),
+            (DRIVER_RELEASE_CACHE_PROTO_RELPATHS[1], &op_proto),
+        ] {
+            let expected = inputs
+                .files
+                .iter()
+                .find(|input| {
+                    input.kind == SOURCE_COMMIT_FILE_INPUT_KIND
+                        && input
+                            .relpath
+                            .as_ref()
+                            .is_some_and(|value| value.value == relpath)
+                })
+                .and_then(|input| input.sha256.as_ref())
+                .context("source-commit cache input missing expected checksum")?;
+            if cache_file_sha256(path)? != expected.value {
+                bail!("source-commit cache input checksum mismatch: {relpath}");
+            }
+        }
 
-        let manifest = build_driver_release_cache_manifest(&staging_dir, version, platform)?;
+        let manifest =
+            build_driver_release_cache_manifest(&staging_dir, version, platform, inputs)?;
         write_cache_manifest_atomic(
             &staging_dir.join(DRIVER_RELEASE_CACHE_READY_FILE),
             &manifest,
         )?;
-        validate_driver_release_cache(&staging_dir, version, platform)?;
+        validate_driver_release_cache(&staging_dir, version, platform, expected_input_sha256)?;
 
         if let Some(parent) = cache_dir.parent() {
             fs::create_dir_all(parent).with_context(|| {
@@ -478,7 +894,7 @@ pub(crate) fn ensure_driver_release_cache(
             )
         })?;
         if let Ok(mut set) = driver_release_cache_validation_set().lock() {
-            set.insert(cache_dir.clone());
+            set.insert((cache_dir.clone(), expected_input_sha256.to_string()));
         }
 
         Ok(Some(CommandTrace {
@@ -555,7 +971,7 @@ pub(crate) fn prepare_queue_runtime_environment(
     }
 
     let mut driver_runtimes: HashSet<DriverRuntimeSpec> = HashSet::new();
-    let mut driver_releases: HashSet<(String, String)> = HashSet::new();
+    let mut driver_releases: HashSet<(String, String, String)> = HashSet::new();
     let mut yosys_runtimes: HashSet<YosysRuntimeSpec> = HashSet::new();
 
     for action in actions {
@@ -588,16 +1004,25 @@ pub(crate) fn prepare_queue_runtime_environment(
             | ActionSpec::IrFnToMffcCorpus {
                 version, runtime, ..
             } => {
-                driver_releases.insert((version, runtime.release_platform.clone()));
+                driver_releases.insert((
+                    version,
+                    runtime.release_platform.clone(),
+                    runtime.release_cache_input_sha256.clone(),
+                ));
                 driver_runtimes.insert(runtime);
             }
             ActionSpec::DriverAigToStats { runtime, .. } => {
                 let release_platform = runtime.release_platform.clone();
                 let driver_version = runtime.driver_version.clone();
+                let release_cache_input_sha256 = runtime.release_cache_input_sha256.clone();
                 driver_runtimes.insert(runtime);
                 let runtime_xlsynth_version =
                     resolve_xlsynth_version_for_driver(repo_root, &driver_version)?;
-                driver_releases.insert((runtime_xlsynth_version, release_platform));
+                driver_releases.insert((
+                    runtime_xlsynth_version,
+                    release_platform,
+                    release_cache_input_sha256,
+                ));
             }
             ActionSpec::ComboVerilogToYosysAbcAig { runtime, .. } => {
                 yosys_runtimes.insert(runtime);
@@ -617,8 +1042,8 @@ pub(crate) fn prepare_queue_runtime_environment(
     for runtime in &yosys_runtimes {
         ensure_yosys_image(repo_root, runtime)?;
     }
-    for (version, platform) in &driver_releases {
-        ensure_driver_release_cache(store, repo_root, version, platform)?;
+    for (version, platform, expected_input_sha256) in &driver_releases {
+        ensure_driver_release_cache(store, repo_root, version, platform, expected_input_sha256)?;
     }
     Ok(())
 }
@@ -930,12 +1355,15 @@ pub(crate) fn bind_driver_runtime_image(
     #[cfg(not(test))]
     {
         ensure_driver_image(repo_root, &runtime)?;
-        runtime.docker_image_id = inspect_image_id(&runtime.docker_image)?.with_context(|| {
+        let image_id = inspect_image_id(&runtime.docker_image)?.with_context(|| {
             format!(
                 "driver image `{}` disappeared after preparation",
                 runtime.docker_image
             )
         })?;
+        let content_ref = docker_image_content_ref(&image_id)?;
+        require_image_runtime_fingerprint(&content_ref, &driver_runtime_fingerprint(&runtime)?)?;
+        runtime.docker_image_id = image_id;
         Ok(runtime)
     }
 }
@@ -958,12 +1386,18 @@ pub(crate) fn bind_yosys_runtime_image(
     #[cfg(not(test))]
     {
         ensure_yosys_image(repo_root, &runtime)?;
-        runtime.docker_image_id = inspect_image_id(&runtime.docker_image)?.with_context(|| {
+        let image_id = inspect_image_id(&runtime.docker_image)?.with_context(|| {
             format!(
                 "Yosys image `{}` disappeared after preparation",
                 runtime.docker_image
             )
         })?;
+        let content_ref = docker_image_content_ref(&image_id)?;
+        require_image_runtime_fingerprint(&content_ref, &yosys_runtime_fingerprint(&runtime)?)?;
+        if !image_has_python3(&content_ref)? {
+            bail!("prepared Yosys image `{content_ref}` lacks python3");
+        }
+        runtime.docker_image_id = image_id;
         Ok(runtime)
     }
 }
@@ -2400,17 +2834,35 @@ mod tests {
         store.ensure_layout().expect("ensure store");
         let version = "v0.39.0";
         let platform = crate::DEFAULT_RELEASE_PLATFORM;
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let expected_input_sha256 = driver_release_cache_input_sha256(repo_root, version, platform)
+            .expect("cache input digest");
         seed_fake_driver_release_cache(&store, version, platform).expect("seed cache");
         let cache_dir = store.driver_release_cache_dir(version, platform);
-        validate_driver_release_cache(&cache_dir, version, platform)
+        validate_driver_release_cache(&cache_dir, version, platform, &expected_input_sha256)
             .expect("seeded cache validates");
 
         fs::write(cache_dir.join("delay_info_main"), b"x").expect("truncate cached binary");
         assert!(
-            validate_driver_release_cache(&cache_dir, version, platform).is_err(),
+            validate_driver_release_cache(&cache_dir, version, platform, &expected_input_sha256,)
+                .is_err(),
             "manifest must reject a same-path truncated cache file"
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    #[ignore = "requires network"]
+    fn release_cache_input_manifest_resolves_live_checksums() {
+        let version = "v0.45.0";
+        let platform = crate::DEFAULT_RELEASE_PLATFORM;
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let inputs = fetch_release_cache_input_manifest(repo_root, version, platform)
+            .expect("resolve live inputs");
+        validate_driver_release_cache_inputs(&inputs, version, platform)
+            .expect("validate live inputs");
+        assert_eq!(inputs.files.len(), 11);
+        assert_eq!(driver_release_cache_input_sha256_hex(&inputs).len(), 64);
     }
 
     #[test]
@@ -2458,6 +2910,12 @@ mod tests {
                 "../../testdata/persistent_runners/fake-driver.Dockerfile"
             ))),
             docker_image_id: String::new(),
+            release_cache_input_sha256: driver_release_cache_input_sha256(
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+                "v0.39.0",
+                crate::DEFAULT_RELEASE_PLATFORM,
+            )
+            .expect("test cache input digest"),
         }
     }
 
@@ -2674,12 +3132,14 @@ mod tests {
         }
         fs::write(cache_dir.join(format!("libxls-{platform}.so")), b"fake-dso")?;
         fs::write(cache_dir.join("dslx_stdlib.tar.gz"), b"fake-stdlib-archive")?;
-        let manifest = build_driver_release_cache_manifest(&cache_dir, version, platform)?;
+        let inputs = resolve_driver_release_cache_input_manifest(&repo_root, version, platform)?;
+        let expected_input_sha256 = driver_release_cache_input_sha256_hex(&inputs);
+        let manifest = build_driver_release_cache_manifest(&cache_dir, version, platform, inputs)?;
         write_cache_manifest_atomic(
             &cache_dir.join(crate::DRIVER_RELEASE_CACHE_READY_FILE),
             &manifest,
         )?;
-        validate_driver_release_cache(&cache_dir, version, platform)?;
+        validate_driver_release_cache(&cache_dir, version, platform, &expected_input_sha256)?;
         Ok(())
     }
 

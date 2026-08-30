@@ -20,14 +20,16 @@ use crate::proto::{
     driver_runtime_to_proto, timestamp_from_proto, timestamp_to_proto,
 };
 use crate::query::{
-    canonical_root_actions_for_crate_version, enqueue_processing_for_crate_version,
-    is_timeout_error, load_stdlib_g8r_vs_yosys_dataset_index, load_versions_cards_index,
-    stdlib_enumeration_status_from_provenance,
+    canonical_root_actions_for_crate_version, canonical_root_actions_for_runtime,
+    enqueue_processing_for_crate_version, is_timeout_error, load_stdlib_g8r_vs_yosys_dataset_index,
+    load_versions_cards_index, stdlib_enumeration_status_from_provenance,
 };
 use crate::queue::{
     QueueState, action_dependency_action_ids, load_queue_canceled_record, queue_state_for_action,
 };
-use crate::runtime::explicit_driver_runtime_for_crate_version;
+use crate::runtime::{
+    explicit_driver_runtime_for_crate_version, explicit_driver_runtime_recipe_for_crate_version,
+};
 use crate::store::ArtifactStore;
 use crate::versioning::{
     cmp_dotted_numeric_version, load_version_compat_map, normalize_tag_version,
@@ -380,6 +382,42 @@ fn canonical_roots(
     Ok(result)
 }
 
+fn canonical_roots_for_runtime(
+    dso_version: &str,
+    runtime: &crate::model::DriverRuntimeSpec,
+) -> Result<Vec<pb::CampaignRootAction>> {
+    let roots = canonical_root_actions_for_runtime(dso_version, runtime)?;
+    let mut result = Vec::with_capacity(roots.len());
+    for action in roots {
+        let action_id = compute_model_action_id_v2(&action)?.to_hex();
+        result.push(pb::CampaignRootAction {
+            action_id: Some(action_id_to_proto(
+                &action_id,
+                "campaign.root_action.action_id",
+            )?),
+            action: Some(action_spec_to_proto(&action)?),
+        });
+    }
+    result.sort_by(|a, b| {
+        a.action_id
+            .as_ref()
+            .map(|id| id.value.as_slice())
+            .cmp(&b.action_id.as_ref().map(|id| id.value.as_slice()))
+    });
+    Ok(result)
+}
+
+fn same_driver_runtime_recipe(
+    lhs: &crate::model::DriverRuntimeSpec,
+    rhs: &crate::model::DriverRuntimeSpec,
+) -> bool {
+    lhs.driver_version == rhs.driver_version
+        && lhs.release_platform == rhs.release_platform
+        && lhs.docker_image == rhs.docker_image
+        && lhs.dockerfile == rhs.dockerfile
+        && lhs.dockerfile_sha256 == rhs.dockerfile_sha256
+}
+
 fn new_manifest(
     repo_root: &Path,
     requested_crate_version: &str,
@@ -611,15 +649,40 @@ pub(crate) fn pending_campaign_versions(
     store: &ArtifactStore,
     repo_root: &Path,
 ) -> Result<Vec<String>> {
-    let finalized_run_ids = list_finalized_campaign_runs(store)?
-        .into_iter()
-        .filter_map(|manifest| manifest.run_id.map(|run_id| run_id.value))
-        .collect::<BTreeSet<_>>();
+    let campaign_id = compute_campaign_id(&load_default_campaign()?)?;
+    let finalized = list_finalized_campaign_runs(store)?;
     let mut pending = Vec::new();
     for version in load_version_compat_map(repo_root)?.into_keys() {
-        let planned = new_manifest(repo_root, &version)?;
-        let run_id = required(&planned.run_id, "planned_campaign_run.run_id")?;
-        if !finalized_run_ids.contains(&run_id.value) {
+        let dso_with_v = resolve_xlsynth_version_for_driver(repo_root, &version)?;
+        let dso_version = normalize_version(&dso_with_v, "dso_version")?;
+        let recipe =
+            explicit_driver_runtime_recipe_for_crate_version(repo_root, &version, &dso_version)?;
+        let is_finalized = finalized.iter().any(|manifest| {
+            let Some(manifest_runtime_pb) = manifest.driver_runtime.as_ref() else {
+                return false;
+            };
+            let Ok(manifest_runtime) =
+                driver_runtime_from_proto(manifest_runtime_pb, "campaign.driver_runtime")
+            else {
+                return false;
+            };
+            let Ok(expected_roots) = canonical_roots_for_runtime(&dso_version, &manifest_runtime)
+            else {
+                return false;
+            };
+            manifest.campaign_id.as_ref() == Some(&campaign_id)
+                && manifest
+                    .crate_version
+                    .as_ref()
+                    .is_some_and(|value| value.value == version)
+                && manifest
+                    .dso_version
+                    .as_ref()
+                    .is_some_and(|value| value.value == dso_version)
+                && same_driver_runtime_recipe(&manifest_runtime, &recipe)
+                && manifest.root_actions == expected_roots
+        });
+        if !is_finalized {
             pending.push(version);
         }
     }
@@ -1313,6 +1376,14 @@ mod tests {
             &dockerfile_path,
         )
         .expect("copy runtime Dockerfile");
+        let cache_script_path = root.join(crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT);
+        fs::create_dir_all(cache_script_path.parent().expect("cache script parent"))
+            .expect("create cache script directory");
+        fs::copy(
+            source_root.join(crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT),
+            &cache_script_path,
+        )
+        .expect("copy cache setup script");
         fs::set_permissions(&dockerfile_path, fs::Permissions::from_mode(0o444))
             .expect("make runtime Dockerfile read-only");
         fs::set_permissions(
@@ -1322,6 +1393,20 @@ mod tests {
         .expect("make Dockerfile directory read-only");
         fs::set_permissions(&compat_path, fs::Permissions::from_mode(0o444))
             .expect("make compatibility map read-only");
+        fs::set_permissions(&cache_script_path, fs::Permissions::from_mode(0o444))
+            .expect("make cache setup script read-only");
+        let mut current = cache_script_path.parent();
+        while let Some(dir) = current {
+            if !dir.starts_with(&root) {
+                break;
+            }
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o555))
+                .expect("make cache script directory read-only");
+            if dir == root {
+                break;
+            }
+            current = dir.parent();
+        }
         let mut current = compat_path.parent();
         while let Some(dir) = current {
             if !dir.starts_with(&root) {
@@ -1341,6 +1426,21 @@ mod tests {
     fn remove_read_only_resource_root(root: &Path) {
         use std::os::unix::fs::PermissionsExt;
 
+        let cache_script_path = root.join(crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT);
+        let mut current = cache_script_path.parent();
+        while let Some(dir) = current {
+            if !dir.starts_with(root) {
+                break;
+            }
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755))
+                .expect("restore cache script directory permissions");
+            if dir == root {
+                break;
+            }
+            current = dir.parent();
+        }
+        fs::set_permissions(&cache_script_path, fs::Permissions::from_mode(0o644))
+            .expect("restore cache setup script permissions");
         let compat_path = root.join(crate::VERSION_COMPAT_PATH);
         let mut current = compat_path.parent();
         while let Some(dir) = current {

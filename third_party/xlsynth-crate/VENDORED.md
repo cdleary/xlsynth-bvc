@@ -1,6 +1,6 @@
 # Vendored xlsynth-crate Assets
 
-This directory contains hermetic third-party assets copied from specific
+This directory contains hermetic third-party assets based on specific
 `xlsynth/xlsynth-crate` release tags.
 
 ## Pinned tool setup script
@@ -10,8 +10,12 @@ This directory contains hermetic third-party assets copied from specific
 - Source path: `scripts/download_release.py`
 - Vendored path: `third_party/xlsynth-crate/v0.29.0/scripts/download_release.py`
 
-The Docker image uses the vendored script from this pinned tag for reproducible
-setup behavior.
+The Docker image uses this pinned script for reproducible setup behavior. The
+vendored copy has a local integrity extension: repeatable `--expected_sha256`
+arguments let the caller require exact checksums without refetching mutable
+sidecar files. Its checked-in bytes are included in each canonical
+`DriverReleaseCacheInputManifest`, so changing the extension changes dependent
+driver action identities.
 
 ## Compatibility map (refreshable)
 

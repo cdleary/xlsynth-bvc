@@ -25,6 +25,7 @@ message QueueRunningRecord {
   string lease_owner = 6;
   google.protobuf.Timestamp lease_acquired_at = 7;
   google.protobuf.Timestamp lease_expires_at = 8;
+  Sha256Digest lease_token = 9;
 }
 
 message QueueDoneRecord {

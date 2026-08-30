@@ -234,6 +234,10 @@ pub(crate) fn driver_runtime_to_proto(
             &value.docker_image_id,
             &format!("{field}.docker_image_id"),
         )?),
+        release_cache_input_sha256: Some(digest_from_hex(
+            &value.release_cache_input_sha256,
+            &format!("{field}.release_cache_input_sha256"),
+        )?),
     })
 }
 
@@ -291,6 +295,13 @@ fn validate_driver_runtime(value: &pb::DriverRuntimeSpec, field: &str) -> Result
     validate_digest(
         required(&value.docker_image_id, &format!("{field}.docker_image_id"))?,
         &format!("{field}.docker_image_id"),
+    )?;
+    validate_digest(
+        required(
+            &value.release_cache_input_sha256,
+            &format!("{field}.release_cache_input_sha256"),
+        )?,
+        &format!("{field}.release_cache_input_sha256"),
     )
 }
 
@@ -980,6 +991,13 @@ pub(crate) fn driver_runtime_from_proto(
             required(&value.docker_image_id, &format!("{field}.docker_image_id"))?,
             &format!("{field}.docker_image_id"),
         )?,
+        release_cache_input_sha256: digest_to_hex(
+            required(
+                &value.release_cache_input_sha256,
+                &format!("{field}.release_cache_input_sha256"),
+            )?,
+            &format!("{field}.release_cache_input_sha256"),
+        )?,
     })
 }
 
@@ -1303,6 +1321,7 @@ mod tests {
             dockerfile: "docker\\xlsynth-driver.Dockerfile".to_string(),
             dockerfile_sha256: "d".repeat(64),
             docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
     }
 
@@ -1560,6 +1579,19 @@ mod tests {
     }
 
     #[test]
+    fn action_id_binds_driver_release_cache_inputs() {
+        let mut actions = sample_actions();
+        let (_, mut action) = actions.remove(4);
+        let first = compute_model_action_id_v2(&action).expect("first");
+        let model::ActionSpec::DriverIrToOpt { runtime, .. } = &mut action else {
+            panic!("expected DriverIrToOpt");
+        };
+        runtime.release_cache_input_sha256 = "a".repeat(64);
+        let second = compute_model_action_id_v2(&action).expect("second");
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn download_action_ids_bind_locked_upstream_inputs() {
         let mut actions = sample_actions();
         let (_, mut stdlib) = actions.remove(1);
@@ -1600,47 +1632,47 @@ mod tests {
             ),
             (
                 "download_release_stdlib",
-                "bbb811263b1f0eaacbc8e73e2a4f4541f40997ae1dbc1b2f9a80e838f0a1ec46",
+                "df432e30ea75e7a64c339faff5932b412319092eab6b33cf5fa64e67241a693f",
             ),
             (
                 "download_source_subtree",
-                "5780c8111ecca48fff5a94cdcea4fef3c217c6be498efc6d44dffe4a42212f43",
+                "cc55a8ea5a0e6db9d6e12408f3f2bd46c3eb705f0a9491f57c7050acb50a424c",
             ),
             (
                 "driver_dslx_fn_to_ir",
-                "94b5be97aa7d94eab0b667a18966197613659ae60684a87cc0bff6435781c090",
+                "7db5ae0259521f7852921d0563eec56526ac22e1c2a85bc773978d679241afe7",
             ),
             (
                 "driver_ir_to_opt",
-                "5280e35e6c308aa7eb2b1e84cb5288e4be8716ae9d4c99620f70072725b79b5a",
+                "b468700e09c93f26606175ab9424dccb6e44ed1d31820887402ebc58cb565f3c",
             ),
             (
                 "driver_ir_to_delay_info",
-                "ea3c7e9ce3f90e56944f474e3ef118145ed6b8a54c57d4d9be2a9c08e65fac4a",
+                "0255cb2e729081b55fd21d25c62326a9afac4b989a9dd5e8d4ff5542dd77d4ff",
             ),
             (
                 "driver_ir_equiv",
-                "9698f2b6f55256979f18a7a20039e5fdab2cb934807457b12450f85f3bb05de3",
+                "4b29ec69e747ca167f016032e8cd1272c6be7d6c3191e17fa362671f9980c8ad",
             ),
             (
                 "driver_ir_aig_equiv",
-                "7c40a11f0cf4e656478638e67a709173f91bce1bc76c1d469e2a3aad7e6c7342",
+                "4c582f6baee46b736d0f2b76fa998c0968f91b06b69a44312bd564c70a077e94",
             ),
             (
                 "driver_ir_to_g8r_aig",
-                "ee01588da3728a59adb579b40ca93c2ab32d51b2c9574234d7ac305d5de50197",
+                "e655a196251225c5c07d8b9aa25beec999996251300c2efb34e35c6e3061b309",
             ),
             (
                 "ir_fn_to_combinational_verilog",
-                "261ff5eaf4accd0916af607589a252261086f559c1f74d71d246c1bae815109f",
+                "6a94ce7dfd3cf2a329a73689a388f5174e09b181e35f6d5121bd089900c80af4",
             ),
             (
                 "ir_fn_to_k_bool_cone_corpus",
-                "7e5a82ad03ed7d1cd3522e70deb5d41355ef8f2cd99d16ad8bdb7b021c707472",
+                "e27dcf9a9f652942edd6c065df1b48e0c5a10e9b78cdbe9cf27a86ede0c718c9",
             ),
             (
                 "ir_fn_to_mffc_corpus",
-                "276f3116d83ac579674993a220808a722c1e9217836cfd4f88a75b9fd59c7770",
+                "4d7bfb87bd9a922538a2052572157090f957aabd591a5ec0299befa5728861e3",
             ),
             (
                 "combo_verilog_to_yosys_abc_aig",
@@ -1652,7 +1684,7 @@ mod tests {
             ),
             (
                 "driver_aig_to_stats",
-                "a58fe5c2547923a48ddcabc1ea7819c88ed7c2e74e37302df2887d97e80d71e8",
+                "abffafa58b08ce058f92c154d79c3d465094e07f0b2f1e334b2b2927dbddfe5d",
             ),
             (
                 "aig_stat_diff",
@@ -1668,7 +1700,6 @@ mod tests {
                 (name, action_id_hex)
             })
             .collect::<Vec<_>>();
-
         assert_eq!(actual.len(), GOLDENS.len());
         for ((actual_name, actual_id), (name, id)) in actual.iter().zip(GOLDENS) {
             assert_eq!(actual_name, name);

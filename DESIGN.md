@@ -90,6 +90,14 @@ occurs, a worker cancels descendants only when its failed terminal transition
 remains authoritative; a failure that loses to committed success performs no
 downstream cancellation.
 
+Each claim also receives a unique lease token. Success and failure commits take
+an advisory per-action transition lock and compare that exact token with the
+current running record before changing terminal state, removing the lease, or
+enqueuing/canceling descendants. An expired worker therefore cannot commit
+against a reclaimed incarnation of the same action. The operating system
+releases the transition lock when a process dies, preserving process-restart
+recovery.
+
 Driver release caches are built entirely in a unique private-state staging
 directory. The downloader may create partial files there, but consumers never
 mount that directory. Setup inventories the exact regular-file closure and
@@ -99,15 +107,27 @@ into its final cache path. A parsed and fully validated manifest, not marker
 existence, is readiness evidence. Cache setup locks contain protobuf owner
 identity and do not age out while the exact local process incarnation is alive.
 
+The cache's upstream closure is identity-bearing as well as locally validated.
+Planning records the published SHA-256 checksums for every required binary,
+DSO, and stdlib archive, plus hashes of the required schema files fetched from
+the checked-in source commit and of the checked-in cache setup script, in a sorted canonical
+`DriverReleaseCacheInputManifest`. Its digest is stored in
+`DriverRuntimeSpec` and therefore in every driver-backed action ID. Cache
+setup must reproduce that digest, passes the captured checksums to the
+downloader, and persists the input manifest alongside the exact materialized
+file inventory. A replaced release asset or changed setup script cannot execute
+under an older action identity.
+
 ## Executable runtime identity
 
 Docker image tags are build inputs and operator-facing names; they are not
 execution identities. Before an action is created, the declared Dockerfile
 recipe is built or verified and the resolved 256-bit OCI image ID is stored in
 the runtime protobuf. That immutable image ID participates in the action ID.
-Execution revalidates the tag-to-ID relationship and invokes Docker by
-`sha256:<image-id>`, so rebuilding a mutable tag cannot silently change an
-existing action.
+Fingerprint validation is performed through the immutable
+`sha256:<image-id>` reference resolved from the tag, and execution uses that
+same immutable reference. A concurrent retag cannot pair one image's validated
+recipe with another image's identity.
 
 Persistent runners are keyed by immutable image ID, store root, protocol
 version, and the checked-in worker script bytes. A named container is reused
@@ -149,6 +169,18 @@ encoding before trusting the bytes. Structural index files additionally require
 their input bytes to already be in canonical form so their manifest-bound
 content digests remain stable.
 
+Public protobufs are canonical byte boundaries, not merely decodable messages.
+Snapshot construction publishes re-encoded public run and analysis messages;
+snapshot and site verification require raw bytes to equal the validated
+message's canonical encoding. Unknown, duplicate, or otherwise ignored wire
+fields therefore cannot carry unreviewed private bytes into the site.
+
+Snapshot and site closure verification reject symlinks and special filesystem
+nodes. Destructive overwrite is rejected before deletion when the output
+equals, contains, or otherwise overlaps a protected input/resource boundary.
+Every site dataset's length and SHA-256 must match the corresponding embedded
+source-snapshot entry, not only its relative path.
+
 Raw executor and discovery error strings are private operational data. Public
 failure and enumeration records use fixed enums and structured counters, such
 as `timeout`, `failed`, or `discovery_failed`, never truncated or redacted
@@ -159,11 +191,13 @@ action arguments. Validation errors likewise identify the field contract
 without echoing a rejected value that may contain private text.
 
 Publication metadata follows the same content-idempotence rule as publication
-identity. A snapshot's `generated_at` value is a deterministic data watermark:
-the newest generation/update timestamp among its included datasets, campaign
-runs, and analyses (or the Unix epoch when no included record has a timestamp).
-Rebuilding unchanged inputs therefore reproduces the same snapshot and site
-bytes even when the publication work directory has been lost.
+identity. Browser-dataset `generated_utc` fields are nonsemantic and normalized
+to the Unix epoch at snapshot time. A snapshot's `generated_at` value is a
+deterministic data watermark: the newest update timestamp among included
+campaign runs and analyses, or the Unix epoch when none is present. Rebuilding
+unchanged store inputs therefore reproduces the same snapshot and site bytes
+even when indices are rebuilt and the publication work directory has been
+lost.
 
 Publication promotion is serialized by an advisory lock in the publication
 root. The lock spans immutable site and catalog promotion, both current-site

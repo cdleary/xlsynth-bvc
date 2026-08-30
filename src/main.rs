@@ -138,8 +138,7 @@ const DEFAULT_K_BOOL_CONE_MAX_IR_OPS: u64 = 16;
 const DEFAULT_MFFC_MIN_INTERNAL_NON_LITERAL: u64 = 4;
 const DELAY_INFO_OUTPUT_FORMAT_TEXTPROTO_V1: &str = "textproto_v1";
 const DSLX_LIST_FNS_LEGACY_SOURCE_DRIVER_MAX: &str = "0.29.0";
-const XLSYNTH_SOURCE_ARCHIVE_URL_PREFIX: &str =
-    "https://github.com/xlsynth/xlsynth/archive/refs/tags";
+const XLSYNTH_SOURCE_ARCHIVE_URL_PREFIX: &str = "https://github.com/xlsynth/xlsynth/archive";
 const MODULE_SUBTREE_ROOT_PATHS: &[&str] = &["xls/modules/add_dual_path"];
 static DOCKER_RUN_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -215,10 +214,15 @@ impl DriverCli {
             repo_root,
             DriverRuntimeSpec {
                 driver_version: resolved_driver_version,
-                release_platform: self.release_platform,
+                release_platform: self.release_platform.clone(),
                 docker_image,
                 dockerfile_sha256: runtime_dockerfile_sha256(repo_root, &dockerfile)?,
                 docker_image_id: String::new(),
+                release_cache_input_sha256: crate::service::driver_release_cache_input_sha256(
+                    repo_root,
+                    xlsynth_version,
+                    &self.release_platform,
+                )?,
                 dockerfile,
             },
         )?;
@@ -314,6 +318,14 @@ mod tests {
             include_bytes!("../docker/xlsynth-driver.Dockerfile"),
         )
         .expect("write test runtime Dockerfile");
+        let cache_script = root.join(VENDORED_DOWNLOAD_RELEASE_SCRIPT);
+        fs::create_dir_all(cache_script.parent().expect("cache script parent"))
+            .expect("create cache script parent");
+        fs::write(
+            &cache_script,
+            include_bytes!("../third_party/xlsynth-crate/v0.29.0/scripts/download_release.py"),
+        )
+        .expect("write test cache setup script");
         root
     }
 
@@ -335,8 +347,8 @@ mod tests {
         builder.finish().expect("finish tarball");
     }
 
-    fn sample_running(action_id: &str) -> QueueRunningWithPath {
-        QueueRunningWithPath {
+    fn sample_running(store: &ArtifactStore, action_id: &str) -> QueueRunningWithPath {
+        let running = QueueRunningWithPath {
             running: QueueRunning {
                 schema_version: ACTION_SCHEMA_VERSION,
                 action_id: action_id.to_string(),
@@ -348,11 +360,21 @@ mod tests {
                     stdlib_tarball_sha256: "11".repeat(32),
                 },
                 lease_owner: "worker-test".to_string(),
+                lease_token: "dd".repeat(32),
                 lease_acquired_utc: Utc::now(),
                 lease_expires_utc: Utc::now(),
             },
-            path: PathBuf::from("/tmp/running.json"),
+            path: store.running_queue_path(action_id),
+        };
+        if let Some(parent) = running.path.parent() {
+            fs::create_dir_all(parent).expect("create running queue parent");
         }
+        fs::write(
+            &running.path,
+            crate::proto::encode_queue_running(&running.running).expect("encode running record"),
+        )
+        .expect("write running record");
+        running
     }
 
     #[test]
@@ -586,6 +608,7 @@ mod tests {
             dockerfile: DEFAULT_DOCKERFILE.to_string(),
             dockerfile_sha256: "d".repeat(64),
             docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         };
         let action = ActionSpec::DriverIrToG8rAig {
             ir_action_id: "opt-ir-action".to_string(),
@@ -659,7 +682,7 @@ mod tests {
     fn write_failed_record_persists_failed_action_record_without_queue_failed_copy() {
         let (store, root) = make_test_store();
         let action_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let running = sample_running(action_id);
+        let running = sample_running(&store, action_id);
         write_failed_record(&store, &running, "worker-a", "boom").expect("writing failed record");
 
         assert!(store.failed_action_record_exists(action_id));

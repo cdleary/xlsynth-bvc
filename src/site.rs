@@ -19,8 +19,7 @@ use walkdir::WalkDir;
 use crate::analysis::decode_analysis_report;
 use crate::proto::v1 as pb;
 use crate::snapshot::{
-    STATIC_SNAPSHOT_MANIFEST_FILENAME, load_static_snapshot_manifest,
-    should_include_snapshot_index_key, verify_static_snapshot,
+    load_static_snapshot_manifest, should_include_snapshot_index_key, verify_static_snapshot,
 };
 
 pub(crate) const STATIC_SITE_RECORD_VERSION: u32 = 1;
@@ -189,6 +188,54 @@ fn ensure_empty_output_dir(path: &Path, overwrite: bool) -> Result<()> {
     }
     fs::create_dir_all(path)
         .with_context(|| format!("creating static site directory: {}", path.display()))
+}
+
+fn normalized_absolute_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("getting current directory for path validation")?
+            .join(path)
+    };
+    let mut existing = absolute.as_path();
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .with_context(|| format!("path has no existing ancestor: {}", absolute.display()))?;
+    }
+    let mut resolved = fs::canonicalize(existing)
+        .with_context(|| format!("canonicalizing path ancestor: {}", existing.display()))?;
+    for component in absolute
+        .strip_prefix(existing)
+        .context("resolving output path suffix")?
+        .components()
+    {
+        match component {
+            Component::Normal(part) => resolved.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("unexpected absolute component in path suffix")
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn reject_site_output_overlap(out_dir: &Path, snapshot_dir: &Path) -> Result<()> {
+    let output = normalized_absolute_path(out_dir)?;
+    let snapshot = normalized_absolute_path(snapshot_dir)?;
+    if output.starts_with(&snapshot) || snapshot.starts_with(&output) {
+        bail!(
+            "static site output must not overlap source snapshot: output={} snapshot={}",
+            output.display(),
+            snapshot.display()
+        );
+    }
+    Ok(())
 }
 
 fn escape_html(value: &str) -> String {
@@ -409,8 +456,14 @@ fn actual_site_relpaths(site_dir: &Path) -> Result<BTreeSet<String>> {
     let mut found = BTreeSet::new();
     for entry in WalkDir::new(site_dir).sort_by_file_name() {
         let entry = entry.context("walking static site")?;
-        if !entry.file_type().is_file() {
+        if entry.file_type().is_dir() {
             continue;
+        }
+        if !entry.file_type().is_file() {
+            bail!(
+                "static site contains a symlink or special filesystem node: {}",
+                entry.path().display()
+            );
         }
         let relpath = entry
             .path()
@@ -432,6 +485,7 @@ pub(crate) fn build_static_site(
     let snapshot = load_static_snapshot_manifest(&options.snapshot_dir)?;
     let base_url = normalize_base_url(&options.base_url)?;
     let root_site_url = site_root_url("index.html")?;
+    reject_site_output_overlap(&options.out_dir, &options.snapshot_dir)?;
     ensure_empty_output_dir(&options.out_dir, options.overwrite)?;
 
     let (css_name, js_name) = static_site_asset_names();
@@ -535,11 +589,11 @@ pub(crate) fn build_static_site(
         "catalog.json",
         &serde_json::to_vec_pretty(&catalog).context("serializing browser catalog")?,
     )?;
-    fs::copy(
-        options.snapshot_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME),
-        options.out_dir.join("snapshot_manifest.v1.pb"),
-    )
-    .context("copying source snapshot manifest into site")?;
+    write_file(
+        &options.out_dir,
+        "snapshot_manifest.v1.pb",
+        &crate::snapshot::encode_static_snapshot_manifest(&snapshot)?,
+    )?;
 
     for run in &catalog.runs {
         let page_relpath = format!("runs/{}/index.html", run.run_id);
@@ -930,12 +984,13 @@ fn analysis_to_browser(report: &pb::AnalysisReport) -> Result<(String, Vec<Brows
 
 pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSummary> {
     let manifest_path = site_dir.join(STATIC_SITE_MANIFEST_FILENAME);
-    let manifest = pb::StaticSiteManifest::decode(
-        fs::read(&manifest_path)
-            .with_context(|| format!("reading site manifest: {}", manifest_path.display()))?
-            .as_slice(),
-    )
-    .context("decoding protobuf site manifest")?;
+    let manifest_bytes = fs::read(&manifest_path)
+        .with_context(|| format!("reading site manifest: {}", manifest_path.display()))?;
+    let manifest = pb::StaticSiteManifest::decode(manifest_bytes.as_slice())
+        .context("decoding protobuf site manifest")?;
+    if manifest.encode_to_vec() != manifest_bytes {
+        bail!("static site manifest is not canonically encoded");
+    }
     if manifest.record_version != STATIC_SITE_RECORD_VERSION {
         bail!(
             "unsupported site manifest version {}; expected {}",
@@ -1048,6 +1103,22 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     if catalog_data_relpaths != snapshot_data_relpaths {
         bail!("static site catalog does not exactly project the embedded source snapshot");
     }
+    for entry in &source_snapshot.dataset_files {
+        let relpath = if entry.relpath.ends_with(".json") {
+            let suffix = entry
+                .relpath
+                .strip_prefix("web_index/")
+                .unwrap_or(&entry.relpath);
+            format!("data/{suffix}")
+        } else {
+            format!("data/{}", entry.relpath)
+        };
+        let bytes = fs::read(site_dir.join(&relpath))
+            .with_context(|| format!("reading snapshot-bound site dataset: {relpath}"))?;
+        if bytes.len() as u64 != entry.bytes || sha256_hex(&bytes) != entry.sha256 {
+            bail!("site dataset does not match embedded source snapshot: {relpath}");
+        }
+    }
 
     let (css_name, js_name) = static_site_asset_names();
     for (relpath, expected_bytes) in [
@@ -1130,12 +1201,19 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         let public_bytes = fs::read(site_dir.join(&run.protobuf_url))?;
         let public = pb::PublicCampaignRun::decode(public_bytes.as_slice())
             .context("decoding catalog public run protobuf")?;
+        if public.encode_to_vec() != public_bytes {
+            bail!("catalog public run protobuf is not canonically encoded");
+        }
         let mut expected = public_run_to_browser(&public, run.protobuf_url.clone())?;
         if let Some(findings_url) = &run.findings_protobuf_url {
             if !declared.contains_key(findings_url) {
                 bail!("run findings protobuf is undeclared: {findings_url}");
             }
-            let report = decode_analysis_report(&fs::read(site_dir.join(findings_url))?)?;
+            let findings_bytes = fs::read(site_dir.join(findings_url))?;
+            let report = decode_analysis_report(&findings_bytes)?;
+            if report.encode_to_vec() != findings_bytes {
+                bail!("run findings protobuf is not canonically encoded: {findings_url}");
+            }
             let (finding_run_id, findings) = analysis_to_browser(&report)?;
             if finding_run_id != run.run_id {
                 bail!("run findings identity mismatch for {}", run.run_id);
@@ -1403,7 +1481,9 @@ mod tests {
     use crate::executor::compute_action_id;
     use crate::model::{ActionSpec, ArtifactRef, ArtifactType, Provenance, QueueFailed};
     use crate::query::{canonical_root_actions_for_crate_version, rebuild_versions_cards_index};
-    use crate::snapshot::{BuildStaticSnapshotOptions, build_static_snapshot};
+    use crate::snapshot::{
+        BuildStaticSnapshotOptions, STATIC_SNAPSHOT_MANIFEST_FILENAME, build_static_snapshot,
+    };
     use crate::store::ArtifactStore;
     use crate::versioning::{load_version_compat_map, resolve_xlsynth_version_for_driver};
     use chrono::Utc;
@@ -1415,6 +1495,10 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("xlsynth-bvc-site-{}-{nanos}", std::process::id()))
+    }
+
+    fn test_repo_root() -> PathBuf {
+        std::env::current_dir().expect("current directory")
     }
 
     fn empty_versions_index_bytes() -> Vec<u8> {
@@ -1459,7 +1543,7 @@ mod tests {
         let snapshot_dir = root.join("snapshot");
         build_static_snapshot(
             &store,
-            &root,
+            &test_repo_root(),
             &BuildStaticSnapshotOptions {
                 out_dir: snapshot_dir.clone(),
                 overwrite: false,
@@ -1642,7 +1726,7 @@ mod tests {
         let snapshot_dir = root.join("snapshot");
         build_static_snapshot(
             &store,
-            &root,
+            &test_repo_root(),
             &BuildStaticSnapshotOptions {
                 out_dir: snapshot_dir.clone(),
                 overwrite: false,
@@ -1664,6 +1748,165 @@ mod tests {
     }
 
     #[test]
+    fn site_overwrite_rejects_snapshot_ancestor_before_deletion() {
+        let root = temp_root();
+        let store = ArtifactStore::new(root.join("store"));
+        store.ensure_layout().expect("store layout");
+        store
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
+            .expect("write dataset");
+        let snapshot_dir = root.join("snapshot");
+        build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+        let marker = snapshot_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME);
+
+        let error = build_static_site(&BuildStaticSiteOptions {
+            snapshot_dir,
+            out_dir: root.clone(),
+            base_url: "/".into(),
+            overwrite: true,
+        })
+        .expect_err("snapshot ancestor output must fail");
+        assert!(format!("{error:#}").contains("must not overlap source snapshot"));
+        assert!(marker.is_file(), "source snapshot must survive rejection");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn site_verifier_rejects_symlinks() {
+        let root = temp_root();
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("store layout");
+        store
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
+            .expect("write dataset");
+        let snapshot_dir = root.join("snapshot");
+        build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+        let site_dir = root.join("site");
+        build_static_site(&BuildStaticSiteOptions {
+            snapshot_dir,
+            out_dir: site_dir.clone(),
+            base_url: "/".into(),
+            overwrite: false,
+        })
+        .expect("build site");
+        std::os::unix::fs::symlink("/tmp", site_dir.join("private-link")).expect("create symlink");
+        let error = verify_static_site(&site_dir).expect_err("symlink must fail");
+        assert!(format!("{error:#}").contains("symlink or special"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn site_verifier_binds_dataset_bytes_to_source_snapshot() {
+        let root = temp_root();
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("store layout");
+        store
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
+            .expect("write dataset");
+        let snapshot_dir = root.join("snapshot");
+        build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+        let site_dir = root.join("site");
+        build_static_site(&BuildStaticSiteOptions {
+            snapshot_dir,
+            out_dir: site_dir.clone(),
+            base_url: "/".into(),
+            overwrite: false,
+        })
+        .expect("build site");
+
+        let dataset_relpath = format!("data/{}", crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME);
+        let dataset_path = site_dir.join(&dataset_relpath);
+        let original = fs::read_to_string(&dataset_path).expect("read dataset");
+        let changed = original.replacen("1970-01-01T00:00:00Z", "1971-01-01T00:00:00Z", 1);
+        assert_ne!(original, changed);
+        fs::write(&dataset_path, changed.as_bytes()).expect("rewrite dataset");
+
+        let catalog_path = site_dir.join("catalog.json");
+        let mut catalog: BrowserCatalog =
+            serde_json::from_slice(&fs::read(&catalog_path).expect("read catalog"))
+                .expect("decode catalog");
+        let dataset = catalog
+            .datasets
+            .iter_mut()
+            .find(|dataset| dataset.url == dataset_relpath)
+            .expect("catalog dataset");
+        dataset.bytes = changed.len() as u64;
+        dataset.sha256 = sha256_hex(changed.as_bytes());
+        fs::write(
+            &catalog_path,
+            serde_json::to_vec(&catalog).expect("encode catalog"),
+        )
+        .expect("rewrite catalog");
+
+        let manifest_path = site_dir.join(STATIC_SITE_MANIFEST_FILENAME);
+        let mut manifest = pb::StaticSiteManifest::decode(
+            fs::read(&manifest_path)
+                .expect("read site manifest")
+                .as_slice(),
+        )
+        .expect("decode site manifest");
+        for relpath in [&dataset_relpath, "catalog.json"] {
+            let replacement =
+                publication_file(&site_dir, relpath).expect("describe changed site file");
+            let slot = manifest
+                .files
+                .iter_mut()
+                .find(|file| {
+                    file.relpath
+                        .as_ref()
+                        .is_some_and(|value| value.value == relpath)
+                })
+                .expect("declared site file");
+            *slot = replacement;
+        }
+        fs::write(&manifest_path, manifest.encode_to_vec()).expect("rewrite site manifest");
+
+        let error = verify_static_site(&site_dir)
+            .expect_err("site data must remain bound to source snapshot");
+        assert!(
+            format!("{error:#}").contains("does not match embedded source snapshot"),
+            "unexpected error: {error:#}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn site_verifier_rejects_self_consistent_non_allowlisted_files() {
         let root = temp_root();
         let store = ArtifactStore::new(root.clone());
@@ -1677,7 +1920,7 @@ mod tests {
         let snapshot_dir = root.join("snapshot");
         build_static_snapshot(
             &store,
-            &root,
+            &test_repo_root(),
             &BuildStaticSnapshotOptions {
                 out_dir: snapshot_dir.clone(),
                 overwrite: false,

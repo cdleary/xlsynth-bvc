@@ -34,6 +34,11 @@ Generated protobuf structs may represent incomplete states. Every message that
 enters action identity, sled, queue storage, or publication must pass an
 explicit validator.
 
+At the public snapshot/site boundary, successful decoding is not sufficient:
+published protobuf bytes must equal the canonical re-encoding of the validated
+message. This prevents unknown or duplicate wire fields from carrying
+unreviewed bytes into a statically served artifact.
+
 Validators enforce at least:
 
 - SHA-256 and action ID byte lengths

@@ -562,9 +562,10 @@ mod tests {
             )
             .expect("write index");
         let snapshot_dir = root.join("snapshot");
+        let repo_root = std::env::current_dir().expect("current directory");
         build_static_snapshot(
             &store,
-            &root,
+            &repo_root,
             &BuildStaticSnapshotOptions {
                 out_dir: snapshot_dir.clone(),
                 overwrite: false,
@@ -616,7 +617,7 @@ mod tests {
             fs::read(site_dir.join(STATIC_SITE_MANIFEST_FILENAME)).expect("first site manifest");
         build_static_snapshot(
             &store,
-            &root,
+            &repo_root,
             &BuildStaticSnapshotOptions {
                 out_dir: snapshot_dir.clone(),
                 overwrite: true,

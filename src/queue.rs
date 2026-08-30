@@ -2,9 +2,11 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +24,57 @@ use crate::store::ArtifactStore;
 
 static CLAIM_SCAN_CURSOR: AtomicUsize = AtomicUsize::new(0);
 static QUEUE_WRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static QUEUE_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct QueueTransitionLock {
+    file: File,
+}
+
+impl QueueTransitionLock {
+    fn acquire(store: &ArtifactStore, action_id: &str) -> Result<Self> {
+        let path = store.queue_transition_lock_path(action_id);
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("queue transition lock path missing parent"))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating queue transition lock directory: {}",
+                parent.display()
+            )
+        })?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening queue transition lock: {}", path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("locking queue transition: {}", path.display()))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for QueueTransitionLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn new_queue_lease_token(action_id: &str, worker_id: &str) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = QUEUE_LEASE_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = Sha256::new();
+    hasher.update(b"xlsynth-bvc/queue-lease/v1\0");
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(now.to_le_bytes());
+    hasher.update(nonce.to_le_bytes());
+    hasher.update(action_id.as_bytes());
+    hasher.update(worker_id.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 fn write_bytes_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
@@ -667,6 +720,7 @@ pub(crate) fn try_claim_pending_item(
         Some(v) => v,
         None => return Ok(None),
     };
+    let _transition_lock = QueueTransitionLock::acquire(store, &action_id)?;
     if terminal_queue_state_for_action(store, &action_id).is_some() {
         remove_file_if_exists(pending_path)?;
         return Ok(None);
@@ -730,6 +784,7 @@ pub(crate) fn try_claim_pending_item(
 
     let lease_acquired_utc = Utc::now();
     let lease_expires_utc = lease_acquired_utc + chrono::Duration::seconds(lease_seconds);
+    let lease_token = new_queue_lease_token(&action_id, worker_id);
     let running = QueueRunning {
         schema_version: crate::ACTION_SCHEMA_VERSION,
         action_id,
@@ -737,6 +792,7 @@ pub(crate) fn try_claim_pending_item(
         priority,
         action,
         lease_owner: worker_id.to_string(),
+        lease_token,
         lease_acquired_utc,
         lease_expires_utc,
     };
@@ -769,7 +825,20 @@ pub(crate) fn write_done_record(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn write_failed_record(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+    worker_id: &str,
+    error: &str,
+) -> Result<bool> {
+    Ok(with_current_running_lease(store, running, || {
+        write_failed_record_for_current_lease(store, running, worker_id, error)
+    })?
+    .unwrap_or(false))
+}
+
+fn write_failed_record_for_current_lease(
     store: &ArtifactStore,
     running: &QueueRunningWithPath,
     worker_id: &str,
@@ -794,6 +863,59 @@ pub(crate) fn write_failed_record(
         return Ok(false);
     }
     Ok(true)
+}
+
+fn current_running_lease_matches(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+) -> Result<bool> {
+    let path = store.running_queue_path(running.action_id());
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading current running lease: {}", path.display()));
+        }
+    };
+    let current = decode_queue_running(&bytes)
+        .with_context(|| format!("decoding current running lease: {}", path.display()))?;
+    Ok(current.action_id == running.running.action_id
+        && current.lease_owner == running.running.lease_owner
+        && current.lease_token == running.running.lease_token)
+}
+
+pub(crate) fn with_current_running_lease<T, F>(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+    operation: F,
+) -> Result<Option<T>>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let _transition_lock = QueueTransitionLock::acquire(store, running.action_id())?;
+    if !current_running_lease_matches(store, running)? {
+        return Ok(None);
+    }
+    operation().map(Some)
+}
+
+pub(crate) fn fail_running_and_cancel_descendants(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+    worker_id: &str,
+    error: &str,
+) -> Result<Option<usize>> {
+    Ok(with_current_running_lease(store, running, || {
+        if !write_failed_record_for_current_lease(store, running, worker_id, error)? {
+            remove_file_if_exists(&running.path)?;
+            return Ok(None);
+        }
+        let canceled = cancel_downstream_pending_actions(store, running.action_id(), worker_id)?;
+        remove_file_if_exists(&running.path)?;
+        Ok(Some(canceled))
+    })?
+    .flatten())
 }
 
 pub(crate) fn write_failed_action_record(
@@ -1130,6 +1252,9 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
     let mut running_paths = list_queue_files(&store.queue_running_dir())?;
     running_paths.sort();
     for running_path in running_paths {
+        let _transition_lock = queue_action_id_from_path(&running_path)
+            .map(|action_id| QueueTransitionLock::acquire(store, &action_id))
+            .transpose()?;
         if let Some(action_id) = queue_action_id_from_path(&running_path)
             && terminal_queue_state_for_action(store, &action_id).is_some()
         {
@@ -1538,6 +1663,7 @@ mod tests {
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
             dockerfile_sha256: "d".repeat(64),
             docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
     }
 
@@ -2154,6 +2280,7 @@ mod tests {
                 priority: 0,
                 action: provenance.action,
                 lease_owner: "duplicate-worker".to_string(),
+                lease_token: "dd".repeat(32),
                 lease_acquired_utc: now,
                 lease_expires_utc: now,
             },
@@ -2166,6 +2293,51 @@ mod tests {
         );
         assert!(!store.failed_action_record_exists(&action_id));
         assert!(store.action_exists(&action_id));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn stale_lease_cannot_fail_newer_lease_or_cancel_descendants() {
+        let (store, root) = make_test_store();
+        let root_action_id =
+            enqueue_action(&store, terminal_test_action()).expect("enqueue root action");
+        let child_action = ActionSpec::DriverIrToOpt {
+            ir_action_id: root_action_id.clone(),
+            top_fn_name: Some("main".to_string()),
+            version: "v0.37.0".to_string(),
+            runtime: sample_runtime(),
+        };
+        let child_action_id =
+            enqueue_action(&store, child_action).expect("enqueue dependent action");
+        let stale = claim_next_pending_item(&store, "worker-a", 1)
+            .expect("claim root")
+            .expect("running root");
+
+        let mut current = stale.running.clone();
+        current.lease_owner = "worker-b".to_string();
+        current.lease_token = "ff".repeat(32);
+        current.lease_acquired_utc = Utc::now();
+        current.lease_expires_utc = Utc::now() + chrono::Duration::seconds(900);
+        write_bytes_atomic(
+            &stale.path,
+            &encode_queue_running(&current).expect("encode new lease"),
+        )
+        .expect("install newer lease");
+
+        assert_eq!(
+            fail_running_and_cancel_descendants(&store, &stale, "worker-a", "late failure")
+                .expect("fenced stale failure"),
+            None
+        );
+        assert!(!store.failed_action_record_exists(&root_action_id));
+        assert!(store.pending_queue_path(&child_action_id).exists());
+        assert!(!store.canceled_queue_path(&child_action_id).exists());
+        let persisted = load_queue_running_record(&store, &root_action_id)
+            .expect("load current running")
+            .expect("current running exists");
+        assert_eq!(persisted.lease_token, current.lease_token);
 
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");

@@ -1168,16 +1168,7 @@ fn record_queue_failure_and_cancel(
     worker_id: &str,
     error_text: &str,
 ) -> Result<Option<usize>> {
-    let failure_won = write_failed_record(store, running, worker_id, error_text)?;
-    remove_file_if_exists(&running.path)?;
-    if !failure_won {
-        return Ok(None);
-    }
-    Ok(Some(cancel_downstream_pending_actions(
-        store,
-        running.action_id(),
-        worker_id,
-    )?))
+    fail_running_and_cancel_descendants(store, running, worker_id, error_text)
 }
 
 pub(crate) fn drain_queue(
@@ -1404,15 +1395,18 @@ fn finalize_successful_queue_action<F>(
 where
     F: FnOnce(),
 {
-    // Keep the running lease visible until post-success bookkeeping finishes so
-    // queue status does not briefly report the worker as idle while it is still
-    // expanding follow-up work.
-    before_mark_done();
-    store.delete_failed_action_record(running.action_id())?;
-    remove_file_if_exists(&store.canceled_queue_path(running.action_id()))?;
-    write_done_record(store, running, output_artifact, worker_id)?;
-    remove_file_if_exists(&store.pending_queue_path(running.action_id()))?;
-    remove_file_if_exists(&running.path)?;
+    with_current_running_lease(store, running, || {
+        // Keep the running lease visible until post-success bookkeeping finishes so
+        // queue status does not briefly report the worker as idle while it is still
+        // expanding follow-up work.
+        before_mark_done();
+        store.delete_failed_action_record(running.action_id())?;
+        remove_file_if_exists(&store.canceled_queue_path(running.action_id()))?;
+        write_done_record(store, running, output_artifact, worker_id)?;
+        remove_file_if_exists(&store.pending_queue_path(running.action_id()))?;
+        remove_file_if_exists(&running.path)?;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -3391,6 +3385,7 @@ mod tests {
             dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
             dockerfile_sha256: "d".repeat(64),
             docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
     }
 
@@ -3645,6 +3640,7 @@ mod tests {
                 priority: crate::DEFAULT_QUEUE_PRIORITY,
                 action,
                 lease_owner: "worker-1".to_string(),
+                lease_token: "dd".repeat(32),
                 lease_acquired_utc: now,
                 lease_expires_utc: now,
             },

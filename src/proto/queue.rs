@@ -201,6 +201,10 @@ pub(crate) fn encode_queue_running(value: &model::QueueRunning) -> Result<Vec<u8
         priority: value.priority,
         action: Some(action_spec_to_proto(&value.action)?),
         lease_owner: value.lease_owner.clone(),
+        lease_token: Some(digest_from_hex(
+            &value.lease_token,
+            "queue_running.lease_token",
+        )?),
         lease_acquired_at: Some(timestamp_to_proto(&value.lease_acquired_utc)),
         lease_expires_at: Some(timestamp_to_proto(&value.lease_expires_utc)),
     }))
@@ -222,6 +226,10 @@ pub(crate) fn decode_queue_running(bytes: &[u8]) -> Result<model::QueueRunning> 
         priority: value.priority,
         action: action_spec_from_proto(required(&value.action, "queue_running.action")?)?,
         lease_owner: value.lease_owner,
+        lease_token: digest_to_hex(
+            required(&value.lease_token, "queue_running.lease_token")?,
+            "queue_running.lease_token",
+        )?,
         lease_acquired_utc: timestamp_from_proto(
             &value.lease_acquired_at,
             "queue_running.lease_acquired_at",
@@ -404,6 +412,7 @@ mod tests {
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
             dockerfile_sha256: "d".repeat(64),
             docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
     }
 
@@ -441,6 +450,7 @@ mod tests {
             priority: 17,
             action: action(),
             lease_owner: "builder-1".to_string(),
+            lease_token: "33".repeat(32),
             lease_acquired_utc: now,
             lease_expires_utc: now + chrono::Duration::seconds(30),
         };

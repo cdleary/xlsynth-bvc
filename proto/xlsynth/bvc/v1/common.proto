@@ -38,6 +38,9 @@ message DriverRuntimeSpec {
   Sha256Digest dockerfile_sha256 = 5;
   // Immutable local OCI image config digest resolved when the action is planned.
   Sha256Digest docker_image_id = 6;
+  // Digest of the canonical DriverReleaseCacheInputManifest for the DSO used
+  // by this action. Cache setup must reproduce this digest before execution.
+  Sha256Digest release_cache_input_sha256 = 7;
 }
 
 // Runtime identity for Yosys/ABC-backed actions.
@@ -56,11 +59,38 @@ message DriverReleaseCacheFile {
   Sha256Digest sha256 = 3;
 }
 
+enum DriverReleaseCacheInputKind {
+  DRIVER_RELEASE_CACHE_INPUT_KIND_UNSPECIFIED = 0;
+  DRIVER_RELEASE_CACHE_INPUT_KIND_RELEASE_ASSET = 1;
+  DRIVER_RELEASE_CACHE_INPUT_KIND_SOURCE_COMMIT_FILE = 2;
+  DRIVER_RELEASE_CACHE_INPUT_KIND_LOCAL_RESOURCE_FILE = 3;
+}
+
+// One immutable upstream input to a materialized driver release cache.
+message DriverReleaseCacheInputFile {
+  DriverReleaseCacheInputKind kind = 1;
+  NormalizedRelpath relpath = 2;
+  Sha256Digest sha256 = 3;
+}
+
+// Canonical, sorted description of every upstream byte string used to build a
+// driver release cache. Release assets are pinned by their published checksum;
+// source files are fetched from source_commit, and local resource files are
+// read from the deployed read-only resource root.
+message DriverReleaseCacheInputManifest {
+  uint32 record_version = 1;
+  DsoVersion dso_version = 2;
+  string platform = 3;
+  string source_commit = 4;
+  repeated DriverReleaseCacheInputFile files = 5;
+}
+
 message DriverReleaseCacheManifest {
   uint32 record_version = 1;
   DsoVersion dso_version = 2;
   string platform = 3;
   repeated DriverReleaseCacheFile files = 4;
+  DriverReleaseCacheInputManifest inputs = 5;
 }
 
 message DriverReleaseCacheSetupLock {

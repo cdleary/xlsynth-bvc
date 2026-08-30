@@ -90,6 +90,7 @@ pub(crate) fn same_driver_runtime(lhs: &DriverRuntimeSpec, rhs: &DriverRuntimeSp
         && lhs.dockerfile == rhs.dockerfile
         && lhs.dockerfile_sha256 == rhs.dockerfile_sha256
         && lhs.docker_image_id == rhs.docker_image_id
+        && lhs.release_cache_input_sha256 == rhs.release_cache_input_sha256
 }
 
 pub(crate) fn details_input_ir_structural_hash(details: &serde_json::Value) -> Option<&str> {
@@ -295,6 +296,7 @@ pub(crate) fn compute_ir_fn_structural_hash(
         repo_root,
         version,
         &runtime_for_hash.release_platform,
+        &runtime_for_hash.release_cache_input_sha256,
     )?;
     let scratch_dir = make_temp_work_dir("ir-fn-structural-hash")?;
     let result = (|| -> Result<(String, CommandTrace)> {
@@ -1003,6 +1005,7 @@ mod tests {
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
             dockerfile_sha256: "d".repeat(64),
             docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
     }
 

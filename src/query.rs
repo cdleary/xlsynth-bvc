@@ -6648,6 +6648,13 @@ pub(crate) fn canonical_root_actions_for_crate_version(
     dso_version: &str,
 ) -> Result<Vec<ActionSpec>> {
     let runtime = explicit_driver_runtime_for_crate_version(repo_root, crate_version, dso_version)?;
+    canonical_root_actions_for_runtime(dso_version, &runtime)
+}
+
+pub(crate) fn canonical_root_actions_for_runtime(
+    dso_version: &str,
+    runtime: &DriverRuntimeSpec,
+) -> Result<Vec<ActionSpec>> {
     let release_input = crate::proto::release_input_for_dso_version(dso_version)?;
     let mut roots = Vec::with_capacity(1 + MODULE_SUBTREE_ROOT_PATHS.len());
     roots.push(ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
@@ -7718,6 +7725,7 @@ mod tests {
             dockerfile: "FROM ubuntu:24.04".to_string(),
             dockerfile_sha256: "d".repeat(64),
             docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
     }
 
@@ -8174,6 +8182,7 @@ mod tests {
                 stdlib_tarball_sha256: "11".repeat(32),
             },
             lease_owner: format!("{runner_prefix}3"),
+            lease_token: "dd".repeat(32),
             lease_acquired_utc: now,
             lease_expires_utc: now + chrono::Duration::seconds(60),
         };
@@ -8188,6 +8197,7 @@ mod tests {
                 stdlib_tarball_sha256: "11".repeat(32),
             },
             lease_owner: "other-host:42:web-runner-7".to_string(),
+            lease_token: "ee".repeat(32),
             lease_acquired_utc: now,
             lease_expires_utc: now + chrono::Duration::seconds(120),
         };
@@ -8245,6 +8255,7 @@ mod tests {
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
             docker_image_id: "e".repeat(64),
             dockerfile_sha256: "d".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         };
 
         let expander_item = QueueItem {

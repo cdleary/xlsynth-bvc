@@ -106,22 +106,70 @@ fn ensure_empty_output_dir(path: &Path, overwrite: bool) -> Result<()> {
     Ok(())
 }
 
+fn normalized_absolute_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("getting current directory for path validation")?
+            .join(path)
+    };
+    let mut existing = absolute.as_path();
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .with_context(|| format!("path has no existing ancestor: {}", absolute.display()))?;
+    }
+    let mut resolved = fs::canonicalize(existing)
+        .with_context(|| format!("canonicalizing path ancestor: {}", existing.display()))?;
+    for component in absolute
+        .strip_prefix(existing)
+        .context("resolving output path suffix")?
+        .components()
+    {
+        match component {
+            Component::Normal(part) => resolved.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("unexpected absolute component in path suffix")
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn reject_snapshot_output_overlap(
+    out_dir: &Path,
+    store: &ArtifactStore,
+    repo_root: &Path,
+) -> Result<()> {
+    let output = normalized_absolute_path(out_dir)?;
+    let store_root = normalized_absolute_path(&store.root)?;
+    if store_root.starts_with(&output) {
+        bail!(
+            "snapshot output must not equal or contain the private store: output={} store={}",
+            output.display(),
+            store_root.display()
+        );
+    }
+    let resource_root = normalized_absolute_path(repo_root)?;
+    if output.starts_with(&resource_root) || resource_root.starts_with(&output) {
+        bail!(
+            "snapshot output must not overlap the resource root: output={} resource={}",
+            output.display(),
+            resource_root.display()
+        );
+    }
+    Ok(())
+}
+
 fn observe_generated_utc(latest: &mut Option<DateTime<Utc>>, candidate: DateTime<Utc>) {
     if latest.as_ref().is_none_or(|current| candidate > *current) {
         *latest = Some(candidate);
     }
-}
-
-fn observe_json_generated_utc(latest: &mut Option<DateTime<Utc>>, bytes: &[u8]) {
-    let Some(value) = serde_json::from_slice::<serde_json::Value>(bytes)
-        .ok()
-        .and_then(|value| value.get("generated_utc").cloned())
-        .and_then(|value| value.as_str().map(str::to_string))
-        .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
-    else {
-        return;
-    };
-    observe_generated_utc(latest, value.with_timezone(&Utc));
 }
 
 fn observe_proto_generated_utc(
@@ -216,6 +264,51 @@ fn write_snapshot_dataset_entry(
 ) -> Result<StaticSnapshotDatasetFile> {
     let bytes = crate::query::canonicalize_public_web_index_json(index_key, bytes)
         .with_context(|| format!("projecting allowlisted public dataset {index_key}"))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).context("decoding canonical public dataset")?;
+    let Some(generated_utc) = value
+        .as_object()
+        .and_then(|object| object.get("generated_utc"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        let disk_path = snapshot_web_index_path(out_dir, index_key)?;
+        if let Some(parent) = disk_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("creating snapshot dataset parent: {}", parent.display())
+            })?;
+        }
+        fs::write(&disk_path, &bytes)
+            .with_context(|| format!("writing snapshot dataset file: {}", disk_path.display()))?;
+        let relpath = disk_path
+            .strip_prefix(out_dir)
+            .context("computing snapshot dataset relpath")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        return Ok(StaticSnapshotDatasetFile {
+            index_key: index_key.to_string(),
+            relpath,
+            bytes: bytes.len() as u64,
+            sha256: sha256_hex(&bytes),
+        });
+    };
+    let encoded_old = serde_json::to_string(generated_utc)
+        .context("encoding original public dataset timestamp")?;
+    let encoded_epoch = serde_json::to_string("1970-01-01T00:00:00Z")
+        .context("encoding normalized public dataset timestamp")?;
+    let mut normalized =
+        String::from_utf8(bytes).context("canonical public dataset is not UTF-8")?;
+    let compact = format!("\"generated_utc\":{encoded_old}");
+    let pretty = format!("\"generated_utc\": {encoded_old}");
+    let (needle, replacement) = if normalized.contains(&compact) {
+        (compact, format!("\"generated_utc\":{encoded_epoch}"))
+    } else if normalized.contains(&pretty) {
+        (pretty, format!("\"generated_utc\": {encoded_epoch}"))
+    } else {
+        bail!("canonical public dataset lacks its typed generated_utc field");
+    };
+    normalized = normalized.replacen(&needle, &replacement, 1);
+    let bytes = crate::query::canonicalize_public_web_index_json(index_key, normalized.as_bytes())
+        .with_context(|| format!("canonicalizing timestamp-normalized dataset {index_key}"))?;
     let disk_path = snapshot_web_index_path(out_dir, index_key)?;
     if let Some(parent) = disk_path.parent() {
         fs::create_dir_all(parent)
@@ -616,7 +709,9 @@ fn snapshot_id_for_dataset_files(
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn encode_static_snapshot_manifest(manifest: &StaticSnapshotManifest) -> Result<Vec<u8>> {
+pub(crate) fn encode_static_snapshot_manifest(
+    manifest: &StaticSnapshotManifest,
+) -> Result<Vec<u8>> {
     if manifest.schema_version != STATIC_SNAPSHOT_SCHEMA_VERSION {
         bail!(
             "unsupported static snapshot schema_version={} expected {}",
@@ -827,6 +922,13 @@ pub(crate) fn load_static_snapshot_manifest(snapshot_dir: &Path) -> Result<Stati
             expected_id
         );
     }
+    let canonical = encode_static_snapshot_manifest(&manifest)?;
+    if canonical != bytes {
+        bail!(
+            "static snapshot manifest is not canonically encoded: {}",
+            manifest_path.display()
+        );
+    }
     Ok(manifest)
 }
 
@@ -835,6 +937,7 @@ pub(crate) fn build_static_snapshot(
     repo_root: &Path,
     options: &BuildStaticSnapshotOptions,
 ) -> Result<BuildStaticSnapshotSummary> {
+    reject_snapshot_output_overlap(&options.out_dir, store, repo_root)?;
     ensure_empty_output_dir(&options.out_dir, options.overwrite)?;
     fs::create_dir_all(options.out_dir.join(STATIC_SNAPSHOT_WEB_INDEX_DIR)).with_context(|| {
         format!(
@@ -853,12 +956,6 @@ pub(crate) fn build_static_snapshot(
     if !options.skip_rebuild_web_indices {
         let direct_files = rebuild_snapshot_web_indices(store, repo_root, &options.out_dir)
             .context("rebuilding snapshot web indices before snapshot")?;
-        for entry in &direct_files {
-            let path = options.out_dir.join(&entry.relpath);
-            let bytes = fs::read(&path)
-                .with_context(|| format!("reading rebuilt snapshot dataset: {}", path.display()))?;
-            observe_json_generated_utc(&mut latest_source_generated_utc, &bytes);
-        }
         total_dataset_bytes += direct_files.iter().map(|entry| entry.bytes).sum::<u64>();
         dataset_files.extend(direct_files);
     }
@@ -874,7 +971,6 @@ pub(crate) fn build_static_snapshot(
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (index_key, bytes) in entries {
-        observe_json_generated_utc(&mut latest_source_generated_utc, &bytes);
         let entry = write_snapshot_dataset_entry(&options.out_dir, &index_key, &bytes)?;
         total_dataset_bytes += entry.bytes;
         dataset_files.push(entry);
@@ -934,7 +1030,7 @@ pub(crate) fn build_static_snapshot(
                 &options.out_dir,
                 &run_id,
                 "findings.pb",
-                &analysis_bytes,
+                &analysis.encode_to_vec(),
             )?;
             total_dataset_bytes += entry.bytes;
             dataset_files.push(entry);
@@ -1066,6 +1162,12 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
             let public_run = pb::PublicCampaignRun::decode(bytes.as_slice())
                 .with_context(|| format!("decoding public campaign run: {}", entry.relpath))?;
             validate_public_run(&public_run)?;
+            if public_run.encode_to_vec() != bytes {
+                bail!(
+                    "public campaign run is not canonically encoded: {}",
+                    entry.relpath
+                );
+            }
             let run_id = digest_to_hex(
                 public_run
                     .run_id
@@ -1091,6 +1193,12 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
         } else if entry.index_key.starts_with("runs/") && entry.index_key.ends_with("/findings.pb")
         {
             let report = decode_analysis_report(&bytes)?;
+            if report.encode_to_vec() != bytes {
+                bail!(
+                    "analysis report is not canonically encoded: {}",
+                    entry.relpath
+                );
+            }
             let run_id = digest_to_hex(
                 report
                     .run_id
@@ -1147,8 +1255,14 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
 
     for entry in WalkDir::new(snapshot_dir).sort_by_file_name() {
         let entry = entry.context("walking snapshot directory during verification")?;
-        if !entry.file_type().is_file() {
+        if entry.file_type().is_dir() {
             continue;
+        }
+        if !entry.file_type().is_file() {
+            bail!(
+                "snapshot contains a symlink or special filesystem node: {}",
+                entry.path().display()
+            );
         }
         let relpath = entry
             .path()
@@ -1244,6 +1358,10 @@ mod tests {
         path
     }
 
+    fn test_repo_root() -> PathBuf {
+        std::env::current_dir().expect("current directory")
+    }
+
     #[test]
     fn static_snapshot_build_and_verify_roundtrip() {
         let root = make_temp_dir("build-verify");
@@ -1288,7 +1406,7 @@ mod tests {
         let out_dir = root.join("snapshot-out");
         let summary = build_static_snapshot(
             &store,
-            &root,
+            &test_repo_root(),
             &BuildStaticSnapshotOptions {
                 out_dir: out_dir.clone(),
                 overwrite: false,
@@ -1305,7 +1423,7 @@ mod tests {
             fs::read(out_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME)).expect("first manifest");
         let second = build_static_snapshot(
             &store,
-            &root,
+            &test_repo_root(),
             &BuildStaticSnapshotOptions {
                 out_dir: out_dir.clone(),
                 overwrite: true,
@@ -1318,6 +1436,132 @@ mod tests {
             first_manifest,
             fs::read(out_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME)).expect("second manifest")
         );
+    }
+
+    #[test]
+    fn default_snapshot_rebuild_is_content_idempotent() {
+        let root = make_temp_dir("default-rebuild-idempotent");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("ensure layout");
+        crate::service::populate_ir_fn_corpus_structural_index(
+            &store,
+            &test_repo_root(),
+            &root.join("unused-structural-output"),
+            false,
+            1,
+        )
+        .expect("seed empty structural index");
+        let out_dir = root.join("snapshot-out");
+        let options = BuildStaticSnapshotOptions {
+            out_dir: out_dir.clone(),
+            overwrite: false,
+            skip_rebuild_web_indices: false,
+        };
+        let first =
+            build_static_snapshot(&store, &test_repo_root(), &options).expect("first snapshot");
+        let first_manifest =
+            fs::read(out_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME)).expect("first manifest");
+
+        let second = build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                overwrite: true,
+                ..options
+            },
+        )
+        .expect("second snapshot");
+        let second_manifest =
+            fs::read(out_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME)).expect("second manifest");
+
+        assert_eq!(first.snapshot_id, second.snapshot_id);
+        assert_eq!(first_manifest, second_manifest);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn snapshot_overwrite_rejects_store_ancestor_before_deletion() {
+        let root = make_temp_dir("reject-store-ancestor");
+        let store = ArtifactStore::new(root.join("private-store"));
+        store.ensure_layout().expect("ensure layout");
+        let marker = store.root.join("must-survive");
+        fs::write(&marker, b"private").expect("write marker");
+
+        let error = build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: root.clone(),
+                overwrite: true,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect_err("store ancestor output must fail");
+        assert!(format!("{error:#}").contains("must not equal or contain the private store"));
+        assert_eq!(fs::read(&marker).expect("marker survives"), b"private");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn snapshot_verifier_rejects_symlinks() {
+        let root = make_temp_dir("reject-symlink");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("ensure layout");
+        store
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
+            .expect("write web index");
+        let snapshot_dir = root.join("snapshot-out");
+        build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+        std::os::unix::fs::symlink("/tmp", snapshot_dir.join("private-link"))
+            .expect("create symlink");
+        let error = verify_static_snapshot(&snapshot_dir).expect_err("symlink must fail");
+        assert!(format!("{error:#}").contains("symlink or special"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn snapshot_manifest_rejects_unknown_wire_fields() {
+        let root = make_temp_dir("reject-unknown-wire");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("ensure layout");
+        store
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
+            .expect("write web index");
+        let snapshot_dir = root.join("snapshot-out");
+        build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+        let manifest_path = snapshot_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME);
+        let mut bytes = fs::read(&manifest_path).expect("read manifest");
+        bytes.extend_from_slice(&[0xa2, 0x06, 0x07]);
+        bytes.extend_from_slice(b"private");
+        fs::write(&manifest_path, bytes).expect("append unknown field");
+        let error =
+            load_static_snapshot_manifest(&snapshot_dir).expect_err("unknown wire must fail");
+        assert!(format!("{error:#}").contains("not canonically encoded"));
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -1335,7 +1579,7 @@ mod tests {
         let out_dir = root.join("snapshot-out");
         build_static_snapshot(
             &store,
-            &root,
+            &test_repo_root(),
             &BuildStaticSnapshotOptions {
                 out_dir: out_dir.clone(),
                 overwrite: false,
@@ -1370,7 +1614,7 @@ mod tests {
         let snapshot_dir = root.join("snapshot-out");
         build_static_snapshot(
             &store,
-            &root,
+            &test_repo_root(),
             &BuildStaticSnapshotOptions {
                 out_dir: snapshot_dir.clone(),
                 overwrite: false,
@@ -1416,7 +1660,7 @@ mod tests {
         let snapshot_dir = root.join("snapshot-out");
         build_static_snapshot(
             &store,
-            &root,
+            &test_repo_root(),
             &BuildStaticSnapshotOptions {
                 out_dir: snapshot_dir.clone(),
                 overwrite: false,
@@ -1473,7 +1717,7 @@ mod tests {
         let out_dir = root.join("snapshot-out");
         let summary = build_static_snapshot(
             &store,
-            &root,
+            &test_repo_root(),
             &BuildStaticSnapshotOptions {
                 out_dir: out_dir.clone(),
                 overwrite: false,
@@ -1520,7 +1764,7 @@ mod tests {
         let out_dir = root.join("snapshot-out");
         let summary = build_static_snapshot(
             &store,
-            &root,
+            &test_repo_root(),
             &BuildStaticSnapshotOptions {
                 out_dir: out_dir.clone(),
                 overwrite: false,
@@ -1588,7 +1832,7 @@ mod tests {
 
         let error = build_static_snapshot(
             &store,
-            &root,
+            &test_repo_root(),
             &BuildStaticSnapshotOptions {
                 out_dir: root.join("snapshot-out"),
                 overwrite: false,
@@ -1660,7 +1904,7 @@ mod tests {
         let out_dir = root.join("snapshot-out");
         let summary = build_static_snapshot(
             &store,
-            &root,
+            &test_repo_root(),
             &BuildStaticSnapshotOptions {
                 out_dir: out_dir.clone(),
                 overwrite: false,

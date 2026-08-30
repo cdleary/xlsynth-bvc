@@ -1333,6 +1333,7 @@ mod tests {
             dockerfile: "docker/xlsynth-driver.Dockerfile".into(),
             dockerfile_sha256: "d".repeat(64),
             docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         };
         let enumeration_runtime = model::DriverRuntimeSpec {
             driver_version: "0.48.0".into(),
@@ -1341,6 +1342,7 @@ mod tests {
             dockerfile: "docker/xlsynth-driver.Dockerfile".into(),
             docker_image_id: "e".repeat(64),
             dockerfile_sha256: "d".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         };
         let failed_dslx_files = if failed_file {
             vec!["xls/dslx/stdlib/bad.x".to_string()]

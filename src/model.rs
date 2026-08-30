@@ -13,6 +13,7 @@ pub(crate) struct DriverRuntimeSpec {
     pub(crate) dockerfile: String,
     pub(crate) docker_image_id: String,
     pub(crate) dockerfile_sha256: String,
+    pub(crate) release_cache_input_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -316,6 +317,7 @@ pub(crate) struct QueueRunning {
     pub(crate) priority: i32,
     pub(crate) action: ActionSpec,
     pub(crate) lease_owner: String,
+    pub(crate) lease_token: String,
     pub(crate) lease_acquired_utc: DateTime<Utc>,
     pub(crate) lease_expires_utc: DateTime<Utc>,
 }
@@ -867,6 +869,7 @@ mod tests {
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
             dockerfile_sha256: "d".repeat(64),
             docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
     }
 

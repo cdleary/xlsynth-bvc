@@ -99,6 +99,7 @@ pub(crate) fn resolve_driver_runtime_for_aig_stats(
             dockerfile: source_runtime.dockerfile.clone(),
             dockerfile_sha256: source_runtime.dockerfile_sha256.clone(),
             docker_image_id: String::new(),
+            release_cache_input_sha256: source_runtime.release_cache_input_sha256.clone(),
         },
     )
 }
@@ -133,6 +134,7 @@ pub(crate) fn resolve_driver_runtime_for_dslx_list_fns(
             dockerfile: source_runtime.dockerfile.clone(),
             dockerfile_sha256: source_runtime.dockerfile_sha256.clone(),
             docker_image_id: String::new(),
+            release_cache_input_sha256: source_runtime.release_cache_input_sha256.clone(),
         },
     )
 }
@@ -159,6 +161,11 @@ pub(crate) fn canonical_stdlib_discovery_runtime_for_version(
                         crate::DEFAULT_DOCKERFILE,
                     )?,
                     docker_image_id: String::new(),
+                    release_cache_input_sha256: crate::service::driver_release_cache_input_sha256(
+                        repo_root,
+                        requested_xlsynth_version,
+                        crate::DEFAULT_RELEASE_PLATFORM,
+                    )?,
                 },
             )
         }
@@ -223,6 +230,11 @@ pub(crate) fn default_driver_runtime_for_version(
             dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
             dockerfile_sha256: runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?,
             docker_image_id: String::new(),
+            release_cache_input_sha256: crate::service::driver_release_cache_input_sha256(
+                repo_root,
+                requested_xlsynth_version,
+                crate::DEFAULT_RELEASE_PLATFORM,
+            )?,
         },
     )?;
     ensure_driver_runtime_compatibility(repo_root, &runtime, requested_xlsynth_version)?;
@@ -234,18 +246,34 @@ pub(crate) fn explicit_driver_runtime_for_crate_version(
     crate_version: &str,
     requested_xlsynth_version: &str,
 ) -> Result<DriverRuntimeSpec> {
-    let driver_version = crate::versioning::normalize_tag_version(crate_version).to_string();
-    let runtime = crate::service::bind_driver_runtime_image(
+    let mut runtime = explicit_driver_runtime_recipe_for_crate_version(
         repo_root,
-        DriverRuntimeSpec {
-            driver_version: driver_version.clone(),
-            release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
-            docker_image: default_driver_image(&driver_version),
-            dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
-            dockerfile_sha256: runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?,
-            docker_image_id: String::new(),
-        },
+        crate_version,
+        requested_xlsynth_version,
     )?;
+    runtime.release_cache_input_sha256 = crate::service::driver_release_cache_input_sha256(
+        repo_root,
+        requested_xlsynth_version,
+        &runtime.release_platform,
+    )?;
+    crate::service::bind_driver_runtime_image(repo_root, runtime)
+}
+
+pub(crate) fn explicit_driver_runtime_recipe_for_crate_version(
+    repo_root: &Path,
+    crate_version: &str,
+    requested_xlsynth_version: &str,
+) -> Result<DriverRuntimeSpec> {
+    let driver_version = crate::versioning::normalize_tag_version(crate_version).to_string();
+    let runtime = DriverRuntimeSpec {
+        driver_version: driver_version.clone(),
+        release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
+        docker_image: default_driver_image(&driver_version),
+        dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+        dockerfile_sha256: runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?,
+        docker_image_id: String::new(),
+        release_cache_input_sha256: String::new(),
+    };
     ensure_driver_runtime_compatibility(repo_root, &runtime, requested_xlsynth_version)?;
     Ok(runtime)
 }
