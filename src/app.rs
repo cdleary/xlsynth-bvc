@@ -1290,7 +1290,64 @@ pub(crate) fn drain_queue(
                 .iter()
                 .map(|running| running.action().clone())
                 .collect();
-            let batch_results = match execute_action_batch(store, batch_actions) {
+            let fenced_batch_results = with_current_running_leases(store, &running_batch, || {
+                let execution_result = execute_action_batch(store, batch_actions);
+                if let Ok(batch_results) = &execution_result {
+                    let result_by_action_id = batch_results
+                        .iter()
+                        .map(|result| (result.action_id.as_str(), result))
+                        .collect::<HashMap<_, _>>();
+                    for running in &running_batch {
+                        let Some(result) = result_by_action_id.get(running.action_id()) else {
+                            continue;
+                        };
+                        let Some(output_artifact) = result.output_artifact.clone() else {
+                            continue;
+                        };
+                        finalize_successful_queue_action_locked(
+                            store,
+                            running,
+                            output_artifact,
+                            worker_id,
+                            || {
+                                if let Err(err) =
+                                    note_completed_action_for_previous_loss_k_cone_policy(
+                                        store,
+                                        running.action_id(),
+                                    )
+                                {
+                                    eprintln!(
+                                        "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
+                                        running.action_id(),
+                                        err
+                                    );
+                                }
+                                if crate::auto_suggested_enqueue_enabled()
+                                    && let Err(err) = enqueue_suggested_actions(
+                                        store,
+                                        repo_root,
+                                        running.action_id(),
+                                        false,
+                                        1,
+                                        running.priority(),
+                                    )
+                                {
+                                    eprintln!(
+                                        "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
+                                        running.action_id(),
+                                        err
+                                    );
+                                }
+                            },
+                        )?;
+                    }
+                }
+                Ok(execution_result)
+            })?;
+            let Some(batch_results) = fenced_batch_results else {
+                continue;
+            };
+            let batch_results = match batch_results {
                 Ok(results) => results,
                 Err(err) => {
                     let error_text = format!("{:#}", err);
@@ -1316,48 +1373,14 @@ pub(crate) fn drain_queue(
                         running.action_id()
                     );
                     if let Some(canceled_now) =
-                        record_queue_failure_and_cancel(store, &running, worker_id, &error_text)?
+                        record_queue_failure_and_cancel(store, running, worker_id, &error_text)?
                     {
                         failed += 1;
                         canceled += canceled_now;
                     }
                     continue;
                 };
-                if let Some(output_artifact) = result.output_artifact.clone() {
-                    finalize_successful_queue_action(
-                        store,
-                        &running,
-                        output_artifact,
-                        worker_id,
-                        || {
-                            if let Err(err) = note_completed_action_for_previous_loss_k_cone_policy(
-                                store,
-                                running.action_id(),
-                            ) {
-                                eprintln!(
-                                    "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
-                                    running.action_id(),
-                                    err
-                                );
-                            }
-                            if crate::auto_suggested_enqueue_enabled()
-                                && let Err(err) = enqueue_suggested_actions(
-                                    store,
-                                    repo_root,
-                                    running.action_id(),
-                                    false,
-                                    1,
-                                    running.priority(),
-                                )
-                            {
-                                eprintln!(
-                                    "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
-                                    running.action_id(),
-                                    err
-                                );
-                            }
-                        },
-                    )?;
+                if result.output_artifact.is_some() {
                     drained += 1;
                 } else {
                     let error_text = result
@@ -1366,7 +1389,7 @@ pub(crate) fn drain_queue(
                         .unwrap_or("batched execution failed without an error payload")
                         .to_string();
                     if let Some(canceled_now) =
-                        record_queue_failure_and_cancel(store, &running, worker_id, &error_text)?
+                        record_queue_failure_and_cancel(store, running, worker_id, &error_text)?
                     {
                         failed += 1;
                         canceled += canceled_now;
@@ -1376,45 +1399,53 @@ pub(crate) fn drain_queue(
             continue;
         }
 
-        let action_result = execute_action(store, running_batch[0].action().clone());
-        match action_result {
-            Ok((_action_id, output_artifact)) => {
-                finalize_successful_queue_action(
-                    store,
-                    &running_batch[0],
-                    output_artifact,
-                    worker_id,
-                    || {
-                        if let Err(err) = note_completed_action_for_previous_loss_k_cone_policy(
-                            store,
-                            running_batch[0].action_id(),
-                        ) {
-                            eprintln!(
-                                "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
-                                running_batch[0].action_id(),
-                                err
-                            );
-                        }
-                        if crate::auto_suggested_enqueue_enabled()
-                            && let Err(err) = enqueue_suggested_actions(
+        let fenced_action_result = with_current_running_lease(store, &running_batch[0], || {
+            match execute_action(store, running_batch[0].action().clone()) {
+                Ok((_action_id, output_artifact)) => {
+                    finalize_successful_queue_action_locked(
+                        store,
+                        &running_batch[0],
+                        output_artifact,
+                        worker_id,
+                        || {
+                            if let Err(err) = note_completed_action_for_previous_loss_k_cone_policy(
                                 store,
-                                repo_root,
                                 running_batch[0].action_id(),
-                                false,
-                                1,
-                                running_batch[0].priority(),
-                            )
-                        {
-                            eprintln!(
-                                "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
-                                running_batch[0].action_id(),
-                                err
-                            );
-                        }
-                    },
-                )?;
-                drained += 1;
+                            ) {
+                                eprintln!(
+                                    "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
+                                    running_batch[0].action_id(),
+                                    err
+                                );
+                            }
+                            if crate::auto_suggested_enqueue_enabled()
+                                && let Err(err) = enqueue_suggested_actions(
+                                    store,
+                                    repo_root,
+                                    running_batch[0].action_id(),
+                                    false,
+                                    1,
+                                    running_batch[0].priority(),
+                                )
+                            {
+                                eprintln!(
+                                    "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
+                                    running_batch[0].action_id(),
+                                    err
+                                );
+                            }
+                        },
+                    )?;
+                    Ok(Ok(()))
+                }
+                Err(error) => Ok(Err(error)),
             }
+        })?;
+        let Some(action_result) = fenced_action_result else {
+            continue;
+        };
+        match action_result {
+            Ok(()) => drained += 1,
             Err(err) => {
                 let error_text = format!("{:#}", err);
                 if let Some(canceled_now) = record_queue_failure_and_cancel(
@@ -1444,6 +1475,7 @@ pub(crate) fn drain_queue(
     Ok(drained)
 }
 
+#[cfg(test)]
 fn finalize_successful_queue_action<F>(
     store: &ArtifactStore,
     running: &QueueRunningWithPath,
@@ -1455,17 +1487,36 @@ where
     F: FnOnce(),
 {
     with_current_running_lease(store, running, || {
-        // Keep the running lease visible until post-success bookkeeping finishes so
-        // queue status does not briefly report the worker as idle while it is still
-        // expanding follow-up work.
-        before_mark_done();
-        store.delete_failed_action_record(running.action_id())?;
-        remove_file_if_exists(&store.canceled_queue_path(running.action_id()))?;
-        write_done_record(store, running, output_artifact, worker_id)?;
-        remove_file_if_exists(&store.pending_queue_path(running.action_id()))?;
-        remove_file_if_exists(&running.path)?;
-        Ok(())
+        finalize_successful_queue_action_locked(
+            store,
+            running,
+            output_artifact,
+            worker_id,
+            before_mark_done,
+        )
     })?;
+    Ok(())
+}
+
+fn finalize_successful_queue_action_locked<F>(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+    output_artifact: ArtifactRef,
+    worker_id: &str,
+    before_mark_done: F,
+) -> Result<()>
+where
+    F: FnOnce(),
+{
+    // Keep the running lease visible until post-success bookkeeping finishes so
+    // queue status does not briefly report the worker as idle while it is still
+    // expanding follow-up work.
+    before_mark_done();
+    store.delete_failed_action_record(running.action_id())?;
+    remove_file_if_exists(&store.canceled_queue_path(running.action_id()))?;
+    write_done_record(store, running, output_artifact, worker_id)?;
+    remove_file_if_exists(&store.pending_queue_path(running.action_id()))?;
+    remove_file_if_exists(&running.path)?;
     Ok(())
 }
 

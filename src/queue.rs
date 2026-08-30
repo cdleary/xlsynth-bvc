@@ -855,9 +855,36 @@ pub(crate) fn with_current_running_lease<T, F>(
 where
     F: FnOnce() -> Result<T>,
 {
-    let _transition_lock = QueueTransitionLock::acquire(store, running.action_id())?;
-    if !current_running_lease_matches(store, running)? {
-        return Ok(None);
+    with_current_running_leases(store, std::slice::from_ref(running), operation)
+}
+
+pub(crate) fn with_current_running_leases<T, F>(
+    store: &ArtifactStore,
+    running: &[QueueRunningWithPath],
+    operation: F,
+) -> Result<Option<T>>
+where
+    F: FnOnce() -> Result<T>,
+{
+    if running.is_empty() {
+        bail!("queue lease fence requires at least one running action");
+    }
+    let mut ordered = running.iter().collect::<Vec<_>>();
+    ordered.sort_by(|a, b| a.action_id().cmp(b.action_id()));
+    if ordered
+        .windows(2)
+        .any(|pair| pair[0].action_id() == pair[1].action_id())
+    {
+        bail!("queue lease fence contains a duplicate action_id");
+    }
+    let _transition_locks = ordered
+        .iter()
+        .map(|running| QueueTransitionLock::acquire(store, running.action_id()))
+        .collect::<Result<Vec<_>>>()?;
+    for running in running {
+        if !current_running_lease_matches(store, running)? {
+            return Ok(None);
+        }
     }
     operation().map(Some)
 }
@@ -2507,6 +2534,61 @@ mod tests {
             .expect("load current running")
             .expect("current running exists");
         assert_eq!(persisted.lease_token, current.lease_token);
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn execution_fence_blocks_expired_lease_reclamation_until_operation_finishes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (store, root) = make_test_store();
+        enqueue_action(&store, terminal_test_action()).expect("enqueue action");
+        let running = claim_next_pending_item(&store, "foreign-worker", -1)
+            .expect("claim action")
+            .expect("running action");
+        let store = Arc::new(store);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let execution_store = Arc::clone(&store);
+        let execution = thread::spawn(move || {
+            with_current_running_lease(&execution_store, &running, || {
+                entered_tx.send(()).expect("signal execution fence");
+                release_rx.recv().expect("release execution fence");
+                Ok(())
+            })
+            .expect("fenced operation")
+            .expect("lease remains current")
+        });
+        entered_rx.recv().expect("execution entered fence");
+
+        let (reclaim_started_tx, reclaim_started_rx) = mpsc::channel();
+        let (reclaim_done_tx, reclaim_done_rx) = mpsc::channel();
+        let reclaim_store = Arc::clone(&store);
+        let reclaim = thread::spawn(move || {
+            reclaim_started_tx.send(()).expect("signal reclaim start");
+            let count = reclaim_expired_running_leases(&reclaim_store).expect("reclaim leases");
+            reclaim_done_tx.send(count).expect("signal reclaim done");
+        });
+        reclaim_started_rx.recv().expect("reclaim started");
+        assert!(
+            reclaim_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "reclamation must wait while queue-owned execution can promote output"
+        );
+
+        release_tx.send(()).expect("release execution");
+        execution.join().expect("execution thread");
+        assert_eq!(
+            reclaim_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reclaim completes after execution"),
+            1
+        );
+        reclaim.join().expect("reclaim thread");
 
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");

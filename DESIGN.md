@@ -114,6 +114,11 @@ committed success performs no downstream cancellation.
 Each claim also receives a unique lease token. Claims, enqueues, retries,
 dependency cancellation, work-policy cancellation/removal, and success or
 failure commits all take the same advisory per-action transition lock.
+Queue-owned execution holds that token-validated lock from before invoking the
+executor through canonical artifact promotion and the success transition; a
+batch acquires all member locks in action-ID order and validates every token
+before starting. Thus an expired foreign worker cannot publish stale output
+after another worker reclaims the action.
 Dependency cancellation rechecks terminal/active state and dependency readiness
 while holding that lock; callers do not write dependency-canceled records
 directly. Lease-bound commits additionally
