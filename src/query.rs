@@ -630,6 +630,10 @@ pub(crate) fn build_stdlib_g8r_vs_yosys_dataset(
             &mut ir_node_count_cache,
         )
         .unwrap_or(0);
+        let stdlib_root_action_id = resolve_stdlib_root_action_id_from_opt_ir_action(
+            &provenance_by_action_id,
+            ir_action_id,
+        );
         let g8r_product = g8r.and_nodes * g8r.depth;
         let yosys_abc_product = yosys.and_nodes * yosys.depth;
         samples.push(StdlibG8rVsYosysSample {
@@ -640,6 +644,7 @@ pub(crate) fn build_stdlib_g8r_vs_yosys_dataset(
             } else {
                 g8r.dso_version.clone()
             },
+            stdlib_root_action_id,
             ir_action_id: ir_action_id.clone(),
             ir_top: g8r.ir_top.clone().or_else(|| yosys.ir_top.clone()),
             structural_hash: None,
@@ -1554,6 +1559,7 @@ fn build_ir_fn_corpus_dataset_from_entity_maps(
             } else {
                 g8r.dso_version.clone()
             },
+            stdlib_root_action_id: None,
             ir_action_id: g8r.ir_action_id.clone(),
             ir_top: g8r.ir_top.clone().or_else(|| yosys.ir_top.clone()),
             structural_hash: Some(entity_key.0.clone()),
@@ -5018,6 +5024,30 @@ pub(crate) fn resolve_direct_dslx_origin_from_opt_ir_action(
     Some((dslx_file.clone(), dslx_fn_name.clone()))
 }
 
+pub(crate) fn resolve_stdlib_root_action_id_from_opt_ir_action(
+    provenance_by_action_id: &ProvenanceLookup<'_>,
+    opt_ir_action_id: &str,
+) -> Option<String> {
+    let opt_provenance = *provenance_by_action_id.get(opt_ir_action_id)?;
+    let ActionSpec::DriverIrToOpt { ir_action_id, .. } = &opt_provenance.action else {
+        return None;
+    };
+    let source_provenance = *provenance_by_action_id.get(ir_action_id.as_str())?;
+    let ActionSpec::DriverDslxFnToIr {
+        dslx_subtree_action_id,
+        ..
+    } = &source_provenance.action
+    else {
+        return None;
+    };
+    let root_provenance = *provenance_by_action_id.get(dslx_subtree_action_id.as_str())?;
+    matches!(
+        root_provenance.action,
+        ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. }
+    )
+    .then(|| dslx_subtree_action_id.clone())
+}
+
 pub(crate) fn parse_aig_stats_metric(stats_json: &serde_json::Value, key: &str) -> Option<f64> {
     let value = stats_json.get(key)?;
     match value {
@@ -7754,6 +7784,7 @@ mod tests {
             fn_key: fn_key.to_string(),
             crate_version: crate_version.to_string(),
             dso_version: "0.39.0".to_string(),
+            stdlib_root_action_id: None,
             ir_action_id: format!("{structural_hash}:{crate_version}:{ir_top}"),
             ir_top: Some(ir_top.to_string()),
             structural_hash: Some(structural_hash.to_string()),
@@ -8861,6 +8892,7 @@ mod tests {
                 fn_key: "xls/dslx/stdlib/float32.x::eq_2".to_string(),
                 crate_version: "0.31.0".to_string(),
                 dso_version: "0.35.0".to_string(),
+                stdlib_root_action_id: Some("f".repeat(64)),
                 ir_action_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(),
                 ir_top: Some("__float32__eq_2".to_string()),
@@ -8891,6 +8923,10 @@ mod tests {
         let loaded = load_stdlib_g8r_vs_yosys_dataset_index(&store, false)
             .expect("load index")
             .expect("index should exist");
+        assert_eq!(
+            loaded.samples[0].stdlib_root_action_id.as_deref(),
+            Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+        );
         assert_eq!(loaded.fraig, false);
         assert_eq!(loaded.samples.len(), 1);
         assert_eq!(
@@ -8909,6 +8945,56 @@ mod tests {
     }
 
     #[test]
+    fn resolves_exact_stdlib_root_from_opt_ir_lineage() {
+        let (store, root) = make_test_store("stdlib-root-lineage");
+        let runtime = test_runtime();
+        let root_action_id = materialize_test_provenance(
+            &store,
+            "root",
+            ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+                version: "v0.31.0".to_string(),
+                discovery_runtime: Some(runtime.clone()),
+                stdlib_tarball_sha256: "1".repeat(64),
+            },
+            ArtifactType::DslxFileSubtree,
+            "stdlib",
+        );
+        let source_ir_action_id = materialize_test_provenance(
+            &store,
+            "source-ir",
+            ActionSpec::DriverDslxFnToIr {
+                dslx_subtree_action_id: root_action_id.clone(),
+                dslx_file: "xls/dslx/stdlib/float32.x".to_string(),
+                dslx_fn_name: "add".to_string(),
+                version: "v0.31.0".to_string(),
+                runtime: runtime.clone(),
+            },
+            ArtifactType::IrPackageFile,
+            "source.ir",
+        );
+        let opt_ir_action_id = materialize_test_provenance(
+            &store,
+            "opt-ir",
+            ActionSpec::DriverIrToOpt {
+                ir_action_id: source_ir_action_id,
+                top_fn_name: None,
+                version: "v0.31.0".to_string(),
+                runtime,
+            },
+            ArtifactType::IrPackageFile,
+            "opt.ir",
+        );
+        let provenances = store.list_provenances_shared().expect("list provenance");
+        let lookup = build_provenance_lookup(provenances.as_ref());
+
+        assert_eq!(
+            resolve_stdlib_root_action_id_from_opt_ir_action(&lookup, &opt_ir_action_id),
+            Some(root_action_id)
+        );
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
     fn filter_ir_fn_corpus_g8r_vs_yosys_samples_applies_thresholds() {
         let dataset = StdlibG8rVsYosysDataset {
             fraig: false,
@@ -8917,6 +9003,7 @@ mod tests {
                     fn_key: "f::a".to_string(),
                     crate_version: "0.33.0".to_string(),
                     dso_version: "0.35.0".to_string(),
+                    stdlib_root_action_id: None,
                     ir_action_id: "a".repeat(64),
                     ir_top: Some("__a".to_string()),
                     structural_hash: Some("0".repeat(64)),
@@ -8935,6 +9022,7 @@ mod tests {
                     fn_key: "f::b".to_string(),
                     crate_version: "0.33.0".to_string(),
                     dso_version: "0.35.0".to_string(),
+                    stdlib_root_action_id: None,
                     ir_action_id: "d".repeat(64),
                     ir_top: Some("__b".to_string()),
                     structural_hash: Some("1".repeat(64)),
@@ -8953,6 +9041,7 @@ mod tests {
                     fn_key: "f::c".to_string(),
                     crate_version: "0.32.0".to_string(),
                     dso_version: "0.35.0".to_string(),
+                    stdlib_root_action_id: None,
                     ir_action_id: "0".repeat(64),
                     ir_top: Some("__c".to_string()),
                     structural_hash: Some("2".repeat(64)),
@@ -9267,6 +9356,7 @@ mod tests {
                     fn_key: "f::a".to_string(),
                     crate_version: "0.33.0".to_string(),
                     dso_version: "0.35.0".to_string(),
+                    stdlib_root_action_id: None,
                     ir_action_id: "0".repeat(64),
                     ir_top: Some("__a".to_string()),
                     structural_hash: Some(structural_hash_a.clone()),
@@ -9285,6 +9375,7 @@ mod tests {
                     fn_key: "f::a2".to_string(),
                     crate_version: "0.32.0".to_string(),
                     dso_version: "0.35.0".to_string(),
+                    stdlib_root_action_id: None,
                     ir_action_id: "3".repeat(64),
                     ir_top: Some("__a2".to_string()),
                     structural_hash: Some(structural_hash_a.clone()),
@@ -9303,6 +9394,7 @@ mod tests {
                     fn_key: "f::b".to_string(),
                     crate_version: "0.33.0".to_string(),
                     dso_version: "0.35.0".to_string(),
+                    stdlib_root_action_id: None,
                     ir_action_id: "6".repeat(64),
                     ir_top: Some("__b".to_string()),
                     structural_hash: Some(structural_hash_b.clone()),
@@ -9425,6 +9517,7 @@ fn only(z: bits[1] id=1) -> bits[1] {
                 fn_key: "float32.x:add".to_string(),
                 crate_version: "0.31.0".to_string(),
                 dso_version: "0.35.0".to_string(),
+                stdlib_root_action_id: None,
                 ir_action_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(),
                 ir_top: Some("__float32__add".to_string()),
@@ -9493,6 +9586,7 @@ fn only(z: bits[1] id=1) -> bits[1] {
                 fn_key: "fn [0123456789ab]".to_string(),
                 crate_version: "0.31.0".to_string(),
                 dso_version: "0.35.0".to_string(),
+                stdlib_root_action_id: None,
                 ir_action_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_string(),
                 ir_top: Some("__float32__add".to_string()),
