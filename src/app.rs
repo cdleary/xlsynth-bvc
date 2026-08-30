@@ -38,7 +38,7 @@ use crate::query::{
 };
 use crate::queue::*;
 use crate::queue_only_previous_loss_k_cones_enabled;
-use crate::queue_progress::{WatchQueueOptions, watch_queue};
+use crate::queue_progress::{WatchQueueOptions, watch_interval, watch_queue};
 use crate::runtime::*;
 use crate::service::*;
 use crate::site::{
@@ -233,7 +233,7 @@ pub(crate) fn run() -> Result<()> {
         watch_queue(
             &store_dir,
             &WatchQueueOptions {
-                interval: Duration::from_secs_f64(*interval_seconds),
+                interval: watch_interval(*interval_seconds)?,
                 running_limit: *running_limit,
                 once: *once,
                 exit_when_idle: *exit_when_idle,

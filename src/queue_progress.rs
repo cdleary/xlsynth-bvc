@@ -23,6 +23,13 @@ pub(crate) struct WatchQueueOptions {
     pub(crate) json: bool,
 }
 
+pub(crate) fn watch_interval(interval_seconds: f64) -> Result<Duration> {
+    if !interval_seconds.is_finite() || interval_seconds <= 0.0 {
+        bail!("--interval-seconds must be finite and greater than zero");
+    }
+    Ok(Duration::from_secs_f64(interval_seconds))
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct QueueProgressSnapshot {
     updated_utc: DateTime<Utc>,
@@ -410,6 +417,17 @@ fn sparkline(values: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_interval_rejects_values_that_duration_cannot_construct() {
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(watch_interval(value).is_err(), "accepted {value}");
+        }
+        assert_eq!(
+            watch_interval(2.5).expect("interval"),
+            Duration::from_millis(2500)
+        );
+    }
 
     #[test]
     fn render_queue_progress_labels_lower_bound_and_running_actions() {
