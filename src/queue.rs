@@ -30,7 +30,7 @@ struct QueueTransitionLock {
 }
 
 impl QueueTransitionLock {
-    fn acquire(store: &ArtifactStore, action_id: &str) -> Result<Self> {
+    fn open(store: &ArtifactStore, action_id: &str) -> Result<(File, PathBuf)> {
         let path = store.queue_transition_lock_path(action_id);
         let parent = path
             .parent()
@@ -47,9 +47,24 @@ impl QueueTransitionLock {
             .write(true)
             .open(&path)
             .with_context(|| format!("opening queue transition lock: {}", path.display()))?;
+        Ok((file, path))
+    }
+
+    fn acquire(store: &ArtifactStore, action_id: &str) -> Result<Self> {
+        let (file, path) = Self::open(store, action_id)?;
         file.lock_exclusive()
             .with_context(|| format!("locking queue transition: {}", path.display()))?;
         Ok(Self { file })
+    }
+
+    fn try_acquire(store: &ArtifactStore, action_id: &str) -> Result<Option<Self>> {
+        let (file, path) = Self::open(store, action_id)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error)
+                .with_context(|| format!("try-locking queue transition: {}", path.display())),
+        }
     }
 }
 
@@ -1317,9 +1332,14 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
                 Err(_) => {}
             }
         }
-        let _transition_lock = queue_action_id_from_path(&running_path)
-            .map(|action_id| QueueTransitionLock::acquire(store, &action_id))
-            .transpose()?;
+        let _transition_lock = if let Some(action_id) = queue_action_id_from_path(&running_path) {
+            let Some(lock) = QueueTransitionLock::try_acquire(store, &action_id)? else {
+                continue;
+            };
+            Some(lock)
+        } else {
+            None
+        };
         if let Some(action_id) = queue_action_id_from_path(&running_path)
             && terminal_queue_state_for_action(store, &action_id).is_some()
         {
@@ -2561,7 +2581,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_fence_blocks_expired_lease_reclamation_until_operation_finishes() {
+    fn reclamation_skips_busy_expired_execution_then_reclaims_after_release() {
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -2585,31 +2605,26 @@ mod tests {
         });
         entered_rx.recv().expect("execution entered fence");
 
-        let (reclaim_started_tx, reclaim_started_rx) = mpsc::channel();
         let (reclaim_done_tx, reclaim_done_rx) = mpsc::channel();
         let reclaim_store = Arc::clone(&store);
         let reclaim = thread::spawn(move || {
-            reclaim_started_tx.send(()).expect("signal reclaim start");
             let count = reclaim_expired_running_leases(&reclaim_store).expect("reclaim leases");
             reclaim_done_tx.send(count).expect("signal reclaim done");
         });
-        reclaim_started_rx.recv().expect("reclaim started");
-        assert!(
+        assert_eq!(
             reclaim_done_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
-            "reclamation must wait while queue-owned execution can promote output"
+                .recv_timeout(Duration::from_secs(2))
+                .expect("busy expired execution must not block reclaim scan"),
+            0
         );
+        reclaim.join().expect("first reclaim thread");
 
         release_tx.send(()).expect("release execution");
         execution.join().expect("execution thread");
         assert_eq!(
-            reclaim_done_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("reclaim completes after execution"),
+            reclaim_expired_running_leases(&store).expect("reclaim after execution release"),
             1
         );
-        reclaim.join().expect("reclaim thread");
 
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
