@@ -304,6 +304,127 @@ fn write_file(out_dir: &Path, relpath: &str, bytes: &[u8]) -> Result<()> {
     fs::write(&path, bytes).with_context(|| format!("writing static site file: {}", path.display()))
 }
 
+fn static_site_asset_names() -> (String, String) {
+    let css_hash = &sha256_hex(STYLE_CSS.as_bytes())[..16];
+    let js_hash = &sha256_hex(APP_JS.as_bytes())[..16];
+    (
+        format!("site-{css_hash}.css"),
+        format!("explorer-{js_hash}.js"),
+    )
+}
+
+fn insert_unique_site_relpath(paths: &mut BTreeSet<String>, relpath: String) -> Result<()> {
+    normalized_relpath(&relpath)?;
+    if !paths.insert(relpath.clone()) {
+        bail!("static site topology contains duplicate path: {relpath}");
+    }
+    Ok(())
+}
+
+fn expected_catalog_site_relpaths(
+    catalog: &BrowserCatalog,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let (css_name, js_name) = static_site_asset_names();
+    let mut all = [
+        "catalog.json".to_string(),
+        "snapshot_manifest.v1.pb".to_string(),
+        "index.html".to_string(),
+        "runs.html".to_string(),
+        "dataset.html".to_string(),
+        format!("assets/{css_name}"),
+        format!("assets/{js_name}"),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let mut data = BTreeSet::new();
+
+    for dataset in &catalog.datasets {
+        let expected_url = format!("data/{}", dataset.logical_key);
+        if dataset.url != expected_url {
+            bail!(
+                "browser catalog dataset URL is not canonical: expected {expected_url}, got {}",
+                dataset.url
+            );
+        }
+        insert_unique_site_relpath(&mut data, dataset.url.clone())?;
+    }
+
+    for run in &catalog.runs {
+        let expected_page_url = format!("runs/{}/", run.run_id);
+        let expected_page_relpath = format!("runs/{}/index.html", run.run_id);
+        let expected_protobuf_url = format!("data/runs/{}/run.pb", run.run_id);
+        if run.page_url != expected_page_url || run.protobuf_url != expected_protobuf_url {
+            bail!(
+                "browser catalog run paths are not canonical for {}",
+                run.run_id
+            );
+        }
+        insert_unique_site_relpath(&mut all, expected_page_relpath)?;
+        insert_unique_site_relpath(&mut data, run.protobuf_url.clone())?;
+        if let Some(findings_url) = &run.findings_protobuf_url {
+            let expected_findings_url = format!("data/runs/{}/findings.pb", run.run_id);
+            if findings_url != &expected_findings_url {
+                bail!(
+                    "browser catalog findings path is not canonical for {}",
+                    run.run_id
+                );
+            }
+            insert_unique_site_relpath(&mut data, findings_url.clone())?;
+        }
+    }
+
+    for relpath in &data {
+        insert_unique_site_relpath(&mut all, relpath.clone())?;
+    }
+    Ok((all, data))
+}
+
+fn expected_snapshot_site_data_relpaths(
+    snapshot: &crate::snapshot::StaticSnapshotManifest,
+) -> Result<BTreeSet<String>> {
+    let mut expected = BTreeSet::new();
+    for entry in &snapshot.dataset_files {
+        let relpath = if entry.relpath.ends_with(".json") {
+            let suffix = entry
+                .relpath
+                .strip_prefix("web_index/")
+                .unwrap_or(&entry.relpath);
+            format!("data/{suffix}")
+        } else if entry.index_key.starts_with("runs/")
+            && (entry.relpath.ends_with("/run.pb") || entry.relpath.ends_with("/findings.pb"))
+        {
+            format!("data/{}", entry.relpath)
+        } else {
+            bail!(
+                "source snapshot contains unsupported static-site dataset: {}",
+                entry.relpath
+            );
+        };
+        insert_unique_site_relpath(&mut expected, relpath)?;
+    }
+    Ok(expected)
+}
+
+fn actual_site_relpaths(site_dir: &Path) -> Result<BTreeSet<String>> {
+    let mut found = BTreeSet::new();
+    for entry in WalkDir::new(site_dir).sort_by_file_name() {
+        let entry = entry.context("walking static site")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relpath = entry
+            .path()
+            .strip_prefix(site_dir)
+            .context("stripping static site root")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relpath != STATIC_SITE_MANIFEST_FILENAME {
+            insert_unique_site_relpath(&mut found, relpath)?;
+        }
+    }
+    Ok(found)
+}
+
 pub(crate) fn build_static_site(
     options: &BuildStaticSiteOptions,
 ) -> Result<BuildStaticSiteSummary> {
@@ -313,10 +434,7 @@ pub(crate) fn build_static_site(
     let root_site_url = site_root_url("index.html")?;
     ensure_empty_output_dir(&options.out_dir, options.overwrite)?;
 
-    let css_hash = &sha256_hex(STYLE_CSS.as_bytes())[..16];
-    let js_hash = &sha256_hex(APP_JS.as_bytes())[..16];
-    let css_name = format!("site-{css_hash}.css");
-    let js_name = format!("explorer-{js_hash}.js");
+    let (css_name, js_name) = static_site_asset_names();
     write_file(
         &options.out_dir,
         &format!("assets/{css_name}"),
@@ -598,22 +716,19 @@ pub(crate) fn build_static_site(
         .as_bytes(),
     )?;
 
-    let mut relpaths = Vec::new();
-    for entry in WalkDir::new(&options.out_dir).sort_by_file_name() {
-        let entry = entry.context("walking generated site")?;
-        if entry.file_type().is_file() {
-            let relpath = entry
-                .path()
-                .strip_prefix(&options.out_dir)
-                .context("stripping site root")?
-                .to_string_lossy()
-                .replace('\\', "/");
-            if relpath != STATIC_SITE_MANIFEST_FILENAME {
-                relpaths.push(relpath);
-            }
-        }
+    let (relpaths, catalog_data_relpaths) = expected_catalog_site_relpaths(&catalog)?;
+    let snapshot_data_relpaths = expected_snapshot_site_data_relpaths(&snapshot)?;
+    if catalog_data_relpaths != snapshot_data_relpaths {
+        bail!("static site catalog does not exactly project the source snapshot");
     }
-    relpaths.sort();
+    let found = actual_site_relpaths(&options.out_dir)?;
+    if found != relpaths {
+        let unexpected = found.difference(&relpaths).collect::<Vec<_>>();
+        let missing = relpaths.difference(&found).collect::<Vec<_>>();
+        bail!(
+            "generated static site does not match its allowlisted topology; unexpected={unexpected:?} missing={missing:?}"
+        );
+    }
     let files = relpaths
         .iter()
         .map(|path| publication_file(&options.out_dir, path))
@@ -873,32 +988,12 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         total_bytes += file.bytes;
     }
 
-    let mut found = BTreeSet::new();
-    for entry in WalkDir::new(site_dir).sort_by_file_name() {
-        let entry = entry.context("walking site during verification")?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let relpath = entry
-            .path()
-            .strip_prefix(site_dir)
-            .context("stripping site root")?
-            .to_string_lossy()
-            .replace('\\', "/");
-        if relpath == STATIC_SITE_MANIFEST_FILENAME {
-            continue;
-        }
-        if !declared.contains_key(&relpath) {
-            bail!("site contains undeclared file: {relpath}");
-        }
-        found.insert(relpath);
-    }
-    if found.len() != declared.len() {
-        let missing: Vec<_> = declared
-            .keys()
-            .filter(|key| !found.contains(*key))
-            .collect();
-        bail!("site manifest declares missing files: {missing:?}");
+    let declared_relpaths = declared.keys().cloned().collect::<BTreeSet<_>>();
+    let found = actual_site_relpaths(site_dir)?;
+    if found != declared_relpaths {
+        let undeclared = found.difference(&declared_relpaths).collect::<Vec<_>>();
+        let missing = declared_relpaths.difference(&found).collect::<Vec<_>>();
+        bail!("site file closure mismatch; undeclared={undeclared:?} missing={missing:?}");
     }
 
     let attr_re = Regex::new(r#"(?:href|src)=\"([^\"]+)\""#).expect("valid regex");
@@ -931,6 +1026,41 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     {
         bail!("browser catalog does not match protobuf site manifest");
     }
+    let (expected_relpaths, catalog_data_relpaths) = expected_catalog_site_relpaths(&catalog)?;
+    if declared_relpaths != expected_relpaths {
+        let unexpected = declared_relpaths
+            .difference(&expected_relpaths)
+            .collect::<Vec<_>>();
+        let missing = expected_relpaths
+            .difference(&declared_relpaths)
+            .collect::<Vec<_>>();
+        bail!(
+            "site manifest does not match the allowlisted topology; unexpected={unexpected:?} missing={missing:?}"
+        );
+    }
+
+    let source_snapshot = load_static_snapshot_manifest(site_dir)
+        .context("validating embedded source snapshot manifest")?;
+    if source_snapshot.snapshot_id != snapshot_id {
+        bail!("embedded source snapshot identity disagrees with site manifest");
+    }
+    let snapshot_data_relpaths = expected_snapshot_site_data_relpaths(&source_snapshot)?;
+    if catalog_data_relpaths != snapshot_data_relpaths {
+        bail!("static site catalog does not exactly project the embedded source snapshot");
+    }
+
+    let (css_name, js_name) = static_site_asset_names();
+    for (relpath, expected_bytes) in [
+        (format!("assets/{css_name}"), STYLE_CSS.as_bytes()),
+        (format!("assets/{js_name}"), APP_JS.as_bytes()),
+    ] {
+        let actual = fs::read(site_dir.join(&relpath))
+            .with_context(|| format!("reading trusted static asset: {relpath}"))?;
+        if actual.as_slice() != expected_bytes {
+            bail!("static asset does not match the compiled allowlisted content: {relpath}");
+        }
+    }
+
     let declared_dataset_urls = declared
         .keys()
         .filter(|relpath| relpath.starts_with("data/") && relpath.ends_with(".json"))
@@ -1534,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    fn site_verifier_rejects_self_consistent_uncataloged_json() {
+    fn site_verifier_rejects_self_consistent_non_allowlisted_files() {
         let root = temp_root();
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("store layout");
@@ -1564,12 +1694,21 @@ mod tests {
         })
         .expect("build site");
 
-        let private_relpath = "data/internal-build-metadata.v1.json";
-        fs::write(
-            site_dir.join(private_relpath),
-            br#"{"private_path":"/srv/build/secrets"}"#,
-        )
-        .expect("write private site JSON");
+        let private_files: [(&str, &[u8]); 3] = [
+            (
+                "data/internal-build-metadata.v1.json",
+                br#"{"private_path":"/srv/build/secrets"}"#,
+            ),
+            ("data/private-provenance.pb", b"private protobuf bytes"),
+            ("worker.log", b"private worker output"),
+        ];
+        for (relpath, bytes) in private_files {
+            let path = site_dir.join(relpath);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create private file parent");
+            }
+            fs::write(path, bytes).expect("write non-allowlisted site file");
+        }
         let manifest_path = site_dir.join(STATIC_SITE_MANIFEST_FILENAME);
         let mut manifest = pb::StaticSiteManifest::decode(
             fs::read(&manifest_path)
@@ -1577,15 +1716,17 @@ mod tests {
                 .as_slice(),
         )
         .expect("decode site manifest");
-        manifest
-            .files
-            .push(publication_file(&site_dir, private_relpath).expect("describe private file"));
+        for (relpath, _) in private_files {
+            manifest
+                .files
+                .push(publication_file(&site_dir, relpath).expect("describe private file"));
+        }
         fs::write(&manifest_path, manifest.encode_to_vec()).expect("rewrite site manifest");
 
         let error = verify_static_site(&site_dir)
-            .expect_err("self-consistent uncataloged JSON must fail verification");
+            .expect_err("self-consistent non-allowlisted files must fail verification");
         assert!(
-            format!("{error:#}").contains("do not exactly match"),
+            format!("{error:#}").contains("allowlisted topology"),
             "unexpected error: {error:#}"
         );
         fs::remove_dir_all(root).expect("cleanup");

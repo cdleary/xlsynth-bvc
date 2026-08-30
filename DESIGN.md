@@ -94,6 +94,14 @@ browser datasets, builds a verified static site, and promotes immutable site
 and catalog objects before updating the small current-site pointers. Static web
 serving requires neither the Rust process nor sled.
 
+The static-site manifest is an exact allowlist, not an extensible inventory.
+Its file set must equal the derived topology of fixed pages and compiled assets,
+cataloged typed JSON datasets, public run protobufs, optional public findings
+protobufs, and the embedded source-snapshot manifest. Verification requires
+closure between that source snapshot, the browser catalog, the manifest, and
+the files on disk. A self-consistent manifest entry for any other JSON,
+protobuf, log, or artifact is rejected before publication.
+
 The public dataset projection is fail-closed: only explicitly named index keys
 and structurally validated content-addressed group keys may enter a snapshot.
 Adding a private index to the store does not publish it by default. Public
