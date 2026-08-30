@@ -43,6 +43,7 @@ pub(crate) fn execute_action(
     store: &ArtifactStore,
     action: ActionSpec,
 ) -> Result<(String, ArtifactRef)> {
+    let action = canonicalize_action_for_execution(action)?;
     let action_id = compute_action_id(&action)?;
 
     if store.action_exists(&action_id) {
@@ -403,6 +404,10 @@ pub(crate) fn execute_action_batch(
     store: &ArtifactStore,
     actions: Vec<ActionSpec>,
 ) -> Result<Vec<BatchActionExecutionResult>> {
+    let actions = actions
+        .into_iter()
+        .map(canonicalize_action_for_execution)
+        .collect::<Result<Vec<_>>>()?;
     if actions.len() <= 1 {
         return execute_actions_individually(store, actions);
     }
@@ -626,6 +631,13 @@ pub(crate) fn promote_staging_action_dir(staging_dir: &Path, final_dir: &Path) -
 
 pub(crate) fn compute_action_id(action: &ActionSpec) -> Result<String> {
     Ok(crate::proto::compute_model_action_id_v2(action)?.to_hex())
+}
+
+fn canonicalize_action_for_execution(action: ActionSpec) -> Result<ActionSpec> {
+    let proto = crate::proto::action_spec_to_proto(&action)
+        .context("canonicalizing action before execution")?;
+    crate::proto::action_spec_from_proto(&proto)
+        .context("round-tripping canonical action before execution")
 }
 
 pub(crate) fn make_staging_dir(store: &ArtifactStore, action_id: &str) -> Result<PathBuf> {
@@ -5394,6 +5406,40 @@ mod tests {
         let id_a = compute_action_id(&action).expect("compute id a");
         let id_b = compute_action_id(&action.clone()).expect("compute id b");
         assert_eq!(id_a, id_b);
+    }
+
+    #[test]
+    fn execution_canonicalizes_the_same_paths_used_for_action_identity() {
+        let runtime = DriverRuntimeSpec {
+            driver_version: "0.31.0".to_string(),
+            release_platform: "ubuntu2004".to_string(),
+            docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
+            dockerfile: "docker\\xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
+        };
+        let action = ActionSpec::DriverDslxFnToIr {
+            dslx_subtree_action_id: "1".repeat(64),
+            dslx_file: "pkg/a\\b.x".to_string(),
+            dslx_fn_name: "main".to_string(),
+            version: "v0.31.0".to_string(),
+            runtime,
+        };
+        let action_id = compute_action_id(&action).expect("action id");
+        let canonical = canonicalize_action_for_execution(action).expect("canonical action");
+        assert_eq!(
+            compute_action_id(&canonical).expect("canonical id"),
+            action_id
+        );
+        let ActionSpec::DriverDslxFnToIr {
+            dslx_file, runtime, ..
+        } = canonical
+        else {
+            panic!("unexpected canonical action kind");
+        };
+        assert_eq!(dslx_file, "pkg/a/b.x");
+        assert_eq!(runtime.dockerfile, "docker/xlsynth-driver.Dockerfile");
     }
 
     #[test]

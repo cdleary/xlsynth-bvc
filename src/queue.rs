@@ -1407,13 +1407,11 @@ fn running_owner_local_process_exists(lease_owner: &str, local_host: &str) -> Op
         return None;
     }
     let owner_pid = parts.next()?.parse::<u32>().ok()?;
+    let recorded_start_ticks = parts.next()?.parse::<u64>().ok()?;
     let proc_path = Path::new("/proc").join(owner_pid.to_string());
     if !proc_path.exists() {
         return Some(false);
     }
-    let Some(recorded_start_ticks) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
-        return Some(true);
-    };
     Some(queue_process_start_ticks(owner_pid) == Some(recorded_start_ticks))
 }
 
@@ -2732,13 +2730,32 @@ mod tests {
     }
 
     #[test]
-    fn running_owner_process_missing_on_local_host_true_for_missing_local_pid() {
+    fn legacy_local_owner_without_start_ticks_is_expiry_based() {
         let local_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
         let owner = format!("{local_host}:999999:web-runner-0");
-        assert!(running_owner_process_missing_on_local_host(
-            &owner,
-            &local_host
-        ));
+        assert_eq!(
+            running_owner_local_process_exists(&owner, &local_host),
+            None
+        );
+    }
+
+    #[test]
+    fn expired_legacy_owner_is_reclaimed_even_when_pid_is_live() {
+        let (store, root) = make_test_store();
+        let action_id = enqueue_action(&store, terminal_test_action()).expect("enqueue action");
+        let local_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
+        let owner = format!("{local_host}:{}", std::process::id());
+        let claimed = claim_next_pending_item(&store, &owner, -1)
+            .expect("claim pending action")
+            .expect("action should be claimed");
+        assert!(claimed.running.lease_expires_utc < Utc::now());
+
+        assert_eq!(reclaim_expired_running_leases(&store).expect("reclaim"), 1);
+        assert!(!store.running_queue_path(&action_id).exists());
+        assert!(store.pending_queue_path(&action_id).exists());
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -2779,7 +2796,7 @@ mod tests {
         let local_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
         let dead_pid = u32::MAX;
         assert!(!Path::new("/proc").join(dead_pid.to_string()).exists());
-        let owner = format!("{local_host}:{dead_pid}:campaign:test-run:runner-0");
+        let owner = format!("{local_host}:{dead_pid}:0:campaign:test-run:runner-0");
         let claimed = claim_next_pending_item(&store, &owner, 900)
             .expect("claim pending action")
             .expect("action should be claimed");

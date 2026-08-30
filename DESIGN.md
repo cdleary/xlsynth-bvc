@@ -104,7 +104,9 @@ Lease expiry is a recovery signal, not permission to duplicate live local work. 
 local lease owner includes its PID and Linux process-start ticks; reclamation
 keeps the lease while that exact process incarnation exists, even after the
 nominal expiry time, and immediately recovers it after the owner dies. Foreign
-or legacy owners remain expiry-based. A caller-supplied `--worker-id` is only a
+or legacy owners remain expiry-based; a same-host `HOST:PID` owner without
+numeric process-start ticks is never treated as live-process evidence. A
+caller-supplied `--worker-id` is only a
 validated display label appended after the mandatory host/PID/start-time
 identity; it can never replace the process-fencing prefix. If duplicate
 execution nevertheless occurs, a worker cancels descendants only when its
@@ -343,6 +345,12 @@ process adversarially replacing path components between checks.
 ## Content-addressed store invariant
 
 An action ID has exactly one committed action identity and output-file set.
+Model actions are converted to validated protobuf before hashing. Before
+execution, single and batched actions round-trip through that same protobuf
+representation, so they consume the canonical versions, relative-path
+separators, runtime fields, and script references that the action ID commits
+to; a raw model spelling cannot hash as one path while executing as a distinct
+Linux path.
 Initial promotion is first-writer-wins. A concurrent or repeated promotion for
 an existing ID may verify or discard its staging data, but it must never replace
 the committed action or output contract. Sled commits the provenance and
