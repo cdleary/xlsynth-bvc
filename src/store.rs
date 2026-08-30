@@ -76,6 +76,14 @@ trait ArtifactBackend: std::fmt::Debug + Send + Sync {
     fn web_index_location(&self, store_root: &Path, index_key: &str) -> String;
     fn size_on_disk_bytes(&self, store_root: &Path) -> Result<u64>;
     fn flush_durable(&self) -> Result<()>;
+    #[cfg(test)]
+    fn load_raw_action_file_value_for_test(
+        &self,
+        _action_id: &str,
+        _relpath: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        bail!("raw action-file rows are only available from the sled backend")
+    }
 }
 
 fn shard_dir(base: &Path, key: &str) -> PathBuf {
@@ -1810,6 +1818,23 @@ pub(crate) fn backfill_sled_action_file_compression(
 }
 
 impl ArtifactBackend for SledArtifactBackend {
+    #[cfg(test)]
+    fn load_raw_action_file_value_for_test(
+        &self,
+        action_id: &str,
+        relpath: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let db = self.open_db()?;
+        let tree = db
+            .open_tree(Self::TREE_ACTION_FILE_BYTES)
+            .context("opening action_file_bytes tree for test inspection")?;
+        let key = Self::action_file_key(action_id, relpath);
+        Ok(tree
+            .get(key)
+            .context("reading raw action-file row for test inspection")?
+            .map(|bytes| bytes.to_vec()))
+    }
+
     fn ensure_layout(&self, store_root: &Path) -> Result<()> {
         fs::create_dir_all(self.artifacts_dir(store_root))
             .context("creating materialized artifacts directory")?;
@@ -3080,6 +3105,16 @@ impl ArtifactStore {
     pub(crate) fn flush_durable(&self) -> Result<()> {
         self.artifact_backend.flush_durable()
     }
+
+    #[cfg(test)]
+    fn load_raw_action_file_value_for_test(
+        &self,
+        action_id: &str,
+        relpath: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        self.artifact_backend
+            .load_raw_action_file_value_for_test(action_id, relpath)
+    }
 }
 
 #[cfg(test)]
@@ -3599,43 +3634,28 @@ mod tests {
             make_test_provenance(&"d".repeat(64), large_relpath, large_bytes.len() as u64);
         let action_id = provenance.action_id.clone();
 
-        {
-            let store = ArtifactStore::new_with_sled(root.clone(), db_path.clone());
-            store.ensure_layout().expect("ensure sled layout");
-            let staging_dir = store.staging_dir().join(format!("{action_id}-staged"));
-            let payload_dir = staging_dir.join("payload");
-            std::fs::create_dir_all(&payload_dir).expect("create staged payload");
-            std::fs::write(payload_dir.join("prep_for_gatify.ir"), &large_bytes)
-                .expect("write large staged file");
-            std::fs::write(
-                staging_dir.join("provenance.pb"),
-                crate::proto::encode_provenance(&provenance).expect("encode provenance"),
-            )
-            .expect("write staged provenance");
-            store
-                .promote_staging_action_dir(&action_id, &staging_dir)
-                .expect("promote staged action");
-        }
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path.clone());
+        store.ensure_layout().expect("ensure sled layout");
+        let staging_dir = store.staging_dir().join(format!("{action_id}-staged"));
+        let payload_dir = staging_dir.join("payload");
+        std::fs::create_dir_all(&payload_dir).expect("create staged payload");
+        std::fs::write(payload_dir.join("prep_for_gatify.ir"), &large_bytes)
+            .expect("write large staged file");
+        std::fs::write(
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
+        )
+        .expect("write staged provenance");
+        store
+            .promote_staging_action_dir(&action_id, &staging_dir)
+            .expect("promote staged action");
 
-        let db = sled::Config::new()
-            .path(&db_path)
-            .cache_capacity(16 * 1024 * 1024)
-            .open()
-            .expect("open sled db for inspection");
-        let file_tree = db
-            .open_tree(SledArtifactBackend::TREE_ACTION_FILE_BYTES)
-            .expect("open action_file_bytes tree");
-        let key = SledArtifactBackend::action_file_key(&action_id, large_relpath);
-        let stored = file_tree
-            .get(key)
+        let stored = store
+            .load_raw_action_file_value_for_test(&action_id, large_relpath)
             .expect("read action-file row")
             .expect("action-file row should exist");
         assert!(stored.starts_with(SledArtifactBackend::ACTION_FILE_ZSTD_MAGIC));
         assert!(stored.len() < large_bytes.len());
-        drop(file_tree);
-        drop(db);
-
-        let store = ArtifactStore::new_with_sled(root.clone(), db_path.clone());
         let action_dir = store
             .materialize_action_dir(&action_id)
             .expect("materialize sled action");
@@ -3643,6 +3663,7 @@ mod tests {
             std::fs::read_to_string(action_dir.join("payload/prep_for_gatify.ir")).expect("read");
         assert_eq!(decoded, large_bytes);
 
+        drop(store);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
