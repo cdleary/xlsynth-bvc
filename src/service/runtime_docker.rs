@@ -124,10 +124,11 @@ pub(crate) fn ensure_driver_release_cache(
                 script_path.display()
             );
         }
+        let release_tag = xlsynth_release_tag(version);
         let args: Vec<OsString> = vec![
             script_path.into_os_string(),
             OsString::from("-v"),
-            OsString::from(version),
+            OsString::from(&release_tag),
             OsString::from("-o"),
             cache_dir.clone().into_os_string(),
             OsString::from("-p"),
@@ -158,11 +159,11 @@ pub(crate) fn ensure_driver_release_cache(
         let op_proto = cache_dir.join("protos/xls/ir/op.proto");
         let delay_info_url = format!(
             "https://raw.githubusercontent.com/xlsynth/xlsynth/{}/xls/estimators/delay_model/delay_info.proto",
-            version
+            release_tag
         );
         let op_url = format!(
             "https://raw.githubusercontent.com/xlsynth/xlsynth/{}/xls/ir/op.proto",
-            version
+            release_tag
         );
         if let Some(parent) = delay_info_proto.parent() {
             fs::create_dir_all(parent)

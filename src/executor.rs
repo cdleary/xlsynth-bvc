@@ -660,7 +660,8 @@ pub(crate) fn run_download_stdlib_action(
     let client = Client::builder()
         .build()
         .context("creating reqwest client")?;
-    let base_url = format!("https://github.com/xlsynth/xlsynth/releases/download/{version}");
+    let release_tag = xlsynth_release_tag(version);
+    let base_url = format!("https://github.com/xlsynth/xlsynth/releases/download/{release_tag}");
     let tarball_url = format!("{base_url}/dslx_stdlib.tar.gz");
 
     let tarball_path = payload_dir

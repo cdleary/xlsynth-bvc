@@ -17,8 +17,12 @@ pub(crate) fn normalize_tag_version(version: &str) -> &str {
     version.strip_prefix('v').unwrap_or(version)
 }
 
+pub(crate) fn xlsynth_release_tag(version: &str) -> String {
+    format!("v{}", normalize_tag_version(version))
+}
+
 pub(crate) fn version_label(kind: &str, version: &str) -> String {
-    format!("{kind}:v{}", normalize_tag_version(version))
+    format!("{kind}:{}", xlsynth_release_tag(version))
 }
 
 fn parse_dotted_numeric_version(version: &str) -> Option<Vec<u32>> {
@@ -305,4 +309,16 @@ pub(crate) fn parse_release_tag(tag: &str) -> Result<ReleaseTag> {
         patch,
         patch2,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xlsynth_release_tag_restores_external_tag_spelling() {
+        assert_eq!(xlsynth_release_tag("0.45.0"), "v0.45.0");
+        assert_eq!(xlsynth_release_tag("v0.45.0"), "v0.45.0");
+        assert_eq!(xlsynth_release_tag("0.45.0-1"), "v0.45.0-1");
+    }
 }
