@@ -123,7 +123,7 @@ fn digest_hex(value: &pb::Sha256Digest, field: &str) -> Result<String> {
     Ok(hex::encode(&value.value))
 }
 
-fn state_path(store: &ArtifactStore, run_id: &str) -> PathBuf {
+pub(crate) fn coordinator_state_path(store: &ArtifactStore, run_id: &str) -> PathBuf {
     store
         .coordinator_dir()
         .join(&run_id[0..2])
@@ -531,7 +531,7 @@ pub(crate) fn coordinate_release(
         options.run_id.as_deref(),
     )?;
     let plan = summarize_campaign_run(&store, &manifest, true)?;
-    let path = state_path(&store, &plan.run_id);
+    let path = coordinator_state_path(&store, &plan.run_id);
     let baseline = match checkpointed_baseline_binding(
         &path,
         options.baseline_run_id.as_deref(),
@@ -1009,7 +1009,7 @@ mod tests {
         store.ensure_layout().expect("layout");
         let run_id = "1".repeat(64);
         let baseline_run_id = "2".repeat(64);
-        let path = state_path(&store, &run_id);
+        let path = coordinator_state_path(&store, &run_id);
         let state = load_or_new_state(
             &path,
             &run_id,
@@ -1043,7 +1043,7 @@ mod tests {
         assert!(format!("{error:#}").contains("baseline binding"));
 
         let no_baseline_run_id = "4".repeat(64);
-        let no_baseline_path = state_path(&store, &no_baseline_run_id);
+        let no_baseline_path = coordinator_state_path(&store, &no_baseline_run_id);
         let no_baseline =
             load_or_new_state(&no_baseline_path, &no_baseline_run_id, "0.40.0", None, None)
                 .expect("new no-baseline state");

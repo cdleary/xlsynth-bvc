@@ -539,6 +539,11 @@ fn validate_manifest(manifest: &pb::CampaignRunManifest) -> Result<()> {
         }
         prior = Some(bytes);
     }
+    let expected_roots = canonical_roots_for_runtime(&dso_version.value, &runtime_model)
+        .context("deriving canonical campaign roots from the embedded runtime")?;
+    if manifest.root_actions != expected_roots {
+        bail!("campaign_run.root_actions do not match the canonical runtime root set");
+    }
     let status = pb::CampaignRunStatus::try_from(manifest.status)
         .context("campaign_run.status is unknown")?;
     if status == pb::CampaignRunStatus::Unspecified {
@@ -607,8 +612,8 @@ fn load_manifest(path: &Path) -> Result<pb::CampaignRunManifest> {
     Ok(manifest)
 }
 
-pub(crate) fn validate_campaign_run_file(path: &Path) -> Result<()> {
-    load_manifest(path).map(|_| ())
+pub(crate) fn load_campaign_run_file(path: &Path) -> Result<pb::CampaignRunManifest> {
+    load_manifest(path)
 }
 
 pub(crate) fn list_campaign_runs(store: &ArtifactStore) -> Result<Vec<pb::CampaignRunManifest>> {
@@ -617,14 +622,34 @@ pub(crate) fn list_campaign_runs(store: &ArtifactStore) -> Result<Vec<pb::Campai
         return Ok(Vec::new());
     }
     let mut manifests = Vec::new();
+    let mut run_ids = BTreeSet::new();
     for entry in WalkDir::new(&root).sort_by_file_name() {
         let entry = entry.with_context(|| format!("walking campaign runs: {}", root.display()))?;
+        if !entry.file_type().is_file() && !entry.file_type().is_dir() {
+            bail!(
+                "campaign record tree contains a symlink or special filesystem node: {}",
+                entry.path().display()
+            );
+        }
         if !entry.file_type().is_file()
             || entry.file_name().to_string_lossy() != CAMPAIGN_RUN_MANIFEST_FILENAME
         {
             continue;
         }
-        manifests.push(load_manifest(entry.path())?);
+        let manifest = load_manifest(entry.path())?;
+        let run_id = required(&manifest.run_id, "campaign_run.run_id")?;
+        let expected_path = campaign_run_path(store, run_id)?;
+        if entry.path() != expected_path {
+            bail!(
+                "campaign run path does not match its embedded run_id: {}",
+                entry.path().display()
+            );
+        }
+        let run_id = digest_hex(run_id, "campaign_run.run_id")?;
+        if !run_ids.insert(run_id.clone()) {
+            bail!("campaign record tree contains duplicate run_id {run_id}");
+        }
+        manifests.push(manifest);
     }
     manifests.sort_by(|a, b| {
         a.run_id
@@ -1800,6 +1825,26 @@ mod tests {
         let manifest = pb::CampaignRunManifest::default();
         let error = validate_manifest(&manifest).expect_err("invalid manifest");
         assert!(error.to_string().contains("record version"));
+    }
+
+    #[test]
+    fn manifest_requires_the_exact_canonical_runtime_root_set() {
+        let repo_root = std::env::current_dir().expect("current dir");
+        let version = known_crate_version(&repo_root);
+        let mut manifest = new_manifest(&repo_root, &version).expect("manifest");
+        assert!(manifest.root_actions.len() > 1, "test needs multiple roots");
+        manifest.root_actions.remove(0);
+        manifest
+            .completion
+            .as_mut()
+            .expect("completion")
+            .root_action_count = manifest.root_actions.len() as u64;
+
+        let error = validate_manifest(&manifest).expect_err("partial root set must fail");
+        assert!(
+            format!("{error:#}").contains("canonical runtime root set"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

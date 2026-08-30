@@ -1569,6 +1569,8 @@ struct PersistentRunnerHeartbeat {
     state: String,
     #[serde(default)]
     current_request_id: Option<String>,
+    #[serde(default)]
+    idle_since_unix_seconds: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -2226,16 +2228,22 @@ fn persistent_runner_is_idle(paths: &PersistentRunnerPaths) -> Result<bool> {
     let Some(heartbeat) = read_persistent_runner_heartbeat(paths)? else {
         return Ok(false);
     };
-    Ok(heartbeat.state == "idle" && heartbeat.current_request_id.is_none())
+    Ok(heartbeat.state == "idle"
+        && heartbeat.current_request_id.is_none()
+        && heartbeat.idle_since_unix_seconds.is_some())
 }
 
-fn persistent_runner_heartbeat_age_secs(paths: &PersistentRunnerPaths) -> Option<u64> {
-    let metadata = fs::metadata(&paths.heartbeat_path).ok()?;
-    let modified = metadata.modified().ok()?;
-    std::time::SystemTime::now()
-        .duration_since(modified)
-        .ok()
-        .map(|age| age.as_secs())
+fn persistent_runner_idle_age_secs(paths: &PersistentRunnerPaths) -> Option<u64> {
+    let heartbeat = read_persistent_runner_heartbeat(paths).ok()??;
+    if heartbeat.state != "idle" || heartbeat.current_request_id.is_some() {
+        return None;
+    }
+    let idle_since = heartbeat.idle_since_unix_seconds?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    now.checked_sub(idle_since)
 }
 
 fn cleanup_persistent_runner_container(container_name: &str) -> Result<()> {
@@ -2470,7 +2478,7 @@ fn cleanup_idle_persistent_runner_pool_slots(
         if !status.running || !status.idle {
             continue;
         }
-        if persistent_runner_heartbeat_age_secs(&status.paths).unwrap_or(0) < ttl_secs {
+        if persistent_runner_idle_age_secs(&status.paths).unwrap_or(0) < ttl_secs {
             continue;
         }
         cleanup_persistent_runner_container(&status.container_name).ok();
@@ -3012,6 +3020,38 @@ mod tests {
             nanos
         ));
         root
+    }
+
+    #[test]
+    fn persistent_runner_idle_age_survives_fresh_heartbeats() {
+        let root = make_temp_store_root("idle-age-heartbeats");
+        let paths = PersistentRunnerPaths::new(&root, "runner-key");
+        paths.ensure_layout().expect("runner layout");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let heartbeat = json!({
+            "runner_instance_id": "instance-1",
+            "state": "idle",
+            "current_request_id": null,
+            "idle_since_unix_seconds": now - 30,
+        });
+
+        for _ in 0..3 {
+            fs::write(
+                &paths.heartbeat_path,
+                serde_json::to_vec(&heartbeat).expect("heartbeat JSON"),
+            )
+            .expect("refresh heartbeat");
+            assert!(persistent_runner_is_idle(&paths).expect("idle state"));
+            assert!(
+                persistent_runner_idle_age_secs(&paths).expect("idle age") >= 30,
+                "fresh heartbeat writes must not reset idle age"
+            );
+        }
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

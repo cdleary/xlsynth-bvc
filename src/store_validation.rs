@@ -11,9 +11,11 @@ use walkdir::WalkDir;
 use crate::analysis::{decode_analysis_report, validate_analysis_report_against_store};
 use crate::campaign::{
     CAMPAIGN_ANALYSIS_FILENAME, CAMPAIGN_RUN_MANIFEST_FILENAME, campaign_analysis_path,
-    validate_campaign_run_file,
+    campaign_run_path, load_campaign_run_file,
 };
-use crate::coordinator::{COORDINATOR_LOCK_FILENAME, decode_coordinator_state};
+use crate::coordinator::{
+    COORDINATOR_LOCK_FILENAME, coordinator_state_path, decode_coordinator_state,
+};
 use crate::executor::compute_action_id;
 use crate::model::{QueueCanceled, QueueDone, QueueFailed, QueueItem, QueueRunning};
 use crate::proto::{
@@ -114,6 +116,11 @@ fn list_regular_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
         let entry = entry.with_context(|| format!("walking record tree: {}", root.display()))?;
         if entry.file_type().is_file() {
             paths.push(entry.into_path());
+        } else if !entry.file_type().is_dir() {
+            bail!(
+                "record tree contains a symlink or special filesystem node: {}",
+                entry.path().display()
+            );
         }
     }
     Ok(paths)
@@ -180,10 +187,27 @@ fn validate_campaign_records(store: &ArtifactStore) -> Result<(usize, usize)> {
     let root = store.campaign_runs_dir();
     let mut campaign_runs = 0_usize;
     let mut analyses = 0_usize;
+    let mut campaign_run_ids = BTreeSet::new();
+    let mut analysis_run_ids = BTreeSet::new();
     for path in list_regular_files(&root)? {
         match path.file_name().and_then(|value| value.to_str()) {
             Some(CAMPAIGN_RUN_MANIFEST_FILENAME) => {
-                validate_campaign_run_file(&path)?;
+                let manifest = load_campaign_run_file(&path)?;
+                let run_id = manifest
+                    .run_id
+                    .as_ref()
+                    .context("campaign run manifest missing run_id")?;
+                let expected_path = campaign_run_path(store, run_id)?;
+                if path != expected_path {
+                    bail!(
+                        "campaign run path does not match its embedded run_id: {}",
+                        path.display()
+                    );
+                }
+                let run_id = hex::encode(&run_id.value);
+                if !campaign_run_ids.insert(run_id.clone()) {
+                    bail!("campaign record tree contains duplicate run_id {run_id}");
+                }
                 campaign_runs += 1;
             }
             Some(CAMPAIGN_ANALYSIS_FILENAME) => {
@@ -207,6 +231,16 @@ fn validate_campaign_records(store: &ArtifactStore) -> Result<(usize, usize)> {
                         path.display()
                     );
                 }
+                let run_id = hex::encode(
+                    &report
+                        .run_id
+                        .as_ref()
+                        .expect("validated campaign analysis run_id")
+                        .value,
+                );
+                if !analysis_run_ids.insert(run_id.clone()) {
+                    bail!("campaign analysis tree contains duplicate run_id {run_id}");
+                }
                 analyses += 1;
             }
             _ => bail!(
@@ -218,10 +252,12 @@ fn validate_campaign_records(store: &ArtifactStore) -> Result<(usize, usize)> {
     Ok((campaign_runs, analyses))
 }
 
-fn validate_coordinator_records(root: &Path) -> Result<usize> {
+fn validate_coordinator_records(store: &ArtifactStore) -> Result<usize> {
+    let root = store.coordinator_dir();
     let lock_path = root.join(COORDINATOR_LOCK_FILENAME);
     let mut records = 0_usize;
-    for path in list_regular_files(root)? {
+    let mut run_ids = BTreeSet::new();
+    for path in list_regular_files(&root)? {
         if path == lock_path {
             continue;
         }
@@ -233,8 +269,25 @@ fn validate_coordinator_records(root: &Path) -> Result<usize> {
         }
         let bytes = fs::read(&path)
             .with_context(|| format!("reading coordinator record: {}", path.display()))?;
-        decode_coordinator_state(&bytes)
+        let state = decode_coordinator_state(&bytes)
             .with_context(|| format!("validating coordinator record: {}", path.display()))?;
+        let run_id = hex::encode(
+            &state
+                .run_id
+                .as_ref()
+                .expect("validated coordinator run_id")
+                .value,
+        );
+        let expected_path = coordinator_state_path(store, &run_id);
+        if path != expected_path {
+            bail!(
+                "coordinator record path does not match its embedded run_id: {}",
+                path.display()
+            );
+        }
+        if !run_ids.insert(run_id.clone()) {
+            bail!("coordinator record tree contains duplicate run_id {run_id}");
+        }
         records += 1;
     }
     Ok(records)
@@ -335,7 +388,7 @@ pub(crate) fn validate_store(
     }
 
     let (campaign_run_records, analysis_records) = validate_campaign_records(store)?;
-    let coordinator_records = validate_coordinator_records(&store.coordinator_dir())?;
+    let coordinator_records = validate_coordinator_records(store)?;
     let mut verified_payload_files = 0_usize;
     let mut verified_payload_bytes = 0_u64;
     if verify_payloads {
@@ -600,7 +653,9 @@ mod tests {
         let run_id = hex::decode(&campaign.run_id).expect("decode run id");
         let state = pb::CoordinatorState {
             record_version: 2,
-            run_id: Some(pb::Sha256Digest { value: run_id }),
+            run_id: Some(pb::Sha256Digest {
+                value: run_id.clone(),
+            }),
             crate_version: Some(pb::CrateVersion { value: version }),
             current_stage: pb::CoordinatorStage::Planned as i32,
             stage_results: Vec::new(),
@@ -613,7 +668,7 @@ mod tests {
             baseline_run_id: None,
             baseline_crate_version: None,
         };
-        let state_path = store.coordinator_dir().join("aa/bb/state.pb");
+        let state_path = coordinator_state_path(&store, &campaign.run_id);
         fs::create_dir_all(state_path.parent().expect("state parent"))
             .expect("create state parent");
         fs::write(&state_path, state.encode_to_vec()).expect("write coordinator state");
@@ -637,8 +692,64 @@ mod tests {
         assert_eq!(summary.analysis_records, 0);
         assert_eq!(summary.coordinator_records, 1);
 
+        let manifest_path =
+            campaign_run_path(&store, &pb::Sha256Digest { value: run_id }).expect("campaign path");
+        let wrong_manifest_path = store
+            .campaign_runs_dir()
+            .join("ff/ff/copied")
+            .join(CAMPAIGN_RUN_MANIFEST_FILENAME);
+        fs::create_dir_all(wrong_manifest_path.parent().expect("wrong manifest parent"))
+            .expect("create wrong manifest parent");
+        fs::copy(&manifest_path, &wrong_manifest_path).expect("copy miskeyed campaign manifest");
+        let error = crate::campaign::list_campaign_runs(&store)
+            .expect_err("ordinary campaign enumeration must reject a miskeyed manifest");
+        assert!(
+            format!("{error:#}").contains("campaign run path does not match"),
+            "unexpected error: {error:#}"
+        );
+        let error = validate_store(&store, false).expect_err("miskeyed campaign must fail");
+        assert!(
+            format!("{error:#}").contains("campaign run path does not match"),
+            "unexpected error: {error:#}"
+        );
+        fs::remove_file(&wrong_manifest_path).expect("remove miskeyed campaign");
+
+        let wrong_state_path = store.coordinator_dir().join("ff/ff/copied.pb");
+        fs::create_dir_all(wrong_state_path.parent().expect("wrong state parent"))
+            .expect("create wrong state parent");
+        fs::copy(&state_path, &wrong_state_path).expect("copy miskeyed coordinator state");
+        let error = validate_store(&store, false).expect_err("miskeyed coordinator must fail");
+        assert!(
+            format!("{error:#}").contains("coordinator record path does not match"),
+            "unexpected error: {error:#}"
+        );
+
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn record_tree_validation_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path();
+        let outside = root.with_extension("outside");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        fs::create_dir_all(&outside).expect("outside directory");
+        symlink(&outside, store.queue_pending_dir().join("linked-records"))
+            .expect("create record-tree symlink");
+
+        let error = validate_store(&store, false).expect_err("symlink must fail validation");
+        assert!(
+            format!("{error:#}").contains("symlink or special filesystem node"),
+            "unexpected error: {error:#}"
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup store");
+        fs::remove_dir_all(outside).expect("cleanup outside");
     }
 
     #[test]

@@ -65,6 +65,11 @@ analysis sample must transitively descend from the selected run's exact stdlib
 root; same-version rows from another root generation are never attributed to
 that run.
 
+Campaign validation derives the canonical root-action set again from the
+manifest's bound runtime and requires exact equality. A root cannot be added,
+removed, or substituted while retaining a valid campaign record, even when the
+replacement action is individually well formed and content-addressed.
+
 Fresh-store bootstrap follows the same process-restart contract. Initialization
 serializes through an advisory lock and promotes a fully encoded format marker
 from application-owned staging, so an interrupted initializer leaves the final
@@ -179,6 +184,12 @@ publication until successful result validation and writeback, an armed cleanup
 guard retires only that captured container ID on every error path, including
 result read/parse failures, protocol identity mismatches, incarnation changes,
 timeouts, failed commands, and writeback failures.
+
+Heartbeat freshness is liveness evidence only. Idle-pool retirement uses the
+worker's explicit `idle_since_unix_seconds`, which is cleared before a request
+and reset only after successful completion; periodic idle heartbeats therefore
+do not keep burst-only pool slots alive forever. An idle heartbeat without that
+field is not eligible for reuse.
 
 Pending-version discovery compares the current campaign, crate/DSO mapping,
 Docker recipe digest, release-cache input digest, and canonical root actions;
@@ -306,6 +317,19 @@ record paths. Process termination may leave an abandoned staging file, but it
 cannot introduce a non-protobuf sibling into a validator-scanned record tree;
 validation and a later retry ignore that debris. Staging retention/cleanup is
 operational hygiene and is not used as correctness or ownership evidence.
+
+Canonical record paths are part of validation: queue, campaign, analysis, and
+coordinator paths must agree exactly with the identity embedded in each
+protobuf, and duplicate embedded identities fail validation. Record trees and
+atomic-write paths reject symlinks and special filesystem nodes. Before and
+after directory creation, the writer checks path components and requires the
+resolved existing ancestor to remain beneath the resolved store root.
+
+The private store is an application-owned boundary, not a hostile multi-user
+filesystem sandbox. These checks prevent accidental or pre-existing link
+traversal and ordinary process-level races covered by this design; they do not
+claim an `openat2`/directory-fd security boundary against another privileged
+process adversarially replacing path components between checks.
 
 ## Content-addressed store invariant
 

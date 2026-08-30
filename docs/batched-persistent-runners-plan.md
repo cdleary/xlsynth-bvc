@@ -41,6 +41,10 @@ Each persistent container acts as a single-runner request loop:
 - execute the provided shell script
 - write `stdout.log`, `stderr.log`, `result.json`, and heartbeat updates
 
+Heartbeat updates carry both the current state and an explicit idle-start
+timestamp. File freshness is used for liveness; idle-pool TTL cleanup measures
+from the idle-start timestamp so periodic heartbeats do not extend slot life.
+
 The worker does not know anything about the global queue or provenance model.
 
 ## Cutover Boundary
@@ -215,7 +219,7 @@ The steady-state property we care about is confirmed by warm reruns:
 There are still a few worthwhile follow-ups, but they are incremental:
 
 - broaden cached capability metadata if new driver feature probes appear
-- add optional stale-runner retirement if idle containers become a resource problem
+- tune idle-runner TTL and pool-size defaults from build-machine measurements
 - improve request/result typing only if debugging or multi-member reporting becomes painful
 
 ## Summary

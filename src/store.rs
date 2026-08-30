@@ -11,7 +11,7 @@ use sled::transaction::{
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +27,103 @@ use crate::proto::{
 };
 use crate::queue::action_dependency_action_ids;
 use crate::snapshot::snapshot_web_index_path;
+
+#[derive(Clone, Copy)]
+enum StorePathLeafKind {
+    Directory,
+    RegularFileOrMissing,
+}
+
+fn validate_store_path_without_links(
+    store_root: &Path,
+    path: &Path,
+    leaf_kind: StorePathLeafKind,
+    label: &str,
+) -> Result<()> {
+    let relative = path.strip_prefix(store_root).with_context(|| {
+        format!(
+            "{label} must be inside the private store: {}",
+            path.display()
+        )
+    })?;
+    if relative.as_os_str().is_empty() {
+        bail!("{label} must not be the private store root");
+    }
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!(
+            "{label} contains a non-normal path component: {}",
+            path.display()
+        );
+    }
+
+    let root_metadata = fs::symlink_metadata(store_root)
+        .with_context(|| format!("statting private store root: {}", store_root.display()))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        bail!(
+            "private store root must be a real directory, not a symlink or special node: {}",
+            store_root.display()
+        );
+    }
+    let canonical_root = fs::canonicalize(store_root)
+        .with_context(|| format!("resolving private store root: {}", store_root.display()))?;
+    let components = relative.components().collect::<Vec<_>>();
+    let mut current = store_root.to_path_buf();
+    let mut existing_ancestor = store_root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!("{label} traverses a symlink: {}", current.display());
+                }
+                let is_leaf = index + 1 == components.len();
+                let valid_type = if is_leaf {
+                    match leaf_kind {
+                        StorePathLeafKind::Directory => metadata.is_dir(),
+                        StorePathLeafKind::RegularFileOrMissing => metadata.is_file(),
+                    }
+                } else {
+                    metadata.is_dir()
+                };
+                if !valid_type {
+                    bail!(
+                        "{label} traverses a special or wrong-kind node: {}",
+                        current.display()
+                    );
+                }
+                existing_ancestor = current.clone();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("statting {label}: {}", current.display()));
+            }
+        }
+    }
+    let canonical_ancestor = fs::canonicalize(&existing_ancestor).with_context(|| {
+        format!(
+            "resolving existing {label} ancestor: {}",
+            existing_ancestor.display()
+        )
+    })?;
+    if !canonical_ancestor.starts_with(&canonical_root) {
+        bail!(
+            "{label} resolves outside the private store: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_store_directory_without_links(store_root: &Path, path: &Path, label: &str) -> Result<()> {
+    validate_store_path_without_links(store_root, path, StorePathLeafKind::Directory, label)?;
+    fs::create_dir_all(path).with_context(|| format!("creating {label}: {}", path.display()))?;
+    validate_store_path_without_links(store_root, path, StorePathLeafKind::Directory, label)?;
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum ArtifactBackendSelection {
@@ -2728,20 +2825,24 @@ impl ArtifactStore {
         {
             bail!("atomic record domain must be a nonempty ASCII identifier");
         }
-        if !destination.starts_with(&self.root) {
-            bail!(
-                "atomic record destination must be inside the private store: {}",
-                destination.display()
-            );
-        }
+        validate_store_path_without_links(
+            &self.root,
+            destination,
+            StorePathLeafKind::RegularFileOrMissing,
+            "atomic record destination",
+        )?;
         let parent = destination
             .parent()
             .ok_or_else(|| anyhow!("atomic record destination has no parent"))?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating atomic record parent: {}", parent.display()))?;
+        ensure_store_directory_without_links(&self.root, parent, "atomic record parent")?;
         let staging = self.staging_dir().join("atomic-records").join(domain);
-        fs::create_dir_all(&staging)
-            .with_context(|| format!("creating atomic record staging: {}", staging.display()))?;
+        ensure_store_directory_without_links(&self.root, &staging, "atomic record staging")?;
+        validate_store_path_without_links(
+            &self.root,
+            destination,
+            StorePathLeafKind::RegularFileOrMissing,
+            "atomic record destination",
+        )?;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -2755,14 +2856,37 @@ impl ArtifactStore {
             "{filename}.tmp-{}-{timestamp}-{nonce}",
             std::process::id()
         ));
-        fs::write(&temp, contents)
+        let mut temp_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .with_context(|| format!("creating atomic record staging file: {}", temp.display()))?;
+        temp_file
+            .write_all(contents)
             .with_context(|| format!("writing atomic record staging file: {}", temp.display()))?;
+        drop(temp_file);
+        validate_store_path_without_links(
+            &self.root,
+            &staging,
+            StorePathLeafKind::Directory,
+            "atomic record staging",
+        )?;
+        validate_store_path_without_links(
+            &self.root,
+            destination,
+            StorePathLeafKind::RegularFileOrMissing,
+            "atomic record destination",
+        )?;
         match fs::rename(&temp, destination) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!("recreating atomic record parent: {}", parent.display())
-                })?;
+                ensure_store_directory_without_links(&self.root, parent, "atomic record parent")?;
+                validate_store_path_without_links(
+                    &self.root,
+                    destination,
+                    StorePathLeafKind::RegularFileOrMissing,
+                    "atomic record destination",
+                )?;
                 fs::rename(&temp, destination).with_context(|| {
                     format!(
                         "promoting staged record after parent recreation: {} -> {}",
@@ -3213,6 +3337,37 @@ mod tests {
             .expect("clock before epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_record_write_rejects_symlinked_destination_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = make_test_root("xlsynth-bvc-atomic-record-symlink");
+        let outside = make_test_root("xlsynth-bvc-atomic-record-outside");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("store layout");
+        fs::create_dir_all(&outside).expect("outside directory");
+        fs::create_dir_all(store.coordinator_dir()).expect("coordinator directory");
+        let linked_parent = store.coordinator_dir().join("aa");
+        symlink(&outside, &linked_parent).expect("symlink destination parent");
+        let destination = linked_parent.join("record.pb");
+
+        let error = store
+            .write_record_atomic("coordinator", &destination, b"record")
+            .expect_err("symlink traversal must fail");
+        assert!(
+            format!("{error:#}").contains("traverses a symlink"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !outside.join("record.pb").exists(),
+            "atomic writer must not create a file outside the store"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup store");
+        fs::remove_dir_all(outside).expect("cleanup outside");
     }
 
     fn make_test_provenance(seed_digest: &str, output_path: &str, output_bytes: u64) -> Provenance {

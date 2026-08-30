@@ -84,7 +84,7 @@ def heartbeat_thread_fn(
     stop_event: threading.Event,
 ) -> None:
     while not stop_event.wait(HEARTBEAT_INTERVAL_SECS):
-        state, current_request_id = state_fn()
+        state, current_request_id, idle_since_unix_seconds = state_fn()
         write_json_atomic(
             heartbeat_path,
             {
@@ -93,6 +93,7 @@ def heartbeat_thread_fn(
                 "runner_key": runner_key,
                 "state": state,
                 "current_request_id": current_request_id,
+                "idle_since_unix_seconds": idle_since_unix_seconds,
                 "started_utc": state_fn.started_utc,
                 "last_heartbeat_utc": utc_now(),
             },
@@ -218,6 +219,7 @@ def process_request(
     timeout_secs = int(request["timeout_secs"])
     heartbeat_state["state"] = "busy"
     heartbeat_state["current_request_id"] = request_id
+    heartbeat_state["idle_since_unix_seconds"] = None
 
     job_root = Path(request["job_root"])
     stdout_log = job_root / "stdout.log"
@@ -250,7 +252,11 @@ def process_request(
             stop_event = threading.Event()
 
             def running_state():
-                return heartbeat_state["state"], heartbeat_state["current_request_id"]
+                return (
+                    heartbeat_state["state"],
+                    heartbeat_state["current_request_id"],
+                    heartbeat_state["idle_since_unix_seconds"],
+                )
 
             running_state.started_utc = heartbeat_state["started_utc"]
             thread = threading.Thread(
@@ -327,6 +333,9 @@ def process_request(
     retire = error is not None
     heartbeat_state["state"] = "retired" if retire else "idle"
     heartbeat_state["current_request_id"] = None
+    heartbeat_state["idle_since_unix_seconds"] = (
+        None if retire else int(time.time())
+    )
     return not retire
 
 
@@ -360,10 +369,15 @@ def main() -> int:
         "state": "idle",
         "current_request_id": None,
         "started_utc": started_utc,
+        "idle_since_unix_seconds": int(time.time()),
     }
 
     def state_fn():
-        return heartbeat_state["state"], heartbeat_state["current_request_id"]
+        return (
+            heartbeat_state["state"],
+            heartbeat_state["current_request_id"],
+            heartbeat_state["idle_since_unix_seconds"],
+        )
 
     state_fn.started_utc = started_utc
     write_json_atomic(
