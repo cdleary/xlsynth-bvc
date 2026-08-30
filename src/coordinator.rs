@@ -414,7 +414,7 @@ fn select_or_plan_campaign_run(
         return Ok(manifest);
     }
 
-    let mut candidates = list_campaign_runs(store)?
+    let candidates = list_campaign_runs(store)?
         .into_iter()
         .filter(|manifest| {
             manifest.campaign_id.as_ref() == Some(&campaign_id)
@@ -424,8 +424,15 @@ fn select_or_plan_campaign_run(
                     .is_some_and(|version| version.value == requested_version)
         })
         .collect::<Vec<_>>();
-    if candidates.len() > 1 {
-        let ids = candidates
+    let mut resumable = candidates
+        .into_iter()
+        .filter(|manifest| {
+            pb::CampaignRunStatus::try_from(manifest.status)
+                .is_ok_and(|status| status == pb::CampaignRunStatus::Building)
+        })
+        .collect::<Vec<_>>();
+    if resumable.len() > 1 {
+        let ids = resumable
             .iter()
             .map(|manifest| {
                 digest_hex(
@@ -435,16 +442,17 @@ fn select_or_plan_campaign_run(
             })
             .collect::<Result<Vec<_>>>()?;
         bail!(
-            "multiple stored campaign runs match crate version {requested_version}; resume one explicitly with --run-id: {}",
+            "multiple in-progress campaign runs match crate version {requested_version}; resume one explicitly with --run-id: {}",
             ids.join(", ")
         );
     }
-    if let Some(manifest) = candidates.pop() {
+    if let Some(manifest) = resumable.pop() {
         return Ok(manifest);
     }
 
-    // Live planning is only permitted when there is no stored identity to resume.
-    // Persist the fully bound runtime and roots before the coordinator records success.
+    // Finalized generations are history. Bind today's declared inputs and select
+    // their exact run ID (reusing it if already present) instead of choosing an
+    // arbitrary old generation by crate-version label alone.
     persist_campaign_run_plan(store, repo_root, requested_version)
 }
 
@@ -739,6 +747,22 @@ mod tests {
         ))
     }
 
+    fn make_mutable_resource_root(label: &str) -> PathBuf {
+        let source_root = std::env::current_dir().expect("current dir");
+        let root = temp_path(label);
+        for relpath in [
+            crate::VERSION_COMPAT_PATH,
+            crate::DEFAULT_DOCKERFILE,
+            crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
+        ] {
+            let target = root.join(relpath);
+            fs::create_dir_all(target.parent().expect("resource parent"))
+                .expect("create resource parent");
+            fs::copy(source_root.join(relpath), &target).expect("copy resource input");
+        }
+        root
+    }
+
     #[test]
     fn coordinator_lock_excludes_overlap_and_recovers_on_drop() {
         let root = temp_path("lock");
@@ -803,6 +827,52 @@ mod tests {
         assert_eq!(explicit.run_id, persisted.run_id);
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn finalized_history_does_not_hide_current_runtime_generation() {
+        let root = temp_path("current-generation-store");
+        let repo_root = make_mutable_resource_root("current-generation-resources");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let version = crate::versioning::load_version_compat_map(&repo_root)
+            .expect("version map")
+            .into_keys()
+            .next()
+            .expect("known version");
+        let mut old = persist_campaign_run_plan(&store, &repo_root, &version)
+            .expect("persist old generation");
+        old.status = pb::CampaignRunStatus::Complete as i32;
+        old.completion = Some(pb::CompletionReport {
+            status: pb::CampaignRunStatus::Complete as i32,
+            root_action_count: old.root_actions.len() as u64,
+            completed_root_count: old.root_actions.len() as u64,
+            ..Default::default()
+        });
+        let old_summary = summarize_campaign_run(&store, &old, true).expect("old summary");
+        fs::write(&old_summary.manifest_path, old.encode_to_vec())
+            .expect("finalize old generation fixture");
+
+        let setup_script = repo_root.join(crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT);
+        let mut bytes = fs::read(&setup_script).expect("read setup script");
+        bytes.extend_from_slice(b"\n# next runtime generation\n");
+        fs::write(&setup_script, bytes).expect("change runtime input");
+
+        let selected = select_or_plan_campaign_run(&store, &repo_root, &version, None)
+            .expect("select current generation");
+        assert_ne!(selected.run_id, old.run_id);
+        assert_eq!(
+            pb::CampaignRunStatus::try_from(selected.status).expect("selected status"),
+            pb::CampaignRunStatus::Building
+        );
+        assert_eq!(
+            list_campaign_runs(&store).expect("campaign history").len(),
+            2
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup store");
+        fs::remove_dir_all(repo_root).expect("cleanup resources");
     }
 
     #[test]

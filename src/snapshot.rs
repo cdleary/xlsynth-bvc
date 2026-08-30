@@ -147,13 +147,21 @@ fn reject_snapshot_output_overlap(
     repo_root: &Path,
 ) -> Result<()> {
     let output = normalized_absolute_path(out_dir)?;
-    let store_root = normalized_absolute_path(&store.root)?;
-    if store_root.starts_with(&output) {
-        bail!(
-            "snapshot output must not equal or contain the private store: output={} store={}",
-            output.display(),
-            store_root.display()
-        );
+    for (label, protected_path) in [
+        ("private store", store.root.as_path()),
+        (
+            "artifact backend storage",
+            store.artifact_backend_storage_path(),
+        ),
+    ] {
+        let protected = normalized_absolute_path(protected_path)?;
+        if output.starts_with(&protected) || protected.starts_with(&output) {
+            bail!(
+                "snapshot output must not overlap {label}: output={} protected={}",
+                output.display(),
+                protected.display()
+            );
+        }
     }
     let resource_root = normalized_absolute_path(repo_root)?;
     if output.starts_with(&resource_root) || resource_root.starts_with(&output) {
@@ -1470,7 +1478,7 @@ mod tests {
     #[test]
     fn static_snapshot_build_and_verify_roundtrip() {
         let root = make_temp_dir("build-verify");
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
         store
             .write_web_index_bytes(
@@ -1546,7 +1554,7 @@ mod tests {
     #[test]
     fn default_snapshot_rebuild_is_content_idempotent() {
         let root = make_temp_dir("default-rebuild-idempotent");
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
         crate::service::populate_ir_fn_corpus_structural_index(
             &store,
@@ -1602,15 +1610,71 @@ mod tests {
             },
         )
         .expect_err("store ancestor output must fail");
-        assert!(format!("{error:#}").contains("must not equal or contain the private store"));
+        assert!(format!("{error:#}").contains("must not overlap private store"));
         assert_eq!(fs::read(&marker).expect("marker survives"), b"private");
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn snapshot_overwrite_rejects_output_below_private_store_before_deletion() {
+        let root = make_temp_dir("reject-store-descendant");
+        let store = ArtifactStore::new(root.join("private-store"));
+        store.ensure_layout().expect("ensure layout");
+        let out_dir = store.root.join("queue");
+        let marker = out_dir.join("must-survive");
+        fs::write(&marker, b"private").expect("write marker");
+
+        let error = build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir,
+                overwrite: true,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect_err("store-descendant output must fail");
+        assert!(format!("{error:#}").contains("must not overlap private store"));
+        assert_eq!(fs::read(&marker).expect("marker survives"), b"private");
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn snapshot_overwrite_rejects_external_artifact_backend_ancestor() {
+        let root = make_temp_dir("reject-external-artifact-backend");
+        let external_root = root.join("external-db-root");
+        let db_path = external_root.join("artifacts.sled");
+        let store = ArtifactStore::new_with_sled(root.join("private-store"), db_path.clone());
+        store.ensure_layout().expect("ensure layout");
+        let marker = external_root.join("must-survive");
+        fs::write(&marker, b"database-neighbor").expect("write marker");
+
+        let error = build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: external_root,
+                overwrite: true,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect_err("artifact-backend ancestor output must fail");
+        assert!(format!("{error:#}").contains("must not overlap artifact backend storage"));
+        assert!(db_path.exists());
+        assert_eq!(
+            fs::read(&marker).expect("marker survives"),
+            b"database-neighbor"
+        );
+        drop(store);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn snapshot_verifier_rejects_symlinks() {
         let root = make_temp_dir("reject-symlink");
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
         store
             .write_web_index_bytes(
@@ -1639,7 +1703,7 @@ mod tests {
     #[test]
     fn snapshot_manifest_rejects_unknown_wire_fields() {
         let root = make_temp_dir("reject-unknown-wire");
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
         store
             .write_web_index_bytes(
@@ -1672,7 +1736,7 @@ mod tests {
     #[test]
     fn static_snapshot_verify_detects_tamper() {
         let root = make_temp_dir("tamper");
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
         store
             .write_web_index_bytes(
@@ -1708,7 +1772,7 @@ mod tests {
     #[test]
     fn static_snapshot_verify_rejects_self_consistent_private_dataset() {
         let root = make_temp_dir("verify-private-dataset");
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
         store
             .write_web_index_bytes(
@@ -1754,7 +1818,7 @@ mod tests {
     #[test]
     fn static_snapshot_verify_rejects_self_consistent_typed_invalid_dataset() {
         let root = make_temp_dir("verify-invalid-dataset");
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
         store
             .write_web_index_bytes(
@@ -1804,7 +1868,7 @@ mod tests {
     #[test]
     fn static_snapshot_build_skips_incremental_delta_rows() {
         let root = make_temp_dir("skip-incremental");
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
         store
             .write_web_index_bytes(
@@ -1851,7 +1915,7 @@ mod tests {
     #[test]
     fn static_snapshot_build_skips_stdlib_file_action_graph_index() {
         let root = make_temp_dir("skip-action-graph");
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
         store
             .write_web_index_bytes(
@@ -1897,7 +1961,7 @@ mod tests {
     #[test]
     fn static_snapshot_rejects_incomplete_structural_index() {
         let root = make_temp_dir("incomplete-structural-index");
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
         let structural_hash = "c".repeat(64);
         let manifest = crate::model::IrFnCorpusStructuralManifest {
@@ -1989,7 +2053,7 @@ mod tests {
     #[test]
     fn static_snapshot_excludes_unknown_private_index_and_host_path() {
         let root = make_temp_dir("private-index");
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
         store
             .write_web_index_bytes(

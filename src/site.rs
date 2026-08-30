@@ -1785,7 +1785,7 @@ mod tests {
     #[test]
     fn site_build_and_verify_supports_subdirectory_base() {
         let root = temp_root();
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("store layout");
         store
             .write_web_index_bytes(
@@ -1968,7 +1968,7 @@ mod tests {
     #[test]
     fn site_verifier_detects_tamper() {
         let root = temp_root();
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("store layout");
         store
             .write_web_index_bytes(
@@ -2003,7 +2003,7 @@ mod tests {
     #[test]
     fn site_verifier_rejects_self_consistent_script_and_unknown_catalog_field() {
         let root = temp_root();
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("store layout");
         store
             .write_web_index_bytes(
@@ -2115,7 +2115,7 @@ mod tests {
     #[test]
     fn site_verifier_rejects_symlinks() {
         let root = temp_root();
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("store layout");
         store
             .write_web_index_bytes(
@@ -2151,7 +2151,7 @@ mod tests {
     #[test]
     fn site_verifier_binds_dataset_bytes_to_source_snapshot() {
         let root = temp_root();
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("store layout");
         store
             .write_web_index_bytes(
@@ -2240,7 +2240,7 @@ mod tests {
     #[test]
     fn site_verifier_rejects_self_consistent_non_allowlisted_files() {
         let root = temp_root();
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("store layout");
         store
             .write_web_index_bytes(
@@ -2309,7 +2309,7 @@ mod tests {
     #[test]
     fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() {
         let root = temp_root();
-        let store = ArtifactStore::new(root.clone());
+        let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("store layout");
         let repo_root = std::env::current_dir().expect("current dir");
         let crate_version = load_version_compat_map(&repo_root)

@@ -142,12 +142,18 @@ fn normalized_relpath(value: &str, field: &str) -> Result<String> {
     Ok(normalized)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+fn atomic_write(staging_root: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("atomic write path has no parent"))?;
     fs::create_dir_all(parent)
         .with_context(|| format!("creating publication parent: {}", parent.display()))?;
+    fs::create_dir_all(staging_root).with_context(|| {
+        format!(
+            "creating publication atomic staging root: {}",
+            staging_root.display()
+        )
+    })?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -157,8 +163,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("publication");
-    let temp = parent.join(format!(
-        ".{name}.tmp-{}-{timestamp}-{nonce}",
+    let temp = staging_root.join(format!(
+        "atomic-{name}-{}-{timestamp}-{nonce}",
         std::process::id()
     ));
     fs::write(&temp, bytes)
@@ -170,6 +176,43 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             path.display()
         )
     })
+}
+
+fn remove_abandoned_atomic_write_staging(staging_root: &Path) -> Result<usize> {
+    if !staging_root.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for entry in fs::read_dir(staging_root)
+        .with_context(|| format!("reading publication staging: {}", staging_root.display()))?
+    {
+        let entry = entry.context("reading publication staging entry")?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !name.starts_with("atomic-") {
+            continue;
+        }
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .with_context(|| format!("reading atomic staging type: {}", path.display()))?
+            .is_file()
+        {
+            bail!(
+                "publication atomic staging entry is not a regular file: {}",
+                path.display()
+            );
+        }
+        fs::remove_file(&path).with_context(|| {
+            format!(
+                "removing abandoned publication atomic write: {}",
+                path.display()
+            )
+        })?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 fn copy_site(source: &Path, destination: &Path) -> Result<()> {
@@ -435,6 +478,9 @@ pub(crate) fn publish_static_site_with_protected_roots(
     validate_publication_top_level(publish_root)?;
     let _lock = PublicationLock::acquire(publish_root)?;
     validate_publication_top_level(publish_root)?;
+    let staging_root = publish_root.join(".staging");
+    fs::create_dir_all(&staging_root)?;
+    remove_abandoned_atomic_write_staging(&staging_root)?;
     let (site_manifest, manifest_bytes, site_id_digest) = site_identity(site_dir)?;
     let site_id = digest_hex(&site_id_digest, "site_id")?;
     let snapshot_id = digest_hex(
@@ -442,13 +488,12 @@ pub(crate) fn publish_static_site_with_protected_roots(
         "site.source_snapshot_id",
     )?;
     atomic_write(
+        &staging_root,
         &publish_root.join("index.html"),
         PUBLISHED_ROOT_INDEX_HTML.as_bytes(),
     )?;
     let site_relpath = format!("sites/{site_id}");
     let target = publish_root.join(&site_relpath);
-    let staging_root = publish_root.join(".staging");
-    fs::create_dir_all(&staging_root)?;
     remove_abandoned_site_staging(&staging_root, &site_id)?;
     let reused_immutable_site = if target.exists() {
         let (_, existing_manifest, existing_site_id) = site_identity(&target)?;
@@ -515,7 +560,7 @@ pub(crate) fn publish_static_site_with_protected_roots(
         }
     } else {
         validate_catalog(&catalog)?;
-        atomic_write(&catalog_path, &catalog.encode_to_vec())?;
+        atomic_write(&staging_root, &catalog_path, &catalog.encode_to_vec())?;
     }
     let pointer_path = publish_root.join(CURRENT_POINTER_PROTO);
     let mut pointer = pb::CurrentSitePointer {
@@ -545,7 +590,7 @@ pub(crate) fn publish_static_site_with_protected_roots(
         }
     }
     validate_pointer(&pointer)?;
-    atomic_write(&pointer_path, &pointer.encode_to_vec())?;
+    atomic_write(&staging_root, &pointer_path, &pointer.encode_to_vec())?;
     let browser_pointer = BrowserCurrentPointer {
         schema_version: 1,
         site_id: site_id.clone(),
@@ -553,6 +598,7 @@ pub(crate) fn publish_static_site_with_protected_roots(
         site_url: format!("{site_relpath}/"),
     };
     atomic_write(
+        &staging_root,
         &publish_root.join(CURRENT_POINTER_JSON),
         &encode_browser_current_pointer(&browser_pointer)?,
     )?;
@@ -783,10 +829,15 @@ mod tests {
         fs::create_dir_all(abandoned.join("partial")).expect("seed abandoned staging");
         fs::write(abandoned.join("partial/index.html"), "partial")
             .expect("write abandoned staging");
+        let abandoned_atomic = publish_root
+            .join(".staging")
+            .join("atomic-current.pb-interrupted");
+        fs::write(&abandoned_atomic, b"partial pointer").expect("seed interrupted atomic write");
 
         let first = publish_static_site(&site_dir, &publish_root).expect("first publish");
         assert!(!first.reused_immutable_site);
         assert!(!abandoned.exists());
+        assert!(!abandoned_atomic.exists());
         let catalog_path = publish_root.join(&first.catalog_relpath);
         let first_catalog = fs::read(&catalog_path).expect("first catalog");
         let first_pointer =

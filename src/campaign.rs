@@ -416,6 +416,7 @@ fn same_driver_runtime_recipe(
         && lhs.docker_image == rhs.docker_image
         && lhs.dockerfile == rhs.dockerfile
         && lhs.dockerfile_sha256 == rhs.dockerfile_sha256
+        && lhs.release_cache_input_sha256 == rhs.release_cache_input_sha256
 }
 
 fn new_manifest(
@@ -672,8 +673,13 @@ pub(crate) fn pending_campaign_versions(
     for version in load_version_compat_map(repo_root)?.into_keys() {
         let dso_with_v = resolve_xlsynth_version_for_driver(repo_root, &version)?;
         let dso_version = normalize_version(&dso_with_v, "dso_version")?;
-        let recipe =
+        let mut recipe =
             explicit_driver_runtime_recipe_for_crate_version(repo_root, &version, &dso_version)?;
+        recipe.release_cache_input_sha256 = crate::service::driver_release_cache_input_sha256(
+            repo_root,
+            &dso_version,
+            &recipe.release_platform,
+        )?;
         let is_finalized = finalized.iter().any(|manifest| {
             let Some(manifest_runtime_pb) = manifest.driver_runtime.as_ref() else {
                 return false;
@@ -1432,6 +1438,22 @@ mod tests {
             .clone()
     }
 
+    fn make_mutable_resource_root(label: &str) -> PathBuf {
+        let source_root = std::env::current_dir().expect("current dir");
+        let root = temp_path(label);
+        for relpath in [
+            crate::VERSION_COMPAT_PATH,
+            crate::DEFAULT_DOCKERFILE,
+            crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
+        ] {
+            let target = root.join(relpath);
+            fs::create_dir_all(target.parent().expect("resource parent"))
+                .expect("create resource parent");
+            fs::copy(source_root.join(relpath), &target).expect("copy resource input");
+        }
+        root
+    }
+
     #[cfg(unix)]
     fn make_read_only_resource_root() -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -1681,6 +1703,44 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn pending_versions_detect_release_cache_input_change() {
+        let repo_root = make_mutable_resource_root("pending-cache-input-change");
+        let store_root = temp_path("pending-cache-input-store");
+        let store = ArtifactStore::new(store_root.clone());
+        store.ensure_layout().expect("layout");
+        let version = known_crate_version(&repo_root);
+
+        let mut finalized = new_manifest(&repo_root, &version).expect("current manifest");
+        finalized.status = pb::CampaignRunStatus::Complete as i32;
+        finalized.completion = Some(pb::CompletionReport {
+            status: pb::CampaignRunStatus::Complete as i32,
+            root_action_count: finalized.root_actions.len() as u64,
+            completed_root_count: finalized.root_actions.len() as u64,
+            ..Default::default()
+        });
+        write_manifest(&store, &finalized).expect("write finalized manifest");
+        assert!(
+            !pending_campaign_versions(&store, &repo_root)
+                .expect("current generation is finalized")
+                .contains(&version)
+        );
+
+        let setup_script = repo_root.join(crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT);
+        let mut bytes = fs::read(&setup_script).expect("read setup script");
+        bytes.extend_from_slice(b"\n# changed cache input\n");
+        fs::write(&setup_script, bytes).expect("change cache setup script");
+        assert!(
+            pending_campaign_versions(&store, &repo_root)
+                .expect("changed cache input is pending")
+                .contains(&version)
+        );
+
+        drop(store);
+        fs::remove_dir_all(store_root).expect("cleanup store");
+        fs::remove_dir_all(repo_root).expect("cleanup resources");
     }
 
     #[test]

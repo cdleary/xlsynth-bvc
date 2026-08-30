@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use fs2::FileExt;
 use prost::Message;
 
 const RUNTIME_FINGERPRINT_LABEL: &str = "org.xlsynth-bvc.runtime-fingerprint";
@@ -1432,6 +1433,7 @@ const PERSISTENT_RUNNER_YOSYS_POOL_SIZE_ENV: &str = "XLSYNTH_BVC_YOSYS_PERSISTEN
 const PERSISTENT_RUNNER_IDLE_TTL_SECS_ENV: &str = "XLSYNTH_BVC_PERSISTENT_RUNNER_IDLE_TTL_SECS";
 const PERSISTENT_RUNNER_DEFAULT_IDLE_TTL_SECS: u64 = 15 * 60;
 const PERSISTENT_RUNNER_WORKER_SCRIPT: &str = "scripts/persistent_runner_worker.py";
+const PERSISTENT_RUNNER_SLOT_LOCK_FILENAME: &str = "slot.lock";
 static PERSISTENT_RUNNER_START_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 
@@ -1452,6 +1454,7 @@ struct PersistentRunnerPaths {
     heartbeat_path: PathBuf,
     live_path: PathBuf,
     capabilities_path: PathBuf,
+    slot_lock_path: PathBuf,
 }
 
 impl PersistentRunnerPaths {
@@ -1469,6 +1472,7 @@ impl PersistentRunnerPaths {
             heartbeat_path: root.join("heartbeat.json"),
             live_path: root.join("live.json"),
             capabilities_path: root.join("capabilities.json"),
+            slot_lock_path: root.join(PERSISTENT_RUNNER_SLOT_LOCK_FILENAME),
             root,
         }
     }
@@ -1535,6 +1539,8 @@ struct PersistentRunnerRequest {
 struct PersistentRunnerResult {
     request_id: String,
     request_token: String,
+    runner_instance_id: String,
+    container_name: String,
     status: String,
     exit_code: Option<i32>,
     timed_out: bool,
@@ -1557,27 +1563,28 @@ struct PersistentRunnerCapabilities {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct PersistentRunnerHeartbeat {
     #[serde(default)]
+    runner_instance_id: String,
+    #[serde(default)]
     state: String,
     #[serde(default)]
     current_request_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct SelectedPersistentRunner {
     runner_key: String,
     runner_instance_id: String,
     container_name: String,
     paths: PersistentRunnerPaths,
+    _slot_guard: PersistentRunnerSlotGuard,
 }
 
 #[derive(Debug, Clone)]
 struct PersistentRunnerSlotStatus {
-    slot: usize,
     runner_key: String,
     container_name: String,
     paths: PersistentRunnerPaths,
     running: bool,
-    depth: usize,
     idle: bool,
 }
 
@@ -1585,6 +1592,68 @@ struct PersistentRunnerSlotStatus {
 struct ExternalWriteback {
     host_path: PathBuf,
     job_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct PersistentRunnerSlotGuard {
+    file: fs::File,
+}
+
+impl PersistentRunnerSlotGuard {
+    fn acquire(paths: &PersistentRunnerPaths) -> Result<Self> {
+        paths.ensure_layout()?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&paths.slot_lock_path)
+            .with_context(|| {
+                format!(
+                    "opening persistent runner slot lock: {}",
+                    paths.slot_lock_path.display()
+                )
+            })?;
+        file.lock_exclusive().with_context(|| {
+            format!(
+                "locking persistent runner slot: {}",
+                paths.slot_lock_path.display()
+            )
+        })?;
+        Ok(Self { file })
+    }
+
+    fn try_acquire(paths: &PersistentRunnerPaths) -> Result<Option<Self>> {
+        paths.ensure_layout()?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&paths.slot_lock_path)
+            .with_context(|| {
+                format!(
+                    "opening persistent runner slot lock: {}",
+                    paths.slot_lock_path.display()
+                )
+            })?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "locking persistent runner slot: {}",
+                    paths.slot_lock_path.display()
+                )
+            }),
+        }
+    }
+}
+
+impl Drop for PersistentRunnerSlotGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 fn persistent_runner_start_lock() -> &'static std::sync::Mutex<()> {
@@ -1645,8 +1714,13 @@ fn persistent_runner_slot_key(base_runner_key: &str, pool_size: usize, slot: usi
     }
 }
 
-fn persistent_runner_instance_id(runner_key: &str) -> String {
-    format!("instance-{}", runner_key)
+fn new_persistent_runner_instance_id(runner_key: &str) -> String {
+    let nonce = DOCKER_RUN_NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "instance-{}-{}-{nonce}",
+        runner_key,
+        &process_instance_id()[..16]
+    )
 }
 
 fn env_usize(name: &str) -> Option<usize> {
@@ -2118,6 +2192,7 @@ fn ensure_persistent_runner_started(
     let _guard = persistent_runner_start_lock()
         .lock()
         .map_err(|_| anyhow!("persistent runner start lock poisoned"))?;
+    let _slot_guard = PersistentRunnerSlotGuard::acquire(runner_paths)?;
     ensure_persistent_runner_started_locked(
         repo_root,
         store_root,
@@ -2164,7 +2239,7 @@ fn ensure_persistent_runner_started_locked(
         )
     })?;
     let worker_script = ensure_worker_script_path(repo_root)?;
-    let instance_id = persistent_runner_instance_id(runner_key);
+    let instance_id = new_persistent_runner_instance_id(runner_key);
     let runner_root_container = format!(
         "{}/{}/{}/{}",
         store_root_container_path(),
@@ -2219,7 +2294,7 @@ fn ensure_persistent_runner_started_locked(
         OsString::from("--runner-key"),
         OsString::from(runner_key.to_string()),
         OsString::from("--runner-instance-id"),
-        OsString::from(instance_id),
+        OsString::from(instance_id.clone()),
         OsString::from("--container-name"),
         OsString::from(container_name.to_string()),
         OsString::from("--image"),
@@ -2242,7 +2317,10 @@ fn ensure_persistent_runner_started_locked(
 
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(30) {
-        if runner_paths.heartbeat_path.exists() && docker_container_is_running(container_name)? {
+        if docker_container_is_running(container_name)?
+            && read_persistent_runner_heartbeat(runner_paths)?
+                .is_some_and(|heartbeat| heartbeat.runner_instance_id == instance_id)
+        {
             return Ok(());
         }
         if !docker_container_is_running(container_name)? {
@@ -2270,19 +2348,12 @@ fn persistent_runner_slot_status(
     let container_name = persistent_runner_container_name(image, &runner_key);
     let paths = PersistentRunnerPaths::new(store_root, &runner_key);
     let running = docker_container_is_running(&container_name)?;
-    let depth = if running {
-        persistent_runner_depth(&paths)?
-    } else {
-        0
-    };
     let idle = running && persistent_runner_is_idle(&paths)?;
     Ok(PersistentRunnerSlotStatus {
-        slot,
         runner_key,
         container_name,
         paths,
         running,
-        depth,
         idle,
     })
 }
@@ -2301,6 +2372,11 @@ fn cleanup_idle_persistent_runner_pool_slots(
         return Ok(());
     }
     for slot in 1..pool_size {
+        let runner_key = persistent_runner_slot_key(base_runner_key, pool_size, slot);
+        let paths = PersistentRunnerPaths::new(store_root, &runner_key);
+        let Some(_slot_guard) = PersistentRunnerSlotGuard::try_acquire(&paths)? else {
+            continue;
+        };
         let status =
             persistent_runner_slot_status(store_root, image, base_runner_key, pool_size, slot)?;
         if !status.running || !status.idle {
@@ -2319,32 +2395,67 @@ fn select_persistent_runner_locked(
     store_root: &Path,
     image: &str,
     family: PersistentRunnerFamily,
-) -> Result<SelectedPersistentRunner> {
+) -> Result<Option<SelectedPersistentRunner>> {
     let base_runner_key = persistent_runner_key(image, store_root);
     let pool_size = persistent_runner_pool_size(family);
     cleanup_idle_persistent_runner_pool_slots(store_root, image, &base_runner_key, pool_size)?;
 
-    let mut statuses = Vec::with_capacity(pool_size);
+    // A slot reservation spans request publication, execution, result handling,
+    // writeback, and any container retirement. This deliberately permits no
+    // host-side queue behind a worker: a failed worker can only abandon the
+    // request whose caller owns its slot.
     for slot in 0..pool_size {
-        statuses.push(persistent_runner_slot_status(
-            store_root,
-            image,
-            &base_runner_key,
-            pool_size,
-            slot,
-        )?);
+        let runner_key = persistent_runner_slot_key(&base_runner_key, pool_size, slot);
+        let paths = PersistentRunnerPaths::new(store_root, &runner_key);
+        let Some(slot_guard) = PersistentRunnerSlotGuard::try_acquire(&paths)? else {
+            continue;
+        };
+        let status =
+            persistent_runner_slot_status(store_root, image, &base_runner_key, pool_size, slot)?;
+        if !status.idle {
+            continue;
+        }
+        let heartbeat = read_persistent_runner_heartbeat(&status.paths)?
+            .context("idle persistent runner is missing its heartbeat")?;
+        if heartbeat.runner_instance_id.is_empty() {
+            bail!("idle persistent runner heartbeat is missing its instance identity");
+        }
+        return Ok(Some(SelectedPersistentRunner {
+            runner_key: status.runner_key,
+            runner_instance_id: heartbeat.runner_instance_id,
+            container_name: status.container_name,
+            paths: status.paths,
+            _slot_guard: slot_guard,
+        }));
     }
 
-    if let Some(status) = statuses.iter().find(|status| status.idle) {
-        return Ok(SelectedPersistentRunner {
-            runner_key: status.runner_key.clone(),
-            runner_instance_id: persistent_runner_instance_id(&status.runner_key),
-            container_name: status.container_name.clone(),
-            paths: status.paths.clone(),
-        });
-    }
-
-    if let Some(status) = statuses.iter().find(|status| !status.running) {
+    for slot in 0..pool_size {
+        let runner_key = persistent_runner_slot_key(&base_runner_key, pool_size, slot);
+        let paths = PersistentRunnerPaths::new(store_root, &runner_key);
+        let Some(slot_guard) = PersistentRunnerSlotGuard::try_acquire(&paths)? else {
+            continue;
+        };
+        let status =
+            persistent_runner_slot_status(store_root, image, &base_runner_key, pool_size, slot)?;
+        if status.running && status.idle {
+            let heartbeat = read_persistent_runner_heartbeat(&status.paths)?
+                .context("idle persistent runner is missing its heartbeat")?;
+            if heartbeat.runner_instance_id.is_empty() {
+                bail!("idle persistent runner heartbeat is missing its instance identity");
+            }
+            return Ok(Some(SelectedPersistentRunner {
+                runner_key: status.runner_key,
+                runner_instance_id: heartbeat.runner_instance_id,
+                container_name: status.container_name,
+                paths: status.paths,
+                _slot_guard: slot_guard,
+            }));
+        }
+        if status.running {
+            // No live caller owns the cross-process slot lock, so a busy or
+            // retired worker is orphaned state from an interrupted host.
+            cleanup_persistent_runner_container(&status.container_name)?;
+        }
         ensure_persistent_runner_started_locked(
             repo_root,
             store_root,
@@ -2353,24 +2464,17 @@ fn select_persistent_runner_locked(
             &status.container_name,
             &status.paths,
         )?;
-        return Ok(SelectedPersistentRunner {
-            runner_key: status.runner_key.clone(),
-            runner_instance_id: persistent_runner_instance_id(&status.runner_key),
-            container_name: status.container_name.clone(),
-            paths: status.paths.clone(),
-        });
+        let heartbeat = read_persistent_runner_heartbeat(&status.paths)?
+            .context("new persistent runner is missing its heartbeat")?;
+        return Ok(Some(SelectedPersistentRunner {
+            runner_key: status.runner_key,
+            runner_instance_id: heartbeat.runner_instance_id,
+            container_name: status.container_name,
+            paths: status.paths,
+            _slot_guard: slot_guard,
+        }));
     }
-
-    let status = statuses
-        .iter()
-        .min_by_key(|status| (status.depth, status.slot))
-        .ok_or_else(|| anyhow!("persistent runner pool has no slots"))?;
-    Ok(SelectedPersistentRunner {
-        runner_key: status.runner_key.clone(),
-        runner_instance_id: persistent_runner_instance_id(&status.runner_key),
-        container_name: status.container_name.clone(),
-        paths: status.paths.clone(),
-    })
+    Ok(None)
 }
 
 pub(crate) fn execute_persistent_runner_script(
@@ -2442,11 +2546,19 @@ fn execute_persistent_runner_script_with_timeout_and_family(
     let (request_id, request_token) =
         persistent_runner_request_identity(process_instance_id(), request_seq);
 
+    let runner = loop {
+        let selected = {
+            let _guard = persistent_runner_start_lock()
+                .lock()
+                .map_err(|_| anyhow!("persistent runner start lock poisoned"))?;
+            select_persistent_runner_locked(&repo_root, &store_root, image, family)?
+        };
+        if let Some(runner) = selected {
+            break runner;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
     let (runner, result_path, command_argv, writebacks) = {
-        let _guard = persistent_runner_start_lock()
-            .lock()
-            .map_err(|_| anyhow!("persistent runner start lock poisoned"))?;
-        let runner = select_persistent_runner_locked(&repo_root, &store_root, image, family)?;
         let job_root = runner.paths.jobs_dir.join(&request_id);
         fs::create_dir_all(&job_root).with_context(|| {
             format!("creating persistent runner job dir: {}", job_root.display())
@@ -2538,6 +2650,15 @@ fn execute_persistent_runner_script_with_timeout_and_family(
                 request_id
             );
         }
+        if read_persistent_runner_heartbeat(&runner.paths)?
+            .is_some_and(|heartbeat| heartbeat.runner_instance_id != runner.runner_instance_id)
+        {
+            bail!(
+                "persistent runner incarnation changed before producing result (container={} request_id={})",
+                runner.container_name,
+                request_id
+            );
+        }
         if let Ok(metadata) = fs::metadata(&runner.paths.heartbeat_path)
             && let Ok(modified) = metadata.modified()
             && let Ok(age) = std::time::SystemTime::now().duration_since(modified)
@@ -2569,7 +2690,11 @@ fn execute_persistent_runner_script_with_timeout_and_family(
         fs::remove_file(runner.paths.archive_dir.join(format!("{request_id}.json"))).ok();
         remove_path_if_exists(&runner.paths.jobs_dir.join(&request_id)).ok();
     };
-    if result.request_id != request_id || result.request_token != request_token {
+    if result.request_id != request_id
+        || result.request_token != request_token
+        || result.runner_instance_id != runner.runner_instance_id
+        || result.container_name != runner.container_name
+    {
         cleanup_request_files();
         bail!(
             "persistent runner result identity mismatch for request {}",
@@ -3381,6 +3506,8 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
             ScopedEnvVar::set(crate::BVC_DISABLE_AUTO_SUGGESTED_ENQUEUE_ENV, "1");
         let _disable_incremental_upsert =
             ScopedEnvVar::set(crate::BVC_ENABLE_INCREMENTAL_IR_CORPUS_UPSERT_ENV, "0");
+        let _single_driver_runner = ScopedEnvVar::set(PERSISTENT_RUNNER_DRIVER_POOL_SIZE_ENV, "1");
+        let _single_yosys_runner = ScopedEnvVar::set(PERSISTENT_RUNNER_YOSYS_POOL_SIZE_ENV, "1");
 
         let repo_root = std::env::current_dir().context("getting repo root")?;
         let store_root = make_temp_store_root("queue-drain-persistent-runners");
@@ -3666,27 +3793,46 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
 
         let timeout_output = store.staging_dir().join("persistent-timeout-output");
         fs::create_dir_all(&timeout_output)?;
-        let timeout_error = execute_persistent_runner_script_with_timeout(
-            &image_a,
-            &[DockerMount::read_write(&timeout_output, "/outputs")?],
-            &BTreeMap::new(),
-            "(sleep 30; printf orphan > /outputs/orphan.txt) & wait",
-            "timeout-orphan-regression",
-            1,
-        )
-        .expect_err("timed-out persistent request must fail");
-        assert!(format!("{timeout_error:#}").contains("TIMEOUT(1)"));
-        assert!(!docker_container_is_running(&container_a)?);
+        let started_marker = store.staging_dir().join("pool-failure-started");
+        let first_image = image_a.clone();
+        let first_output = timeout_output.clone();
+        let first = thread::spawn(move || {
+            execute_persistent_runner_script_with_timeout(
+                &first_image,
+                &[DockerMount::read_write(&first_output, "/outputs")?],
+                &BTreeMap::new(),
+                "touch /store-root/.staging/pool-failure-started; (sleep 30; printf orphan > /outputs/orphan.txt) & wait",
+                "timeout-orphan-regression",
+                3,
+            )
+        });
+        let marker_deadline = Instant::now() + Duration::from_secs(5);
+        while !started_marker.exists() && Instant::now() < marker_deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            started_marker.exists(),
+            "first pooled request never started"
+        );
+        let second_image = image_a.clone();
+        let second_output = timeout_output.clone();
+        let second = thread::spawn(move || {
+            execute_persistent_runner_script_with_timeout(
+                &second_image,
+                &[DockerMount::read_write(&second_output, "/outputs")?],
+                &BTreeMap::new(),
+                "printf clean > /outputs/clean.txt",
+                "post-timeout-replacement",
+                30,
+            )
+        });
+        let timeout_error = first
+            .join()
+            .expect("join timed-out runner request")
+            .expect_err("timed-out persistent request must fail");
+        assert!(format!("{timeout_error:#}").contains("TIMEOUT(3)"));
         assert!(!timeout_output.join("orphan.txt").exists());
-
-        execute_persistent_runner_script_with_timeout(
-            &image_a,
-            &[DockerMount::read_write(&timeout_output, "/outputs")?],
-            &BTreeMap::new(),
-            "printf clean > /outputs/clean.txt",
-            "post-timeout-replacement",
-            30,
-        )?;
+        second.join().expect("join replacement runner request")?;
         assert_eq!(
             fs::read_to_string(timeout_output.join("clean.txt"))?,
             "clean"

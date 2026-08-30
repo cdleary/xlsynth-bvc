@@ -161,7 +161,19 @@ incarnation-qualified ID and a full request token, and results are validated
 against both before writeback; failed results are cleaned up as well as
 successful ones. Each request runs in a new process group. A timeout kills and
 reaps that whole group, and any failed request retires and force-removes its
-container before the host accepts writebacks or permits later reuse.
+container before the host accepts writebacks or permits later reuse. A
+cross-process advisory reservation covers one pool slot for the complete
+request lifecycle. Saturated callers wait for a slot instead of publishing
+work behind a busy container, so retirement cannot abandon unrelated requests.
+Every actual container start has a unique instance identity; result and
+heartbeat checks fence a request to that exact incarnation.
+
+Pending-version discovery compares the current campaign, crate/DSO mapping,
+Docker recipe digest, release-cache input digest, and canonical root actions;
+a crate-version label alone is never currentness evidence. The coordinator
+resumes a unique in-progress generation for process recovery. When none exists,
+it binds today's declared runtime and selects or creates that exact run;
+finalized generations remain history and do not mask newer declared inputs.
 
 ## Canonical data and publication boundary
 
@@ -225,7 +237,9 @@ campaign-compatible public run records in the same snapshot.
 
 Snapshot and site closure verification reject symlinks and special filesystem
 nodes. Destructive overwrite is rejected before deletion when the output
-equals, contains, or otherwise overlaps a protected input/resource boundary.
+equals, contains, or is contained by a protected input/resource boundary.
+Snapshot output must not overlap either the private store root or its artifact
+backend storage, including when an external Sled database is configured.
 Every site dataset's length and SHA-256 must match the corresponding embedded
 source-snapshot entry, not only its relative path.
 
@@ -261,7 +275,11 @@ coordinator lock: publishers using different stores but the same public root
 must not interleave their pointer updates.
 Publication attempts use unique staging names. While holding the same lock, a
 retry may remove abandoned staging entries for its validated content-addressed
-site ID; process IDs are not used as persistent ownership evidence.
+site ID; process IDs are not used as persistent ownership evidence. Atomic
+catalog and root-pointer writes also stage beneath `.staging`, never beside a
+root destination. A retry removes abandoned atomic-write files under the lock,
+so process interruption cannot create an unexpected top-level entry that
+wedges later publication.
 
 ## Content-addressed store invariant
 
