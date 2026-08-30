@@ -131,6 +131,10 @@ whole claimed batch. Any early return before a success, failure, or
 cancellation becomes authoritative requeues only the still-current lease
 incarnations. A live worker error therefore cannot strand an unreclaimable
 lease, while an old guard cannot disturb a replacement claim.
+Reclamation optimistically skips well-formed live or unexpired leases without
+taking their transition locks. Only plausible reclaim candidates are locked and
+then re-read and revalidated, so one long fenced execution cannot serialize
+unrelated workers' queue scans.
 The operating system releases the transition lock when a process dies,
 preserving process-restart recovery.
 

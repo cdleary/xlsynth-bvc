@@ -1283,6 +1283,18 @@ pub(crate) fn cancel_downstream_pending_actions(
     Ok(canceled)
 }
 
+fn running_lease_should_be_reclaimed(
+    running: &QueueRunning,
+    now: DateTime<Utc>,
+    local_host: &str,
+) -> bool {
+    match running_owner_local_process_exists(&running.lease_owner, local_host) {
+        Some(true) => false,
+        Some(false) => true,
+        None => running.lease_expires_utc <= now,
+    }
+}
+
 pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<usize> {
     let now = Utc::now();
     let local_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
@@ -1290,6 +1302,21 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
     let mut running_paths = list_queue_files(&store.queue_running_dir())?;
     running_paths.sort();
     for running_path in running_paths {
+        if let Some(action_id) = queue_action_id_from_path(&running_path)
+            && terminal_queue_state_for_action(store, &action_id).is_none()
+        {
+            match fs::read(&running_path) {
+                Ok(bytes) => {
+                    if let Ok(running) = decode_queue_running(&bytes)
+                        && !running_lease_should_be_reclaimed(&running, now, &local_host)
+                    {
+                        continue;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {}
+            }
+        }
         let _transition_lock = queue_action_id_from_path(&running_path)
             .map(|action_id| QueueTransitionLock::acquire(store, &action_id))
             .transpose()?;
@@ -1316,11 +1343,7 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
         };
 
         let reclaim = if let Ok(running) = decode_queue_running(&bytes) {
-            match running_owner_local_process_exists(&running.lease_owner, &local_host) {
-                Some(true) => false,
-                Some(false) => true,
-                None => running.lease_expires_utc <= now,
-            }
+            running_lease_should_be_reclaimed(&running, now, &local_host)
         } else {
             true
         };
@@ -2590,6 +2613,51 @@ mod tests {
         );
         reclaim.join().expect("reclaim thread");
 
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reclamation_prefilter_does_not_wait_for_unexpired_execution_fence() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (store, root) = make_test_store();
+        enqueue_action(&store, terminal_test_action()).expect("enqueue action");
+        let running = claim_next_pending_item(&store, "foreign-worker", 900)
+            .expect("claim action")
+            .expect("running action");
+        let store = Arc::new(store);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let execution_store = Arc::clone(&store);
+        let execution = thread::spawn(move || {
+            with_current_running_lease(&execution_store, &running, || {
+                entered_tx.send(()).expect("signal execution fence");
+                release_rx.recv().expect("release execution fence");
+                Ok(())
+            })
+            .expect("fenced operation")
+            .expect("lease remains current")
+        });
+        entered_rx.recv().expect("execution entered fence");
+
+        let (reclaim_done_tx, reclaim_done_rx) = mpsc::channel();
+        let reclaim_store = Arc::clone(&store);
+        let reclaim = thread::spawn(move || {
+            let count = reclaim_expired_running_leases(&reclaim_store).expect("reclaim leases");
+            reclaim_done_tx.send(count).expect("signal reclaim done");
+        });
+        assert_eq!(
+            reclaim_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("unexpired prefilter must not wait for execution"),
+            0
+        );
+        reclaim.join().expect("reclaim thread");
+
+        release_tx.send(()).expect("release execution");
+        execution.join().expect("execution thread");
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
     }
