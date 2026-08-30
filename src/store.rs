@@ -14,8 +14,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Cursor;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::model::{ArtifactRef, Provenance, QueueFailed};
@@ -88,6 +89,7 @@ const STORE_FORMAT_NAME: &str = "xlsynth-bvc-protobuf-store";
 const STORE_FORMAT_MARKER: &str = "store-format.pb";
 const STORE_FORMAT_INIT_LOCK: &str = ".store-format-init.lock";
 const STORE_FORMAT_MARKER_STAGING: &str = ".store-format.pb.staging";
+static FAILED_ACTION_MIRROR_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn ensure_store_format_marker(store_root: &Path) -> Result<()> {
     fs::create_dir_all(store_root)
@@ -925,13 +927,37 @@ fn load_failed_action_record_from_disk(
 
 fn write_failed_action_record_to_disk(store_root: &Path, failed: &QueueFailed) -> Result<()> {
     let path = failed_action_record_path(store_root, &failed.action_id);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("creating failed action record parent: {}", parent.display())
-        })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("failed action record path has no parent"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating failed action record parent: {}", parent.display()))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = FAILED_ACTION_MIRROR_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(
+        ".failed.pb.tmp-{}-{timestamp}-{nonce}",
+        std::process::id()
+    ));
+    fs::write(&temp, encode_queue_failed(failed)?).with_context(|| {
+        format!(
+            "writing failed action record mirror staging file: {}",
+            temp.display()
+        )
+    })?;
+    if let Err(error) = fs::rename(&temp, &path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error).with_context(|| {
+            format!(
+                "atomically replacing failed action record mirror: {} -> {}",
+                temp.display(),
+                path.display()
+            )
+        });
     }
-    fs::write(&path, encode_queue_failed(failed)?)
-        .with_context(|| format!("writing failed action record mirror: {}", path.display()))
+    Ok(())
 }
 
 fn remove_file_if_exists(path: &Path, dry_run: bool) -> Result<bool> {
@@ -1933,10 +1959,7 @@ impl ArtifactBackend for SledArtifactBackend {
         Ok(())
     }
 
-    fn failed_action_record_exists(&self, store_root: &Path, action_id: &str) -> bool {
-        if failed_action_record_path(store_root, action_id).exists() {
-            return true;
-        }
+    fn failed_action_record_exists(&self, _store_root: &Path, action_id: &str) -> bool {
         let db = match self.open_db() {
             Ok(db) => db,
             Err(_) => return false,
@@ -1953,12 +1976,6 @@ impl ArtifactBackend for SledArtifactBackend {
         store_root: &Path,
         action_id: &str,
     ) -> Result<Option<QueueFailed>> {
-        if let Some(record) = load_failed_action_record_from_disk(store_root, action_id)? {
-            if record.action_id != action_id {
-                bail!("failed action record path does not match its embedded action_id");
-            }
-            return Ok(Some(record));
-        }
         let db = self.open_db()?;
         let tree = db
             .open_tree(Self::TREE_FAILED_BY_ACTION)
@@ -1972,7 +1989,52 @@ impl ArtifactBackend for SledArtifactBackend {
             if parsed.action_id != action_id {
                 bail!("failed action record Sled key does not match its embedded action_id");
             }
+            let mirror_is_current = match load_failed_action_record_from_disk(store_root, action_id)
+            {
+                Ok(Some(mirror)) if mirror.action_id == action_id => {
+                    encode_queue_failed(&mirror)?.as_slice() == bytes.as_ref()
+                }
+                Ok(Some(_)) => {
+                    warn!(
+                        "ignoring failed action record mirror with mismatched action id: {}",
+                        failed_action_record_path(store_root, action_id).display()
+                    );
+                    false
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    warn!(
+                        "ignoring corrupt failed action record mirror {}: {:#}",
+                        failed_action_record_path(store_root, action_id).display(),
+                        error
+                    );
+                    false
+                }
+            };
+            if !mirror_is_current
+                && let Err(error) = write_failed_action_record_to_disk(store_root, &parsed)
+            {
+                warn!(
+                    "failed to repair non-canonical failed action record mirror {}: {:#}",
+                    failed_action_record_path(store_root, action_id).display(),
+                    error
+                );
+            }
             return Ok(Some(parsed));
+        }
+        let stale_mirror = failed_action_record_path(store_root, action_id);
+        if stale_mirror.exists() {
+            warn!(
+                "removing failed action record mirror without canonical Sled row: {}",
+                stale_mirror.display()
+            );
+            if let Err(error) = fs::remove_file(&stale_mirror) {
+                warn!(
+                    "failed to remove stale failed action record mirror {}: {:#}",
+                    stale_mirror.display(),
+                    error
+                );
+            }
         }
         Ok(None)
     }
@@ -2938,6 +3000,19 @@ impl ArtifactStore {
     pub(crate) fn load_failed_action_record(&self, action_id: &str) -> Result<Option<QueueFailed>> {
         self.artifact_backend
             .load_failed_action_record(&self.root, action_id)
+    }
+
+    pub(crate) fn load_failed_action_record_mirror_for_diagnostics(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<QueueFailed>> {
+        let Some(record) = load_failed_action_record_from_disk(&self.root, action_id)? else {
+            return Ok(None);
+        };
+        if record.action_id != action_id {
+            bail!("failed action record mirror path does not match its embedded action_id");
+        }
+        Ok(Some(record))
     }
 
     pub(crate) fn write_failed_action_record(&self, failed: &QueueFailed) -> Result<()> {
@@ -4005,6 +4080,92 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].action_id, action_id);
         assert_eq!(loaded[0].error, "synthetic failure");
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_sled_failed_record_point_load_repairs_corrupt_mirror() {
+        let root = make_test_root("xlsynth-bvc-store-sled-failed-corrupt-mirror");
+        let db_path = root.join("store.sled");
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path);
+        store.ensure_layout().expect("ensure sled layout");
+
+        let action_id = "d".repeat(64);
+        let failed = QueueFailed {
+            schema_version: 1,
+            action_id: action_id.clone(),
+            enqueued_utc: Utc::now(),
+            failed_utc: Utc::now(),
+            failed_by: "test-worker".to_string(),
+            action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+                version: "v0.37.0".to_string(),
+                discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
+            },
+            error: "synthetic failure".to_string(),
+        };
+        store
+            .write_failed_action_record(&failed)
+            .expect("write failed record");
+        let mirror_path = failed_action_record_path(&root, &action_id);
+        std::fs::write(&mirror_path, b"truncated").expect("corrupt failed record mirror");
+
+        let loaded = store
+            .load_failed_action_record(&action_id)
+            .expect("fall back to canonical Sled failed record")
+            .expect("failed record remains present");
+        assert_eq!(loaded.action_id, action_id);
+        assert_eq!(loaded.error, "synthetic failure");
+        let repaired = load_failed_action_record_from_path(&mirror_path)
+            .expect("decode repaired mirror")
+            .expect("repaired mirror exists");
+        assert_eq!(repaired.action_id, action_id);
+        assert_eq!(repaired.error, "synthetic failure");
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_sled_failed_record_point_load_ignores_stale_mirror() {
+        let root = make_test_root("xlsynth-bvc-store-sled-failed-stale-mirror");
+        let db_path = root.join("store.sled");
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path);
+        store.ensure_layout().expect("ensure sled layout");
+
+        let action_id = "e".repeat(64);
+        let failed = QueueFailed {
+            schema_version: 1,
+            action_id: action_id.clone(),
+            enqueued_utc: Utc::now(),
+            failed_utc: Utc::now(),
+            failed_by: "test-worker".to_string(),
+            action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+                version: "v0.37.0".to_string(),
+                discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
+            },
+            error: "synthetic failure".to_string(),
+        };
+        store
+            .write_failed_action_record(&failed)
+            .expect("write failed record");
+        let mirror_path = failed_action_record_path(&root, &action_id);
+        let mirror_bytes = encode_queue_failed(&failed).expect("encode stale mirror");
+        store
+            .delete_failed_action_record(&action_id)
+            .expect("delete canonical failed record");
+        std::fs::create_dir_all(mirror_path.parent().expect("mirror parent"))
+            .expect("recreate mirror parent");
+        std::fs::write(&mirror_path, mirror_bytes).expect("restore stale mirror only");
+
+        assert!(
+            store
+                .load_failed_action_record(&action_id)
+                .expect("ignore stale mirror")
+                .is_none()
+        );
+        assert!(!mirror_path.exists());
 
         std::fs::remove_dir_all(root).expect("cleanup");
     }

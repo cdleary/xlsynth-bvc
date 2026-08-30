@@ -1459,12 +1459,12 @@ fn build_sample_record_from_queue_state(
         g8r_aig_status.as_str(),
         combo_verilog_status.as_str(),
     ];
-    let terminal_error = action_error_summary(store, &plan.aig_stat_diff_action_id)
-        .or_else(|| action_error_summary(store, &plan.yosys_abc_stats_action_id))
-        .or_else(|| action_error_summary(store, &plan.yosys_abc_aig_action_id))
-        .or_else(|| action_error_summary(store, &plan.combo_verilog_action_id))
-        .or_else(|| action_error_summary(store, &plan.g8r_stats_action_id))
-        .or_else(|| action_error_summary(store, &plan.g8r_aig_action_id))
+    let terminal_error = queue_files_action_error_summary(store, &plan.aig_stat_diff_action_id)
+        .or_else(|| queue_files_action_error_summary(store, &plan.yosys_abc_stats_action_id))
+        .or_else(|| queue_files_action_error_summary(store, &plan.yosys_abc_aig_action_id))
+        .or_else(|| queue_files_action_error_summary(store, &plan.combo_verilog_action_id))
+        .or_else(|| queue_files_action_error_summary(store, &plan.g8r_stats_action_id))
+        .or_else(|| queue_files_action_error_summary(store, &plan.g8r_aig_action_id))
         .or_else(|| {
             if summarize_sample_status(&statuses, false) == "failed" {
                 persisted_sample.error.clone()
@@ -1561,13 +1561,26 @@ fn queue_or_persisted_action_status_label(
     action_id: &str,
     persisted_status: &str,
 ) -> String {
-    match queue_state_for_action(store, action_id) {
+    let queue_state = queue_state_for_action(store, action_id);
+    match queue_state {
+        crate::queue::QueueState::Done => return "done".to_string(),
+        crate::queue::QueueState::Failed => return "failed".to_string(),
+        crate::queue::QueueState::Canceled => return "canceled".to_string(),
+        _ => {}
+    }
+    if matches!(
+        store.load_failed_action_record_mirror_for_diagnostics(action_id),
+        Ok(Some(_))
+    ) {
+        return "failed".to_string();
+    }
+    match queue_state {
         crate::queue::QueueState::Pending => "pending".to_string(),
         crate::queue::QueueState::Running { .. } => "running".to_string(),
-        crate::queue::QueueState::Done => "done".to_string(),
-        crate::queue::QueueState::Failed => "failed".to_string(),
-        crate::queue::QueueState::Canceled => "canceled".to_string(),
         crate::queue::QueueState::None => persisted_status.to_string(),
+        crate::queue::QueueState::Done
+        | crate::queue::QueueState::Failed
+        | crate::queue::QueueState::Canceled => unreachable!("terminal states returned above"),
     }
 }
 
@@ -1611,6 +1624,16 @@ fn action_status_label(store: &ArtifactStore, action_id: &str) -> String {
 
 fn action_error_summary(store: &ArtifactStore, action_id: &str) -> Option<String> {
     if let Ok(Some(failed)) = load_queue_failed_record(store, action_id) {
+        return Some(summarize_error(&failed.error));
+    }
+    if let Ok(Some(canceled)) = load_queue_canceled_record(store, action_id) {
+        return Some(summarize_error(&canceled.reason));
+    }
+    None
+}
+
+fn queue_files_action_error_summary(store: &ArtifactStore, action_id: &str) -> Option<String> {
+    if let Ok(Some(failed)) = store.load_failed_action_record_mirror_for_diagnostics(action_id) {
         return Some(summarize_error(&failed.error));
     }
     if let Ok(Some(canceled)) = load_queue_canceled_record(store, action_id) {
