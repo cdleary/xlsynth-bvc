@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -222,6 +222,13 @@ fn read_queue_progress(
 
 impl DoneProgressCache {
     fn refresh(&mut self, done_paths: &[PathBuf]) -> Result<usize> {
+        let present = done_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .collect::<HashSet<_>>();
+        self.records
+            .retain(|path, _| present.contains(path.as_path()));
+
         let mut malformed_records = 0_usize;
         for path in done_paths {
             if self.records.contains_key(path) {
@@ -427,6 +434,23 @@ mod tests {
             watch_interval(2.5).expect("interval"),
             Duration::from_millis(2500)
         );
+    }
+
+    #[test]
+    fn done_progress_cache_evicts_records_absent_from_latest_scan() {
+        let mut cache = DoneProgressCache::default();
+        cache.records.insert(
+            PathBuf::from("removed.pb"),
+            DoneProgressRecord {
+                completed_utc: Utc::now(),
+                artifact_type: "aig_file".to_string(),
+            },
+        );
+
+        cache.refresh(&[]).expect("refresh empty done set");
+
+        assert!(cache.records.is_empty());
+        assert!(cache.completed_artifacts().is_empty());
     }
 
     #[test]
