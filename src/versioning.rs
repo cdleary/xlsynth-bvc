@@ -3,64 +3,26 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 use reqwest::blocking::Client;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::model::{
-    ActionSpec, DiscoverReleasesSummary, DiscoveredRelease, GithubRelease,
-    RefreshVersionCompatSummary, ReleaseTag, VersionCompatEntry,
+    ActionSpec, DiscoverReleasesSummary, DiscoveredRelease, GithubRelease, ReleaseTag,
+    VersionCompatEntry,
 };
 use crate::store::ArtifactStore;
-
-pub(crate) fn refresh_version_compat_json() -> Result<RefreshVersionCompatSummary> {
-    let client = Client::builder()
-        .user_agent(format!("xlsynth-bvc/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("creating compatibility refresh client")?;
-    let body = client
-        .get(crate::VERSION_COMPAT_MAIN_URL)
-        .send()
-        .context("fetching generated_version_compat.json from main")?
-        .error_for_status()
-        .context("status check for generated_version_compat.json download")?
-        .bytes()
-        .context("reading generated_version_compat.json response body")?;
-
-    let output_path = PathBuf::from(crate::VERSION_COMPAT_PATH);
-    if let Some(parent) = output_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "creating parent directory for version compat file: {}",
-                parent.display()
-            )
-        })?;
-    }
-    fs::write(&output_path, &body).with_context(|| {
-        format!(
-            "writing refreshed version compatibility file: {}",
-            output_path.display()
-        )
-    })?;
-    let sha256 = {
-        let digest = Sha256::digest(&body);
-        hex::encode(digest)
-    };
-    Ok(RefreshVersionCompatSummary {
-        output_path: output_path.display().to_string(),
-        source_url: crate::VERSION_COMPAT_MAIN_URL.to_string(),
-        bytes: body.len(),
-        sha256,
-    })
-}
 
 pub(crate) fn normalize_tag_version(version: &str) -> &str {
     version.strip_prefix('v').unwrap_or(version)
 }
 
+pub(crate) fn xlsynth_release_tag(version: &str) -> String {
+    format!("v{}", normalize_tag_version(version))
+}
+
 pub(crate) fn version_label(kind: &str, version: &str) -> String {
-    format!("{kind}:v{}", normalize_tag_version(version))
+    format!("{kind}:{}", xlsynth_release_tag(version))
 }
 
 fn parse_dotted_numeric_version(version: &str) -> Option<Vec<u32>> {
@@ -148,7 +110,7 @@ pub(crate) fn load_version_compat_map(
     let path = repo_root.join(crate::VERSION_COMPAT_PATH);
     let text = fs::read_to_string(&path).with_context(|| {
         format!(
-            "reading version compatibility map: {} (run `refresh-version-compat` if missing)",
+            "reading deployed version compatibility map: {} (update it out of band with `scripts/sync-version-compat.sh` and redeploy)",
             path.display()
         )
     })?;
@@ -184,7 +146,7 @@ pub(crate) fn resolve_xlsynth_version_for_driver(
     let key = normalize_tag_version(driver_version);
     let entry = compat.get(key).ok_or_else(|| {
         anyhow!(
-            "driver crate version `{}` was not found in compatibility map {}; run `refresh-version-compat` or choose a known version",
+            "driver crate version `{}` was not found in deployed compatibility map {}; update it out of band with `scripts/sync-version-compat.sh` and redeploy, or choose a known version",
             driver_version,
             crate::VERSION_COMPAT_PATH
         )
@@ -256,9 +218,11 @@ pub(crate) fn discover_releases(
                 repo_root,
                 &release.tag_name,
             )?;
+            let release_input = crate::proto::release_input_for_dso_version(&release.tag_name)?;
             let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: release.tag_name.clone(),
                 discovery_runtime: Some(runtime),
+                stdlib_tarball_sha256: release_input.stdlib_tarball_sha256,
             };
             let action_id = crate::executor::compute_action_id(&action)?;
             let was_known = store.action_exists(&action_id)
@@ -345,4 +309,16 @@ pub(crate) fn parse_release_tag(tag: &str) -> Result<ReleaseTag> {
         patch,
         patch2,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xlsynth_release_tag_restores_external_tag_spelling() {
+        assert_eq!(xlsynth_release_tag("0.45.0"), "v0.45.0");
+        assert_eq!(xlsynth_release_tag("v0.45.0"), "v0.45.0");
+        assert_eq!(xlsynth_release_tag("0.45.0-1"), "v0.45.0-1");
+    }
 }

@@ -2,9 +2,53 @@
 
 use super::*;
 
+pub(crate) fn process_instance_id() -> &'static str {
+    static VALUE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VALUE.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut hasher = Sha256::new();
+        hasher.update(b"xlsynth-bvc/process-instance/v1\0");
+        hasher.update(std::process::id().to_le_bytes());
+        hasher.update(now.to_le_bytes());
+        hex::encode(hasher.finalize())
+    })
+}
+
+pub(crate) fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
 pub(crate) fn default_worker_id() -> String {
     let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
-    format!("{}:{}", host, std::process::id())
+    format!(
+        "{}:{}:{}:{}",
+        host,
+        std::process::id(),
+        process_start_ticks(std::process::id()).unwrap_or(0),
+        &process_instance_id()[..16]
+    )
+}
+
+pub(crate) fn qualified_worker_id(label: Option<&str>) -> Result<String> {
+    let base = default_worker_id();
+    let Some(label) = label else {
+        return Ok(base);
+    };
+    let label = label.trim();
+    if label.is_empty()
+        || label.len() > 64
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("worker label must be 1-64 ASCII letters, digits, '.', '_', or '-'");
+    }
+    Ok(format!("{base}:label:{label}"))
 }
 
 pub(crate) fn default_completed_by() -> String {
@@ -61,6 +105,9 @@ pub(crate) fn same_driver_runtime(lhs: &DriverRuntimeSpec, rhs: &DriverRuntimeSp
         && lhs.release_platform == rhs.release_platform
         && lhs.docker_image == rhs.docker_image
         && lhs.dockerfile == rhs.dockerfile
+        && lhs.dockerfile_sha256 == rhs.dockerfile_sha256
+        && lhs.docker_image_id == rhs.docker_image_id
+        && lhs.release_cache_input_sha256 == rhs.release_cache_input_sha256
 }
 
 pub(crate) fn details_input_ir_structural_hash(details: &serde_json::Value) -> Option<&str> {
@@ -266,6 +313,7 @@ pub(crate) fn compute_ir_fn_structural_hash(
         repo_root,
         version,
         &runtime_for_hash.release_platform,
+        &runtime_for_hash.release_cache_input_sha256,
     )?;
     let scratch_dir = make_temp_work_dir("ir-fn-structural-hash")?;
     let result = (|| -> Result<(String, CommandTrace)> {
@@ -306,10 +354,10 @@ test -s /scratch/structural_hash.json
         let mounts = vec![
             DockerMount::read_only(ir_input_path, "/inputs/input.ir")?,
             DockerMount::read_write(&scratch_dir, "/scratch")?,
-            driver_cache_mount(store)?,
+            driver_cache_mount(store, &runtime_for_hash)?,
         ];
         let run_trace = execute_persistent_runner_script(
-            &runtime_for_hash.docker_image,
+            &docker_image_content_ref(&runtime_for_hash.docker_image_id)?,
             &mounts,
             &env,
             &script,
@@ -489,7 +537,7 @@ pub(crate) fn build_aig_stat_diff_suggestion_for_stats_action(
                 verilog_action_id: combo_action_id,
                 verilog_top_module_name: top_fn_name.clone(),
                 yosys_script_ref,
-                runtime: default_yosys_runtime(),
+                runtime: default_yosys_runtime(repo_root)?,
             };
             let yosys_aig_action_id = compute_action_id(&yosys_aig)?;
             let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &runtime)
@@ -949,6 +997,18 @@ pub(crate) fn summarize_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_worker_label_retains_live_process_fencing_prefix() {
+        let default = default_worker_id();
+        let qualified = qualified_worker_id(Some("worker-a")).expect("qualified worker id");
+        assert_eq!(qualified, format!("{default}:label:worker-a"));
+        assert_eq!(
+            qualified.split(':').take(3).collect::<Vec<_>>(),
+            default.split(':').take(3).collect::<Vec<_>>()
+        );
+        assert!(qualified_worker_id(Some("line\nbreak")).is_err());
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_test_store() -> (ArtifactStore, PathBuf) {
@@ -972,6 +1032,9 @@ mod tests {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.39.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
     }
 
@@ -992,8 +1055,8 @@ mod tests {
             fs::write(path, bytes).expect("write staged file");
         }
         fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(provenance).expect("serialize provenance"),
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(provenance).expect("encode provenance"),
         )
         .expect("write provenance");
         store
@@ -1004,18 +1067,19 @@ mod tests {
     #[test]
     fn resolve_known_input_ir_structural_hash_reads_producer_output_hash() {
         let (store, root) = make_test_store();
-        let producer_id = "a".repeat(64);
         let hash = "b".repeat(64);
+        let action = ActionSpec::DriverIrToOpt {
+            ir_action_id: "c".repeat(64),
+            top_fn_name: Some("__top".to_string()),
+            version: "v0.39.0".to_string(),
+            runtime: sample_runtime(),
+        };
+        let producer_id = crate::executor::compute_action_id(&action).expect("compute producer id");
         let provenance = Provenance {
             schema_version: crate::ACTION_SCHEMA_VERSION,
             action_id: producer_id.clone(),
             created_utc: Utc::now(),
-            action: ActionSpec::DriverIrToOpt {
-                ir_action_id: "c".repeat(64),
-                top_fn_name: Some("__top".to_string()),
-                version: "v0.39.0".to_string(),
-                runtime: sample_runtime(),
-            },
+            action,
             dependencies: Vec::new(),
             output_artifact: ArtifactRef {
                 action_id: producer_id.clone(),
@@ -1048,7 +1112,6 @@ mod tests {
     #[test]
     fn resolve_known_input_ir_structural_hash_reads_k_bool_manifest_entry() {
         let (store, root) = make_test_store();
-        let action_id = "d".repeat(64);
         let hash = "e".repeat(64);
         let runtime = sample_runtime();
         let manifest = KBoolConeCorpusManifest {
@@ -1074,18 +1137,20 @@ mod tests {
                 ir_op_count: Some(3),
             }],
         };
+        let action = ActionSpec::IrFnToKBoolConeCorpus {
+            ir_action_id: "f".repeat(64),
+            top_fn_name: Some("__orig".to_string()),
+            k: 3,
+            max_ir_ops: Some(16),
+            version: "v0.39.0".to_string(),
+            runtime,
+        };
+        let action_id = crate::executor::compute_action_id(&action).expect("compute corpus id");
         let provenance = Provenance {
             schema_version: crate::ACTION_SCHEMA_VERSION,
             action_id: action_id.clone(),
             created_utc: Utc::now(),
-            action: ActionSpec::IrFnToKBoolConeCorpus {
-                ir_action_id: "f".repeat(64),
-                top_fn_name: Some("__orig".to_string()),
-                k: 3,
-                max_ir_ops: Some(16),
-                version: "v0.39.0".to_string(),
-                runtime,
-            },
+            action,
             dependencies: Vec::new(),
             output_artifact: ArtifactRef {
                 action_id: action_id.clone(),

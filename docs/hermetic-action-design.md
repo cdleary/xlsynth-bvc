@@ -42,9 +42,13 @@ Example pattern:
 
 Each action is represented as a typed `ActionSpec` and hashed to an `action_id`:
 
-- Hash input: `{schema_version, action_spec}` JSON.
+- Hash input: a domain-separated, normalized protobuf `ActionFingerprint`.
 - Hash function: SHA-256.
-- Determinism: identical action specs map to identical action IDs.
+- Determinism: identical normalized action specs map to identical action IDs.
+
+The runtime submessage binds the declared Docker build recipe, the resolved
+immutable OCI image ID, and the digest of the canonical release-cache input
+manifest. See `docs/action-id-v2.md` for the canonical encoding.
 
 Current action types:
 
@@ -77,17 +81,17 @@ Root (default): `bvc-artifacts/`
   - `web_index_bytes` tree
 - Materialized read cache (filesystem, disposable):
   - `bvc-artifacts/.materialized-actions/<aa>/<bb>/<action_id>/payload/...`
-  - `bvc-artifacts/.materialized-actions/<aa>/<bb>/<action_id>/provenance.json`
+  - `bvc-artifacts/.materialized-actions/<aa>/<bb>/<action_id>/provenance.pb`
 - Queue:
-  - `bvc-artifacts/queue/pending/<aa>/<bb>/<action_id>.json`
-  - `bvc-artifacts/queue/running/<aa>/<bb>/<action_id>.json`
-  - `bvc-artifacts/queue/done/<aa>/<bb>/<action_id>.json`
-  - `bvc-artifacts/queue/canceled/<aa>/<bb>/<action_id>.json`
+  - `bvc-artifacts/queue/pending/<aa>/<bb>/<action_id>.pb`
+  - `bvc-artifacts/queue/running/<aa>/<bb>/<action_id>.pb`
+  - `bvc-artifacts/queue/done/<aa>/<bb>/<action_id>.pb`
+  - `bvc-artifacts/queue/canceled/<aa>/<bb>/<action_id>.pb`
 `<aa>` and `<bb>` are the leading bytes of `action_id` (hex), which prevents too many entries in one directory as the store grows.
 
 ## Provenance
 
-Each materialized artifact directory includes `provenance.json` with:
+Each materialized artifact directory includes `provenance.pb` with:
 
 - action ID
 - action spec
@@ -152,17 +156,38 @@ Image build (`docker/xlsynth-driver.Dockerfile`):
 Before queue draining, the executor preflights pending work:
 
 - builds required driver/yosys images
-- prepares a per-version/per-platform release cache at `bvc-artifacts/driver-release-cache/<dso_version>/<platform>/` using vendored `download_release.py`
+- prepares an immutable content-addressed release cache at `bvc-artifacts/driver-release-cache/by-input-sha256/<input-manifest-sha256>/` using vendored `download_release.py`
 - fetches delay-info decode protos into that same cache
 
-Cache setup uses a lock file (`.setup.lock`) and ready marker (`.ready.json`) so parallel workers do not stampede the same GitHub assets.
+Planning first creates a canonical protobuf input manifest containing the
+published checksums of every required release asset and the hashes of schema
+files fetched from the release's locked source commit and the checked-in cache
+setup script. The input-manifest digest participates in driver action identity.
+Cache setup downloads into a unique staging directory, verifies assets against
+those captured checksums, fetches schemas by immutable commit, inventories the
+exact materialized file closure, writes both descriptions to `.ready.pb`, and
+atomically promotes the complete directory. A protobuf owner lock prevents
+parallel setup; the lock cannot age out while its exact local process
+incarnation is alive.
 
-At action execution time, driver containers mount that cache read-only at `/cache`, stage tools into `/tmp/xlsynth-release`, and run with:
+Each input-manifest digest has a separate final directory. Final generations
+are never replaced in place, are fully revalidated before use, and are mounted
+individually read-only at `/cache-input`; different deployment generations can
+therefore coexist without a pathname race.
+
+At action execution time, driver containers mount their exact cache generation
+read-only at `/cache-input`, stage tools into `/tmp/xlsynth-release`, and run
+with:
 
 - `docker run --pull never`
 - `docker run --network none`
 
 This keeps action execution offline after setup and avoids repeated release-asset pulls from GitHub.
+Docker tags are planning names only. Unbound builds use a
+fingerprint-qualified tag; planning resolves that image to an immutable image
+ID and stores it in the action protobuf. Preflight and execution of a bound
+action invoke Docker by `sha256:<image-id>` without consulting the current tag
+or Dockerfile, so retained historical images remain replayable.
 Driver action creation validates `crate_version <-> dso_version` compatibility against `third_party/xlsynth-crate/generated_version_compat.json`.
 There is no hardcoded default driver crate version in Rust code: actions either use an explicit `--driver-version` or resolve to the latest compatible crate version from `generated_version_compat.json` at action creation time.
 Driver action provenance records both labels explicitly as `crate:vX.Y.Z` and `dso:vX.Y.Z`.
@@ -170,7 +195,7 @@ Because compatibility is modeled as crate->dso, the DSO label is derivable from 
 but many crate versions may map to the same DSO release; storing both labels keeps provenance and
 queries explicit.
 `download-stdlib` uses that same compatibility map to resolve a runtime for `dslx-list-fns`-based suggestion generation; failures are recorded in provenance details without failing the stdlib extraction artifact.
-`ir-to-delay-info` uses `delay_info_main --proto_out` and decodes the emitted binary `xls.DelayInfoProto` with `protoc` into canonical textual output (`delay_info.textproto`) using schema files cached during setup from the matching `xlsynth/xlsynth` tag for the requested version.
+`ir-to-delay-info` uses `delay_info_main --proto_out` and decodes the emitted binary `xls.DelayInfoProto` with `protoc` into canonical textual output (`delay_info.textproto`) using schema files cached during setup from the release's locked `xlsynth/xlsynth` source commit.
 
 Yosys/ABC actions use a dedicated image (`docker/yosys-abc.Dockerfile`) and take a script reference that is captured as `(path, sha256)` in the action spec; rematerialization re-validates that hash.
 
@@ -179,11 +204,13 @@ The vendored third-party metadata is documented in `third_party/xlsynth-crate/VE
 ## Queue/Enqueue Flow
 
 - `enqueue`: writes queue item in `pending/` by action ID (dedup by action ID), with optional explicit `priority` (default `0`).
-- `drain-queue`: first preflights runtime dependencies (image builds + release/proto cache fill), then workers claim only dependency-ready items (all dependency action IDs already completed) with an atomic hard-link-based claim from `pending` into `running`, attach a lease record (`lease_owner`, `lease_expires_utc`), execute, then write `done` and remove `running`.
+- `drain-queue`: first preflights runtime dependencies (image builds + release/proto cache fill), then workers claim only dependency-ready items (all dependency action IDs already completed) with an atomic hard-link-based claim from `pending` into `running`, attach a unique lease token plus owner/expiry data, execute, then commit terminal state under a per-action advisory fence that verifies the same lease token.
 - claim order is: higher explicit queue priority first, then action-kind scheduler priority, then enqueue time.
 - suggested descendants do not inherit root priority verbatim anymore: enqueue uses the parent item's explicit priority as a base and adds a small stage bonus derived from action-kind scheduler priority, so lineages closer to `DriverAigToStats` / `AigStatDiff` naturally outrank older upstream work from the same root priority.
 - compatible `DriverIrToG8rAig` micro-batching is intentionally conservative: extra claims stay within the same explicit queue priority band and are capped at four total actions per worker so newly-ready stats/diff work is less likely to wait behind already-leased G8r batches.
 - expired running leases are reclaimed back to pending before draining (unless disabled).
+- a stale worker whose lease was reclaimed cannot commit success/failure or
+  enqueue/cancel descendants for the replacement lease incarnation.
 - each action execution has a default 300-second timeout; timeout failures are recorded as persisted failed-action records (`TIMEOUT(300)`).
 - on failure: running item is removed from `running/`, failure details are persisted in sled (`failed_by_action`), and queued downstream actions that depend on that failed action are recursively moved from `pending/` to `canceled/`.
 
@@ -221,7 +248,7 @@ The built-in `discover-releases` command does this polling directly and supports
 - `ingest-legacy-failed-records [--dry-run] [--keep-legacy-files]` one-shot migration that ingests legacy filesystem failure records (`failed-action-records/` and `queue/failed/`) into sled `failed_by_action`; with defaults it prunes those legacy directories after successful parse.
 - `audit-suggested [--include-completed]` scans all completed actions and reports suggestion completion gaps.
 - `find-aig-stat-diffs --opt-ir-action-id <id>` answers whether any completed `AigStatDiff` joins exist for a given optimized IR action.
-- `populate-ir-fn-corpus-structural [--recompute-missing-hashes]` materializes a derived index of IR functions grouped by `ir-fn-structural-hash` into sled web-index keys (`ir-fn-corpus-structural.v1/...`), not filesystem files under the repo checkout.
+- `populate-ir-fn-corpus-structural [--recompute-missing-hashes]` materializes a derived index of IR functions grouped by `ir-fn-structural-hash` into sled web-index keys (`ir-fn-corpus-structural.v2/...`), not filesystem files under the repo checkout. The v2 manifest binds every group key to its exact JSON digest and member count.
 
 ## JSON-RPC API
 
@@ -249,7 +276,6 @@ Sort keys:
   - uses `(ir_action_id, ir_top)` identity for referential integrity when one IR package action contains multiple functions.
 - `enqueue-structural-opt-ir-g8r --crate-version vA.B.C --fraig {true|false} [--recompute-missing-hashes] [--dry-run]` enqueues at most one canonical `DriverIrToG8rAig` action per unique optimized-IR structural hash for that crate/dso/fraig target, skipping hashes already represented in done/pending/running/failed/canceled states.
 - `backfill-k-bool-cone-suggestions [--enqueue] [--dry-run]` repairs historical `IrFnToKBoolConeCorpus` provenances by reconstructing owned k-cone follow-up suggestions from manifests (global ownership by first-seen `(created_utc, action_id)` per cone structural hash); with `--enqueue` it also enqueues missing immediate follow-ups.
-- `refresh-version-compat` updates only `third_party/xlsynth-crate/generated_version_compat.json` from upstream `main`.
 - `scripts/sync-version-compat.sh [--check]` is the repo-level update/check script for `third_party/xlsynth-crate/generated_version_compat.json`.
 - `dslx-to-mangled-ir-fn-name --dslx-module-name M --dslx-fn-name F` computes a typical mangled IR function name for planning.
 - `show-provenance <action_id>` prints provenance.
@@ -298,7 +324,7 @@ When migrating away from a legacy action-identity variant, delete the legacy act
 
 ## Schema Evolution Notes
 
-- Action identity is `sha256({schema_version, action_spec})`. If action semantics or key fields change, increment `ACTION_SCHEMA_VERSION`.
+- Action identity uses the domain-separated protobuf encoding in `docs/action-id-v2.md`. If an existing semantic action's canonical bytes change after deployment, advance the identity version and domain.
 - Queue entries whose dependencies are absent from all queue states and absent from artifacts are stale/orphaned; deleting those pending entries is acceptable.
 - Suggested-action IDs may change across schema/spec evolution; regenerate by re-running enqueue/discovery from current provenance instead of preserving old pending IDs.
 - Favor simplicity for this repo: stale queue data can be deleted, and required outputs can be re-materialized from current action specs.

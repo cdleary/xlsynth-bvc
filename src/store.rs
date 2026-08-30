@@ -1,20 +1,129 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result, anyhow, bail};
+use fs2::FileExt;
 use log::{info, warn};
+use prost::Message;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use sled::transaction::{
+    ConflictableTransactionError, ConflictableTransactionResult, Transactional,
+};
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::fs;
-use std::io::Cursor;
+use std::fs::{self, OpenOptions};
+use std::io::{Cursor, Write};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-use crate::model::{ArtifactRef, Provenance, QueueCanceled, QueueFailed, QueueItem, QueueRunning};
+use crate::model::{ArtifactRef, Provenance, QueueFailed};
+use crate::proto::{FILE_DESCRIPTOR_SET, v1 as pb};
+use crate::proto::{
+    decode_queue_canceled, decode_queue_failed, decode_queue_item, decode_queue_running,
+    encode_queue_failed,
+};
 use crate::queue::action_dependency_action_ids;
 use crate::snapshot::snapshot_web_index_path;
+
+#[derive(Clone, Copy)]
+enum StorePathLeafKind {
+    Directory,
+    RegularFileOrMissing,
+}
+
+fn validate_store_path_without_links(
+    store_root: &Path,
+    path: &Path,
+    leaf_kind: StorePathLeafKind,
+    label: &str,
+) -> Result<()> {
+    let relative = path.strip_prefix(store_root).with_context(|| {
+        format!(
+            "{label} must be inside the private store: {}",
+            path.display()
+        )
+    })?;
+    if relative.as_os_str().is_empty() {
+        bail!("{label} must not be the private store root");
+    }
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!(
+            "{label} contains a non-normal path component: {}",
+            path.display()
+        );
+    }
+
+    let root_metadata = fs::symlink_metadata(store_root)
+        .with_context(|| format!("statting private store root: {}", store_root.display()))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        bail!(
+            "private store root must be a real directory, not a symlink or special node: {}",
+            store_root.display()
+        );
+    }
+    let canonical_root = fs::canonicalize(store_root)
+        .with_context(|| format!("resolving private store root: {}", store_root.display()))?;
+    let components = relative.components().collect::<Vec<_>>();
+    let mut current = store_root.to_path_buf();
+    let mut existing_ancestor = store_root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!("{label} traverses a symlink: {}", current.display());
+                }
+                let is_leaf = index + 1 == components.len();
+                let valid_type = if is_leaf {
+                    match leaf_kind {
+                        StorePathLeafKind::Directory => metadata.is_dir(),
+                        StorePathLeafKind::RegularFileOrMissing => metadata.is_file(),
+                    }
+                } else {
+                    metadata.is_dir()
+                };
+                if !valid_type {
+                    bail!(
+                        "{label} traverses a special or wrong-kind node: {}",
+                        current.display()
+                    );
+                }
+                existing_ancestor = current.clone();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("statting {label}: {}", current.display()));
+            }
+        }
+    }
+    let canonical_ancestor = fs::canonicalize(&existing_ancestor).with_context(|| {
+        format!(
+            "resolving existing {label} ancestor: {}",
+            existing_ancestor.display()
+        )
+    })?;
+    if !canonical_ancestor.starts_with(&canonical_root) {
+        bail!(
+            "{label} resolves outside the private store: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_store_directory_without_links(store_root: &Path, path: &Path, label: &str) -> Result<()> {
+    validate_store_path_without_links(store_root, path, StorePathLeafKind::Directory, label)?;
+    fs::create_dir_all(path).with_context(|| format!("creating {label}: {}", path.display()))?;
+    validate_store_path_without_links(store_root, path, StorePathLeafKind::Directory, label)?;
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum ArtifactBackendSelection {
@@ -33,7 +142,6 @@ trait ArtifactBackend: std::fmt::Debug + Send + Sync {
         action_id: &str,
         staging_dir: &Path,
     ) -> Result<()>;
-    fn provenance_path(&self, store_root: &Path, action_id: &str) -> PathBuf;
     fn failed_action_record_exists(&self, store_root: &Path, action_id: &str) -> bool;
     fn load_failed_action_record(
         &self,
@@ -65,12 +173,140 @@ trait ArtifactBackend: std::fmt::Debug + Send + Sync {
     fn web_index_location(&self, store_root: &Path, index_key: &str) -> String;
     fn size_on_disk_bytes(&self, store_root: &Path) -> Result<u64>;
     fn flush_durable(&self) -> Result<()>;
+    #[cfg(test)]
+    fn load_raw_action_file_value_for_test(
+        &self,
+        _action_id: &str,
+        _relpath: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        bail!("raw action-file rows are only available from the sled backend")
+    }
 }
 
 fn shard_dir(base: &Path, key: &str) -> PathBuf {
     let first = key.get(0..2).unwrap_or("xx");
     let second = key.get(2..4).unwrap_or("xx");
     base.join(first).join(second)
+}
+
+const STORE_FORMAT_VERSION: u32 = 1;
+const STORE_FORMAT_NAME: &str = "xlsynth-bvc-protobuf-store";
+const STORE_FORMAT_MARKER: &str = "store-format.pb";
+const STORE_FORMAT_INIT_LOCK: &str = ".store-format-init.lock";
+const STORE_FORMAT_MARKER_STAGING: &str = ".store-format.pb.staging";
+static FAILED_ACTION_MIRROR_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
+static ATOMIC_RECORD_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn ensure_store_format_marker(store_root: &Path) -> Result<()> {
+    fs::create_dir_all(store_root)
+        .with_context(|| format!("creating store root: {}", store_root.display()))?;
+    let init_lock_path = store_root.join(STORE_FORMAT_INIT_LOCK);
+    let init_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&init_lock_path)
+        .with_context(|| {
+            format!(
+                "opening store format initialization lock: {}",
+                init_lock_path.display()
+            )
+        })?;
+    init_lock.lock_exclusive().with_context(|| {
+        format!(
+            "locking store format initialization: {}",
+            init_lock_path.display()
+        )
+    })?;
+
+    let marker_path = store_root.join(STORE_FORMAT_MARKER);
+    let staging_path = store_root.join(STORE_FORMAT_MARKER_STAGING);
+    let descriptor_sha256 = Sha256::digest(FILE_DESCRIPTOR_SET).to_vec();
+    if marker_path.exists() {
+        let bytes = fs::read(&marker_path)
+            .with_context(|| format!("reading store format marker: {}", marker_path.display()))?;
+        let marker = pb::StoreFormat::decode(bytes.as_slice())
+            .with_context(|| format!("decoding store format marker: {}", marker_path.display()))?;
+        if marker.format_version != STORE_FORMAT_VERSION || marker.format_name != STORE_FORMAT_NAME
+        {
+            bail!(
+                "unsupported store format in {}: name={:?} version={} expected name={:?} version={}",
+                marker_path.display(),
+                marker.format_name,
+                marker.format_version,
+                STORE_FORMAT_NAME,
+                STORE_FORMAT_VERSION
+            );
+        }
+        let digest = marker
+            .schema_descriptor_sha256
+            .context("store format marker missing schema_descriptor_sha256")?;
+        if digest.value != descriptor_sha256 {
+            bail!(
+                "store schema descriptor mismatch in {}; this binary requires a fresh or deliberately upgraded protobuf store",
+                marker_path.display()
+            );
+        }
+        if staging_path.exists() {
+            fs::remove_file(&staging_path).with_context(|| {
+                format!(
+                    "removing abandoned store format staging file: {}",
+                    staging_path.display()
+                )
+            })?;
+        }
+        return Ok(());
+    }
+    if staging_path.exists() {
+        fs::remove_file(&staging_path).with_context(|| {
+            format!(
+                "removing abandoned store format staging file: {}",
+                staging_path.display()
+            )
+        })?;
+    }
+    let mut foreign_entry = None;
+    for entry in fs::read_dir(store_root)
+        .with_context(|| format!("listing unmarked store root: {}", store_root.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("reading unmarked store entry in {}", store_root.display()))?;
+        if entry.file_name() == STORE_FORMAT_INIT_LOCK
+            || entry.file_name() == STORE_FORMAT_MARKER_STAGING
+        {
+            continue;
+        }
+        foreign_entry = Some(entry.path());
+        break;
+    }
+    if let Some(path) = foreign_entry {
+        bail!(
+            "refusing to initialize protobuf format marker in nonempty store {}; found {}; use a fresh empty store because legacy migration is intentionally unsupported",
+            store_root.display(),
+            path.display()
+        );
+    }
+    let marker = pb::StoreFormat {
+        format_version: STORE_FORMAT_VERSION,
+        format_name: STORE_FORMAT_NAME.to_string(),
+        schema_descriptor_sha256: Some(pb::Sha256Digest {
+            value: descriptor_sha256,
+        }),
+    };
+    fs::write(&staging_path, marker.encode_to_vec()).with_context(|| {
+        format!(
+            "writing staged store format marker: {}",
+            staging_path.display()
+        )
+    })?;
+    fs::rename(&staging_path, &marker_path).with_context(|| {
+        format!(
+            "promoting staged store format marker: {} -> {}",
+            staging_path.display(),
+            marker_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn promote_staging_action_dir_fs(staging_dir: &Path, final_dir: &Path) -> Result<()> {
@@ -93,7 +329,7 @@ fn promote_staging_action_dir_fs(staging_dir: &Path, final_dir: &Path) -> Result
                 });
             }
 
-            let final_provenance = final_dir.join("provenance.json");
+            let final_provenance = final_dir.join("provenance.pb");
             if final_provenance.exists() {
                 fs::remove_dir_all(staging_dir).ok();
                 return Ok(());
@@ -121,6 +357,7 @@ fn promote_staging_action_dir_fs(staging_dir: &Path, final_dir: &Path) -> Result
 struct SledArtifactBackend {
     db_path: PathBuf,
     db: Mutex<Option<sled::Db>>,
+    materialization_lock: Mutex<()>,
 }
 
 impl SledArtifactBackend {
@@ -136,6 +373,19 @@ impl SledArtifactBackend {
     const ACTION_FILE_COMPRESS_LARGE_MIN_BYTES_DEFAULT: usize = 1024 * 1024;
     const ACTION_FILE_COMPRESS_LEVEL_DEFAULT: i32 = 3;
     const ACTION_FILE_COMPRESS_LEVEL_LARGE_DEFAULT: i32 = 12;
+
+    fn decode_keyed_provenance(key: &[u8], value: &[u8]) -> Result<Provenance> {
+        let provenance = crate::proto::decode_provenance(value)
+            .context("decoding sled protobuf provenance row")?;
+        if key != provenance.action_id.as_bytes() {
+            bail!(
+                "sled provenance key {} disagrees with decoded action id {}",
+                String::from_utf8_lossy(key),
+                provenance.action_id
+            );
+        }
+        Ok(provenance)
+    }
 
     fn action_file_compress_min_bytes() -> usize {
         static VALUE: OnceLock<usize> = OnceLock::new();
@@ -214,6 +464,28 @@ impl SledArtifactBackend {
             return Ok(stored_bytes.to_vec());
         };
         zstd::stream::decode_all(Cursor::new(payload)).context("zstd decoding action-file row")
+    }
+
+    fn validate_provenance_replacement(
+        existing_bytes: &[u8],
+        replacement_bytes: &[u8],
+    ) -> Result<()> {
+        let existing = pb::Provenance::decode(existing_bytes)
+            .context("decoding existing provenance before replacement")?;
+        let replacement =
+            pb::Provenance::decode(replacement_bytes).context("decoding replacement provenance")?;
+        if existing.record_version != replacement.record_version
+            || existing.action_id != replacement.action_id
+            || existing.action != replacement.action
+            || existing.dependencies != replacement.dependencies
+            || existing.output_artifact != replacement.output_artifact
+            || existing.output_files != replacement.output_files
+        {
+            bail!(
+                "provenance replacement may update discovery metadata only; action identity and output contract must remain unchanged"
+            );
+        }
+        Ok(())
     }
 
     fn cache_capacity_bytes() -> u64 {
@@ -316,8 +588,12 @@ impl SledArtifactBackend {
     }
 
     fn materialize_action_from_db(&self, store_root: &Path, action_id: &str) -> Result<PathBuf> {
+        let _materialization_guard = self
+            .materialization_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("acquiring sled materialization lock"))?;
         let final_dir = self.materialized_action_dir_for(store_root, action_id);
-        if final_dir.join("provenance.json").exists() {
+        if final_dir.join("provenance.pb").exists() {
             return Ok(final_dir);
         }
 
@@ -336,6 +612,8 @@ impl SledArtifactBackend {
             Some(bytes) => bytes.to_vec(),
             None => return Ok(final_dir),
         };
+        Self::decode_keyed_provenance(action_id.as_bytes(), &provenance_bytes)
+            .context("validating materialized provenance row identity")?;
 
         let staging_root = store_root.join(".staging");
         fs::create_dir_all(&staging_root).with_context(|| {
@@ -381,7 +659,7 @@ impl SledArtifactBackend {
                 wrote_any = true;
             }
 
-            let provenance_path = stage_dir.join("provenance.json");
+            let provenance_path = stage_dir.join("provenance.pb");
             if !wrote_any || !provenance_path.exists() {
                 fs::write(&provenance_path, &provenance_bytes).with_context(|| {
                     format!(
@@ -721,8 +999,8 @@ pub(crate) struct SledPruneActionsByRelpathSizeSummary {
     pub(crate) elapsed_secs: f64,
 }
 
-fn queue_json_path(store_root: &Path, state: &str, action_id: &str) -> PathBuf {
-    shard_dir(&store_root.join("queue").join(state), action_id).join(format!("{action_id}.json"))
+fn queue_record_path(store_root: &Path, state: &str, action_id: &str) -> PathBuf {
+    shard_dir(&store_root.join("queue").join(state), action_id).join(format!("{action_id}.pb"))
 }
 
 fn materialized_action_dir_path(store_root: &Path, action_id: &str) -> PathBuf {
@@ -732,20 +1010,16 @@ fn materialized_action_dir_path(store_root: &Path, action_id: &str) -> PathBuf {
 fn failed_action_record_path(store_root: &Path, action_id: &str) -> PathBuf {
     shard_dir(&store_root.join("failed-action-records"), action_id)
         .join(action_id)
-        .join("failed.json")
-}
-
-fn legacy_queue_failed_action_record_path(store_root: &Path, action_id: &str) -> PathBuf {
-    queue_json_path(store_root, "failed", action_id)
+        .join("failed.pb")
 }
 
 fn load_failed_action_record_from_path(path: &Path) -> Result<Option<QueueFailed>> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(path)
+    let bytes = fs::read(path)
         .with_context(|| format!("reading failed action record path: {}", path.display()))?;
-    let record: QueueFailed = serde_json::from_str(&text)
+    let record = decode_queue_failed(&bytes)
         .with_context(|| format!("parsing failed action record path: {}", path.display()))?;
     Ok(Some(record))
 }
@@ -754,29 +1028,42 @@ fn load_failed_action_record_from_disk(
     store_root: &Path,
     action_id: &str,
 ) -> Result<Option<QueueFailed>> {
-    for path in [
-        failed_action_record_path(store_root, action_id),
-        legacy_queue_failed_action_record_path(store_root, action_id),
-    ] {
-        if let Some(record) = load_failed_action_record_from_path(&path)? {
-            return Ok(Some(record));
-        }
-    }
-    Ok(None)
+    load_failed_action_record_from_path(&failed_action_record_path(store_root, action_id))
 }
 
 fn write_failed_action_record_to_disk(store_root: &Path, failed: &QueueFailed) -> Result<()> {
     let path = failed_action_record_path(store_root, &failed.action_id);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("creating failed action record parent: {}", parent.display())
-        })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("failed action record path has no parent"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating failed action record parent: {}", parent.display()))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = FAILED_ACTION_MIRROR_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(
+        ".failed.pb.tmp-{}-{timestamp}-{nonce}",
+        std::process::id()
+    ));
+    fs::write(&temp, encode_queue_failed(failed)?).with_context(|| {
+        format!(
+            "writing failed action record mirror staging file: {}",
+            temp.display()
+        )
+    })?;
+    if let Err(error) = fs::rename(&temp, &path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error).with_context(|| {
+            format!(
+                "atomically replacing failed action record mirror: {} -> {}",
+                temp.display(),
+                path.display()
+            )
+        });
     }
-    fs::write(
-        &path,
-        serde_json::to_string_pretty(failed).context("serializing failed action record mirror")?,
-    )
-    .with_context(|| format!("writing failed action record mirror: {}", path.display()))
+    Ok(())
 }
 
 fn remove_file_if_exists(path: &Path, dry_run: bool) -> Result<bool> {
@@ -801,11 +1088,11 @@ fn remove_dir_if_exists(path: &Path, dry_run: bool) -> Result<bool> {
 
 fn queue_dependency_edges_path(
     path: &Path,
-    parse_action: impl FnOnce(String) -> Result<(String, Vec<String>)>,
+    parse_action: impl FnOnce(Vec<u8>) -> Result<(String, Vec<String>)>,
     reverse_edges: &mut HashMap<String, Vec<String>>,
 ) {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
         Err(err) => {
             warn!(
                 "skipping queue record; read failed path={} error={:#}",
@@ -815,7 +1102,7 @@ fn queue_dependency_edges_path(
             return;
         }
     };
-    let (action_id, deps) = match parse_action(text) {
+    let (action_id, deps) = match parse_action(bytes) {
         Ok(parsed) => parsed,
         Err(err) => {
             warn!(
@@ -851,8 +1138,8 @@ fn build_reverse_dependency_edges(
             row.context("iterating provenance_by_action rows for prune graph")?;
         let action_id = String::from_utf8(action_id.to_vec())
             .context("decoding action_id from provenance key during prune graph build")?;
-        let provenance: Provenance = serde_json::from_slice(provenance_bytes.as_ref())
-            .with_context(|| format!("parsing provenance JSON for action {}", action_id))?;
+        let provenance = crate::proto::decode_provenance(provenance_bytes.as_ref())
+            .with_context(|| format!("decoding protobuf provenance for action {}", action_id))?;
         scanned_provenance_rows += 1;
         for dep in provenance.dependencies {
             reverse_edges
@@ -874,7 +1161,7 @@ fn build_reverse_dependency_edges(
     }
 
     let mut scan_queue_dir = |state: &str,
-                              parse: fn(String) -> Result<(String, Vec<String>)>,
+                              parse: fn(Vec<u8>) -> Result<(String, Vec<String>)>,
                               reverse_edges: &mut HashMap<String, Vec<String>>|
      -> Result<()> {
         let root = store_root.join("queue").join(state);
@@ -898,7 +1185,7 @@ fn build_reverse_dependency_edges(
                 continue;
             }
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            if path.extension().and_then(|s| s.to_str()) != Some("pb") {
                 continue;
             }
             scanned_queue_rows += 1;
@@ -918,9 +1205,8 @@ fn build_reverse_dependency_edges(
         Ok(())
     };
 
-    fn parse_pending(text: String) -> Result<(String, Vec<String>)> {
-        let record: QueueItem =
-            serde_json::from_str(&text).context("parsing pending queue record JSON")?;
+    fn parse_pending(bytes: Vec<u8>) -> Result<(String, Vec<String>)> {
+        let record = decode_queue_item(&bytes).context("parsing pending queue record protobuf")?;
         let deps = action_dependency_action_ids(&record.action)
             .into_iter()
             .map(|s| s.to_string())
@@ -928,9 +1214,9 @@ fn build_reverse_dependency_edges(
         Ok((record.action_id, deps))
     }
 
-    fn parse_running(text: String) -> Result<(String, Vec<String>)> {
-        let record: QueueRunning =
-            serde_json::from_str(&text).context("parsing running queue record JSON")?;
+    fn parse_running(bytes: Vec<u8>) -> Result<(String, Vec<String>)> {
+        let record =
+            decode_queue_running(&bytes).context("parsing running queue record protobuf")?;
         let deps = action_dependency_action_ids(&record.action)
             .into_iter()
             .map(|s| s.to_string())
@@ -938,9 +1224,9 @@ fn build_reverse_dependency_edges(
         Ok((record.action_id, deps))
     }
 
-    fn parse_canceled(text: String) -> Result<(String, Vec<String>)> {
-        let record: QueueCanceled =
-            serde_json::from_str(&text).context("parsing canceled queue record JSON")?;
+    fn parse_canceled(bytes: Vec<u8>) -> Result<(String, Vec<String>)> {
+        let record =
+            decode_queue_canceled(&bytes).context("parsing canceled queue record protobuf")?;
         let deps = action_dependency_action_ids(&record.action)
             .into_iter()
             .map(|s| s.to_string())
@@ -953,8 +1239,8 @@ fn build_reverse_dependency_edges(
     scan_queue_dir("canceled", parse_canceled, &mut reverse_edges)?;
     for row in failed_tree.iter() {
         let (_action_id, value) = row.context("iterating failed_by_action rows for prune graph")?;
-        let failed: QueueFailed = serde_json::from_slice(value.as_ref())
-            .context("parsing failed queue record from sled failed_by_action row")?;
+        let failed = decode_queue_failed(value.as_ref())
+            .context("parsing failed protobuf from sled failed_by_action row")?;
         scanned_failed_record_rows += 1;
         for dep in action_dependency_action_ids(&failed.action) {
             reverse_edges
@@ -1099,19 +1385,28 @@ pub(crate) fn prune_sled_actions_by_ids(
             }
         }
 
-        if remove_file_if_exists(&queue_json_path(store_root, "pending", action_id), dry_run)? {
+        if remove_file_if_exists(
+            &queue_record_path(store_root, "pending", action_id),
+            dry_run,
+        )? {
             deleted_queue_pending_files += 1;
         }
-        if remove_file_if_exists(&queue_json_path(store_root, "running", action_id), dry_run)? {
+        if remove_file_if_exists(
+            &queue_record_path(store_root, "running", action_id),
+            dry_run,
+        )? {
             deleted_queue_running_files += 1;
         }
-        if remove_file_if_exists(&queue_json_path(store_root, "done", action_id), dry_run)? {
+        if remove_file_if_exists(&queue_record_path(store_root, "done", action_id), dry_run)? {
             deleted_queue_done_files += 1;
         }
-        if remove_file_if_exists(&queue_json_path(store_root, "failed", action_id), dry_run)? {
+        if remove_file_if_exists(&queue_record_path(store_root, "failed", action_id), dry_run)? {
             deleted_queue_failed_files += 1;
         }
-        if remove_file_if_exists(&queue_json_path(store_root, "canceled", action_id), dry_run)? {
+        if remove_file_if_exists(
+            &queue_record_path(store_root, "canceled", action_id),
+            dry_run,
+        )? {
             deleted_queue_canceled_files += 1;
         }
         if failed_tree
@@ -1226,8 +1521,8 @@ pub(crate) fn prune_sled_actions_by_relpath_size(
         let (_, provenance_bytes) =
             row.context("iterating provenance_by_action rows during prune seed scan")?;
         scanned_provenance_rows += 1;
-        let provenance: Provenance = serde_json::from_slice(provenance_bytes.as_ref())
-            .context("parsing provenance JSON during prune seed scan")?;
+        let provenance = crate::proto::decode_provenance(provenance_bytes.as_ref())
+            .context("decoding protobuf provenance during prune seed scan")?;
         if let Some(output_file) = provenance.output_files.iter().find(|f| f.path == relpath) {
             matched_relpath_outputs += 1;
             if output_file.bytes >= min_bytes as u64 {
@@ -1335,19 +1630,28 @@ pub(crate) fn prune_sled_actions_by_relpath_size(
             }
         }
 
-        if remove_file_if_exists(&queue_json_path(store_root, "pending", action_id), dry_run)? {
+        if remove_file_if_exists(
+            &queue_record_path(store_root, "pending", action_id),
+            dry_run,
+        )? {
             deleted_queue_pending_files += 1;
         }
-        if remove_file_if_exists(&queue_json_path(store_root, "running", action_id), dry_run)? {
+        if remove_file_if_exists(
+            &queue_record_path(store_root, "running", action_id),
+            dry_run,
+        )? {
             deleted_queue_running_files += 1;
         }
-        if remove_file_if_exists(&queue_json_path(store_root, "done", action_id), dry_run)? {
+        if remove_file_if_exists(&queue_record_path(store_root, "done", action_id), dry_run)? {
             deleted_queue_done_files += 1;
         }
-        if remove_file_if_exists(&queue_json_path(store_root, "failed", action_id), dry_run)? {
+        if remove_file_if_exists(&queue_record_path(store_root, "failed", action_id), dry_run)? {
             deleted_queue_failed_files += 1;
         }
-        if remove_file_if_exists(&queue_json_path(store_root, "canceled", action_id), dry_run)? {
+        if remove_file_if_exists(
+            &queue_record_path(store_root, "canceled", action_id),
+            dry_run,
+        )? {
             deleted_queue_canceled_files += 1;
         }
         if failed_tree
@@ -1612,6 +1916,23 @@ pub(crate) fn backfill_sled_action_file_compression(
 }
 
 impl ArtifactBackend for SledArtifactBackend {
+    #[cfg(test)]
+    fn load_raw_action_file_value_for_test(
+        &self,
+        action_id: &str,
+        relpath: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let db = self.open_db()?;
+        let tree = db
+            .open_tree(Self::TREE_ACTION_FILE_BYTES)
+            .context("opening action_file_bytes tree for test inspection")?;
+        let key = Self::action_file_key(action_id, relpath);
+        Ok(tree
+            .get(key)
+            .context("reading raw action-file row for test inspection")?
+            .map(|bytes| bytes.to_vec()))
+    }
+
     fn ensure_layout(&self, store_root: &Path) -> Result<()> {
         fs::create_dir_all(self.artifacts_dir(store_root))
             .context("creating materialized artifacts directory")?;
@@ -1667,9 +1988,9 @@ impl ArtifactBackend for SledArtifactBackend {
             let relpath = Self::normalize_relpath(rel)?;
             let bytes = fs::read(path)
                 .with_context(|| format!("reading staged action file: {}", path.display()))?;
-            if relpath == "provenance.json" {
-                let parsed: Provenance = serde_json::from_slice(&bytes).with_context(|| {
-                    format!("parsing staged provenance file: {}", path.display())
+            if relpath == "provenance.pb" {
+                let parsed = crate::proto::decode_provenance(&bytes).with_context(|| {
+                    format!("decoding staged protobuf provenance: {}", path.display())
                 })?;
                 if parsed.action_id != action_id {
                     bail!(
@@ -1684,55 +2005,84 @@ impl ArtifactBackend for SledArtifactBackend {
         }
         let provenance_bytes = provenance_bytes.ok_or_else(|| {
             anyhow::anyhow!(
-                "staged action directory missing provenance.json for action {}",
+                "staged action directory missing provenance.pb for action {}",
                 action_id
             )
         })?;
+
+        let mut encoded_staged_files = Vec::with_capacity(staged_files.len());
+        for (relpath, bytes) in &staged_files {
+            let key = Self::action_file_key(action_id, relpath);
+            let encoded = Self::maybe_encode_action_file_value(bytes)
+                .with_context(|| format!("encoding action-file row relpath={relpath}"))?;
+            encoded_staged_files.push((key, encoded));
+        }
+
+        // A materializer must not observe the canonical transaction until the
+        // promotion has flushed and invalidated any cache directory left by a
+        // prior incarnation of this action. Provenance replacement takes this
+        // same lock for the same reason.
+        let _materialization_guard = self
+            .materialization_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("acquiring sled materialization lock for promotion"))?;
 
         let prefix = Self::action_files_prefix(action_id);
         let mut existing_keys = Vec::new();
         for row in file_tree.scan_prefix(prefix) {
             let (key, _) = row.context("iterating existing sled action-file rows")?;
-            existing_keys.push(key);
-        }
-        for key in existing_keys {
-            file_tree
-                .remove(key)
-                .context("removing existing sled action-file row")?;
+            existing_keys.push(key.to_vec());
         }
 
-        for (relpath, bytes) in &staged_files {
-            let key = Self::action_file_key(action_id, relpath);
-            let encoded = Self::maybe_encode_action_file_value(bytes)
-                .with_context(|| format!("encoding action-file row relpath={relpath}"))?;
-            file_tree
-                .insert(key, encoded)
-                .context("writing sled action-file row")?;
-        }
-        provenance_tree
-            .insert(action_id.as_bytes(), provenance_bytes)
-            .context("writing sled provenance row")?;
+        let inserted = (&provenance_tree, &file_tree)
+            .transaction(
+                |(transactional_provenance, transactional_files)|
+                 -> ConflictableTransactionResult<bool, sled::Error> {
+                    if transactional_provenance
+                        .get(action_id.as_bytes())?
+                        .is_some()
+                    {
+                        return Ok(false);
+                    }
+                    for key in &existing_keys {
+                        transactional_files.remove(key.clone())?;
+                    }
+                    for (key, encoded) in &encoded_staged_files {
+                        transactional_files.insert(key.clone(), encoded.clone())?;
+                    }
+                    transactional_provenance
+                        .insert(action_id.as_bytes().to_vec(), provenance_bytes.clone())?;
+                    Ok(true)
+                },
+            )
+            .context("atomically promoting immutable sled action")?;
         db.flush().context("flushing sled artifact database")?;
 
+        if !inserted {
+            let existing = provenance_tree
+                .get(action_id.as_bytes())
+                .context("loading existing sled provenance after promotion race")?
+                .context("existing sled action disappeared after promotion race")?;
+            let parsed = crate::proto::decode_provenance(existing.as_ref())
+                .context("decoding existing sled provenance after promotion race")?;
+            if parsed.action_id != action_id {
+                bail!(
+                    "existing sled provenance action id mismatch: expected {} got {}",
+                    action_id,
+                    parsed.action_id
+                );
+            }
+        }
+
         let materialized_dir = self.materialized_action_dir_for(store_root, action_id);
-        if materialized_dir.exists() {
+        if inserted && materialized_dir.exists() {
             fs::remove_dir_all(&materialized_dir).ok();
         }
         fs::remove_dir_all(staging_dir).ok();
         Ok(())
     }
 
-    fn provenance_path(&self, store_root: &Path, action_id: &str) -> PathBuf {
-        self.materialized_action_dir_for(store_root, action_id)
-            .join("provenance.json")
-    }
-
-    fn failed_action_record_exists(&self, store_root: &Path, action_id: &str) -> bool {
-        if failed_action_record_path(store_root, action_id).exists()
-            || legacy_queue_failed_action_record_path(store_root, action_id).exists()
-        {
-            return true;
-        }
+    fn failed_action_record_exists(&self, _store_root: &Path, action_id: &str) -> bool {
         let db = match self.open_db() {
             Ok(db) => db,
             Err(_) => return false,
@@ -1749,9 +2099,6 @@ impl ArtifactBackend for SledArtifactBackend {
         store_root: &Path,
         action_id: &str,
     ) -> Result<Option<QueueFailed>> {
-        if let Some(record) = load_failed_action_record_from_disk(store_root, action_id)? {
-            return Ok(Some(record));
-        }
         let db = self.open_db()?;
         let tree = db
             .open_tree(Self::TREE_FAILED_BY_ACTION)
@@ -1760,9 +2107,57 @@ impl ArtifactBackend for SledArtifactBackend {
             .get(action_id.as_bytes())
             .context("loading failed action record row from sled")?
         {
-            let parsed: QueueFailed = serde_json::from_slice(bytes.as_ref())
-                .context("parsing failed action record row from sled")?;
+            let parsed = decode_queue_failed(bytes.as_ref())
+                .context("parsing failed action record protobuf row from sled")?;
+            if parsed.action_id != action_id {
+                bail!("failed action record Sled key does not match its embedded action_id");
+            }
+            let mirror_is_current = match load_failed_action_record_from_disk(store_root, action_id)
+            {
+                Ok(Some(mirror)) if mirror.action_id == action_id => {
+                    encode_queue_failed(&mirror)?.as_slice() == bytes.as_ref()
+                }
+                Ok(Some(_)) => {
+                    warn!(
+                        "ignoring failed action record mirror with mismatched action id: {}",
+                        failed_action_record_path(store_root, action_id).display()
+                    );
+                    false
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    warn!(
+                        "ignoring corrupt failed action record mirror {}: {:#}",
+                        failed_action_record_path(store_root, action_id).display(),
+                        error
+                    );
+                    false
+                }
+            };
+            if !mirror_is_current
+                && let Err(error) = write_failed_action_record_to_disk(store_root, &parsed)
+            {
+                warn!(
+                    "failed to repair non-canonical failed action record mirror {}: {:#}",
+                    failed_action_record_path(store_root, action_id).display(),
+                    error
+                );
+            }
             return Ok(Some(parsed));
+        }
+        let stale_mirror = failed_action_record_path(store_root, action_id);
+        if stale_mirror.exists() {
+            warn!(
+                "removing failed action record mirror without canonical Sled row: {}",
+                stale_mirror.display()
+            );
+            if let Err(error) = fs::remove_file(&stale_mirror) {
+                warn!(
+                    "failed to remove stale failed action record mirror {}: {:#}",
+                    stale_mirror.display(),
+                    error
+                );
+            }
         }
         Ok(None)
     }
@@ -1772,8 +2167,7 @@ impl ArtifactBackend for SledArtifactBackend {
         let tree = db
             .open_tree(Self::TREE_FAILED_BY_ACTION)
             .context("opening sled tree failed_by_action")?;
-        let bytes =
-            serde_json::to_vec_pretty(failed).context("serializing failed action record row")?;
+        let bytes = encode_queue_failed(failed)?;
         tree.insert(failed.action_id.as_bytes(), bytes)
             .context("writing failed action record row to sled")?;
         db.flush()
@@ -1795,13 +2189,8 @@ impl ArtifactBackend for SledArtifactBackend {
         {
             deleted = true;
         }
-        for path in [
-            failed_action_record_path(store_root, action_id),
-            legacy_queue_failed_action_record_path(store_root, action_id),
-        ] {
-            if remove_file_if_exists(&path, false)? {
-                deleted = true;
-            }
+        if remove_file_if_exists(&failed_action_record_path(store_root, action_id), false)? {
+            deleted = true;
         }
         if deleted {
             db.flush()
@@ -1817,7 +2206,11 @@ impl ArtifactBackend for SledArtifactBackend {
         let Ok(tree) = db.open_tree(Self::TREE_PROVENANCE_BY_ACTION) else {
             return false;
         };
-        matches!(tree.get(action_id.as_bytes()), Ok(Some(_)))
+        matches!(
+            tree.get(action_id.as_bytes()),
+            Ok(Some(value))
+                if Self::decode_keyed_provenance(action_id.as_bytes(), value.as_ref()).is_ok()
+        )
     }
 
     fn load_provenance(&self, _store_root: &Path, action_id: &str) -> Result<Provenance> {
@@ -1829,23 +2222,65 @@ impl ArtifactBackend for SledArtifactBackend {
             .get(action_id.as_bytes())
             .context("loading provenance row from sled")?
             .ok_or_else(|| anyhow::anyhow!("provenance not found for action {}", action_id))?;
-        let parsed: Provenance =
-            serde_json::from_slice(bytes.as_ref()).context("parsing provenance row from sled")?;
-        Ok(parsed)
+        Self::decode_keyed_provenance(action_id.as_bytes(), bytes.as_ref())
+            .context("validating loaded provenance row identity")
     }
 
     fn write_provenance(&self, store_root: &Path, provenance: &Provenance) -> Result<()> {
+        let _materialization_guard = self
+            .materialization_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("acquiring sled materialization lock"))?;
         let db = self.open_db()?;
-        let tree = db
+        let provenance_tree = db
             .open_tree(Self::TREE_PROVENANCE_BY_ACTION)
             .context("opening sled tree provenance_by_action")?;
-        let bytes = serde_json::to_vec_pretty(provenance).context("serializing provenance row")?;
-        tree.insert(provenance.action_id.as_bytes(), bytes)
-            .context("writing provenance row to sled")?;
+        let file_tree = db
+            .open_tree(Self::TREE_ACTION_FILE_BYTES)
+            .context("opening sled tree action_file_bytes")?;
+        let bytes = crate::proto::encode_provenance(provenance)
+            .context("encoding protobuf provenance row")?;
+        let existing_bytes = provenance_tree
+            .get(provenance.action_id.as_bytes())
+            .context("loading existing provenance before replacement")?
+            .map(|value| value.to_vec());
+        if let Some(existing) = &existing_bytes {
+            Self::validate_provenance_replacement(existing, &bytes)?;
+        }
+        let encoded_file = Self::maybe_encode_action_file_value(&bytes)
+            .context("encoding provenance action-file row")?;
+        let provenance_file_key = Self::action_file_key(&provenance.action_id, "provenance.pb");
+        (&provenance_tree, &file_tree)
+            .transaction(
+                |(transactional_provenance, transactional_files)|
+                 -> ConflictableTransactionResult<(), sled::Error> {
+                    let current = transactional_provenance
+                        .get(provenance.action_id.as_bytes())?
+                        .map(|value| value.to_vec());
+                    if current != existing_bytes {
+                        return Err(ConflictableTransactionError::Abort(
+                            sled::Error::Unsupported(
+                                "provenance changed during replacement".to_string(),
+                            ),
+                        ));
+                    }
+                    transactional_files
+                        .insert(provenance_file_key.clone(), encoded_file.clone())?;
+                    transactional_provenance
+                        .insert(provenance.action_id.as_bytes().to_vec(), bytes.clone())?;
+                    Ok(())
+                },
+            )
+            .context("atomically replacing canonical sled provenance")?;
         db.flush().context("flushing sled artifact database")?;
         let materialized_dir = self.materialized_action_dir_for(store_root, &provenance.action_id);
         if materialized_dir.exists() {
-            fs::remove_dir_all(&materialized_dir).ok();
+            fs::remove_dir_all(&materialized_dir).with_context(|| {
+                format!(
+                    "invalidating materialized action after provenance replacement: {}",
+                    materialized_dir.display()
+                )
+            })?;
         }
         Ok(())
     }
@@ -1860,9 +2295,9 @@ impl ArtifactBackend for SledArtifactBackend {
             .open_tree(Self::TREE_PROVENANCE_BY_ACTION)
             .context("opening sled tree provenance_by_action")?;
         for row in tree.iter() {
-            let (_, value) = row.context("iterating sled provenance rows")?;
-            let provenance: Provenance =
-                serde_json::from_slice(value.as_ref()).context("parsing sled provenance row")?;
+            let (key, value) = row.context("iterating sled provenance rows")?;
+            let provenance = Self::decode_keyed_provenance(key.as_ref(), value.as_ref())
+                .context("validating iterated provenance row identity")?;
             match visitor(provenance)? {
                 ControlFlow::Continue(()) => {}
                 ControlFlow::Break(()) => break,
@@ -1905,9 +2340,12 @@ impl ArtifactBackend for SledArtifactBackend {
         let mut records = Vec::new();
 
         for row in tree.iter() {
-            let (_key, value) = row.context("iterating failed action record rows from sled")?;
-            let record: QueueFailed = serde_json::from_slice(value.as_ref())
-                .context("parsing failed action record row from sled")?;
+            let (key, value) = row.context("iterating failed action record rows from sled")?;
+            let record = decode_queue_failed(value.as_ref())
+                .context("parsing failed action record protobuf row from sled")?;
+            if key.as_ref() != record.action_id.as_bytes() {
+                bail!("failed action record Sled key does not match its embedded action_id");
+            }
             records.push(record);
         }
         records.sort_by(|a, b| a.action_id.cmp(&b.action_id));
@@ -2067,11 +2505,6 @@ impl ArtifactBackend for SnapshotArtifactBackend {
             "promote_staging_action_dir is unavailable in snapshot read-only backend (action_id={})",
             action_id
         )
-    }
-
-    fn provenance_path(&self, _store_root: &Path, action_id: &str) -> PathBuf {
-        shard_dir(&self.snapshot_dir.join("provenance"), action_id)
-            .join(format!("{action_id}.json"))
     }
 
     fn failed_action_record_exists(&self, _store_root: &Path, _action_id: &str) -> bool {
@@ -2254,6 +2687,13 @@ pub(crate) struct ArtifactStore {
 }
 
 impl ArtifactStore {
+    pub(crate) fn artifact_backend_storage_path(&self) -> &Path {
+        match &self.artifact_backend_selection {
+            ArtifactBackendSelection::Sled { db_path } => db_path,
+            ArtifactBackendSelection::Snapshot { snapshot_dir } => snapshot_dir,
+        }
+    }
+
     fn list_cache_ttl_from_env() -> Duration {
         let secs = std::env::var("BVC_STORE_LIST_CACHE_TTL_SECS")
             .ok()
@@ -2274,6 +2714,7 @@ impl ArtifactStore {
         let artifact_backend: Box<dyn ArtifactBackend> = Box::new(SledArtifactBackend {
             db_path,
             db: Mutex::new(None),
+            materialization_lock: Mutex::new(()),
         });
         Self {
             root,
@@ -2304,6 +2745,12 @@ impl ArtifactStore {
     }
 
     pub(crate) fn ensure_layout(&self) -> Result<()> {
+        if matches!(
+            self.artifact_backend_selection,
+            ArtifactBackendSelection::Sled { .. }
+        ) {
+            ensure_store_format_marker(&self.root)?;
+        }
         self.artifact_backend.ensure_layout(&self.root)?;
         fs::create_dir_all(self.staging_dir()).context("creating staging directory")?;
         fs::create_dir_all(self.driver_release_cache_root())
@@ -2365,18 +2812,126 @@ impl ArtifactStore {
         self.root.join(".staging")
     }
 
+    pub(crate) fn write_record_atomic(
+        &self,
+        domain: &str,
+        destination: &Path,
+        contents: &[u8],
+    ) -> Result<()> {
+        if domain.is_empty()
+            || !domain
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            bail!("atomic record domain must be a nonempty ASCII identifier");
+        }
+        validate_store_path_without_links(
+            &self.root,
+            destination,
+            StorePathLeafKind::RegularFileOrMissing,
+            "atomic record destination",
+        )?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| anyhow!("atomic record destination has no parent"))?;
+        ensure_store_directory_without_links(&self.root, parent, "atomic record parent")?;
+        let staging = self.staging_dir().join("atomic-records").join(domain);
+        ensure_store_directory_without_links(&self.root, &staging, "atomic record staging")?;
+        validate_store_path_without_links(
+            &self.root,
+            destination,
+            StorePathLeafKind::RegularFileOrMissing,
+            "atomic record destination",
+        )?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let nonce = ATOMIC_RECORD_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let filename = destination
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("record.pb");
+        let temp = staging.join(format!(
+            "{filename}.tmp-{}-{timestamp}-{nonce}",
+            std::process::id()
+        ));
+        let mut temp_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .with_context(|| format!("creating atomic record staging file: {}", temp.display()))?;
+        temp_file
+            .write_all(contents)
+            .with_context(|| format!("writing atomic record staging file: {}", temp.display()))?;
+        drop(temp_file);
+        validate_store_path_without_links(
+            &self.root,
+            &staging,
+            StorePathLeafKind::Directory,
+            "atomic record staging",
+        )?;
+        validate_store_path_without_links(
+            &self.root,
+            destination,
+            StorePathLeafKind::RegularFileOrMissing,
+            "atomic record destination",
+        )?;
+        match fs::rename(&temp, destination) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ensure_store_directory_without_links(&self.root, parent, "atomic record parent")?;
+                validate_store_path_without_links(
+                    &self.root,
+                    destination,
+                    StorePathLeafKind::RegularFileOrMissing,
+                    "atomic record destination",
+                )?;
+                fs::rename(&temp, destination).with_context(|| {
+                    format!(
+                        "promoting staged record after parent recreation: {} -> {}",
+                        temp.display(),
+                        destination.display()
+                    )
+                })
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                Err(error).with_context(|| {
+                    format!(
+                        "atomically promoting staged record: {} -> {}",
+                        temp.display(),
+                        destination.display()
+                    )
+                })
+            }
+        }
+    }
+
     pub(crate) fn driver_release_cache_root(&self) -> PathBuf {
         self.root.join(crate::DRIVER_RELEASE_CACHE_DIR)
     }
 
-    pub(crate) fn driver_release_cache_dir(&self, version: &str, platform: &str) -> PathBuf {
-        self.driver_release_cache_root()
-            .join(version)
-            .join(platform)
+    pub(crate) fn driver_release_cache_dir(&self, input_sha256: &str) -> Result<PathBuf> {
+        if input_sha256.len() != 64 || !input_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("driver release-cache input digest must be 64 hexadecimal characters");
+        }
+        Ok(self
+            .driver_release_cache_root()
+            .join("by-input-sha256")
+            .join(input_sha256.to_ascii_lowercase()))
     }
 
     pub(crate) fn queue_root(&self) -> PathBuf {
         self.root.join("queue")
+    }
+
+    pub(crate) fn campaign_runs_dir(&self) -> PathBuf {
+        self.root.join("campaign-runs")
+    }
+
+    pub(crate) fn coordinator_dir(&self) -> PathBuf {
+        self.root.join("coordinator")
     }
 
     pub(crate) fn queue_pending_dir(&self) -> PathBuf {
@@ -2393,6 +2948,10 @@ impl ArtifactStore {
 
     pub(crate) fn queue_canceled_dir(&self) -> PathBuf {
         self.queue_root().join("canceled")
+    }
+
+    pub(crate) fn queue_transition_locks_dir(&self) -> PathBuf {
+        self.queue_root().join("transition-locks")
     }
 
     pub(crate) fn action_dir(&self, action_id: &str) -> PathBuf {
@@ -2415,27 +2974,23 @@ impl ArtifactStore {
         Ok(())
     }
 
-    pub(crate) fn provenance_path(&self, action_id: &str) -> PathBuf {
-        self.artifact_backend.provenance_path(&self.root, action_id)
-    }
-
     pub(crate) fn action_exists(&self, action_id: &str) -> bool {
         self.artifact_backend.action_exists(&self.root, action_id)
     }
 
     pub(crate) fn pending_queue_path(&self, action_id: &str) -> PathBuf {
         self.shard_dir(self.queue_pending_dir(), action_id)
-            .join(format!("{action_id}.json"))
+            .join(format!("{action_id}.pb"))
     }
 
     pub(crate) fn running_queue_path(&self, action_id: &str) -> PathBuf {
         self.shard_dir(self.queue_running_dir(), action_id)
-            .join(format!("{action_id}.json"))
+            .join(format!("{action_id}.pb"))
     }
 
     pub(crate) fn done_queue_path(&self, action_id: &str) -> PathBuf {
         self.shard_dir(self.queue_done_dir(), action_id)
-            .join(format!("{action_id}.json"))
+            .join(format!("{action_id}.pb"))
     }
 
     pub(crate) fn failed_action_record_exists(&self, action_id: &str) -> bool {
@@ -2445,7 +3000,12 @@ impl ArtifactStore {
 
     pub(crate) fn canceled_queue_path(&self, action_id: &str) -> PathBuf {
         self.shard_dir(self.queue_canceled_dir(), action_id)
-            .join(format!("{action_id}.json"))
+            .join(format!("{action_id}.pb"))
+    }
+
+    pub(crate) fn queue_transition_lock_path(&self, action_id: &str) -> PathBuf {
+        self.shard_dir(self.queue_transition_locks_dir(), action_id)
+            .join(format!("{action_id}.lock"))
     }
 
     pub(crate) fn load_provenance(&self, action_id: &str) -> Result<Provenance> {
@@ -2610,6 +3170,10 @@ impl ArtifactStore {
         Ok(self.load_failed_action_records_shared()?.as_ref().clone())
     }
 
+    pub(crate) fn load_failed_action_records_uncached(&self) -> Result<Vec<QueueFailed>> {
+        self.artifact_backend.load_failed_action_records(&self.root)
+    }
+
     pub(crate) fn artifacts_db_size_bytes(&self) -> Result<u64> {
         if self.list_cache_ttl.is_zero() {
             let started = Instant::now();
@@ -2677,6 +3241,19 @@ impl ArtifactStore {
             .load_failed_action_record(&self.root, action_id)
     }
 
+    pub(crate) fn load_failed_action_record_mirror_for_diagnostics(
+        &self,
+        action_id: &str,
+    ) -> Result<Option<QueueFailed>> {
+        let Some(record) = load_failed_action_record_from_disk(&self.root, action_id)? else {
+            return Ok(None);
+        };
+        if record.action_id != action_id {
+            bail!("failed action record mirror path does not match its embedded action_id");
+        }
+        Ok(Some(record))
+    }
+
     pub(crate) fn write_failed_action_record(&self, failed: &QueueFailed) -> Result<()> {
         self.artifact_backend
             .write_failed_action_record(&self.root, failed)?;
@@ -2729,162 +3306,16 @@ impl ArtifactStore {
     pub(crate) fn flush_durable(&self) -> Result<()> {
         self.artifact_backend.flush_durable()
     }
-}
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct IngestLegacyFailedRecordsSummary {
-    pub(crate) store_root: String,
-    pub(crate) dry_run: bool,
-    pub(crate) keep_legacy_files: bool,
-    pub(crate) scanned_legacy_failed_action_record_files: u64,
-    pub(crate) scanned_legacy_queue_failed_files: u64,
-    pub(crate) parsed_records: u64,
-    pub(crate) parse_errors: u64,
-    pub(crate) ingested_into_sled: u64,
-    pub(crate) skipped_existing_in_sled: u64,
-    pub(crate) removed_legacy_failed_action_records_dir: bool,
-    pub(crate) removed_legacy_queue_failed_dir: bool,
-    pub(crate) elapsed_secs: f64,
-}
-
-pub(crate) fn ingest_legacy_failed_records(
-    store: &ArtifactStore,
-    dry_run: bool,
-    keep_legacy_files: bool,
-) -> Result<IngestLegacyFailedRecordsSummary> {
-    let started = Instant::now();
-    let legacy_failed_records_root = store.root.join("failed-action-records");
-    let legacy_queue_failed_root = store.queue_root().join("failed");
-    let mut scanned_legacy_failed_action_record_files = 0_u64;
-    let mut scanned_legacy_queue_failed_files = 0_u64;
-    let mut parsed_records = 0_u64;
-    let mut parse_errors = 0_u64;
-    let mut ingested_into_sled = 0_u64;
-    let mut skipped_existing_in_sled = 0_u64;
-
-    let mut load_records_from_dir = |root: &Path,
-                                     count: &mut u64,
-                                     file_matches: &dyn Fn(&Path) -> bool|
-     -> Vec<QueueFailed> {
-        let mut records = Vec::new();
-        if !root.exists() {
-            return records;
-        }
-        for entry in WalkDir::new(root).sort_by_file_name() {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    warn!(
-                        "skipping unreadable legacy failed-record walk entry root={} error={:#}",
-                        root.display(),
-                        err
-                    );
-                    continue;
-                }
-            };
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if !file_matches(path) {
-                continue;
-            }
-            *count += 1;
-            let text = match fs::read_to_string(path) {
-                Ok(text) => text,
-                Err(err) => {
-                    parse_errors += 1;
-                    warn!(
-                        "skipping legacy failed record; read failed path={} error={:#}",
-                        path.display(),
-                        err
-                    );
-                    continue;
-                }
-            };
-            let record: QueueFailed = match serde_json::from_str(&text) {
-                Ok(record) => record,
-                Err(err) => {
-                    parse_errors += 1;
-                    warn!(
-                        "skipping legacy failed record; parse failed path={} error={:#}",
-                        path.display(),
-                        err
-                    );
-                    continue;
-                }
-            };
-            parsed_records += 1;
-            records.push(record);
-        }
-        records
-    };
-
-    let mut records = load_records_from_dir(
-        &legacy_failed_records_root,
-        &mut scanned_legacy_failed_action_record_files,
-        &|path| path.file_name().and_then(|name| name.to_str()) == Some("failed.json"),
-    );
-    records.extend(load_records_from_dir(
-        &legacy_queue_failed_root,
-        &mut scanned_legacy_queue_failed_files,
-        &|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"),
-    ));
-    records.sort_by(|a, b| a.action_id.cmp(&b.action_id));
-
-    for record in records {
-        if store.failed_action_record_exists(&record.action_id) {
-            skipped_existing_in_sled += 1;
-            continue;
-        }
-        ingested_into_sled += 1;
-        if !dry_run {
-            store.write_failed_action_record(&record)?;
-        }
+    #[cfg(test)]
+    fn load_raw_action_file_value_for_test(
+        &self,
+        action_id: &str,
+        relpath: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        self.artifact_backend
+            .load_raw_action_file_value_for_test(action_id, relpath)
     }
-
-    let mut removed_legacy_failed_action_records_dir = false;
-    let mut removed_legacy_queue_failed_dir = false;
-    if !dry_run && !keep_legacy_files && parse_errors == 0 {
-        if legacy_failed_records_root.exists() {
-            fs::remove_dir_all(&legacy_failed_records_root).with_context(|| {
-                format!(
-                    "removing legacy failed-action-records directory: {}",
-                    legacy_failed_records_root.display()
-                )
-            })?;
-            removed_legacy_failed_action_records_dir = true;
-        }
-        if legacy_queue_failed_root.exists() {
-            fs::remove_dir_all(&legacy_queue_failed_root).with_context(|| {
-                format!(
-                    "removing legacy queue failed directory: {}",
-                    legacy_queue_failed_root.display()
-                )
-            })?;
-            removed_legacy_queue_failed_dir = true;
-        }
-    } else if !dry_run && !keep_legacy_files && parse_errors > 0 {
-        warn!(
-            "legacy failed-record ingest parsed with errors (parse_errors={}); keeping legacy directories for manual inspection",
-            parse_errors
-        );
-    }
-
-    Ok(IngestLegacyFailedRecordsSummary {
-        store_root: store.root.display().to_string(),
-        dry_run,
-        keep_legacy_files,
-        scanned_legacy_failed_action_record_files,
-        scanned_legacy_queue_failed_files,
-        parsed_records,
-        parse_errors,
-        ingested_into_sled,
-        skipped_existing_in_sled,
-        removed_legacy_failed_action_records_dir,
-        removed_legacy_queue_failed_dir,
-        elapsed_secs: started.elapsed().as_secs_f64(),
-    })
 }
 
 #[cfg(test)]
@@ -2892,11 +3323,12 @@ mod tests {
     use super::*;
     use crate::model::{
         ActionSpec, ArtifactRef, ArtifactType, CommandTrace, DriverRuntimeSpec, OutputFile,
-        Provenance, QueueFailed, QueueItem,
+        Provenance, QueueFailed, QueueItem, SuggestedAction,
     };
     use chrono::Utc;
     use serde_json::json;
     use std::ops::ControlFlow;
+    use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_test_root(prefix: &str) -> PathBuf {
@@ -2907,18 +3339,51 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 
-    fn make_test_provenance(action_id: &str, output_path: &str, output_bytes: u64) -> Provenance {
+    #[cfg(unix)]
+    #[test]
+    fn atomic_record_write_rejects_symlinked_destination_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = make_test_root("xlsynth-bvc-atomic-record-symlink");
+        let outside = make_test_root("xlsynth-bvc-atomic-record-outside");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("store layout");
+        fs::create_dir_all(&outside).expect("outside directory");
+        fs::create_dir_all(store.coordinator_dir()).expect("coordinator directory");
+        let linked_parent = store.coordinator_dir().join("aa");
+        symlink(&outside, &linked_parent).expect("symlink destination parent");
+        let destination = linked_parent.join("record.pb");
+
+        let error = store
+            .write_record_atomic("coordinator", &destination, b"record")
+            .expect_err("symlink traversal must fail");
+        assert!(
+            format!("{error:#}").contains("traverses a symlink"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !outside.join("record.pb").exists(),
+            "atomic writer must not create a file outside the store"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup store");
+        fs::remove_dir_all(outside).expect("cleanup outside");
+    }
+
+    fn make_test_provenance(seed_digest: &str, output_path: &str, output_bytes: u64) -> Provenance {
+        let action = ActionSpec::ImportIrPackageFile {
+            source_sha256: seed_digest.to_string(),
+            top_fn_name: Some("main".to_string()),
+        };
+        let action_id = crate::executor::compute_action_id(&action).expect("compute V2 action id");
         Provenance {
             schema_version: 1,
-            action_id: action_id.to_string(),
+            action_id: action_id.clone(),
             created_utc: Utc::now(),
-            action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
-                version: "v0.37.0".to_string(),
-                discovery_runtime: None,
-            },
+            action,
             dependencies: Vec::new(),
             output_artifact: ArtifactRef {
-                action_id: action_id.to_string(),
+                action_id,
                 artifact_type: ArtifactType::DslxFileSubtree,
                 relpath: "payload".to_string(),
             },
@@ -2934,6 +3399,34 @@ mod tests {
             details: json!({"test": "sled-roundtrip"}),
             suggested_next_actions: Vec::new(),
         }
+    }
+
+    fn stage_test_sled_action(
+        store: &ArtifactStore,
+        provenance: &Provenance,
+        label: &str,
+        payload: &[u8],
+    ) -> PathBuf {
+        let staging_dir = store
+            .staging_dir()
+            .join(format!("{}-{label}-staged", provenance.action_id));
+        let payload_path = staging_dir.join("payload/result.txt");
+        std::fs::create_dir_all(payload_path.parent().expect("payload parent"))
+            .expect("create staged payload");
+        std::fs::write(&payload_path, payload).expect("write staged payload");
+        let mut staged_provenance = provenance.clone();
+        staged_provenance.details = json!({"source_path": label});
+        staged_provenance.output_files = vec![OutputFile {
+            path: "payload/result.txt".to_string(),
+            bytes: payload.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(payload)),
+        }];
+        std::fs::write(
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&staged_provenance).expect("encode provenance"),
+        )
+        .expect("write staged provenance");
+        staging_dir
     }
 
     #[test]
@@ -2956,6 +3449,74 @@ mod tests {
     }
 
     #[test]
+    fn unmarked_nonempty_store_is_rejected() {
+        let root = make_test_root("xlsynth-bvc-store-unmarked-nonempty");
+        std::fs::create_dir_all(&root).expect("create test root");
+        std::fs::write(root.join("legacy.json"), "{}").expect("write legacy marker");
+        let store = ArtifactStore::new(root.clone());
+        let error = store
+            .ensure_layout()
+            .expect_err("unmarked nonempty store must fail closed");
+        assert!(error.to_string().contains("nonempty store"));
+        assert!(
+            error
+                .to_string()
+                .contains("legacy migration is intentionally unsupported")
+        );
+        assert!(!root.join(STORE_FORMAT_MARKER).exists());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn abandoned_store_format_staging_is_recovered_on_retry() {
+        let root = make_test_root("xlsynth-bvc-store-format-staging-retry");
+        std::fs::create_dir_all(&root).expect("create test root");
+        std::fs::write(root.join(STORE_FORMAT_MARKER_STAGING), b"truncated")
+            .expect("write abandoned staging");
+
+        ensure_store_format_marker(&root).expect("recover store marker initialization");
+        assert!(root.join(STORE_FORMAT_MARKER).is_file());
+        assert!(!root.join(STORE_FORMAT_MARKER_STAGING).exists());
+        ensure_store_format_marker(&root).expect("marker retry is idempotent");
+
+        let marker = pb::StoreFormat::decode(
+            std::fs::read(root.join(STORE_FORMAT_MARKER))
+                .expect("read marker")
+                .as_slice(),
+        )
+        .expect("decode marker");
+        assert_eq!(marker.format_version, STORE_FORMAT_VERSION);
+        assert_eq!(marker.format_name, STORE_FORMAT_NAME);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn concurrent_store_format_initialization_is_serialized() {
+        let root = make_test_root("xlsynth-bvc-store-format-concurrent");
+        let barrier = Arc::new(Barrier::new(8));
+        let threads = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_store_format_marker(&root)
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread
+                .join()
+                .expect("initializer thread")
+                .expect("initializer result");
+        }
+        assert!(root.join(STORE_FORMAT_MARKER).is_file());
+        assert!(!root.join(STORE_FORMAT_MARKER_STAGING).exists());
+        ensure_store_format_marker(&root).expect("marker remains reusable");
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn queue_paths_use_sharded_layout() {
         let root = make_test_root("xlsynth-bvc-store-queue-paths");
         let store = ArtifactStore::new_with_sled(root.clone(), root.join("artifacts.sled"));
@@ -2967,7 +3528,7 @@ mod tests {
                 .join("pending")
                 .join("01")
                 .join("23")
-                .join(format!("{action_id}.json"))
+                .join(format!("{action_id}.pb"))
         );
         std::fs::remove_dir_all(root).expect("cleanup");
     }
@@ -2992,17 +3553,16 @@ mod tests {
         let store = ArtifactStore::new_with_sled(root.clone(), db_path.clone());
         store.ensure_layout().expect("ensure sled layout");
 
-        let action_id =
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        let provenance = make_test_provenance(&"b".repeat(64), "payload/result.txt", 10);
+        let action_id = provenance.action_id.clone();
         let staging_dir = store.staging_dir().join(format!("{action_id}-staged"));
         let payload_dir = staging_dir.join("payload");
         std::fs::create_dir_all(&payload_dir).expect("create staged payload");
         std::fs::write(payload_dir.join("result.txt"), "hello sled").expect("write staged file");
 
-        let provenance = make_test_provenance(&action_id, "payload/result.txt", 10);
         std::fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(&provenance).expect("serialize provenance"),
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
         )
         .expect("write staged provenance");
 
@@ -3015,7 +3575,7 @@ mod tests {
             .load_provenance(&action_id)
             .expect("load sled provenance");
         assert_eq!(loaded.action_id, action_id);
-        assert_eq!(loaded.details, provenance.details);
+        assert_eq!(loaded.output_artifact.relpath, "payload");
 
         let all = store.list_provenances().expect("list sled provenances");
         assert_eq!(all.len(), 1);
@@ -3032,53 +3592,302 @@ mod tests {
     }
 
     #[test]
-    fn test_sled_backend_compresses_large_action_file_rows() {
-        let root = make_test_root("xlsynth-bvc-store-sled-zstd-large");
+    fn sled_provenance_reads_reject_miskeyed_rows() {
+        let root = make_test_root("xlsynth-bvc-store-sled-miskeyed-provenance");
         let db_path = root.join("store.sled");
-        let action_id =
-            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string();
-        let large_relpath = "payload/prep_for_gatify.ir";
-        let large_bytes = "fn foo(x: bits[32]) -> bits[32] { add(x, x) }\n".repeat(8 * 1024);
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path.clone());
+        store.ensure_layout().expect("ensure sled layout");
+        drop(store);
 
-        {
-            let store = ArtifactStore::new_with_sled(root.clone(), db_path.clone());
-            store.ensure_layout().expect("ensure sled layout");
-            let staging_dir = store.staging_dir().join(format!("{action_id}-staged"));
-            let payload_dir = staging_dir.join("payload");
-            std::fs::create_dir_all(&payload_dir).expect("create staged payload");
-            std::fs::write(payload_dir.join("prep_for_gatify.ir"), &large_bytes)
-                .expect("write large staged file");
-            let provenance =
-                make_test_provenance(&action_id, large_relpath, large_bytes.len() as u64);
-            std::fs::write(
-                staging_dir.join("provenance.json"),
-                serde_json::to_string_pretty(&provenance).expect("serialize provenance"),
-            )
-            .expect("write staged provenance");
-            store
-                .promote_staging_action_dir(&action_id, &staging_dir)
-                .expect("promote staged action");
-        }
-
+        let stored_key = "a".repeat(64);
+        let provenance = make_test_provenance(&"b".repeat(64), "payload/result.txt", 10);
         let db = sled::Config::new()
             .path(&db_path)
             .cache_capacity(16 * 1024 * 1024)
             .open()
-            .expect("open sled db for inspection");
-        let file_tree = db
-            .open_tree(SledArtifactBackend::TREE_ACTION_FILE_BYTES)
-            .expect("open action_file_bytes tree");
-        let key = SledArtifactBackend::action_file_key(&action_id, large_relpath);
-        let stored = file_tree
-            .get(key)
+            .expect("open raw sled db");
+        let tree = db
+            .open_tree(SledArtifactBackend::TREE_PROVENANCE_BY_ACTION)
+            .expect("open provenance tree");
+        tree.insert(
+            stored_key.as_bytes(),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
+        )
+        .expect("insert mis-keyed provenance");
+        db.flush().expect("flush mis-keyed provenance");
+        drop(tree);
+        drop(db);
+
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path);
+        store.ensure_layout().expect("reopen sled layout");
+        assert!(
+            !store.action_exists(&stored_key),
+            "a mis-keyed provenance row must not count as a completed action"
+        );
+        for error in [
+            store
+                .load_provenance(&stored_key)
+                .expect_err("keyed load must reject a mis-keyed provenance"),
+            store
+                .list_provenances()
+                .expect_err("iteration must reject a mis-keyed provenance"),
+            store
+                .materialize_action_dir(&stored_key)
+                .expect_err("materialization must reject a mis-keyed provenance"),
+            crate::store_validation::validate_store(&store, false)
+                .expect_err("store validation must reject a mis-keyed provenance"),
+        ] {
+            assert!(
+                format!("{error:#}").contains("disagrees with decoded action id"),
+                "unexpected error: {error:#}"
+            );
+        }
+
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn sled_provenance_replacement_updates_canonical_and_materialized_copies() {
+        let root = make_test_root("xlsynth-bvc-store-sled-provenance-replacement");
+        let db_path = root.join("store.sled");
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path);
+        store.ensure_layout().expect("ensure sled layout");
+        let provenance = make_test_provenance(&"d".repeat(64), "payload/result.txt", 5);
+        let staging = stage_test_sled_action(&store, &provenance, "initial", b"first");
+        store
+            .promote_staging_action_dir(&provenance.action_id, &staging)
+            .expect("promote initial action");
+        let materialized = store
+            .materialize_action_dir(&provenance.action_id)
+            .expect("materialize initial action");
+        assert!(materialized.join("provenance.pb").exists());
+
+        let mut replacement = store
+            .load_provenance(&provenance.action_id)
+            .expect("load initial canonical provenance");
+        let suggested_action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "e".repeat(64),
+            top_fn_name: Some("suggested".to_string()),
+        };
+        let suggested_action_id =
+            crate::executor::compute_action_id(&suggested_action).expect("suggested action id");
+        replacement.created_utc = Utc::now();
+        replacement.commands = vec![CommandTrace {
+            argv: vec!["discovery".to_string(), "--retry".to_string()],
+            exit_code: 0,
+        }];
+        replacement.details = json!({"dslx_list_fns_discovery": {"suggested_actions": 1}});
+        replacement.suggested_next_actions = vec![SuggestedAction {
+            reason: "recovered discovery".to_string(),
+            action_id: suggested_action_id,
+            action: suggested_action,
+        }];
+        store
+            .write_provenance(&replacement)
+            .expect("replace canonical provenance");
+
+        let canonical = store
+            .load_provenance(&provenance.action_id)
+            .expect("reload canonical provenance");
+        assert_eq!(canonical.suggested_next_actions.len(), 1);
+        assert_eq!(canonical.commands[0].argv[0], "discovery");
+        let rematerialized = store
+            .materialize_action_dir(&provenance.action_id)
+            .expect("rematerialize updated action");
+        let materialized_provenance = crate::proto::decode_provenance(
+            &std::fs::read(rematerialized.join("provenance.pb"))
+                .expect("read rematerialized provenance"),
+        )
+        .expect("decode rematerialized provenance");
+        assert_eq!(materialized_provenance.suggested_next_actions.len(), 1);
+        assert_eq!(
+            std::fs::read(rematerialized.join("payload/result.txt"))
+                .expect("read unchanged payload"),
+            b"first"
+        );
+
+        let mut invalid = replacement;
+        invalid.output_artifact.relpath = "different-output".to_string();
+        let error = store
+            .write_provenance(&invalid)
+            .expect_err("output contract replacement must fail");
+        assert!(error.to_string().contains("output contract"));
+        assert_eq!(
+            store
+                .load_provenance(&provenance.action_id)
+                .expect("canonical provenance remains")
+                .output_artifact
+                .relpath,
+            "payload"
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn sled_promotion_preserves_first_writer_on_conflict() {
+        let root = make_test_root("xlsynth-bvc-store-sled-first-writer");
+        let db_path = root.join("store.sled");
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path);
+        store.ensure_layout().expect("ensure sled layout");
+        let provenance = make_test_provenance(&"e".repeat(64), "payload/result.txt", 5);
+        let first = stage_test_sled_action(&store, &provenance, "first", b"first");
+        let second = stage_test_sled_action(&store, &provenance, "second", b"second");
+
+        store
+            .promote_staging_action_dir(&provenance.action_id, &first)
+            .expect("promote first writer");
+        store
+            .promote_staging_action_dir(&provenance.action_id, &second)
+            .expect("ignore conflicting second writer");
+
+        let loaded = store
+            .load_provenance(&provenance.action_id)
+            .expect("load winning provenance");
+        assert_eq!(loaded.details["source_path"], "first");
+        let action_dir = store
+            .materialize_action_dir(&provenance.action_id)
+            .expect("materialize winning action");
+        assert_eq!(
+            std::fs::read(action_dir.join("payload/result.txt")).expect("read winning payload"),
+            b"first"
+        );
+        assert!(!second.exists());
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn sled_promotion_requires_materialization_lock_before_commit() {
+        let root = make_test_root("xlsynth-bvc-store-sled-promotion-materialization-lock");
+        let db_path = root.join("store.sled");
+        let backend = SledArtifactBackend {
+            db_path,
+            db: Mutex::new(None),
+            materialization_lock: Mutex::new(()),
+        };
+        backend.ensure_layout(&root).expect("ensure sled layout");
+
+        let provenance = make_test_provenance(&"b".repeat(64), "payload/result.txt", 5);
+        let action_id = provenance.action_id.clone();
+        let staging = root.join("staging-action");
+        std::fs::create_dir_all(staging.join("payload")).expect("create staged payload");
+        std::fs::write(staging.join("payload/result.txt"), b"first").expect("write staged payload");
+        std::fs::write(
+            staging.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
+        )
+        .expect("write staged provenance");
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = backend
+                .materialization_lock
+                .lock()
+                .expect("acquire materialization lock for poisoning");
+            panic!("poison materialization lock");
+        }));
+        assert!(poison.is_err());
+
+        let error = backend
+            .promote_staging_action_dir(&root, &action_id, &staging)
+            .expect_err("promotion must acquire the materialization lock");
+        assert!(
+            error
+                .to_string()
+                .contains("acquiring sled materialization lock for promotion"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!backend.action_exists(&root, &action_id));
+
+        drop(backend);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn concurrent_sled_promotions_commit_one_complete_action() {
+        let root = make_test_root("xlsynth-bvc-store-sled-concurrent-first-writer");
+        let db_path = root.join("store.sled");
+        let store = Arc::new(ArtifactStore::new_with_sled(root.clone(), db_path));
+        store.ensure_layout().expect("ensure sled layout");
+        let provenance = make_test_provenance(&"c".repeat(64), "payload/result.txt", 5);
+        let first = stage_test_sled_action(&store, &provenance, "first", b"first");
+        let second = stage_test_sled_action(&store, &provenance, "second", b"second");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let first_store = store.clone();
+        let first_id = provenance.action_id.clone();
+        let first_barrier = barrier.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_store.promote_staging_action_dir(&first_id, &first)
+        });
+        let second_store = store.clone();
+        let second_id = provenance.action_id.clone();
+        let second_thread = std::thread::spawn(move || {
+            barrier.wait();
+            second_store.promote_staging_action_dir(&second_id, &second)
+        });
+        first_thread
+            .join()
+            .expect("first promotion thread")
+            .expect("first promotion result");
+        second_thread
+            .join()
+            .expect("second promotion thread")
+            .expect("second promotion result");
+
+        let loaded = store
+            .load_provenance(&provenance.action_id)
+            .expect("load winning provenance");
+        let winner = loaded.details["source_path"]
+            .as_str()
+            .expect("winner label");
+        let action_dir = store
+            .materialize_action_dir(&provenance.action_id)
+            .expect("materialize winning action");
+        let payload =
+            std::fs::read(action_dir.join("payload/result.txt")).expect("read winning payload");
+        assert!(matches!(winner, "first" | "second"));
+        assert_eq!(payload, winner.as_bytes());
+
+        drop(store);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_sled_backend_compresses_large_action_file_rows() {
+        let root = make_test_root("xlsynth-bvc-store-sled-zstd-large");
+        let db_path = root.join("store.sled");
+        let large_relpath = "payload/prep_for_gatify.ir";
+        let large_bytes = "fn foo(x: bits[32]) -> bits[32] { add(x, x) }\n".repeat(8 * 1024);
+        let provenance =
+            make_test_provenance(&"d".repeat(64), large_relpath, large_bytes.len() as u64);
+        let action_id = provenance.action_id.clone();
+
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path.clone());
+        store.ensure_layout().expect("ensure sled layout");
+        let staging_dir = store.staging_dir().join(format!("{action_id}-staged"));
+        let payload_dir = staging_dir.join("payload");
+        std::fs::create_dir_all(&payload_dir).expect("create staged payload");
+        std::fs::write(payload_dir.join("prep_for_gatify.ir"), &large_bytes)
+            .expect("write large staged file");
+        std::fs::write(
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
+        )
+        .expect("write staged provenance");
+        store
+            .promote_staging_action_dir(&action_id, &staging_dir)
+            .expect("promote staged action");
+
+        let stored = store
+            .load_raw_action_file_value_for_test(&action_id, large_relpath)
             .expect("read action-file row")
             .expect("action-file row should exist");
         assert!(stored.starts_with(SledArtifactBackend::ACTION_FILE_ZSTD_MAGIC));
         assert!(stored.len() < large_bytes.len());
-        drop(file_tree);
-        drop(db);
-
-        let store = ArtifactStore::new_with_sled(root.clone(), db_path.clone());
         let action_dir = store
             .materialize_action_dir(&action_id)
             .expect("materialize sled action");
@@ -3086,6 +3895,7 @@ mod tests {
             std::fs::read_to_string(action_dir.join("payload/prep_for_gatify.ir")).expect("read");
         assert_eq!(decoded, large_bytes);
 
+        drop(store);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -3337,26 +4147,26 @@ mod tests {
             .open_tree(SledArtifactBackend::TREE_ACTION_FILE_BYTES)
             .expect("open action_file_bytes tree");
 
-        let action_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let action_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let action_c = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let queue_child = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
         let mut prov_a = make_test_provenance(
-            action_a,
+            &"a".repeat(64),
             "payload/prep_for_gatify.ir",
             (2 * 1024 * 1024) as u64,
         );
+        let action_a = prov_a.action_id.clone();
         prov_a.dependencies = Vec::new();
-        let mut prov_b = make_test_provenance(action_b, "payload/result.aig", 7);
+        let mut prov_b = make_test_provenance(&"b".repeat(64), "payload/result.aig", 7);
+        let action_b = prov_b.action_id.clone();
         prov_b.dependencies = vec![ArtifactRef {
-            action_id: action_a.to_string(),
+            action_id: action_a.clone(),
             artifact_type: ArtifactType::IrPackageFile,
             relpath: "payload".to_string(),
         }];
-        let mut prov_c = make_test_provenance(action_c, "payload/result.v", 7);
+        let mut prov_c = make_test_provenance(&"c".repeat(64), "payload/result.v", 7);
+        let action_c = prov_c.action_id.clone();
         prov_c.dependencies = vec![ArtifactRef {
-            action_id: action_b.to_string(),
+            action_id: action_b.clone(),
             artifact_type: ArtifactType::AigFile,
             relpath: "payload".to_string(),
         }];
@@ -3364,38 +4174,38 @@ mod tests {
         provenance_tree
             .insert(
                 action_a.as_bytes(),
-                serde_json::to_vec(&prov_a).expect("serialize prov_a"),
+                crate::proto::encode_provenance(&prov_a).expect("encode prov_a"),
             )
             .expect("insert prov_a");
         provenance_tree
             .insert(
                 action_b.as_bytes(),
-                serde_json::to_vec(&prov_b).expect("serialize prov_b"),
+                crate::proto::encode_provenance(&prov_b).expect("encode prov_b"),
             )
             .expect("insert prov_b");
         provenance_tree
             .insert(
                 action_c.as_bytes(),
-                serde_json::to_vec(&prov_c).expect("serialize prov_c"),
+                crate::proto::encode_provenance(&prov_c).expect("encode prov_c"),
             )
             .expect("insert prov_c");
 
         let large_prep_bytes = vec![b'x'; 2 * 1024 * 1024];
         file_tree
             .insert(
-                SledArtifactBackend::action_file_key(action_a, "payload/prep_for_gatify.ir"),
+                SledArtifactBackend::action_file_key(&action_a, "payload/prep_for_gatify.ir"),
                 large_prep_bytes.as_slice(),
             )
             .expect("insert prep_for_gatify bytes for action_a");
         file_tree
             .insert(
-                SledArtifactBackend::action_file_key(action_b, "payload/result.aig"),
+                SledArtifactBackend::action_file_key(&action_b, "payload/result.aig"),
                 b"small-aig".as_slice(),
             )
             .expect("insert result.aig bytes for action_b");
         file_tree
             .insert(
-                SledArtifactBackend::action_file_key(action_c, "payload/result.v"),
+                SledArtifactBackend::action_file_key(&action_c, "payload/result.v"),
                 b"small-v".as_slice(),
             )
             .expect("insert result.v bytes for action_c");
@@ -3405,7 +4215,7 @@ mod tests {
         drop(provenance_tree);
         drop(db);
 
-        let queue_pending_path = queue_json_path(&root, "pending", queue_child);
+        let queue_pending_path = queue_record_path(&root, "pending", queue_child);
         if let Some(parent) = queue_pending_path.parent() {
             std::fs::create_dir_all(parent).expect("create queue pending parent");
         }
@@ -3414,6 +4224,9 @@ mod tests {
             release_platform: "linux-x64".to_string(),
             docker_image: "xlsynth-driver:test".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         };
         let queue_item = QueueItem {
             schema_version: crate::ACTION_SCHEMA_VERSION,
@@ -3421,7 +4234,7 @@ mod tests {
             enqueued_utc: Utc::now(),
             priority: crate::DEFAULT_QUEUE_PRIORITY,
             action: ActionSpec::DriverIrToOpt {
-                ir_action_id: action_c.to_string(),
+                ir_action_id: action_c.clone(),
                 top_fn_name: None,
                 version: "v0.37.0".to_string(),
                 runtime,
@@ -3429,7 +4242,7 @@ mod tests {
         };
         std::fs::write(
             &queue_pending_path,
-            serde_json::to_string_pretty(&queue_item).expect("serialize queue pending record"),
+            crate::proto::encode_queue_item(&queue_item).expect("encode queue pending record"),
         )
         .expect("write queue pending record");
 
@@ -3482,19 +4295,19 @@ mod tests {
         );
         assert_eq!(
             file_tree
-                .scan_prefix(SledArtifactBackend::action_files_prefix(action_a))
+                .scan_prefix(SledArtifactBackend::action_files_prefix(&action_a))
                 .count(),
             0
         );
         assert_eq!(
             file_tree
-                .scan_prefix(SledArtifactBackend::action_files_prefix(action_b))
+                .scan_prefix(SledArtifactBackend::action_files_prefix(&action_b))
                 .count(),
             0
         );
         assert_eq!(
             file_tree
-                .scan_prefix(SledArtifactBackend::action_files_prefix(action_c))
+                .scan_prefix(SledArtifactBackend::action_files_prefix(&action_c))
                 .count(),
             0
         );
@@ -3521,6 +4334,7 @@ mod tests {
             action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "v0.37.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
             error: "synthetic failure".to_string(),
         };
@@ -3539,83 +4353,87 @@ mod tests {
     }
 
     #[test]
-    fn test_ingest_legacy_failed_records_moves_data_to_sled_and_prunes_legacy_dirs() {
-        let root = make_test_root("xlsynth-bvc-store-ingest-legacy-failed");
+    fn test_sled_failed_record_point_load_repairs_corrupt_mirror() {
+        let root = make_test_root("xlsynth-bvc-store-sled-failed-corrupt-mirror");
         let db_path = root.join("store.sled");
         let store = ArtifactStore::new_with_sled(root.clone(), db_path);
-        store.ensure_layout().expect("ensure store layout");
+        store.ensure_layout().expect("ensure sled layout");
 
-        let legacy_record = QueueFailed {
-            schema_version: crate::ACTION_SCHEMA_VERSION,
-            action_id: "a".repeat(64),
+        let action_id = "d".repeat(64);
+        let failed = QueueFailed {
+            schema_version: 1,
+            action_id: action_id.clone(),
             enqueued_utc: Utc::now(),
             failed_utc: Utc::now(),
-            failed_by: "legacy-failed-action-records".to_string(),
+            failed_by: "test-worker".to_string(),
             action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "v0.37.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
-            error: "legacy failed-action-records".to_string(),
+            error: "synthetic failure".to_string(),
         };
-        let legacy_path = root
-            .join("failed-action-records")
-            .join("aa")
-            .join("bb")
-            .join(&legacy_record.action_id)
-            .join("failed.json");
-        if let Some(parent) = legacy_path.parent() {
-            std::fs::create_dir_all(parent).expect("create legacy failed-action-records parent");
-        }
-        std::fs::write(
-            &legacy_path,
-            serde_json::to_string_pretty(&legacy_record).expect("serialize legacy failed record"),
-        )
-        .expect("write legacy failed-action-records record");
+        store
+            .write_failed_action_record(&failed)
+            .expect("write failed record");
+        let mirror_path = failed_action_record_path(&root, &action_id);
+        std::fs::write(&mirror_path, b"truncated").expect("corrupt failed record mirror");
 
-        let queue_legacy_record = QueueFailed {
-            schema_version: crate::ACTION_SCHEMA_VERSION,
-            action_id: "b".repeat(64),
+        let loaded = store
+            .load_failed_action_record(&action_id)
+            .expect("fall back to canonical Sled failed record")
+            .expect("failed record remains present");
+        assert_eq!(loaded.action_id, action_id);
+        assert_eq!(loaded.error, "synthetic failure");
+        let repaired = load_failed_action_record_from_path(&mirror_path)
+            .expect("decode repaired mirror")
+            .expect("repaired mirror exists");
+        assert_eq!(repaired.action_id, action_id);
+        assert_eq!(repaired.error, "synthetic failure");
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn test_sled_failed_record_point_load_ignores_stale_mirror() {
+        let root = make_test_root("xlsynth-bvc-store-sled-failed-stale-mirror");
+        let db_path = root.join("store.sled");
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path);
+        store.ensure_layout().expect("ensure sled layout");
+
+        let action_id = "e".repeat(64);
+        let failed = QueueFailed {
+            schema_version: 1,
+            action_id: action_id.clone(),
             enqueued_utc: Utc::now(),
             failed_utc: Utc::now(),
-            failed_by: "legacy-queue-failed".to_string(),
+            failed_by: "test-worker".to_string(),
             action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "v0.37.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
-            error: "legacy queue failed".to_string(),
+            error: "synthetic failure".to_string(),
         };
-        let queue_legacy_path = root
-            .join("queue")
-            .join("failed")
-            .join("bb")
-            .join("cc")
-            .join(format!("{}.json", queue_legacy_record.action_id));
-        if let Some(parent) = queue_legacy_path.parent() {
-            std::fs::create_dir_all(parent).expect("create legacy queue failed parent");
-        }
-        std::fs::write(
-            &queue_legacy_path,
-            serde_json::to_string_pretty(&queue_legacy_record)
-                .expect("serialize legacy queue failed record"),
-        )
-        .expect("write legacy queue failed record");
+        store
+            .write_failed_action_record(&failed)
+            .expect("write failed record");
+        let mirror_path = failed_action_record_path(&root, &action_id);
+        let mirror_bytes = encode_queue_failed(&failed).expect("encode stale mirror");
+        store
+            .delete_failed_action_record(&action_id)
+            .expect("delete canonical failed record");
+        std::fs::create_dir_all(mirror_path.parent().expect("mirror parent"))
+            .expect("recreate mirror parent");
+        std::fs::write(&mirror_path, mirror_bytes).expect("restore stale mirror only");
 
-        let summary = ingest_legacy_failed_records(&store, false, false)
-            .expect("ingest legacy failed records");
-        assert_eq!(summary.parse_errors, 0);
-        assert_eq!(summary.ingested_into_sled, 2);
-        assert!(summary.removed_legacy_failed_action_records_dir);
-        assert!(summary.removed_legacy_queue_failed_dir);
-        assert!(!root.join("failed-action-records").exists());
-        assert!(!root.join("queue").join("failed").exists());
-
-        let mut loaded = store
-            .load_failed_action_records()
-            .expect("load failed action records");
-        loaded.sort_by(|a, b| a.action_id.cmp(&b.action_id));
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].action_id, legacy_record.action_id);
-        assert_eq!(loaded[1].action_id, queue_legacy_record.action_id);
+        assert!(
+            store
+                .load_failed_action_record(&action_id)
+                .expect("ignore stale mirror")
+                .is_none()
+        );
+        assert!(!mirror_path.exists());
 
         std::fs::remove_dir_all(root).expect("cleanup");
     }
@@ -3627,32 +4445,14 @@ mod tests {
         let store = ArtifactStore::new_with_sled(root.clone(), db_path.clone());
         store.ensure_layout().expect("ensure sled layout");
 
-        for suffix in ["1", "2"] {
-            let action_id = format!("{:0>64}", suffix);
+        for suffix in ['1', '2'] {
+            let provenance = make_test_provenance(&suffix.to_string().repeat(64), "empty", 0);
+            let action_id = provenance.action_id.clone();
             let staging_dir = store.staging_dir().join(format!("{action_id}-staged"));
             std::fs::create_dir_all(staging_dir.join("payload")).expect("create staged payload");
-            let provenance = Provenance {
-                schema_version: 1,
-                action_id: action_id.clone(),
-                created_utc: Utc::now(),
-                action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
-                    version: "v0.37.0".to_string(),
-                    discovery_runtime: None,
-                },
-                dependencies: Vec::new(),
-                output_artifact: ArtifactRef {
-                    action_id: action_id.clone(),
-                    artifact_type: ArtifactType::DslxFileSubtree,
-                    relpath: "payload".to_string(),
-                },
-                output_files: Vec::new(),
-                commands: Vec::new(),
-                details: json!({}),
-                suggested_next_actions: Vec::new(),
-            };
             std::fs::write(
-                staging_dir.join("provenance.json"),
-                serde_json::to_string_pretty(&provenance).expect("serialize provenance"),
+                staging_dir.join("provenance.pb"),
+                crate::proto::encode_provenance(&provenance).expect("encode provenance"),
             )
             .expect("write staged provenance");
             store
@@ -3705,18 +4505,9 @@ mod tests {
         std::fs::create_dir_all(&web_index_dir).expect("create snapshot web_index dir");
         std::fs::create_dir_all(web_index_dir.join("nested")).expect("create nested dir");
 
-        let manifest = crate::snapshot::StaticSnapshotManifest {
-            schema_version: crate::snapshot::STATIC_SNAPSHOT_SCHEMA_VERSION,
-            snapshot_id: "test-snapshot".to_string(),
-            generated_utc: Utc::now(),
-            git_commit: None,
-            source_action_set_sha256: None,
-            dataset_files: Vec::new(),
-            total_dataset_bytes: 0,
-        };
         std::fs::write(
             snapshot_dir.join(crate::snapshot::STATIC_SNAPSHOT_MANIFEST_FILENAME),
-            serde_json::to_vec_pretty(&manifest).expect("serialize snapshot manifest"),
+            [],
         )
         .expect("write snapshot manifest");
         std::fs::write(

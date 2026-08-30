@@ -27,9 +27,93 @@ pub(crate) struct FailedKindView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StdlibEnumerationStatusView {
-    pub(crate) badge_class: String,
-    pub(crate) badge_label: String,
-    pub(crate) summary: String,
+    pub(crate) state: StdlibEnumerationState,
+    pub(crate) reason: StdlibEnumerationReason,
+    pub(crate) scanned_files: u64,
+    pub(crate) failed_files: u64,
+    pub(crate) concrete_functions: u64,
+    pub(crate) suggested_actions: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StdlibEnumerationState {
+    Unknown,
+    Missing,
+    Failed,
+    Partial,
+    Ok,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StdlibEnumerationReason {
+    CompatibilityMapMissing,
+    RuntimeUnavailable,
+    RootIdentityUnavailable,
+    RootNotMaterialized,
+    ProvenanceUnavailable,
+    DiscoveryFailed,
+    DiscoveryMetadataMissing,
+    DiscoveryEmpty,
+    DiscoveryCounts,
+}
+
+impl StdlibEnumerationStatusView {
+    pub(crate) fn badge_class(&self) -> &'static str {
+        match self.state {
+            StdlibEnumerationState::Unknown => "enum-unknown",
+            StdlibEnumerationState::Missing => "enum-missing",
+            StdlibEnumerationState::Failed => "enum-failed",
+            StdlibEnumerationState::Partial => "enum-partial",
+            StdlibEnumerationState::Ok => "enum-ok",
+        }
+    }
+
+    pub(crate) fn badge_label(&self) -> &'static str {
+        match self.state {
+            StdlibEnumerationState::Unknown => "unknown",
+            StdlibEnumerationState::Missing => "not run",
+            StdlibEnumerationState::Failed => "failed",
+            StdlibEnumerationState::Partial => "partial",
+            StdlibEnumerationState::Ok => "ok",
+        }
+    }
+
+    pub(crate) fn summary(&self) -> String {
+        match self.reason {
+            StdlibEnumerationReason::CompatibilityMapMissing => {
+                "crate missing in compatibility map".to_string()
+            }
+            StdlibEnumerationReason::RuntimeUnavailable => {
+                "runtime configuration unavailable".to_string()
+            }
+            StdlibEnumerationReason::RootIdentityUnavailable => {
+                "canonical root identity unavailable".to_string()
+            }
+            StdlibEnumerationReason::RootNotMaterialized => {
+                "canonical root stdlib action not materialized".to_string()
+            }
+            StdlibEnumerationReason::ProvenanceUnavailable => {
+                "canonical root provenance unavailable".to_string()
+            }
+            StdlibEnumerationReason::DiscoveryFailed => "function discovery failed".to_string(),
+            StdlibEnumerationReason::DiscoveryMetadataMissing => format!(
+                "suggestions={} (discovery metadata missing)",
+                self.suggested_actions
+            ),
+            StdlibEnumerationReason::DiscoveryEmpty => {
+                "no discovery metadata and no suggested actions".to_string()
+            }
+            StdlibEnumerationReason::DiscoveryCounts => format!(
+                "concrete={} suggested={} failed_files={}/{}",
+                self.concrete_functions,
+                self.suggested_actions,
+                self.failed_files,
+                self.scanned_files
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,8 +133,23 @@ pub(crate) struct FailedActionRowView {
     pub(crate) failed_utc: DateTime<Utc>,
     pub(crate) action_kind: String,
     pub(crate) dso_version: Option<String>,
-    pub(crate) subject: String,
-    pub(crate) error_summary: String,
+    pub(crate) failure_class: PublicFailureClass,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PublicFailureClass {
+    Timeout,
+    Failed,
+}
+
+impl PublicFailureClass {
+    pub(crate) fn as_label(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Default)]

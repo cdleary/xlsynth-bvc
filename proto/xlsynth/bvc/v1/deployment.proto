@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package xlsynth.bvc.v1;
+
+import "google/protobuf/timestamp.proto";
+import "xlsynth/bvc/v1/common.proto";
+
+message PublishedSiteIdentity {
+  uint32 identity_version = 1;
+  Sha256Digest source_snapshot_id = 2;
+  Sha256Digest site_manifest_sha256 = 3;
+}
+
+message PublishedSiteCatalog {
+  uint32 record_version = 1;
+  Sha256Digest site_id = 2;
+  Sha256Digest source_snapshot_id = 3;
+  Sha256Digest site_manifest_sha256 = 4;
+  string base_url = 5;
+  NormalizedRelpath site_relpath = 6;
+  google.protobuf.Timestamp published_at = 7;
+}
+
+message CurrentSitePointer {
+  uint32 record_version = 1;
+  Sha256Digest site_id = 2;
+  NormalizedRelpath catalog_relpath = 3;
+  google.protobuf.Timestamp updated_at = 4;
+}
+
+enum CoordinatorStage {
+  COORDINATOR_STAGE_UNSPECIFIED = 0;
+  COORDINATOR_STAGE_PLANNED = 1;
+  COORDINATOR_STAGE_RECONCILED = 2;
+  COORDINATOR_STAGE_DRAINED = 3;
+  COORDINATOR_STAGE_INDEXED = 4;
+  COORDINATOR_STAGE_FINALIZED = 5;
+  COORDINATOR_STAGE_ANALYZED = 6;
+  COORDINATOR_STAGE_SNAPSHOT_VERIFIED = 7;
+  COORDINATOR_STAGE_SITE_VERIFIED = 8;
+  COORDINATOR_STAGE_PUBLISHED = 9;
+}
+
+enum CoordinatorStageStatus {
+  COORDINATOR_STAGE_STATUS_UNSPECIFIED = 0;
+  COORDINATOR_STAGE_STATUS_SUCCEEDED = 1;
+  COORDINATOR_STAGE_STATUS_FAILED_TRANSIENT = 2;
+  COORDINATOR_STAGE_STATUS_FAILED_DETERMINISTIC = 3;
+}
+
+message CoordinatorStageResult {
+  CoordinatorStage stage = 1;
+  CoordinatorStageStatus status = 2;
+  google.protobuf.Timestamp started_at = 3;
+  google.protobuf.Timestamp finished_at = 4;
+  string summary = 5;
+}
+
+message CoordinatorState {
+  uint32 record_version = 1;
+  Sha256Digest run_id = 2;
+  CrateVersion crate_version = 3;
+  CoordinatorStage current_stage = 4;
+  repeated CoordinatorStageResult stage_results = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  string snapshot_dir = 7;
+  string site_dir = 8;
+  optional Sha256Digest published_site_id = 9;
+  optional Sha256Digest indexed_source_fingerprint = 10;
+  optional Sha256Digest indexed_output_fingerprint = 11;
+  optional Sha256Digest baseline_run_id = 12;
+  optional CrateVersion baseline_crate_version = 13;
+}

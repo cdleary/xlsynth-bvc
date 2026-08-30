@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package xlsynth.bvc.v1;
+
+import "xlsynth/bvc/v1/common.proto";
+
+message StoreFormat {
+  uint32 format_version = 1;
+  string format_name = 2;
+  Sha256Digest schema_descriptor_sha256 = 3;
+}

@@ -2,74 +2,96 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::Serialize;
-use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::model::{
-    ActionBatchKey, ActionSpec, ArtifactRef, QueueCanceled, QueueDone, QueueFailed, QueueItem,
-    QueueRunning, QueueRunningWithPath, action_batch_key,
+    ActionBatchKey, ActionSpec, ArtifactRef, QueueCanceled, QueueCancellationKind, QueueDone,
+    QueueFailed, QueueItem, QueueRunning, QueueRunningWithPath, action_batch_key,
+};
+use crate::proto::{
+    decode_queue_canceled, decode_queue_done, decode_queue_item, decode_queue_running,
+    encode_queue_canceled, encode_queue_done, encode_queue_item, encode_queue_running,
 };
 use crate::store::ArtifactStore;
 
 static CLAIM_SCAN_CURSOR: AtomicUsize = AtomicUsize::new(0);
-static QUEUE_WRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static QUEUE_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn write_text_atomic(path: &Path, contents: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("path missing parent: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("creating parent directory: {}", parent.display()))?;
-    let filename = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("queue_record");
-    let ts = SystemTime::now()
+struct QueueTransitionLock {
+    file: File,
+}
+
+impl QueueTransitionLock {
+    fn open(store: &ArtifactStore, action_id: &str) -> Result<(File, PathBuf)> {
+        let path = store.queue_transition_lock_path(action_id);
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("queue transition lock path missing parent"))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating queue transition lock directory: {}",
+                parent.display()
+            )
+        })?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening queue transition lock: {}", path.display()))?;
+        Ok((file, path))
+    }
+
+    fn acquire(store: &ArtifactStore, action_id: &str) -> Result<Self> {
+        let (file, path) = Self::open(store, action_id)?;
+        file.lock_exclusive()
+            .with_context(|| format!("locking queue transition: {}", path.display()))?;
+        Ok(Self { file })
+    }
+
+    fn try_acquire(store: &ArtifactStore, action_id: &str) -> Result<Option<Self>> {
+        let (file, path) = Self::open(store, action_id)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error)
+                .with_context(|| format!("try-locking queue transition: {}", path.display())),
+        }
+    }
+}
+
+impl Drop for QueueTransitionLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn new_queue_lease_token(action_id: &str, worker_id: &str) -> String {
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let nonce = QUEUE_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(
-        ".{filename}.tmp-{}-{ts}-{nonce}",
-        std::process::id()
-    ));
-    fs::write(&tmp_path, contents)
-        .with_context(|| format!("writing temp queue record: {}", tmp_path.display()))?;
-    match fs::rename(&tmp_path, path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Handle rare races where parent directories are pruned externally.
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "recreating parent directory for queue record promotion: {}",
-                    parent.display()
-                )
-            })?;
-            fs::rename(&tmp_path, path).with_context(|| {
-                format!(
-                    "atomically promoting queue record after parent recreation: {} -> {}",
-                    tmp_path.display(),
-                    path.display()
-                )
-            })
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp_path);
-            Err(e).with_context(|| {
-                format!(
-                    "atomically promoting queue record: {} -> {}",
-                    tmp_path.display(),
-                    path.display()
-                )
-            })
-        }
-    }
+    let nonce = QUEUE_LEASE_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = Sha256::new();
+    hasher.update(b"xlsynth-bvc/queue-lease/v1\0");
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(now.to_le_bytes());
+    hasher.update(nonce.to_le_bytes());
+    hasher.update(action_id.as_bytes());
+    hasher.update(worker_id.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn write_bytes_atomic(store: &ArtifactStore, path: &Path, contents: &[u8]) -> Result<()> {
+    store.write_record_atomic("queue", path, contents)
 }
 
 pub(crate) fn quarantine_corrupt_queue_file(path: &Path, reason: &str) -> Result<()> {
@@ -196,14 +218,27 @@ pub(crate) fn queue_state_display_label(state: &QueueState) -> &'static str {
     state.display_label()
 }
 
+fn terminal_queue_state_for_action(store: &ArtifactStore, action_id: &str) -> Option<QueueState> {
+    if store.action_exists(action_id) || store.done_queue_path(action_id).exists() {
+        return Some(QueueState::Done);
+    }
+    if store.failed_action_record_exists(action_id) {
+        return Some(QueueState::Failed);
+    }
+    if store.canceled_queue_path(action_id).exists() {
+        return Some(QueueState::Canceled);
+    }
+    None
+}
+
 pub(crate) fn queue_state_for_action(store: &ArtifactStore, action_id: &str) -> QueueState {
-    if store.pending_queue_path(action_id).exists() {
-        return QueueState::Pending;
+    if let Some(terminal) = terminal_queue_state_for_action(store, action_id) {
+        return terminal;
     }
     let running_path = store.running_queue_path(action_id);
     if running_path.exists() {
-        if let Ok(text) = fs::read_to_string(&running_path)
-            && let Ok(running) = serde_json::from_str::<QueueRunning>(&text)
+        if let Ok(bytes) = fs::read(&running_path)
+            && let Ok(running) = decode_queue_running(&bytes)
         {
             return QueueState::Running {
                 owner: Some(running.lease_owner),
@@ -215,14 +250,8 @@ pub(crate) fn queue_state_for_action(store: &ArtifactStore, action_id: &str) -> 
             expires_utc: None,
         };
     }
-    if store.done_queue_path(action_id).exists() {
-        return QueueState::Done;
-    }
-    if store.failed_action_record_exists(action_id) {
-        return QueueState::Failed;
-    }
-    if store.canceled_queue_path(action_id).exists() {
-        return QueueState::Canceled;
+    if store.pending_queue_path(action_id).exists() {
+        return QueueState::Pending;
     }
     QueueState::None
 }
@@ -233,6 +262,16 @@ pub(crate) fn enqueue_action_with_priority(
     priority: i32,
 ) -> Result<String> {
     let action_id = crate::executor::compute_action_id(&action)?;
+    let _transition_lock = QueueTransitionLock::acquire(store, &action_id)?;
+    enqueue_action_with_priority_locked(store, action, priority, action_id)
+}
+
+fn enqueue_action_with_priority_locked(
+    store: &ArtifactStore,
+    action: ActionSpec,
+    priority: i32,
+    action_id: String,
+) -> Result<String> {
     if store.action_exists(&action_id) {
         return Ok(action_id);
     }
@@ -247,23 +286,21 @@ pub(crate) fn enqueue_action_with_priority(
     }
 
     if pending_path.exists() {
-        let text = match fs::read_to_string(&pending_path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        let bytes = match fs::read(&pending_path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
                 return Err(e)
                     .with_context(|| format!("reading queue item: {}", pending_path.display()));
             }
         };
-        if !text.is_empty()
-            && let Ok(mut item) = serde_json::from_str::<QueueItem>(&text)
+        if !bytes.is_empty()
+            && let Ok(mut item) = decode_queue_item(&bytes)
             && item.action_id == action_id
             && item.priority < priority
         {
             item.priority = priority;
-            let serialized =
-                serde_json::to_string_pretty(&item).context("serializing promoted queue item")?;
-            write_text_atomic(&pending_path, &serialized)?;
+            write_bytes_atomic(store, &pending_path, &encode_queue_item(&item)?)?;
         }
         return Ok(action_id);
     }
@@ -281,9 +318,25 @@ pub(crate) fn enqueue_action_with_priority(
         priority,
         action,
     };
-    let serialized = serde_json::to_string_pretty(&item).context("serializing queue item")?;
-    write_text_atomic(&pending_path, &serialized)?;
+    write_bytes_atomic(store, &pending_path, &encode_queue_item(&item)?)?;
     Ok(action_id)
+}
+
+pub(crate) fn retry_action_with_priority(
+    store: &ArtifactStore,
+    action: ActionSpec,
+    priority: i32,
+) -> Result<String> {
+    let action_id = crate::executor::compute_action_id(&action)?;
+    let _transition_lock = QueueTransitionLock::acquire(store, &action_id)?;
+    if !store.running_queue_path(&action_id).exists()
+        && !store.done_queue_path(&action_id).exists()
+        && !store.action_exists(&action_id)
+    {
+        store.delete_failed_action_record(&action_id)?;
+        remove_file_if_exists(&store.canceled_queue_path(&action_id))?;
+    }
+    enqueue_action_with_priority_locked(store, action, priority, action_id)
 }
 
 pub(crate) fn enqueue_action(store: &ArtifactStore, action: ActionSpec) -> Result<String> {
@@ -339,8 +392,8 @@ pub(crate) fn claim_next_pending_item(
     for i in 0..total_pending {
         let pending_path = pending[(start_offset + i) % total_pending].clone();
         scanned += 1;
-        let text = match fs::read_to_string(&pending_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&pending_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -349,7 +402,7 @@ pub(crate) fn claim_next_pending_item(
             }
         };
         let (action_id, enqueued_utc, priority, action) =
-            match parse_queue_work_item(&text, &pending_path) {
+            match parse_queue_work_item(&bytes, &pending_path) {
                 Ok(parsed) => parsed,
                 Err(err) => {
                     quarantine_corrupt_queue_file(
@@ -374,35 +427,14 @@ pub(crate) fn claim_next_pending_item(
                 );
             }
             ActionReadiness::NotReady => continue,
-            ActionReadiness::Blocked {
-                dependency_action_id,
-                root_failed_action_id,
-                reason,
-            } => {
-                // Attempt to cancel only while this item is still pending.
-                match fs::remove_file(&pending_path) {
-                    Ok(()) => {
-                        write_canceled_record(
-                            store,
-                            &action_id,
-                            enqueued_utc,
-                            action,
-                            worker_id,
-                            &dependency_action_id,
-                            &root_failed_action_id,
-                            &reason,
-                        )?;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        return Err(e).with_context(|| {
-                            format!(
-                                "removing blocked pending queue item: {}",
-                                pending_path.display()
-                            )
-                        });
-                    }
-                }
+            ActionReadiness::Blocked { .. } => {
+                try_write_dependency_canceled_record(
+                    store,
+                    &action_id,
+                    enqueued_utc,
+                    action,
+                    worker_id,
+                )?;
                 continue;
             }
         }
@@ -471,8 +503,8 @@ pub(crate) fn claim_compatible_pending_items(
 
     let mut ready_candidates = Vec::new();
     for pending_path in pending {
-        let text = match fs::read_to_string(&pending_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&pending_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -481,7 +513,7 @@ pub(crate) fn claim_compatible_pending_items(
             }
         };
         let (action_id, enqueued_utc, priority, action) =
-            match parse_queue_work_item(&text, &pending_path) {
+            match parse_queue_work_item(&bytes, &pending_path) {
                 Ok(parsed) => parsed,
                 Err(err) => {
                     quarantine_corrupt_queue_file(
@@ -512,33 +544,15 @@ pub(crate) fn claim_compatible_pending_items(
                 );
             }
             ActionReadiness::NotReady => continue,
-            ActionReadiness::Blocked {
-                dependency_action_id,
-                root_failed_action_id,
-                reason,
-            } => match fs::remove_file(&pending_path) {
-                Ok(()) => {
-                    write_canceled_record(
-                        store,
-                        &action_id,
-                        enqueued_utc,
-                        action,
-                        worker_id,
-                        &dependency_action_id,
-                        &root_failed_action_id,
-                        &reason,
-                    )?;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "removing blocked pending queue item: {}",
-                            pending_path.display()
-                        )
-                    });
-                }
-            },
+            ActionReadiness::Blocked { .. } => {
+                try_write_dependency_canceled_record(
+                    store,
+                    &action_id,
+                    enqueued_utc,
+                    action,
+                    worker_id,
+                )?;
+            }
         }
     }
 
@@ -666,9 +680,9 @@ pub(crate) fn load_canceled_root_failed_action_id(
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(&path)
+    let bytes = fs::read(&path)
         .with_context(|| format!("reading canceled queue record: {}", path.display()))?;
-    let canceled: QueueCanceled = serde_json::from_str(&text)
+    let canceled = decode_queue_canceled(&bytes)
         .with_context(|| format!("parsing canceled queue record: {}", path.display()))?;
     Ok(Some(canceled.root_failed_action_id))
 }
@@ -683,6 +697,11 @@ pub(crate) fn try_claim_pending_item(
         Some(v) => v,
         None => return Ok(None),
     };
+    let _transition_lock = QueueTransitionLock::acquire(store, &action_id)?;
+    if terminal_queue_state_for_action(store, &action_id).is_some() {
+        remove_file_if_exists(pending_path)?;
+        return Ok(None);
+    }
     let running_path = store.running_queue_path(&action_id);
     if let Some(parent) = running_path.parent() {
         fs::create_dir_all(parent)
@@ -702,6 +721,11 @@ pub(crate) fn try_claim_pending_item(
             });
         }
     }
+    if terminal_queue_state_for_action(store, &action_id).is_some() {
+        remove_file_if_exists(pending_path)?;
+        remove_file_if_exists(&running_path)?;
+        return Ok(None);
+    }
     match fs::remove_file(pending_path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -713,10 +737,10 @@ pub(crate) fn try_claim_pending_item(
         }
     }
 
-    let text = fs::read_to_string(&running_path)
+    let bytes = fs::read(&running_path)
         .with_context(|| format!("reading claimed queue item: {}", running_path.display()))?;
     let (action_id_from_file, enqueued_utc, priority, action) =
-        parse_queue_work_item(&text, &running_path)?;
+        parse_queue_work_item(&bytes, &running_path)?;
     if action_id_from_file != action_id {
         bail!(
             "claimed queue action id mismatch in {}: path={} file={}",
@@ -737,6 +761,7 @@ pub(crate) fn try_claim_pending_item(
 
     let lease_acquired_utc = Utc::now();
     let lease_expires_utc = lease_acquired_utc + chrono::Duration::seconds(lease_seconds);
+    let lease_token = new_queue_lease_token(&action_id, worker_id);
     let running = QueueRunning {
         schema_version: crate::ACTION_SCHEMA_VERSION,
         action_id,
@@ -744,12 +769,11 @@ pub(crate) fn try_claim_pending_item(
         priority,
         action,
         lease_owner: worker_id.to_string(),
+        lease_token,
         lease_acquired_utc,
         lease_expires_utc,
     };
-    let serialized =
-        serde_json::to_string_pretty(&running).context("serializing running queue record")?;
-    write_text_atomic(&running_path, &serialized)?;
+    write_bytes_atomic(store, &running_path, &encode_queue_running(&running)?)?;
     Ok(Some(QueueRunningWithPath {
         running,
         path: running_path,
@@ -774,18 +798,32 @@ pub(crate) fn write_done_record(
         fs::create_dir_all(parent)
             .with_context(|| format!("creating done queue dir: {}", parent.display()))?;
     }
-    let serialized =
-        serde_json::to_string_pretty(&done).context("serializing queue done record")?;
-    write_text_atomic(&done_path, &serialized)?;
+    write_bytes_atomic(store, &done_path, &encode_queue_done(&done)?)?;
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn write_failed_record(
     store: &ArtifactStore,
     running: &QueueRunningWithPath,
     worker_id: &str,
     error: &str,
-) -> Result<()> {
+) -> Result<bool> {
+    Ok(with_current_running_lease(store, running, || {
+        write_failed_record_for_current_lease(store, running, worker_id, error)
+    })?
+    .unwrap_or(false))
+}
+
+fn write_failed_record_for_current_lease(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+    worker_id: &str,
+    error: &str,
+) -> Result<bool> {
+    if store.action_exists(running.action_id()) {
+        return Ok(false);
+    }
     let failed = QueueFailed {
         schema_version: crate::ACTION_SCHEMA_VERSION,
         action_id: running.action_id().to_string(),
@@ -797,7 +835,123 @@ pub(crate) fn write_failed_record(
     };
     // Queue records are ephemeral; persist terminal failures only in the durable store.
     write_failed_action_record(store, &failed)?;
-    Ok(())
+    if store.action_exists(running.action_id()) {
+        store.delete_failed_action_record(running.action_id())?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn current_running_lease_matches(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+) -> Result<bool> {
+    let path = store.running_queue_path(running.action_id());
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading current running lease: {}", path.display()));
+        }
+    };
+    let current = decode_queue_running(&bytes)
+        .with_context(|| format!("decoding current running lease: {}", path.display()))?;
+    Ok(current.action_id == running.running.action_id
+        && current.lease_owner == running.running.lease_owner
+        && current.lease_token == running.running.lease_token)
+}
+
+pub(crate) fn with_current_running_lease<T, F>(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+    operation: F,
+) -> Result<Option<T>>
+where
+    F: FnOnce() -> Result<T>,
+{
+    with_current_running_leases(store, std::slice::from_ref(running), operation)
+}
+
+pub(crate) fn with_current_running_leases<T, F>(
+    store: &ArtifactStore,
+    running: &[QueueRunningWithPath],
+    operation: F,
+) -> Result<Option<T>>
+where
+    F: FnOnce() -> Result<T>,
+{
+    if running.is_empty() {
+        bail!("queue lease fence requires at least one running action");
+    }
+    let mut ordered = running.iter().collect::<Vec<_>>();
+    ordered.sort_by(|a, b| a.action_id().cmp(b.action_id()));
+    if ordered
+        .windows(2)
+        .any(|pair| pair[0].action_id() == pair[1].action_id())
+    {
+        bail!("queue lease fence contains a duplicate action_id");
+    }
+    let _transition_locks = ordered
+        .iter()
+        .map(|running| QueueTransitionLock::acquire(store, running.action_id()))
+        .collect::<Result<Vec<_>>>()?;
+    for running in running {
+        if !current_running_lease_matches(store, running)? {
+            return Ok(None);
+        }
+    }
+    operation().map(Some)
+}
+
+pub(crate) fn requeue_running_lease_if_current(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+) -> Result<bool> {
+    Ok(with_current_running_lease(store, running, || {
+        if terminal_queue_state_for_action(store, running.action_id()).is_some() {
+            remove_file_if_exists(&store.pending_queue_path(running.action_id()))?;
+            remove_file_if_exists(&running.path)?;
+            return Ok(false);
+        }
+        let pending_path = store.pending_queue_path(running.action_id());
+        if let Some(parent) = pending_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("creating rollback pending queue dir: {}", parent.display())
+            })?;
+        }
+        if !pending_path.exists() {
+            let pending = QueueItem {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: running.action_id().to_string(),
+                enqueued_utc: *running.enqueued_utc(),
+                priority: running.priority(),
+                action: running.action().clone(),
+            };
+            write_bytes_atomic(store, &pending_path, &encode_queue_item(&pending)?)?;
+        }
+        remove_file_if_exists(&running.path)?;
+        Ok(true)
+    })?
+    .unwrap_or(false))
+}
+
+pub(crate) fn fail_running_and_cancel_descendants(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+    worker_id: &str,
+    error: &str,
+) -> Result<Option<usize>> {
+    Ok(with_current_running_lease(store, running, || {
+        if !write_failed_record_for_current_lease(store, running, worker_id, error)? {
+            remove_file_if_exists(&running.path)?;
+            return Ok(None);
+        }
+        let canceled = cancel_downstream_pending_actions(store, running.action_id(), worker_id)?;
+        remove_file_if_exists(&running.path)?;
+        Ok(Some(canceled))
+    })?
+    .flatten())
 }
 
 pub(crate) fn write_failed_action_record(
@@ -900,16 +1054,194 @@ pub(crate) fn write_canceled_record(
         root_failed_action_id: root_failed_action_id.to_string(),
         action,
         reason: reason.to_string(),
+        cancellation_kind: QueueCancellationKind::Dependency,
+        work_policy_rule_id: None,
+        work_policy_rule_fingerprint: None,
     };
     let canceled_path = store.canceled_queue_path(action_id);
     if let Some(parent) = canceled_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating canceled queue dir: {}", parent.display()))?;
     }
-    let serialized =
-        serde_json::to_string_pretty(&canceled).context("serializing canceled queue item")?;
-    write_text_atomic(&canceled_path, &serialized)?;
+    write_bytes_atomic(store, &canceled_path, &encode_queue_canceled(&canceled)?)?;
     Ok(())
+}
+
+fn reserve_pending_for_terminal_transition(
+    store: &ArtifactStore,
+    pending_path: &Path,
+    action_id: &str,
+) -> Result<Option<PathBuf>> {
+    let running_path = store.running_queue_path(action_id);
+    if let Some(parent) = running_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating terminal-transition reservation dir: {}",
+                parent.display()
+            )
+        })?;
+    }
+    match fs::hard_link(pending_path, &running_path) {
+        Ok(()) => Ok(Some(running_path)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "reserving pending action for terminal transition: {} -> {}",
+                pending_path.display(),
+                running_path.display()
+            )
+        }),
+    }
+}
+
+pub(crate) fn try_write_dependency_canceled_record(
+    store: &ArtifactStore,
+    action_id: &str,
+    enqueued_utc: DateTime<Utc>,
+    action: ActionSpec,
+    worker_id: &str,
+) -> Result<bool> {
+    let _transition_lock = QueueTransitionLock::acquire(store, action_id)?;
+    if crate::executor::compute_action_id(&action)? != action_id {
+        bail!("dependency cancellation action does not match action id {action_id}");
+    }
+    if terminal_queue_state_for_action(store, action_id).is_some()
+        || store.running_queue_path(action_id).exists()
+    {
+        return Ok(false);
+    }
+    let ActionReadiness::Blocked {
+        dependency_action_id,
+        root_failed_action_id,
+        reason,
+    } = classify_action_readiness(store, &action)?
+    else {
+        return Ok(false);
+    };
+
+    let pending_path = store.pending_queue_path(action_id);
+    let reservation_path = if pending_path.exists() {
+        let Some(path) = reserve_pending_for_terminal_transition(store, &pending_path, action_id)?
+        else {
+            return Ok(false);
+        };
+        Some(path)
+    } else {
+        None
+    };
+    write_canceled_record(
+        store,
+        action_id,
+        enqueued_utc,
+        action,
+        worker_id,
+        &dependency_action_id,
+        &root_failed_action_id,
+        &reason,
+    )?;
+    if let Some(reservation_path) = reservation_path {
+        remove_file_if_exists(&pending_path)?;
+        remove_file_if_exists(&reservation_path)?;
+    }
+    Ok(true)
+}
+
+pub(crate) fn write_work_policy_excluded_record(
+    store: &ArtifactStore,
+    action_id: &str,
+    source_action_id: &str,
+    action: ActionSpec,
+    rule_id: &str,
+    reason: &str,
+    rule_fingerprint: &str,
+) -> Result<bool> {
+    let _transition_lock = QueueTransitionLock::acquire(store, action_id)?;
+    if store.action_exists(action_id)
+        || store.running_queue_path(action_id).exists()
+        || store.done_queue_path(action_id).exists()
+    {
+        return Ok(false);
+    }
+
+    if let Some(existing) = load_queue_canceled_record(store, action_id)? {
+        if existing.cancellation_kind == QueueCancellationKind::Dependency {
+            return Ok(false);
+        }
+        let existing_action_matches = crate::executor::compute_action_id(&existing.action)
+            .is_ok_and(|existing_action_id| existing_action_id == action_id);
+        if existing.work_policy_rule_id.as_deref() == Some(rule_id)
+            && existing.work_policy_rule_fingerprint.as_deref() == Some(rule_fingerprint)
+            && existing.canceled_due_to_action_id == source_action_id
+            && existing.root_failed_action_id == action_id
+            && existing.canceled_by == "campaign-work-policy"
+            && existing.reason == reason
+            && existing_action_matches
+        {
+            remove_file_if_exists(&store.pending_queue_path(action_id))?;
+            store.delete_failed_action_record(action_id)?;
+            return Ok(true);
+        }
+    }
+
+    let pending_path = store.pending_queue_path(action_id);
+    let reservation_path = if pending_path.exists() {
+        let Some(path) = reserve_pending_for_terminal_transition(store, &pending_path, action_id)?
+        else {
+            return Ok(false);
+        };
+        Some(path)
+    } else {
+        None
+    };
+
+    let now = Utc::now();
+    let canceled = QueueCanceled {
+        schema_version: crate::ACTION_SCHEMA_VERSION,
+        action_id: action_id.to_string(),
+        enqueued_utc: now,
+        canceled_utc: now,
+        canceled_by: "campaign-work-policy".to_string(),
+        canceled_due_to_action_id: source_action_id.to_string(),
+        root_failed_action_id: action_id.to_string(),
+        action,
+        reason: reason.to_string(),
+        cancellation_kind: QueueCancellationKind::WorkPolicyExcluded,
+        work_policy_rule_id: Some(rule_id.to_string()),
+        work_policy_rule_fingerprint: Some(rule_fingerprint.to_string()),
+    };
+    let canceled_path = store.canceled_queue_path(action_id);
+    if let Some(parent) = canceled_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating canceled queue dir: {}", parent.display()))?;
+    }
+
+    write_bytes_atomic(store, &canceled_path, &encode_queue_canceled(&canceled)?)?;
+    store.delete_failed_action_record(action_id)?;
+    if let Some(reservation_path) = reservation_path {
+        remove_file_if_exists(&pending_path)?;
+        remove_file_if_exists(&reservation_path)?;
+    }
+    Ok(true)
+}
+
+pub(crate) fn remove_work_policy_excluded_record(
+    store: &ArtifactStore,
+    action_id: &str,
+) -> Result<bool> {
+    let _transition_lock = QueueTransitionLock::acquire(store, action_id)?;
+    let Some(existing) = load_queue_canceled_record(store, action_id)? else {
+        return Ok(false);
+    };
+    if existing.cancellation_kind != QueueCancellationKind::WorkPolicyExcluded {
+        return Ok(false);
+    }
+    remove_file_if_exists(&store.canceled_queue_path(action_id))?;
+    Ok(true)
 }
 
 pub(crate) fn cancel_downstream_pending_actions(
@@ -926,8 +1258,8 @@ pub(crate) fn cancel_downstream_pending_actions(
         let mut pending_paths = list_queue_files(&store.queue_pending_dir())?;
         pending_paths.sort();
         for pending_path in pending_paths {
-            let text = match fs::read_to_string(&pending_path) {
-                Ok(text) => text,
+            let bytes = match fs::read(&pending_path) {
+                Ok(bytes) => bytes,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
                     return Err(e).with_context(|| {
@@ -935,50 +1267,47 @@ pub(crate) fn cancel_downstream_pending_actions(
                     });
                 }
             };
-            let (action_id, enqueued_utc, _, action) = parse_queue_work_item(&text, &pending_path)?;
+            let (action_id, enqueued_utc, _, action) =
+                parse_queue_work_item(&bytes, &pending_path)?;
             if blocked_ids.contains(&action_id) {
                 continue;
             }
-            let Some(dep) = action_dependency_action_ids(&action)
+            let has_blocked_dependency = action_dependency_action_ids(&action)
                 .into_iter()
-                .find(|dep_id| blocked_ids.contains(*dep_id))
-                .map(ToOwned::to_owned)
-            else {
+                .any(|dep_id| blocked_ids.contains(dep_id));
+            if !has_blocked_dependency {
                 continue;
-            };
-
-            // Only emit a canceled record if we can still remove the pending item.
-            match fs::remove_file(&pending_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "removing blocked pending queue item during cancellation: {}",
-                            pending_path.display()
-                        )
-                    });
-                }
             }
-            write_canceled_record(
+
+            if try_write_dependency_canceled_record(
                 store,
                 &action_id,
                 enqueued_utc,
                 action,
                 worker_id,
-                &dep,
-                root_failed_action_id,
-                "dependency failed or was canceled",
-            )?;
-            blocked_ids.insert(action_id);
-            canceled += 1;
-            changed = true;
+            )? {
+                blocked_ids.insert(action_id);
+                canceled += 1;
+                changed = true;
+            }
         }
         if !changed {
             break;
         }
     }
     Ok(canceled)
+}
+
+fn running_lease_should_be_reclaimed(
+    running: &QueueRunning,
+    now: DateTime<Utc>,
+    local_host: &str,
+) -> bool {
+    match running_owner_local_process_exists(&running.lease_owner, local_host) {
+        Some(true) => false,
+        Some(false) => true,
+        None => running.lease_expires_utc <= now,
+    }
 }
 
 pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<usize> {
@@ -988,8 +1317,43 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
     let mut running_paths = list_queue_files(&store.queue_running_dir())?;
     running_paths.sort();
     for running_path in running_paths {
-        let text = match fs::read_to_string(&running_path) {
-            Ok(text) => text,
+        if let Some(action_id) = queue_action_id_from_path(&running_path)
+            && terminal_queue_state_for_action(store, &action_id).is_none()
+        {
+            match fs::read(&running_path) {
+                Ok(bytes) => {
+                    if let Ok(running) = decode_queue_running(&bytes)
+                        && !running_lease_should_be_reclaimed(&running, now, &local_host)
+                    {
+                        continue;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {}
+            }
+        }
+        let _transition_lock = if let Some(action_id) = queue_action_id_from_path(&running_path) {
+            let Some(lock) = QueueTransitionLock::try_acquire(store, &action_id)? else {
+                continue;
+            };
+            Some(lock)
+        } else {
+            None
+        };
+        if let Some(action_id) = queue_action_id_from_path(&running_path)
+            && terminal_queue_state_for_action(store, &action_id).is_some()
+        {
+            remove_file_if_exists(&store.pending_queue_path(&action_id))?;
+            remove_file_if_exists(&running_path)?;
+            if store.action_exists(&action_id) {
+                store.delete_failed_action_record(&action_id)?;
+                remove_file_if_exists(&store.canceled_queue_path(&action_id))?;
+            }
+            reclaimed += 1;
+            continue;
+        }
+        let bytes = match fs::read(&running_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -998,9 +1362,8 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
             }
         };
 
-        let reclaim = if let Ok(running) = serde_json::from_str::<QueueRunning>(&text) {
-            running.lease_expires_utc <= now
-                || running_owner_process_missing_on_local_host(&running.lease_owner, &local_host)
+        let reclaim = if let Ok(running) = decode_queue_running(&bytes) {
+            running_lease_should_be_reclaimed(&running, now, &local_host)
         } else {
             true
         };
@@ -1009,7 +1372,7 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
         }
 
         let (action_id, enqueued_utc, priority, action) =
-            match parse_queue_work_item(&text, &running_path) {
+            match parse_queue_work_item(&bytes, &running_path) {
                 Ok(parsed) => parsed,
                 Err(err) => {
                     quarantine_corrupt_queue_file(
@@ -1027,15 +1390,23 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
             priority,
             action,
         };
+        if terminal_queue_state_for_action(store, &action_id).is_some() {
+            remove_file_if_exists(&store.pending_queue_path(&action_id))?;
+            remove_file_if_exists(&running_path)?;
+            if store.action_exists(&action_id) {
+                store.delete_failed_action_record(&action_id)?;
+                remove_file_if_exists(&store.canceled_queue_path(&action_id))?;
+            }
+            reclaimed += 1;
+            continue;
+        }
         let pending_path = store.pending_queue_path(&action_id);
         if let Some(parent) = pending_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating pending queue dir: {}", parent.display()))?;
         }
         if !pending_path.exists() {
-            let serialized = serde_json::to_string_pretty(&pending)
-                .context("serializing reclaimed queue item")?;
-            write_text_atomic(&pending_path, &serialized)?;
+            write_bytes_atomic(store, &pending_path, &encode_queue_item(&pending)?)?;
         }
         remove_file_if_exists(&running_path)?;
         reclaimed += 1;
@@ -1043,21 +1414,30 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
     Ok(reclaimed)
 }
 
-fn running_owner_process_missing_on_local_host(lease_owner: &str, local_host: &str) -> bool {
+fn queue_process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn running_owner_local_process_exists(lease_owner: &str, local_host: &str) -> Option<bool> {
     let mut parts = lease_owner.split(':');
-    let Some(owner_host) = parts.next() else {
-        return false;
-    };
+    let owner_host = parts.next()?;
     if owner_host != local_host {
-        return false;
+        return None;
     }
-    let Some(owner_pid_raw) = parts.next() else {
-        return false;
-    };
-    let Ok(owner_pid) = owner_pid_raw.parse::<u32>() else {
-        return false;
-    };
-    !Path::new("/proc").join(owner_pid.to_string()).exists()
+    let owner_pid = parts.next()?.parse::<u32>().ok()?;
+    let recorded_start_ticks = parts.next()?.parse::<u64>().ok()?;
+    let proc_path = Path::new("/proc").join(owner_pid.to_string());
+    if !proc_path.exists() {
+        return Some(false);
+    }
+    Some(queue_process_start_ticks(owner_pid) == Some(recorded_start_ticks))
+}
+
+#[cfg(test)]
+fn running_owner_process_missing_on_local_host(lease_owner: &str, local_host: &str) -> bool {
+    running_owner_local_process_exists(lease_owner, local_host) == Some(false)
 }
 
 pub(crate) fn remove_file_if_exists(path: &Path) -> Result<()> {
@@ -1075,18 +1455,10 @@ pub(crate) fn queue_action_id_from_path(path: &Path) -> Option<String> {
 }
 
 pub(crate) fn parse_queue_work_item(
-    text: &str,
+    bytes: &[u8],
     path: &Path,
 ) -> Result<(String, DateTime<Utc>, i32, ActionSpec)> {
-    if let Ok(running) = serde_json::from_str::<QueueRunning>(text) {
-        if running.schema_version != crate::ACTION_SCHEMA_VERSION {
-            bail!(
-                "running queue schema mismatch for {}: got {} expected {}",
-                path.display(),
-                running.schema_version,
-                crate::ACTION_SCHEMA_VERSION
-            );
-        }
+    if let Ok(running) = decode_queue_running(bytes) {
         return Ok((
             running.action_id,
             running.enqueued_utc,
@@ -1095,16 +1467,8 @@ pub(crate) fn parse_queue_work_item(
         ));
     }
 
-    let item: QueueItem = serde_json::from_str(text)
+    let item = decode_queue_item(bytes)
         .with_context(|| format!("parsing queue item: {}", path.display()))?;
-    if item.schema_version != crate::ACTION_SCHEMA_VERSION {
-        bail!(
-            "queue item schema mismatch for {}: got {} expected {}",
-            path.display(),
-            item.schema_version,
-            crate::ACTION_SCHEMA_VERSION
-        );
-    }
     Ok((
         item.action_id,
         item.enqueued_utc,
@@ -1124,7 +1488,7 @@ pub(crate) fn list_queue_files(root: &Path) -> Result<Vec<PathBuf>> {
             continue;
         }
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+        if path.extension().and_then(|s| s.to_str()) == Some("pb") {
             files.push(path.to_path_buf());
         }
     }
@@ -1135,21 +1499,33 @@ pub(crate) fn load_queue_pending_record(
     store: &ArtifactStore,
     action_id: &str,
 ) -> Result<Option<QueueItem>> {
-    load_queue_record(&store.pending_queue_path(action_id), "pending queue record")
+    load_queue_record(
+        &store.pending_queue_path(action_id),
+        "pending queue record",
+        decode_queue_item,
+    )
 }
 
 pub(crate) fn load_queue_running_record(
     store: &ArtifactStore,
     action_id: &str,
 ) -> Result<Option<QueueRunning>> {
-    load_queue_record(&store.running_queue_path(action_id), "running queue record")
+    load_queue_record(
+        &store.running_queue_path(action_id),
+        "running queue record",
+        decode_queue_running,
+    )
 }
 
 pub(crate) fn load_queue_done_record(
     store: &ArtifactStore,
     action_id: &str,
 ) -> Result<Option<QueueDone>> {
-    load_queue_record(&store.done_queue_path(action_id), "done queue record")
+    load_queue_record(
+        &store.done_queue_path(action_id),
+        "done queue record",
+        decode_queue_done,
+    )
 }
 
 pub(crate) fn load_queue_failed_record(
@@ -1166,20 +1542,21 @@ pub(crate) fn load_queue_canceled_record(
     load_queue_record(
         &store.canceled_queue_path(action_id),
         "canceled queue record",
+        decode_queue_canceled,
     )
 }
 
-pub(crate) fn load_queue_record<T: DeserializeOwned>(
+pub(crate) fn load_queue_record<T>(
     path: &Path,
     label: &str,
+    decode: fn(&[u8]) -> Result<T>,
 ) -> Result<Option<T>> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading {}: {}", label, path.display()))?;
-    let record: T = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}: {}", label, path.display()))?;
+    let bytes = fs::read(path).with_context(|| format!("reading {}: {}", label, path.display()))?;
+    let record =
+        decode(&bytes).with_context(|| format!("parsing {}: {}", label, path.display()))?;
     Ok(Some(record))
 }
 
@@ -1206,15 +1583,15 @@ pub(crate) fn repair_corrupt_queue_records(
     fn scan_and_validate_queue_dir(
         root: &Path,
         queue_state: &str,
-        parser: fn(&str, &Path) -> Result<String>,
+        parser: fn(&[u8], &Path) -> Result<String>,
         scanned_files: &mut usize,
         corrupt_records: &mut Vec<CorruptQueueRecord>,
     ) -> Result<()> {
         for path in list_queue_files(root)? {
             *scanned_files += 1;
             let action_id_hint = queue_action_id_from_path(&path);
-            let text = match fs::read_to_string(&path) {
-                Ok(text) => text,
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
                     corrupt_records.push(CorruptQueueRecord {
@@ -1226,7 +1603,7 @@ pub(crate) fn repair_corrupt_queue_records(
                     continue;
                 }
             };
-            let parsed_action_id = match parser(&text, &path) {
+            let parsed_action_id = match parser(&bytes, &path) {
                 Ok(action_id) => action_id,
                 Err(err) => {
                     corrupt_records.push(CorruptQueueRecord {
@@ -1256,59 +1633,27 @@ pub(crate) fn repair_corrupt_queue_records(
         Ok(())
     }
 
-    fn parse_pending_record(text: &str, path: &Path) -> Result<String> {
-        let item: QueueItem = serde_json::from_str(text)
+    fn parse_pending_record(bytes: &[u8], path: &Path) -> Result<String> {
+        let item = decode_queue_item(bytes)
             .with_context(|| format!("parsing pending queue record: {}", path.display()))?;
-        if item.schema_version != crate::ACTION_SCHEMA_VERSION {
-            bail!(
-                "pending queue schema mismatch for {}: got {} expected {}",
-                path.display(),
-                item.schema_version,
-                crate::ACTION_SCHEMA_VERSION
-            );
-        }
         Ok(item.action_id)
     }
 
-    fn parse_running_record(text: &str, path: &Path) -> Result<String> {
-        let running: QueueRunning = serde_json::from_str(text)
+    fn parse_running_record(bytes: &[u8], path: &Path) -> Result<String> {
+        let running = decode_queue_running(bytes)
             .with_context(|| format!("parsing running queue record: {}", path.display()))?;
-        if running.schema_version != crate::ACTION_SCHEMA_VERSION {
-            bail!(
-                "running queue schema mismatch for {}: got {} expected {}",
-                path.display(),
-                running.schema_version,
-                crate::ACTION_SCHEMA_VERSION
-            );
-        }
         Ok(running.action_id)
     }
 
-    fn parse_done_record(text: &str, path: &Path) -> Result<String> {
-        let done: QueueDone = serde_json::from_str(text)
+    fn parse_done_record(bytes: &[u8], path: &Path) -> Result<String> {
+        let done = decode_queue_done(bytes)
             .with_context(|| format!("parsing done queue record: {}", path.display()))?;
-        if done.schema_version != crate::ACTION_SCHEMA_VERSION {
-            bail!(
-                "done queue schema mismatch for {}: got {} expected {}",
-                path.display(),
-                done.schema_version,
-                crate::ACTION_SCHEMA_VERSION
-            );
-        }
         Ok(done.action_id)
     }
 
-    fn parse_canceled_record(text: &str, path: &Path) -> Result<String> {
-        let canceled: QueueCanceled = serde_json::from_str(text)
+    fn parse_canceled_record(bytes: &[u8], path: &Path) -> Result<String> {
+        let canceled = decode_queue_canceled(bytes)
             .with_context(|| format!("parsing canceled queue record: {}", path.display()))?;
-        if canceled.schema_version != crate::ACTION_SCHEMA_VERSION {
-            bail!(
-                "canceled queue schema mismatch for {}: got {} expected {}",
-                path.display(),
-                canceled.schema_version,
-                crate::ACTION_SCHEMA_VERSION
-            );
-        }
         Ok(canceled.action_id)
     }
 
@@ -1372,6 +1717,8 @@ mod tests {
     use crate::model::{ArtifactType, G8rLoweringMode, OutputFile, Provenance};
     use serde_json::json;
     use sha2::{Digest, Sha256};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_test_store() -> (ArtifactStore, PathBuf) {
@@ -1395,19 +1742,24 @@ mod tests {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
     }
 
-    fn write_completed_provenance(store: &ArtifactStore, action_id: &str) {
+    fn write_completed_provenance(store: &ArtifactStore, seed_digest: &str) -> String {
         let bytes = b"package test\n";
+        let action = ActionSpec::ImportIrPackageFile {
+            source_sha256: seed_digest.to_string(),
+            top_fn_name: Some("main".to_string()),
+        };
+        let action_id = crate::executor::compute_action_id(&action).expect("compute V2 action id");
         let provenance = Provenance {
             schema_version: crate::ACTION_SCHEMA_VERSION,
             action_id: action_id.to_string(),
             created_utc: Utc::now(),
-            action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
-                version: "v0.37.0".to_string(),
-                discovery_runtime: None,
-            },
+            action,
             dependencies: Vec::new(),
             output_artifact: ArtifactRef {
                 action_id: action_id.to_string(),
@@ -1427,13 +1779,14 @@ mod tests {
         fs::create_dir_all(staging_dir.join("payload")).expect("create ready payload");
         fs::write(staging_dir.join("payload/input.ir"), bytes).expect("write ready input");
         fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(&provenance).expect("serialize provenance"),
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
         )
         .expect("write provenance");
         store
-            .promote_staging_action_dir(action_id, &staging_dir)
+            .promote_staging_action_dir(&action_id, &staging_dir)
             .expect("promote ready action");
+        action_id
     }
 
     #[test]
@@ -1460,6 +1813,7 @@ mod tests {
         let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version: "v0.37.0".to_string(),
             discovery_runtime: None,
+            stdlib_tarball_sha256: "11".repeat(32),
         };
         let action_id = enqueue_action(&store, action.clone()).expect("enqueue action");
         assert!(store.pending_queue_path(&action_id).exists());
@@ -1481,11 +1835,167 @@ mod tests {
     }
 
     #[test]
+    fn claimed_lease_rollback_requeues_only_the_current_token() {
+        let (store, root) = make_test_store();
+        let action = terminal_test_action();
+        let action_id = enqueue_action(&store, action).expect("enqueue action");
+        let first = claim_next_pending_item(&store, "rollback-worker", 60)
+            .expect("claim first lease")
+            .expect("first lease");
+        assert!(requeue_running_lease_if_current(&store, &first).expect("rollback current lease"));
+        assert!(store.pending_queue_path(&action_id).exists());
+        assert!(!store.running_queue_path(&action_id).exists());
+
+        let second = claim_next_pending_item(&store, "rollback-worker", 60)
+            .expect("claim second lease")
+            .expect("second lease");
+        assert_ne!(first.running.lease_token, second.running.lease_token);
+        assert!(!requeue_running_lease_if_current(&store, &first).expect("fence stale rollback"));
+        assert!(store.running_queue_path(&action_id).exists());
+        assert!(!store.pending_queue_path(&action_id).exists());
+
+        remove_file_if_exists(&second.path).expect("clear second lease");
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn work_policy_cancellation_is_serialized_with_claims() {
+        let (store, root) = make_test_store();
+        let store = Arc::new(store);
+        for iteration in 0..32 {
+            let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+                version: format!("v0.37.{iteration}"),
+                discovery_runtime: None,
+                stdlib_tarball_sha256: format!("{iteration:064x}"),
+            };
+            let action_id =
+                enqueue_action(store.as_ref(), action.clone()).expect("enqueue race action");
+            let pending_path = store.pending_queue_path(&action_id);
+            let barrier = Arc::new(Barrier::new(3));
+
+            let claim_store = store.clone();
+            let claim_barrier = barrier.clone();
+            let claim_pending = pending_path.clone();
+            let claim = thread::spawn(move || {
+                claim_barrier.wait();
+                try_claim_pending_item(claim_store.as_ref(), &claim_pending, "race-worker", 60)
+                    .expect("claim transition")
+            });
+
+            let cancel_store = store.clone();
+            let cancel_barrier = barrier.clone();
+            let cancel_action_id = action_id.clone();
+            let cancel_action = action.clone();
+            let cancel = thread::spawn(move || {
+                cancel_barrier.wait();
+                write_work_policy_excluded_record(
+                    cancel_store.as_ref(),
+                    &cancel_action_id,
+                    &"d".repeat(64),
+                    cancel_action,
+                    "test-rule",
+                    "excluded for race test",
+                    &"f".repeat(64),
+                )
+                .expect("policy transition")
+            });
+
+            barrier.wait();
+            let claimed = claim.join().expect("claim thread");
+            let canceled = cancel.join().expect("cancel thread");
+            assert_ne!(claimed.is_some(), canceled);
+            assert!(
+                !(store.running_queue_path(&action_id).exists()
+                    && store.canceled_queue_path(&action_id).exists())
+            );
+            assert!(!store.pending_queue_path(&action_id).exists());
+
+            remove_file_if_exists(&store.running_queue_path(&action_id))
+                .expect("clear winning running state");
+            remove_file_if_exists(&store.canceled_queue_path(&action_id))
+                .expect("clear winning canceled state");
+        }
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn dependency_cancellation_is_serialized_with_retry() {
+        let (store, root) = make_test_store();
+        let store = Arc::new(store);
+        let dependency_action_id = "1".repeat(64);
+        let failed_record = QueueFailed {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id: dependency_action_id.clone(),
+            enqueued_utc: Utc::now(),
+            failed_utc: Utc::now(),
+            failed_by: "dependency-worker".to_string(),
+            action: terminal_test_action(),
+            error: "dependency failed".to_string(),
+        };
+        write_failed_action_record(store.as_ref(), &failed_record)
+            .expect("write failed dependency");
+
+        for iteration in 0..32 {
+            let action = ActionSpec::DriverIrToOpt {
+                ir_action_id: dependency_action_id.clone(),
+                top_fn_name: Some(format!("race_{iteration}")),
+                version: "v0.37.0".to_string(),
+                runtime: sample_runtime(),
+            };
+            let action_id = crate::executor::compute_action_id(&action).expect("action id");
+            let barrier = Arc::new(Barrier::new(3));
+
+            let retry_store = store.clone();
+            let retry_barrier = barrier.clone();
+            let retry_action = action.clone();
+            let retry = thread::spawn(move || {
+                retry_barrier.wait();
+                retry_action_with_priority(retry_store.as_ref(), retry_action, 0)
+                    .expect("retry transition")
+            });
+
+            let cancel_store = store.clone();
+            let cancel_barrier = barrier.clone();
+            let cancel_action_id = action_id.clone();
+            let cancel_action = action.clone();
+            let cancel = thread::spawn(move || {
+                cancel_barrier.wait();
+                try_write_dependency_canceled_record(
+                    cancel_store.as_ref(),
+                    &cancel_action_id,
+                    Utc::now(),
+                    cancel_action,
+                    "dependency-reconcile",
+                )
+                .expect("dependency-cancel transition")
+            });
+
+            barrier.wait();
+            assert_eq!(retry.join().expect("retry thread"), action_id);
+            let _ = cancel.join().expect("cancel thread");
+            let pending = store.pending_queue_path(&action_id).exists();
+            let canceled = store.canceled_queue_path(&action_id).exists();
+            assert_ne!(pending, canceled);
+            assert!(!store.running_queue_path(&action_id).exists());
+
+            remove_file_if_exists(&store.pending_queue_path(&action_id))
+                .expect("clear pending winner");
+            remove_file_if_exists(&store.canceled_queue_path(&action_id))
+                .expect("clear canceled winner");
+        }
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
     fn enqueue_action_with_priority_promotes_existing_pending_item() {
         let (store, root) = make_test_store();
         let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version: "v0.37.0".to_string(),
             discovery_runtime: None,
+            stdlib_tarball_sha256: "11".repeat(32),
         };
         let action_id =
             enqueue_action_with_priority(&store, action.clone(), 0).expect("enqueue initial");
@@ -1516,11 +2026,13 @@ mod tests {
         let lower_action_priority = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version: "v0.37.0".to_string(),
             discovery_runtime: Some(runtime.clone()),
+            stdlib_tarball_sha256: "11".repeat(32),
         };
         let higher_action_priority = ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
             version: "v0.37.0".to_string(),
             subtree: "xls/modules/add_dual_path".to_string(),
             discovery_runtime: Some(runtime),
+            source_commit: "2".repeat(40),
         };
 
         let lower_id = crate::executor::compute_action_id(&lower_action_priority)
@@ -1550,8 +2062,7 @@ mod tests {
     #[test]
     fn claim_compatible_pending_items_only_claims_matching_g8r_batch_key() {
         let (store, root) = make_test_store();
-        let dep_id = "d".repeat(64);
-        write_completed_provenance(&store, &dep_id);
+        let dep_id = write_completed_provenance(&store, &"d".repeat(64));
 
         let matching_a = ActionSpec::DriverIrToG8rAig {
             ir_action_id: dep_id.clone(),
@@ -1642,6 +2153,7 @@ mod tests {
             action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "v0.37.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
             error: "boom".to_string(),
         };
@@ -1707,19 +2219,21 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup temp store");
     }
 
-    fn touch_fake_provenance(store: &ArtifactStore, action_id: &str) {
+    fn touch_fake_provenance(store: &ArtifactStore, seed_digest: &str) -> String {
+        let action = ActionSpec::ImportIrPackageFile {
+            source_sha256: seed_digest.to_string(),
+            top_fn_name: Some("main".to_string()),
+        };
+        let action_id = crate::executor::compute_action_id(&action).expect("compute V2 action id");
         let staging_dir = store.staging_dir().join(format!("{action_id}-fake"));
         let payload_dir = staging_dir.join("payload");
         fs::create_dir_all(&payload_dir).expect("create fake payload dir");
-        fs::write(payload_dir.join("marker.txt"), action_id).expect("write fake payload marker");
+        fs::write(payload_dir.join("marker.txt"), &action_id).expect("write fake payload marker");
         let provenance = crate::model::Provenance {
             schema_version: crate::ACTION_SCHEMA_VERSION,
             action_id: action_id.to_string(),
             created_utc: Utc::now(),
-            action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
-                version: "v0.37.0".to_string(),
-                discovery_runtime: None,
-            },
+            action,
             dependencies: Vec::new(),
             output_artifact: ArtifactRef {
                 action_id: action_id.to_string(),
@@ -1736,28 +2250,25 @@ mod tests {
             suggested_next_actions: Vec::new(),
         };
         fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(&provenance).expect("serialize fake provenance"),
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode fake provenance"),
         )
         .expect("write fake provenance");
         store
-            .promote_staging_action_dir(action_id, &staging_dir)
+            .promote_staging_action_dir(&action_id, &staging_dir)
             .expect("promote fake provenance action");
+        action_id
     }
 
     #[test]
     fn claim_next_pending_item_prefers_leaf_priority_over_lexicographic_order() {
         let (store, root) = make_test_store();
         let runtime = sample_runtime();
-        let low_dep_id = "1".repeat(64);
-        touch_fake_provenance(&store, &low_dep_id);
+        let low_dep_id = touch_fake_provenance(&store, &"1".repeat(64));
 
-        let dep_a = "a".repeat(64);
-        let dep_b = "b".repeat(64);
-        let dep_c = "c".repeat(64);
-        touch_fake_provenance(&store, &dep_a);
-        touch_fake_provenance(&store, &dep_b);
-        touch_fake_provenance(&store, &dep_c);
+        let dep_a = touch_fake_provenance(&store, &"a".repeat(64));
+        let dep_b = touch_fake_provenance(&store, &"b".repeat(64));
+        let dep_c = touch_fake_provenance(&store, &"c".repeat(64));
 
         let high_action = ActionSpec::AigStatDiff {
             opt_ir_action_id: dep_a.clone(),
@@ -1808,7 +2319,9 @@ mod tests {
         let yosys_runtime = crate::model::YosysRuntimeSpec {
             docker_image: "xlsynth-bvc-yosys:latest".to_string(),
             dockerfile: "docker/yosys-abc.Dockerfile".to_string(),
-            upstream_commit: None,
+            docker_image_id: "e".repeat(64),
+            dockerfile_sha256: "d".repeat(64),
+            upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
         };
         let diff = ActionSpec::AigStatDiff {
             opt_ir_action_id: "a".repeat(64),
@@ -1912,7 +2425,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_corrupt_queue_records_detects_corrupt_running_json() {
+    fn repair_corrupt_queue_records_detects_corrupt_running_protobuf() {
         let (store, root) = make_test_store();
         let action_id = "a".repeat(64);
         let running_path = store.running_queue_path(&action_id);
@@ -1958,14 +2471,362 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup temp store");
     }
 
+    fn terminal_test_action() -> ActionSpec {
+        ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+            version: "v0.37.0".to_string(),
+            discovery_runtime: None,
+            stdlib_tarball_sha256: "11".repeat(32),
+        }
+    }
+
     #[test]
-    fn running_owner_process_missing_on_local_host_true_for_missing_local_pid() {
+    fn reclaim_keeps_failed_action_terminal_instead_of_requeueing() {
+        let (store, root) = make_test_store();
+        let action_id = enqueue_action(&store, terminal_test_action()).expect("enqueue");
+        let running = claim_next_pending_item(&store, "worker-failed", 900)
+            .expect("claim")
+            .expect("running");
+        write_failed_record(&store, &running, "worker-failed", "boom").expect("write failed");
+
+        assert!(running.path.exists());
+        assert_eq!(
+            queue_state_for_action(&store, &action_id),
+            QueueState::Failed
+        );
+        assert_eq!(reclaim_expired_running_leases(&store).expect("reclaim"), 1);
+        assert!(!running.path.exists());
+        assert!(!store.pending_queue_path(&action_id).exists());
+        assert!(store.failed_action_record_exists(&action_id));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn failed_transition_reports_loss_when_success_already_exists() {
+        let (store, root) = make_test_store();
+        let action_id = write_completed_provenance(&store, &"ab".repeat(32));
+        let provenance = store.load_provenance(&action_id).expect("load success");
+        let now = Utc::now();
+        let running = QueueRunningWithPath {
+            running: QueueRunning {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: action_id.clone(),
+                enqueued_utc: now,
+                priority: 0,
+                action: provenance.action,
+                lease_owner: "duplicate-worker".to_string(),
+                lease_token: "dd".repeat(32),
+                lease_acquired_utc: now,
+                lease_expires_utc: now,
+            },
+            path: store.running_queue_path(&action_id),
+        };
+
+        assert!(
+            !write_failed_record(&store, &running, "duplicate-worker", "late failure")
+                .expect("write losing failure")
+        );
+        assert!(!store.failed_action_record_exists(&action_id));
+        assert!(store.action_exists(&action_id));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn stale_lease_cannot_fail_newer_lease_or_cancel_descendants() {
+        let (store, root) = make_test_store();
+        let root_action_id =
+            enqueue_action(&store, terminal_test_action()).expect("enqueue root action");
+        let child_action = ActionSpec::DriverIrToOpt {
+            ir_action_id: root_action_id.clone(),
+            top_fn_name: Some("main".to_string()),
+            version: "v0.37.0".to_string(),
+            runtime: sample_runtime(),
+        };
+        let child_action_id =
+            enqueue_action(&store, child_action).expect("enqueue dependent action");
+        let stale = claim_next_pending_item(&store, "worker-a", 1)
+            .expect("claim root")
+            .expect("running root");
+
+        let mut current = stale.running.clone();
+        current.lease_owner = "worker-b".to_string();
+        current.lease_token = "ff".repeat(32);
+        current.lease_acquired_utc = Utc::now();
+        current.lease_expires_utc = Utc::now() + chrono::Duration::seconds(900);
+        write_bytes_atomic(
+            &store,
+            &stale.path,
+            &encode_queue_running(&current).expect("encode new lease"),
+        )
+        .expect("install newer lease");
+
+        assert_eq!(
+            fail_running_and_cancel_descendants(&store, &stale, "worker-a", "late failure")
+                .expect("fenced stale failure"),
+            None
+        );
+        assert!(!store.failed_action_record_exists(&root_action_id));
+        assert!(store.pending_queue_path(&child_action_id).exists());
+        assert!(!store.canceled_queue_path(&child_action_id).exists());
+        let persisted = load_queue_running_record(&store, &root_action_id)
+            .expect("load current running")
+            .expect("current running exists");
+        assert_eq!(persisted.lease_token, current.lease_token);
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reclamation_skips_busy_expired_execution_then_reclaims_after_release() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (store, root) = make_test_store();
+        enqueue_action(&store, terminal_test_action()).expect("enqueue action");
+        let running = claim_next_pending_item(&store, "foreign-worker", -1)
+            .expect("claim action")
+            .expect("running action");
+        let store = Arc::new(store);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let execution_store = Arc::clone(&store);
+        let execution = thread::spawn(move || {
+            with_current_running_lease(&execution_store, &running, || {
+                entered_tx.send(()).expect("signal execution fence");
+                release_rx.recv().expect("release execution fence");
+                Ok(())
+            })
+            .expect("fenced operation")
+            .expect("lease remains current")
+        });
+        entered_rx.recv().expect("execution entered fence");
+
+        let (reclaim_done_tx, reclaim_done_rx) = mpsc::channel();
+        let reclaim_store = Arc::clone(&store);
+        let reclaim = thread::spawn(move || {
+            let count = reclaim_expired_running_leases(&reclaim_store).expect("reclaim leases");
+            reclaim_done_tx.send(count).expect("signal reclaim done");
+        });
+        assert_eq!(
+            reclaim_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("busy expired execution must not block reclaim scan"),
+            0
+        );
+        reclaim.join().expect("first reclaim thread");
+
+        release_tx.send(()).expect("release execution");
+        execution.join().expect("execution thread");
+        assert_eq!(
+            reclaim_expired_running_leases(&store).expect("reclaim after execution release"),
+            1
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reclamation_prefilter_does_not_wait_for_unexpired_execution_fence() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (store, root) = make_test_store();
+        enqueue_action(&store, terminal_test_action()).expect("enqueue action");
+        let running = claim_next_pending_item(&store, "foreign-worker", 900)
+            .expect("claim action")
+            .expect("running action");
+        let store = Arc::new(store);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let execution_store = Arc::clone(&store);
+        let execution = thread::spawn(move || {
+            with_current_running_lease(&execution_store, &running, || {
+                entered_tx.send(()).expect("signal execution fence");
+                release_rx.recv().expect("release execution fence");
+                Ok(())
+            })
+            .expect("fenced operation")
+            .expect("lease remains current")
+        });
+        entered_rx.recv().expect("execution entered fence");
+
+        let (reclaim_done_tx, reclaim_done_rx) = mpsc::channel();
+        let reclaim_store = Arc::clone(&store);
+        let reclaim = thread::spawn(move || {
+            let count = reclaim_expired_running_leases(&reclaim_store).expect("reclaim leases");
+            reclaim_done_tx.send(count).expect("signal reclaim done");
+        });
+        assert_eq!(
+            reclaim_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("unexpired prefilter must not wait for execution"),
+            0
+        );
+        reclaim.join().expect("reclaim thread");
+
+        release_tx.send(()).expect("release execution");
+        execution.join().expect("execution thread");
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reclaim_finishes_interrupted_terminal_first_cancellation() {
+        let (store, root) = make_test_store();
+        let action = terminal_test_action();
+        let action_id = enqueue_action(&store, action.clone()).expect("enqueue");
+        let pending_path = store.pending_queue_path(&action_id);
+        let running_path = store.running_queue_path(&action_id);
+        fs::create_dir_all(running_path.parent().expect("running parent"))
+            .expect("create running parent");
+        fs::hard_link(&pending_path, &running_path).expect("reserve cancellation");
+        write_canceled_record(
+            &store,
+            &action_id,
+            Utc::now(),
+            action,
+            "worker-cancel",
+            &action_id,
+            &action_id,
+            "test cancellation",
+        )
+        .expect("write cancellation");
+
+        assert_eq!(
+            queue_state_for_action(&store, &action_id),
+            QueueState::Canceled
+        );
+        assert!(pending_path.exists());
+        assert!(running_path.exists());
+        assert_eq!(reclaim_expired_running_leases(&store).expect("reclaim"), 1);
+        assert!(!pending_path.exists());
+        assert!(!running_path.exists());
+        assert!(store.canceled_queue_path(&action_id).exists());
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn claim_discards_pending_record_when_terminal_evidence_exists() {
+        let (store, root) = make_test_store();
+        let action = terminal_test_action();
+        let action_id = enqueue_action(&store, action.clone()).expect("enqueue");
+        write_canceled_record(
+            &store,
+            &action_id,
+            Utc::now(),
+            action,
+            "worker-cancel",
+            &action_id,
+            &action_id,
+            "test cancellation",
+        )
+        .expect("write cancellation");
+
+        assert!(
+            claim_next_pending_item(&store, "worker-claim", 60)
+                .expect("claim scan")
+                .is_none()
+        );
+        assert!(!store.pending_queue_path(&action_id).exists());
+        assert_eq!(
+            queue_state_for_action(&store, &action_id),
+            QueueState::Canceled
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn legacy_local_owner_without_start_ticks_is_expiry_based() {
         let local_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
         let owner = format!("{local_host}:999999:web-runner-0");
-        assert!(running_owner_process_missing_on_local_host(
-            &owner,
-            &local_host
-        ));
+        assert_eq!(
+            running_owner_local_process_exists(&owner, &local_host),
+            None
+        );
+    }
+
+    #[test]
+    fn expired_legacy_owner_is_reclaimed_even_when_pid_is_live() {
+        let (store, root) = make_test_store();
+        let action_id = enqueue_action(&store, terminal_test_action()).expect("enqueue action");
+        let local_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
+        let owner = format!("{local_host}:{}", std::process::id());
+        let claimed = claim_next_pending_item(&store, &owner, -1)
+            .expect("claim pending action")
+            .expect("action should be claimed");
+        assert!(claimed.running.lease_expires_utc < Utc::now());
+
+        assert_eq!(reclaim_expired_running_leases(&store).expect("reclaim"), 1);
+        assert!(!store.running_queue_path(&action_id).exists());
+        assert!(store.pending_queue_path(&action_id).exists());
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn expired_lease_is_not_reclaimed_from_live_local_process() {
+        let (store, root) = make_test_store();
+        let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+            version: "v0.37.0".to_string(),
+            discovery_runtime: None,
+            stdlib_tarball_sha256: "11".repeat(32),
+        };
+        let action_id = enqueue_action(&store, action).expect("enqueue action");
+        let local_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
+        let pid = std::process::id();
+        let start_ticks = queue_process_start_ticks(pid).expect("process start ticks");
+        let owner = format!("{local_host}:{pid}:{start_ticks}:test-worker");
+        let claimed = claim_next_pending_item(&store, &owner, -1)
+            .expect("claim pending action")
+            .expect("action should be claimed");
+        assert!(claimed.running.lease_expires_utc < Utc::now());
+
+        assert_eq!(reclaim_expired_running_leases(&store).expect("reclaim"), 0);
+        assert!(store.running_queue_path(&action_id).exists());
+        assert!(!store.pending_queue_path(&action_id).exists());
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn reclaims_unexpired_lease_from_dead_local_coordinator_process() {
+        let (store, root) = make_test_store();
+        let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+            version: "v0.37.0".to_string(),
+            discovery_runtime: None,
+            stdlib_tarball_sha256: "11".repeat(32),
+        };
+        let action_id = enqueue_action(&store, action).expect("enqueue action");
+        let local_host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
+        let dead_pid = u32::MAX;
+        assert!(!Path::new("/proc").join(dead_pid.to_string()).exists());
+        let owner = format!("{local_host}:{dead_pid}:0:campaign:test-run:runner-0");
+        let claimed = claim_next_pending_item(&store, &owner, 900)
+            .expect("claim pending action")
+            .expect("action should be claimed");
+        assert!(claimed.running.lease_expires_utc > Utc::now());
+        assert!(store.running_queue_path(&action_id).exists());
+
+        assert_eq!(
+            reclaim_expired_running_leases(&store).expect("reclaim dead coordinator lease"),
+            1
+        );
+        assert!(!store.running_queue_path(&action_id).exists());
+        assert!(store.pending_queue_path(&action_id).exists());
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup temp store");
     }
 
     #[test]

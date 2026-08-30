@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(test)]
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
@@ -16,6 +18,9 @@ use crate::executor::{
     compute_action_id, discover_dslx_fn_to_ir_suggestions, extract_ir_fn_block_by_name,
 };
 use crate::model::*;
+use crate::proto::{decode_queue_canceled, decode_queue_running};
+#[cfg(test)]
+use crate::proto::{encode_queue_item, encode_queue_running};
 use crate::queue::*;
 use crate::runtime::*;
 use crate::service::*;
@@ -41,7 +46,9 @@ use crate::{
 };
 
 mod corpus_structural;
+mod public_projection;
 pub(crate) use corpus_structural::*;
+pub(crate) use public_projection::*;
 
 type ProvenanceLookup<'a> = BTreeMap<&'a str, &'a Provenance>;
 
@@ -3505,8 +3512,8 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
     }
 
     for queue_path in list_queue_files(&store.queue_pending_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -3514,7 +3521,7 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
                 });
             }
         };
-        let (action_id, _, _, action) = match parse_queue_work_item(&text, &queue_path) {
+        let (action_id, _, _, action) = match parse_queue_work_item(&bytes, &queue_path) {
             Ok(item) => item,
             Err(err) => {
                 eprintln!(
@@ -3528,8 +3535,8 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
         action_specs.entry(action_id).or_insert(action);
     }
     for queue_path in list_queue_files(&store.queue_running_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -3537,7 +3544,7 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
                 });
             }
         };
-        let (action_id, _, _, action) = match parse_queue_work_item(&text, &queue_path) {
+        let (action_id, _, _, action) = match parse_queue_work_item(&bytes, &queue_path) {
             Ok(item) => item,
             Err(err) => {
                 eprintln!(
@@ -3556,8 +3563,8 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
             .or_insert(failed.action);
     }
     for queue_path in list_queue_files(&store.queue_canceled_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -3565,7 +3572,7 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
                 });
             }
         };
-        let canceled: QueueCanceled = match serde_json::from_str(&text)
+        let canceled: QueueCanceled = match decode_queue_canceled(&bytes)
             .with_context(|| format!("parsing canceled queue record: {}", queue_path.display()))
         {
             Ok(record) => record,
@@ -3947,8 +3954,8 @@ fn collect_runtime_action_specs_for_stdlib_file_action_graph(
 ) -> Result<Vec<(String, ActionSpec)>> {
     let mut action_specs_by_id: BTreeMap<String, ActionSpec> = BTreeMap::new();
     for queue_path in list_queue_files(&store.queue_pending_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -3956,7 +3963,7 @@ fn collect_runtime_action_specs_for_stdlib_file_action_graph(
                 });
             }
         };
-        let (action_id, _, _, action) = match parse_queue_work_item(&text, &queue_path) {
+        let (action_id, _, _, action) = match parse_queue_work_item(&bytes, &queue_path) {
             Ok(item) => item,
             Err(err) => {
                 eprintln!(
@@ -3970,8 +3977,8 @@ fn collect_runtime_action_specs_for_stdlib_file_action_graph(
         action_specs_by_id.entry(action_id).or_insert(action);
     }
     for queue_path in list_queue_files(&store.queue_running_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -3979,7 +3986,7 @@ fn collect_runtime_action_specs_for_stdlib_file_action_graph(
                 });
             }
         };
-        let (action_id, _, _, action) = match parse_queue_work_item(&text, &queue_path) {
+        let (action_id, _, _, action) = match parse_queue_work_item(&bytes, &queue_path) {
             Ok(item) => item,
             Err(err) => {
                 eprintln!(
@@ -3998,8 +4005,8 @@ fn collect_runtime_action_specs_for_stdlib_file_action_graph(
             .or_insert(failed.action);
     }
     for queue_path in list_queue_files(&store.queue_canceled_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -4007,7 +4014,7 @@ fn collect_runtime_action_specs_for_stdlib_file_action_graph(
                 });
             }
         };
-        let canceled: QueueCanceled = match serde_json::from_str(&text)
+        let canceled: QueueCanceled = match decode_queue_canceled(&bytes)
             .with_context(|| format!("parsing canceled queue record: {}", queue_path.display()))
         {
             Ok(record) => record,
@@ -5428,7 +5435,7 @@ pub(crate) fn load_stdlib_g8r_vs_yosys_dataset_index(
     Ok(Some(index_file.dataset))
 }
 
-fn write_stdlib_g8r_vs_yosys_dataset_index(
+pub(crate) fn write_stdlib_g8r_vs_yosys_dataset_index(
     store: &ArtifactStore,
     dataset: &StdlibG8rVsYosysDataset,
 ) -> Result<(String, u64, DateTime<Utc>)> {
@@ -6130,8 +6137,11 @@ pub(crate) fn build_versions_cards(
             failed_utc: failed.failed_utc,
             action_kind: kind,
             dso_version: action_dso_version(&failed.action).map(|v| v.to_string()),
-            subject: action_subject(&failed.action),
-            error_summary: summarize_error(&failed.error),
+            failure_class: if is_timeout {
+                PublicFailureClass::Timeout
+            } else {
+                PublicFailureClass::Failed
+            },
         });
     }
 
@@ -6228,9 +6238,12 @@ pub(crate) fn build_stdlib_enumeration_status(
 ) -> StdlibEnumerationStatusView {
     let Some(compat_entry) = compat.get(crate_version) else {
         return StdlibEnumerationStatusView {
-            badge_class: "enum-unknown".to_string(),
-            badge_label: "unknown".to_string(),
-            summary: "crate missing in compatibility map".to_string(),
+            state: StdlibEnumerationState::Unknown,
+            reason: StdlibEnumerationReason::CompatibilityMapMissing,
+            scanned_files: 0,
+            failed_files: 0,
+            concrete_functions: 0,
+            suggested_actions: 0,
         };
     };
 
@@ -6243,46 +6256,69 @@ pub(crate) fn build_stdlib_enumeration_status(
     let runtime =
         match explicit_driver_runtime_for_crate_version(repo_root, crate_version, &dso_version) {
             Ok(runtime) => runtime,
-            Err(err) => {
+            Err(_) => {
                 return StdlibEnumerationStatusView {
-                    badge_class: "enum-unknown".to_string(),
-                    badge_label: "unknown".to_string(),
-                    summary: summarize_error(&format!("runtime setup failed: {:#}", err)),
+                    state: StdlibEnumerationState::Unknown,
+                    reason: StdlibEnumerationReason::RuntimeUnavailable,
+                    scanned_files: 0,
+                    failed_files: 0,
+                    concrete_functions: 0,
+                    suggested_actions: 0,
                 };
             }
         };
+    let release_input = match crate::proto::release_input_for_dso_version(&dso_version) {
+        Ok(input) => input,
+        Err(_) => {
+            return StdlibEnumerationStatusView {
+                state: StdlibEnumerationState::Unknown,
+                reason: StdlibEnumerationReason::RootIdentityUnavailable,
+                scanned_files: 0,
+                failed_files: 0,
+                concrete_functions: 0,
+                suggested_actions: 0,
+            };
+        }
+    };
     let root_action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
         version: dso_version.clone(),
         discovery_runtime: Some(runtime),
+        stdlib_tarball_sha256: release_input.stdlib_tarball_sha256,
     };
     let root_action_id = match compute_action_id(&root_action) {
         Ok(action_id) => action_id,
-        Err(err) => {
+        Err(_) => {
             return StdlibEnumerationStatusView {
-                badge_class: "enum-unknown".to_string(),
-                badge_label: "unknown".to_string(),
-                summary: summarize_error(&format!("failed computing canonical root id: {:#}", err)),
+                state: StdlibEnumerationState::Unknown,
+                reason: StdlibEnumerationReason::RootIdentityUnavailable,
+                scanned_files: 0,
+                failed_files: 0,
+                concrete_functions: 0,
+                suggested_actions: 0,
             };
         }
     };
     if !store.action_exists(&root_action_id) {
         return StdlibEnumerationStatusView {
-            badge_class: "enum-missing".to_string(),
-            badge_label: "not run".to_string(),
-            summary: format!(
-                "canonical root stdlib action not materialized for dso:{}",
-                normalize_tag_version(&dso_version)
-            ),
+            state: StdlibEnumerationState::Missing,
+            reason: StdlibEnumerationReason::RootNotMaterialized,
+            scanned_files: 0,
+            failed_files: 0,
+            concrete_functions: 0,
+            suggested_actions: 0,
         };
     }
 
     let provenance = match store.load_provenance(&root_action_id) {
         Ok(p) => p,
-        Err(err) => {
+        Err(_) => {
             return StdlibEnumerationStatusView {
-                badge_class: "enum-unknown".to_string(),
-                badge_label: "unknown".to_string(),
-                summary: summarize_error(&format!("failed loading root provenance: {:#}", err)),
+                state: StdlibEnumerationState::Unknown,
+                reason: StdlibEnumerationReason::ProvenanceUnavailable,
+                scanned_files: 0,
+                failed_files: 0,
+                concrete_functions: 0,
+                suggested_actions: 0,
             };
         }
     };
@@ -6295,14 +6331,17 @@ pub(crate) fn stdlib_enumeration_status_from_provenance(
 ) -> StdlibEnumerationStatusView {
     let details = provenance.details.as_object();
 
-    if let Some(error_value) = details.and_then(|d| d.get("dslx_list_fns_discovery_error")) {
+    if details
+        .and_then(|d| d.get("dslx_list_fns_discovery_error"))
+        .is_some()
+    {
         return StdlibEnumerationStatusView {
-            badge_class: "enum-failed".to_string(),
-            badge_label: "failed".to_string(),
-            summary: summarize_error(&format!(
-                "enumeration error: {}",
-                json_value_compact(error_value)
-            )),
+            state: StdlibEnumerationState::Failed,
+            reason: StdlibEnumerationReason::DiscoveryFailed,
+            scanned_files: 0,
+            failed_files: 0,
+            concrete_functions: 0,
+            suggested_actions: 0,
         };
     }
 
@@ -6312,18 +6351,21 @@ pub(crate) fn stdlib_enumeration_status_from_provenance(
     let Some(discovery) = discovery else {
         if !provenance.suggested_next_actions.is_empty() {
             return StdlibEnumerationStatusView {
-                badge_class: "enum-partial".to_string(),
-                badge_label: "partial".to_string(),
-                summary: format!(
-                    "suggestions={} (discovery metadata missing)",
-                    provenance.suggested_next_actions.len()
-                ),
+                state: StdlibEnumerationState::Partial,
+                reason: StdlibEnumerationReason::DiscoveryMetadataMissing,
+                scanned_files: 0,
+                failed_files: 0,
+                concrete_functions: 0,
+                suggested_actions: provenance.suggested_next_actions.len() as u64,
             };
         }
         return StdlibEnumerationStatusView {
-            badge_class: "enum-failed".to_string(),
-            badge_label: "failed".to_string(),
-            summary: "no discovery metadata and no suggested actions".to_string(),
+            state: StdlibEnumerationState::Failed,
+            reason: StdlibEnumerationReason::DiscoveryEmpty,
+            scanned_files: 0,
+            failed_files: 0,
+            concrete_functions: 0,
+            suggested_actions: 0,
         };
     };
 
@@ -6343,39 +6385,47 @@ pub(crate) fn stdlib_enumeration_status_from_provenance(
         .get("suggested_actions")
         .and_then(|v| v.as_u64())
         .unwrap_or(provenance.suggested_next_actions.len() as u64);
-    let summary = format!(
-        "concrete={} suggested={} failed_files={}/{}",
-        concrete_functions, suggested_actions, failed_files, scanned_files
-    );
-
-    let all_files_failed = scanned_files > 0 && failed_files >= scanned_files;
-    let no_concrete_outputs = concrete_functions == 0 && suggested_actions == 0;
-    if all_files_failed || (failed_files > 0 && no_concrete_outputs) {
+    let suggestion_count_matches =
+        suggested_actions == provenance.suggested_next_actions.len() as u64;
+    if scanned_files == 0 {
         return StdlibEnumerationStatusView {
-            badge_class: "enum-failed".to_string(),
-            badge_label: "failed".to_string(),
-            summary,
+            state: StdlibEnumerationState::Failed,
+            reason: StdlibEnumerationReason::DiscoveryEmpty,
+            scanned_files,
+            failed_files,
+            concrete_functions,
+            suggested_actions,
         };
     }
-    if failed_files > 0 || no_concrete_outputs {
+    let all_files_failed = scanned_files > 0 && failed_files >= scanned_files;
+    let no_concrete_outputs = concrete_functions == 0 || suggested_actions == 0;
+    if all_files_failed || (failed_files > 0 && no_concrete_outputs) {
         return StdlibEnumerationStatusView {
-            badge_class: "enum-partial".to_string(),
-            badge_label: "partial".to_string(),
-            summary,
+            state: StdlibEnumerationState::Failed,
+            reason: StdlibEnumerationReason::DiscoveryCounts,
+            scanned_files,
+            failed_files,
+            concrete_functions,
+            suggested_actions,
+        };
+    }
+    if failed_files > 0 || no_concrete_outputs || !suggestion_count_matches {
+        return StdlibEnumerationStatusView {
+            state: StdlibEnumerationState::Partial,
+            reason: StdlibEnumerationReason::DiscoveryCounts,
+            scanned_files,
+            failed_files,
+            concrete_functions,
+            suggested_actions,
         };
     }
     StdlibEnumerationStatusView {
-        badge_class: "enum-ok".to_string(),
-        badge_label: "ok".to_string(),
-        summary,
-    }
-}
-
-pub(crate) fn json_value_compact(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => s.clone(),
-        _ => serde_json::to_string(value)
-            .unwrap_or_else(|_| "<json serialization error>".to_string()),
+        state: StdlibEnumerationState::Ok,
+        reason: StdlibEnumerationReason::DiscoveryCounts,
+        scanned_files,
+        failed_files,
+        concrete_functions,
+        suggested_actions,
     }
 }
 
@@ -6395,15 +6445,15 @@ pub(crate) fn build_unprocessed_version_rows(
     let mut active_queue_by_crate: BTreeMap<String, usize> = BTreeMap::new();
     for queue_dir in [store.queue_pending_dir(), store.queue_running_dir()] {
         for path in list_queue_files(&queue_dir)? {
-            let text = match fs::read_to_string(&path) {
-                Ok(text) => text,
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
                     return Err(e)
                         .with_context(|| format!("reading queue item: {}", path.display()));
                 }
             };
-            let (_, _, _, action) = match parse_queue_work_item(&text, &path) {
+            let (_, _, _, action) = match parse_queue_work_item(&bytes, &path) {
                 Ok(item) => item,
                 Err(err) => {
                     eprintln!(
@@ -6436,6 +6486,8 @@ pub(crate) fn build_unprocessed_version_rows(
         let root_action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version: dso.clone(),
             discovery_runtime: Some(runtime),
+            stdlib_tarball_sha256: crate::proto::release_input_for_dso_version(&dso)?
+                .stdlib_tarball_sha256,
         };
         let root_action_id = compute_action_id(&root_action)?;
         let root_queue_state = queue_state_for_action(store, &root_action_id);
@@ -6477,15 +6529,15 @@ pub(crate) fn build_queue_live_status(
     let pending = pending_paths.len();
     let mut pending_expanders = 0_usize;
     for path in pending_paths {
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e)
                     .with_context(|| format!("reading pending queue record: {}", path.display()));
             }
         };
-        let action = match parse_queue_work_item(&text, &path) {
+        let action = match parse_queue_work_item(&bytes, &path) {
             Ok((_action_id, _enqueued_utc, _priority, action)) => action,
             Err(err) => {
                 eprintln!(
@@ -6513,15 +6565,15 @@ pub(crate) fn build_queue_live_status(
         .map(str::trim)
         .filter(|prefix| !prefix.is_empty());
     for path in list_queue_files(&store.queue_running_dir())? {
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e)
                     .with_context(|| format!("reading running queue record: {}", path.display()));
             }
         };
-        let running: QueueRunning = match serde_json::from_str(&text)
+        let running: QueueRunning = match decode_queue_running(&bytes)
             .with_context(|| format!("parsing running queue record: {}", path.display()))
         {
             Ok(record) => record,
@@ -6596,16 +6648,26 @@ pub(crate) fn canonical_root_actions_for_crate_version(
     dso_version: &str,
 ) -> Result<Vec<ActionSpec>> {
     let runtime = explicit_driver_runtime_for_crate_version(repo_root, crate_version, dso_version)?;
+    canonical_root_actions_for_runtime(dso_version, &runtime)
+}
+
+pub(crate) fn canonical_root_actions_for_runtime(
+    dso_version: &str,
+    runtime: &DriverRuntimeSpec,
+) -> Result<Vec<ActionSpec>> {
+    let release_input = crate::proto::release_input_for_dso_version(dso_version)?;
     let mut roots = Vec::with_capacity(1 + MODULE_SUBTREE_ROOT_PATHS.len());
     roots.push(ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
         version: dso_version.to_string(),
         discovery_runtime: Some(runtime.clone()),
+        stdlib_tarball_sha256: release_input.stdlib_tarball_sha256.clone(),
     });
     for subtree in MODULE_SUBTREE_ROOT_PATHS {
         roots.push(ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
             version: dso_version.to_string(),
             subtree: normalize_subtree_path(subtree)?,
             discovery_runtime: Some(runtime.clone()),
+            source_commit: release_input.source_commit.clone(),
         });
     }
     Ok(roots)
@@ -6633,21 +6695,18 @@ pub(crate) fn enqueue_processing_for_crate_version(
     };
 
     let roots = canonical_root_actions_for_crate_version(repo_root, &crate_version, &dso)?;
+    enqueue_processing_for_root_actions(store, repo_root, roots, priority)
+}
+
+pub(crate) fn enqueue_processing_for_root_actions(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    roots: Vec<ActionSpec>,
+    priority: i32,
+) -> Result<()> {
     for root_action in roots {
         let root_action_id = compute_action_id(&root_action)?;
-        store.delete_failed_action_record(&root_action_id)?;
-        for terminal_path in [store.canceled_queue_path(&root_action_id)] {
-            if terminal_path.exists() {
-                fs::remove_file(&terminal_path).with_context(|| {
-                    format!(
-                        "removing terminal queue record for retry: {}",
-                        terminal_path.display()
-                    )
-                })?;
-            }
-        }
-
-        enqueue_action_with_priority(store, root_action.clone(), priority)?;
+        retry_action_with_priority(store, root_action.clone(), priority)?;
         if store.action_exists(&root_action_id) {
             maybe_refresh_dslx_root_for_suggestion_discovery(store, repo_root, &root_action_id)?;
             let _ = app::enqueue_suggested_actions(
@@ -6683,6 +6742,7 @@ pub(crate) fn maybe_refresh_dslx_root_for_suggestion_discovery(
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version,
             discovery_runtime,
+            ..
         }
         | ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
             version,
@@ -6736,17 +6796,9 @@ pub(crate) fn maybe_refresh_dslx_root_for_suggestion_discovery(
         }),
     );
     provenance.details = serde_json::Value::Object(details);
-    let provenance_path = store.provenance_path(root_action_id);
-    fs::write(
-        &provenance_path,
-        serde_json::to_string_pretty(&provenance).context("serializing refreshed provenance")?,
-    )
-    .with_context(|| {
-        format!(
-            "writing refreshed provenance: {}",
-            provenance_path.display()
-        )
-    })?;
+    store
+        .write_provenance(&provenance)
+        .context("persisting refreshed canonical DSLX discovery provenance")?;
 
     provenance = store.load_provenance(root_action_id)?;
     if dslx_root_provenance_needs_discovery_refresh(&provenance) {
@@ -6766,6 +6818,13 @@ pub(crate) fn maybe_refresh_dslx_root_for_suggestion_discovery(
     Ok(())
 }
 
+fn dslx_root_provenance_has_discovery_result(provenance: &Provenance) -> bool {
+    provenance
+        .details
+        .as_object()
+        .is_some_and(|details| details.contains_key("dslx_list_fns_discovery"))
+}
+
 pub(crate) fn dslx_root_provenance_needs_discovery_refresh(provenance: &Provenance) -> bool {
     if !matches!(
         provenance.action,
@@ -6774,10 +6833,8 @@ pub(crate) fn dslx_root_provenance_needs_discovery_refresh(provenance: &Provenan
     ) {
         return false;
     }
-    if provenance.suggested_next_actions.is_empty() {
-        return true;
-    }
-    false
+    provenance.suggested_next_actions.is_empty()
+        && !dslx_root_provenance_has_discovery_result(provenance)
 }
 
 pub(crate) fn ensure_dslx_root_has_suggested_actions(provenance: &Provenance) -> Result<()> {
@@ -6788,19 +6845,15 @@ pub(crate) fn ensure_dslx_root_has_suggested_actions(provenance: &Provenance) ->
     ) {
         return Ok(());
     }
-    if !provenance.suggested_next_actions.is_empty() {
+    if !provenance.suggested_next_actions.is_empty()
+        || dslx_root_provenance_has_discovery_result(provenance)
+    {
         return Ok(());
     }
     let detail = provenance
         .details
         .as_object()
-        .and_then(|o| o.get("dslx_list_fns_discovery").cloned())
-        .or_else(|| {
-            provenance
-                .details
-                .as_object()
-                .and_then(|o| o.get("dslx_list_fns_discovery_error").cloned())
-        })
+        .and_then(|o| o.get("dslx_list_fns_discovery_error").cloned())
         .unwrap_or_else(|| json!("dslx discovery produced zero suggestions"));
     bail!(
         "dslx discovery produced zero suggested actions for action {}: {}",
@@ -6899,8 +6952,8 @@ fn collect_known_action_specs_and_provenances(
     }
 
     for queue_path in list_queue_files(&store.queue_pending_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -6908,7 +6961,7 @@ fn collect_known_action_specs_and_provenances(
                 });
             }
         };
-        let (queue_action_id, _, _, queue_action) = match parse_queue_work_item(&text, &queue_path)
+        let (queue_action_id, _, _, queue_action) = match parse_queue_work_item(&bytes, &queue_path)
         {
             Ok(item) => item,
             Err(err) => {
@@ -6924,8 +6977,8 @@ fn collect_known_action_specs_and_provenances(
     }
 
     for queue_path in list_queue_files(&store.queue_running_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -6933,7 +6986,7 @@ fn collect_known_action_specs_and_provenances(
                 });
             }
         };
-        let (queue_action_id, _, _, queue_action) = match parse_queue_work_item(&text, &queue_path)
+        let (queue_action_id, _, _, queue_action) = match parse_queue_work_item(&bytes, &queue_path)
         {
             Ok(item) => item,
             Err(err) => {
@@ -6955,8 +7008,8 @@ fn collect_known_action_specs_and_provenances(
     }
 
     for queue_path in list_queue_files(&store.queue_canceled_dir())? {
-        let text = match fs::read_to_string(&queue_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&queue_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -6964,7 +7017,7 @@ fn collect_known_action_specs_and_provenances(
                 });
             }
         };
-        let canceled: QueueCanceled = match serde_json::from_str(&text)
+        let canceled: QueueCanceled = match decode_queue_canceled(&bytes)
             .with_context(|| format!("parsing canceled queue record: {}", queue_path.display()))
         {
             Ok(record) => record,
@@ -7667,6 +7720,9 @@ mod tests {
             release_platform: "x64-linux".to_string(),
             docker_image: "ubuntu:24.04".to_string(),
             dockerfile: "FROM ubuntu:24.04".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
     }
 
@@ -7716,11 +7772,12 @@ mod tests {
 
     fn materialize_test_provenance(
         store: &ArtifactStore,
-        action_id: &str,
+        _seed_action_id: &str,
         action: ActionSpec,
         artifact_type: ArtifactType,
         relpath: &str,
-    ) {
+    ) -> String {
+        let action_id = crate::executor::compute_action_id(&action).expect("compute V2 action id");
         let staging_dir = store.staging_dir().join(format!("{action_id}-stage"));
         let output_path = staging_dir.join(relpath);
         if let Some(parent) = output_path.parent() {
@@ -7749,13 +7806,14 @@ mod tests {
             suggested_next_actions: Vec::new(),
         };
         fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(&provenance).expect("serialize test provenance"),
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode test provenance"),
         )
         .expect("write test provenance");
         store
-            .promote_staging_action_dir(action_id, &staging_dir)
+            .promote_staging_action_dir(&action_id, &staging_dir)
             .expect("promote test provenance");
+        action_id
     }
 
     fn overwrite_test_artifact(
@@ -7785,7 +7843,7 @@ mod tests {
         let source_ir_action_id = "b".repeat(64);
         let structural_hash = "c".repeat(64);
         let fn_name = format!("__mffc_{}", &structural_hash[..16]);
-        materialize_test_provenance(
+        let action_id = materialize_test_provenance(
             &store,
             &action_id,
             ActionSpec::IrFnToMffcCorpus {
@@ -7893,6 +7951,7 @@ mod tests {
             ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "0.35.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
         );
         action_specs.insert(
@@ -8117,8 +8176,10 @@ mod tests {
             action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "v0.35.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
             lease_owner: format!("{runner_prefix}3"),
+            lease_token: "dd".repeat(32),
             lease_acquired_utc: now,
             lease_expires_utc: now + chrono::Duration::seconds(60),
         };
@@ -8130,8 +8191,10 @@ mod tests {
             action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "v0.35.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
             lease_owner: "other-host:42:web-runner-7".to_string(),
+            lease_token: "ee".repeat(32),
             lease_acquired_utc: now,
             lease_expires_utc: now + chrono::Duration::seconds(120),
         };
@@ -8143,7 +8206,7 @@ mod tests {
             }
             fs::write(
                 &path,
-                serde_json::to_string_pretty(running).expect("serialize running record"),
+                encode_queue_running(running).expect("encode running record"),
             )
             .expect("write running queue record");
         }
@@ -8187,6 +8250,9 @@ mod tests {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.33.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            docker_image_id: "e".repeat(64),
+            dockerfile_sha256: "d".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         };
 
         let expander_item = QueueItem {
@@ -8197,6 +8263,7 @@ mod tests {
             action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version: "v0.35.0".to_string(),
                 discovery_runtime: None,
+                stdlib_tarball_sha256: "11".repeat(32),
             },
         };
         let non_expander_item = QueueItem {
@@ -8218,7 +8285,7 @@ mod tests {
             }
             fs::write(
                 &path,
-                serde_json::to_string_pretty(item).expect("serialize pending record"),
+                encode_queue_item(item).expect("encode pending record"),
             )
             .expect("write pending queue record");
         }
@@ -8244,7 +8311,7 @@ mod tests {
                 path: "flows/yosys_to_aig.ys".to_string(),
                 sha256: "0".repeat(64),
             },
-            runtime: crate::runtime::default_yosys_runtime(),
+            runtime: crate::runtime::test_yosys_runtime(),
         };
         assert_eq!(
             action_subject(&action),
@@ -8261,7 +8328,7 @@ mod tests {
                 path: "flows/ablate_abc_fast.ys".to_string(),
                 sha256: "0".repeat(64),
             },
-            runtime: crate::runtime::default_yosys_runtime(),
+            runtime: crate::runtime::test_yosys_runtime(),
         };
         assert_eq!(
             action_graph_node_label(&action),
@@ -8301,7 +8368,7 @@ mod tests {
                         path: "flows/ablate_abc_fast.ys".to_string(),
                         sha256: "0".repeat(64),
                     },
-                    runtime: crate::runtime::default_yosys_runtime(),
+                    runtime: crate::runtime::test_yosys_runtime(),
                 },
                 ArtifactType::AigFile,
             ),
@@ -8348,7 +8415,7 @@ mod tests {
                         path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
                         sha256: "0".repeat(64),
                     },
-                    runtime: crate::runtime::default_yosys_runtime(),
+                    runtime: crate::runtime::test_yosys_runtime(),
                 },
                 ArtifactType::AigFile,
             ),
@@ -8377,7 +8444,7 @@ mod tests {
         let k3_id = "4".repeat(64);
         let k3_child_id = "5".repeat(64);
 
-        materialize_test_provenance(
+        let ir_id = materialize_test_provenance(
             &store,
             &ir_id,
             ActionSpec::DriverDslxFnToIr {
@@ -8390,7 +8457,7 @@ mod tests {
             ArtifactType::IrPackageFile,
             "payload/ir.ir",
         );
-        materialize_test_provenance(
+        let opt_id = materialize_test_provenance(
             &store,
             &opt_id,
             ActionSpec::DriverIrToOpt {
@@ -8402,7 +8469,7 @@ mod tests {
             ArtifactType::IrPackageFile,
             "payload/opt.ir",
         );
-        materialize_test_provenance(
+        let _direct_aig_id = materialize_test_provenance(
             &store,
             &direct_aig_id,
             ActionSpec::DriverIrToG8rAig {
@@ -8416,7 +8483,7 @@ mod tests {
             ArtifactType::AigFile,
             "payload/direct.aig",
         );
-        materialize_test_provenance(
+        let k3_id = materialize_test_provenance(
             &store,
             &k3_id,
             ActionSpec::IrFnToKBoolConeCorpus {
@@ -8430,7 +8497,7 @@ mod tests {
             ArtifactType::IrPackageFile,
             "payload/k3.ir",
         );
-        materialize_test_provenance(
+        let k3_child_id = materialize_test_provenance(
             &store,
             &k3_child_id,
             ActionSpec::DriverIrToG8rAig {
@@ -8491,7 +8558,7 @@ mod tests {
         let opt_id = "2".repeat(64);
         let ir_top = "__float32__add";
 
-        materialize_test_provenance(
+        let ir_id = materialize_test_provenance(
             &store,
             &ir_id,
             ActionSpec::DriverDslxFnToIr {
@@ -8504,7 +8571,7 @@ mod tests {
             ArtifactType::IrPackageFile,
             "payload/ir.ir",
         );
-        materialize_test_provenance(
+        let opt_id = materialize_test_provenance(
             &store,
             &opt_id,
             ActionSpec::DriverIrToOpt {
@@ -8568,7 +8635,7 @@ mod tests {
     fn stdlib_fn_timeline_index_roundtrip_supports_fraig_toggle() {
         let (store, root) = make_test_store("timeline-index");
         let runtime = test_runtime();
-        let yosys_runtime = default_yosys_runtime();
+        let yosys_runtime = crate::runtime::test_yosys_runtime();
         let dslx_id = "1".repeat(64);
         let opt_id = "2".repeat(64);
         let g8r_aig_false_id = "3".repeat(64);
@@ -8583,7 +8650,7 @@ mod tests {
         let dslx_fn_name = "eq_2";
         let ir_top = "__float32__eq_2";
 
-        materialize_test_provenance(
+        let dslx_id = materialize_test_provenance(
             &store,
             &dslx_id,
             ActionSpec::DriverDslxFnToIr {
@@ -8596,7 +8663,7 @@ mod tests {
             ArtifactType::IrPackageFile,
             "payload/dslx.ir",
         );
-        materialize_test_provenance(
+        let opt_id = materialize_test_provenance(
             &store,
             &opt_id,
             ActionSpec::DriverIrToOpt {
@@ -8608,7 +8675,7 @@ mod tests {
             ArtifactType::IrPackageFile,
             "payload/opt.ir",
         );
-        materialize_test_provenance(
+        let g8r_aig_false_id = materialize_test_provenance(
             &store,
             &g8r_aig_false_id,
             ActionSpec::DriverIrToG8rAig {
@@ -8622,7 +8689,7 @@ mod tests {
             ArtifactType::AigFile,
             "payload/g8r_false.aig",
         );
-        materialize_test_provenance(
+        let g8r_stats_false_id = materialize_test_provenance(
             &store,
             &g8r_stats_false_id,
             ActionSpec::DriverAigToStats {
@@ -8641,7 +8708,7 @@ mod tests {
             r#"{"and_nodes": 42, "depth": 6}"#,
         );
 
-        materialize_test_provenance(
+        let g8r_aig_true_id = materialize_test_provenance(
             &store,
             &g8r_aig_true_id,
             ActionSpec::DriverIrToG8rAig {
@@ -8655,7 +8722,7 @@ mod tests {
             ArtifactType::AigFile,
             "payload/g8r_true.aig",
         );
-        materialize_test_provenance(
+        let g8r_stats_true_id = materialize_test_provenance(
             &store,
             &g8r_stats_true_id,
             ActionSpec::DriverAigToStats {
@@ -8674,7 +8741,7 @@ mod tests {
             r#"{"and_nodes": 40, "depth": 5}"#,
         );
 
-        materialize_test_provenance(
+        let ir2combo_id = materialize_test_provenance(
             &store,
             &ir2combo_id,
             ActionSpec::IrFnToCombinationalVerilog {
@@ -8687,7 +8754,7 @@ mod tests {
             ArtifactType::VerilogFile,
             "payload/combo.v",
         );
-        materialize_test_provenance(
+        let yosys_aig_id = materialize_test_provenance(
             &store,
             &yosys_aig_id,
             ActionSpec::ComboVerilogToYosysAbcAig {
@@ -8702,7 +8769,7 @@ mod tests {
             ArtifactType::AigFile,
             "payload/yosys.aig",
         );
-        materialize_test_provenance(
+        let yosys_stats_id = materialize_test_provenance(
             &store,
             &yosys_stats_id,
             ActionSpec::DriverAigToStats {
@@ -8721,7 +8788,7 @@ mod tests {
             r#"{"and_nodes": 55, "depth": 7}"#,
         );
 
-        materialize_test_provenance(
+        let delay_id = materialize_test_provenance(
             &store,
             &delay_id,
             ActionSpec::DriverIrToDelayInfo {
@@ -9647,20 +9714,14 @@ fn only(z: bits[1] id=1) -> bits[1] {
 
         let group_relpath = hash_group_relpath(&structural_hash);
         let group_key = ir_fn_corpus_structural_group_index_key(&structural_hash);
+        let group_bytes = serde_json::to_vec_pretty(&group).expect("serialize group");
         store
-            .write_web_index_bytes(
-                &group_key,
-                &serde_json::to_vec_pretty(&group).expect("serialize group"),
-            )
+            .write_web_index_bytes(&group_key, &group_bytes)
             .expect("write group key");
 
         let manifest = IrFnCorpusStructuralManifest {
             schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
             generated_utc: Utc::now(),
-            store_root: root.display().to_string(),
-            output_dir: ir_fn_corpus_structural_index_location(
-                &ir_fn_corpus_structural_index_prefix(),
-            ),
             recompute_missing_hashes: false,
             total_actions_scanned: 1,
             total_driver_ir_to_opt_actions: 1,
@@ -9682,6 +9743,7 @@ fn only(z: bits[1] id=1) -> bits[1] {
                 structural_hash: structural_hash.clone(),
                 member_count: 1,
                 relpath: group_relpath,
+                content_sha256: format!("{:x}", Sha256::digest(&group_bytes)),
                 ir_node_count: Some(1),
             }],
         };
@@ -9779,20 +9841,14 @@ fn only(z: bits[1] id=1) -> bits[1] {
             }],
         };
         let group_key = ir_fn_corpus_structural_group_index_key(&structural_hash);
+        let group_bytes = serde_json::to_vec_pretty(&group).expect("serialize group");
         store
-            .write_web_index_bytes(
-                &group_key,
-                &serde_json::to_vec_pretty(&group).expect("serialize group"),
-            )
+            .write_web_index_bytes(&group_key, &group_bytes)
             .expect("write group key");
 
         let manifest = IrFnCorpusStructuralManifest {
             schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
             generated_utc: Utc::now(),
-            store_root: root.display().to_string(),
-            output_dir: ir_fn_corpus_structural_index_location(
-                &ir_fn_corpus_structural_index_prefix(),
-            ),
             recompute_missing_hashes: false,
             total_actions_scanned: 1,
             total_driver_ir_to_opt_actions: 1,
@@ -9814,6 +9870,7 @@ fn only(z: bits[1] id=1) -> bits[1] {
                 structural_hash: structural_hash.clone(),
                 member_count: 1,
                 relpath: group_relpath,
+                content_sha256: format!("{:x}", Sha256::digest(&group_bytes)),
                 ir_node_count: Some(1),
             }],
         };
@@ -10093,5 +10150,35 @@ fn only(z: bits[1] id=1) -> bits[1] {
         assert!(missing.selected_file.is_none());
         assert_eq!(missing.series.len(), 2);
         assert_eq!(missing.total_points, 3);
+    }
+
+    #[test]
+    fn recorded_empty_dslx_discovery_is_terminal_and_reusable() {
+        let mut provenance = synthetic_provenance(
+            &"d".repeat(64),
+            ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
+                version: "0.5.0".to_string(),
+                subtree: "xls/modules/add_dual_path".to_string(),
+                discovery_runtime: Some(test_runtime()),
+                source_commit: "2".repeat(40),
+            },
+            ArtifactType::DslxFileSubtree,
+        );
+        assert!(dslx_root_provenance_needs_discovery_refresh(&provenance));
+        assert!(ensure_dslx_root_has_suggested_actions(&provenance).is_err());
+
+        provenance.details = json!({
+            "dslx_list_fns_discovery": {
+                "concrete_functions": 0,
+                "suggested_actions": 0
+            }
+        });
+        assert!(!dslx_root_provenance_needs_discovery_refresh(&provenance));
+        ensure_dslx_root_has_suggested_actions(&provenance)
+            .expect("recorded empty discovery is a valid terminal result");
+
+        provenance.details = json!({"dslx_list_fns_discovery_error": "boom"});
+        assert!(dslx_root_provenance_needs_discovery_refresh(&provenance));
+        assert!(ensure_dslx_root_has_suggested_actions(&provenance).is_err());
     }
 }

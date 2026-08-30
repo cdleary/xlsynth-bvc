@@ -1,0 +1,126 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package xlsynth.bvc.v1;
+
+// A SHA-256 digest. Validators require exactly 32 bytes.
+message Sha256Digest {
+  bytes value = 1;
+}
+
+// A content-addressed action identifier. Validators require exactly 32 bytes.
+message ActionId {
+  bytes value = 1;
+}
+
+// A normalized xlsynth DSO/tool release without a leading "v".
+message DsoVersion {
+  string value = 1;
+}
+
+// A normalized xlsynth-driver crate release without a leading "v".
+message CrateVersion {
+  string value = 1;
+}
+
+// A relative path normalized to "/" separators with no "." or ".." components.
+message NormalizedRelpath {
+  string value = 1;
+}
+
+// Runtime identity for xlsynth-driver-backed actions.
+message DriverRuntimeSpec {
+  CrateVersion driver_crate_version = 1;
+  string release_platform = 2;
+  string docker_image = 3;
+  NormalizedRelpath dockerfile = 4;
+  Sha256Digest dockerfile_sha256 = 5;
+  // Immutable local OCI image config digest resolved when the action is planned.
+  Sha256Digest docker_image_id = 6;
+  // Digest of the canonical DriverReleaseCacheInputManifest for the DSO used
+  // by this action. Cache setup must reproduce this digest before execution.
+  Sha256Digest release_cache_input_sha256 = 7;
+}
+
+// Runtime identity for Yosys/ABC-backed actions.
+message YosysRuntimeSpec {
+  string docker_image = 1;
+  NormalizedRelpath dockerfile = 2;
+  optional string upstream_commit = 3;
+  Sha256Digest dockerfile_sha256 = 4;
+  // Immutable local OCI image config digest resolved when the action is planned.
+  Sha256Digest docker_image_id = 5;
+}
+
+message DriverReleaseCacheFile {
+  NormalizedRelpath relpath = 1;
+  uint64 bytes = 2;
+  Sha256Digest sha256 = 3;
+}
+
+enum DriverReleaseCacheInputKind {
+  DRIVER_RELEASE_CACHE_INPUT_KIND_UNSPECIFIED = 0;
+  DRIVER_RELEASE_CACHE_INPUT_KIND_RELEASE_ASSET = 1;
+  DRIVER_RELEASE_CACHE_INPUT_KIND_SOURCE_COMMIT_FILE = 2;
+  DRIVER_RELEASE_CACHE_INPUT_KIND_LOCAL_RESOURCE_FILE = 3;
+}
+
+// One immutable upstream input to a materialized driver release cache.
+message DriverReleaseCacheInputFile {
+  DriverReleaseCacheInputKind kind = 1;
+  NormalizedRelpath relpath = 2;
+  Sha256Digest sha256 = 3;
+}
+
+// Canonical, sorted description of every upstream byte string used to build a
+// driver release cache. Release assets are pinned by their published checksum;
+// source files are fetched from source_commit, and local resource files are
+// read from the deployed read-only resource root.
+message DriverReleaseCacheInputManifest {
+  uint32 record_version = 1;
+  DsoVersion dso_version = 2;
+  string platform = 3;
+  string source_commit = 4;
+  repeated DriverReleaseCacheInputFile files = 5;
+}
+
+message DriverReleaseCacheManifest {
+  uint32 record_version = 1;
+  DsoVersion dso_version = 2;
+  string platform = 3;
+  repeated DriverReleaseCacheFile files = 4;
+  DriverReleaseCacheInputManifest inputs = 5;
+}
+
+message DriverReleaseCacheSetupLock {
+  uint32 record_version = 1;
+  string hostname = 2;
+  uint32 pid = 3;
+  uint64 process_start_ticks = 4;
+}
+
+// A checked-in script and the digest captured when the action is created.
+message ScriptRef {
+  NormalizedRelpath path = 1;
+  Sha256Digest sha256 = 2;
+}
+
+enum ArtifactType {
+  ARTIFACT_TYPE_UNSPECIFIED = 0;
+  ARTIFACT_TYPE_DSLX_FILE_SUBTREE = 1;
+  ARTIFACT_TYPE_IR_PACKAGE_FILE = 2;
+  ARTIFACT_TYPE_IR_DELAY_INFO_FILE = 3;
+  ARTIFACT_TYPE_AIG_FILE = 4;
+  ARTIFACT_TYPE_VERILOG_FILE = 5;
+  ARTIFACT_TYPE_AIG_STATS_FILE = 6;
+  ARTIFACT_TYPE_AIG_STAT_DIFF_FILE = 7;
+  ARTIFACT_TYPE_EQUIV_REPORT_FILE = 8;
+}
+
+// A reference from one action record to a typed artifact produced by another.
+message ArtifactRef {
+  ActionId action_id = 1;
+  ArtifactType artifact_type = 2;
+  NormalizedRelpath relpath = 3;
+}

@@ -2,7 +2,8 @@
 
 Hermetic, reproducible action execution for xlsynth artifact pipelines.
 
-See `docs/hermetic-action-design.md` for the architecture.
+See `DESIGN.md` for repository-wide invariants and filesystem boundaries.
+See `docs/hermetic-action-design.md` for the action execution architecture.
 See `docs/batched-persistent-runners-plan.md` for the implemented persistent Docker runner design.
 See `docs/ir-dir-corpus-runner.md` for the batch `IR directory -> recipe preset -> output bundle` runner.
 
@@ -152,6 +153,9 @@ cargo run --bin xlsynth_bvc -- \
   drain-queue --worker-id corpus-a --lease-seconds 1800
 ```
 
+The optional `--worker-id` value is a display label; the persisted lease owner
+always retains the host/PID/process-start fencing prefix.
+
 Or drain it with multiple local workers without `serve-web`:
 
 ```bash
@@ -222,7 +226,9 @@ dependency order.
 Each action execution has a default 300-second timeout; timed-out actions are
 recorded as failed with an error prefix `TIMEOUT(300)`.
 Before claiming work, `drain-queue` preflights runtime dependencies for pending
-actions (builds required Docker images and fills `bvc-artifacts/driver-release-cache/<dso>/<platform>/`).
+actions (builds required Docker images and fills immutable
+`bvc-artifacts/driver-release-cache/by-input-sha256/<input-manifest-sha256>/`
+generations).
 After setup, action containers run with `--pull never --network none` and consume
 the cached release assets/protos, so workers do not repeatedly hit GitHub during execution.
 
@@ -289,15 +295,16 @@ cargo run --bin xlsynth_bvc -- discover-releases --after v0.37.0 --dry-run
 ## Compatibility Map Refresh
 
 ```bash
-# Refresh only the crate<->xlsynth compatibility JSON from upstream main
-cargo run --bin xlsynth_bvc -- refresh-version-compat
-
-# Equivalent script form (default: update if needed)
+# Maintainer operation: update the checked-in map if needed
 scripts/sync-version-compat.sh
 
 # CI/check mode: exit non-zero if out of date
 scripts/sync-version-compat.sh --check
 ```
+
+Compatibility-map refresh is reviewed, out-of-band repository maintenance. A
+running `xlsynth-bvc` process only reads the deployed map and never updates its
+checkout.
 
 ## IR Corpus Structural Index
 

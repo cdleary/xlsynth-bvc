@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package xlsynth.bvc.v1;
+
+import "xlsynth/bvc/v1/common.proto";
+
+enum G8rLoweringMode {
+  G8R_LOWERING_MODE_UNSPECIFIED = 0;
+  G8R_LOWERING_MODE_DEFAULT = 1;
+  G8R_LOWERING_MODE_FRONTEND_NO_PREP_REWRITE = 2;
+}
+
+message ImportIrPackageFileAction {
+  Sha256Digest source_sha256 = 1;
+  optional string top_fn_name = 2;
+}
+
+message DownloadAndExtractXlsynthReleaseStdlibTarballAction {
+  DsoVersion dso_version = 1;
+  DriverRuntimeSpec discovery_runtime = 2;
+  Sha256Digest stdlib_tarball_sha256 = 3;
+}
+
+message DownloadAndExtractXlsynthSourceSubtreeAction {
+  DsoVersion dso_version = 1;
+  NormalizedRelpath subtree = 2;
+  DriverRuntimeSpec discovery_runtime = 3;
+  string source_commit = 4;
+}
+
+message DriverDslxFnToIrAction {
+  ActionId dslx_subtree_action_id = 1;
+  NormalizedRelpath dslx_file = 2;
+  string dslx_fn_name = 3;
+  DsoVersion dso_version = 4;
+  DriverRuntimeSpec runtime = 5;
+}
+
+message DriverIrToOptAction {
+  ActionId ir_action_id = 1;
+  optional string top_fn_name = 2;
+  DsoVersion dso_version = 3;
+  DriverRuntimeSpec runtime = 4;
+}
+
+message DriverIrToDelayInfoAction {
+  ActionId ir_action_id = 1;
+  optional string top_fn_name = 2;
+  string delay_model = 3;
+  string output_format = 4;
+  DsoVersion dso_version = 5;
+  DriverRuntimeSpec runtime = 6;
+}
+
+message DriverIrEquivAction {
+  ActionId lhs_ir_action_id = 1;
+  ActionId rhs_ir_action_id = 2;
+  optional string top_fn_name = 3;
+  DsoVersion dso_version = 4;
+  DriverRuntimeSpec runtime = 5;
+}
+
+message DriverIrAigEquivAction {
+  ActionId ir_action_id = 1;
+  ActionId aig_action_id = 2;
+  optional string top_fn_name = 3;
+  DsoVersion dso_version = 4;
+  DriverRuntimeSpec runtime = 5;
+}
+
+message DriverIrToG8rAigAction {
+  ActionId ir_action_id = 1;
+  optional string top_fn_name = 2;
+  bool fraig = 3;
+  G8rLoweringMode lowering_mode = 4;
+  DsoVersion dso_version = 5;
+  DriverRuntimeSpec runtime = 6;
+}
+
+message IrFnToCombinationalVerilogAction {
+  ActionId ir_action_id = 1;
+  optional string top_fn_name = 2;
+  bool use_system_verilog = 3;
+  DsoVersion dso_version = 4;
+  DriverRuntimeSpec runtime = 5;
+}
+
+message IrFnToKBoolConeCorpusAction {
+  ActionId ir_action_id = 1;
+  optional string top_fn_name = 2;
+  uint32 k = 3;
+  optional uint64 max_ir_ops = 4;
+  DsoVersion dso_version = 5;
+  DriverRuntimeSpec runtime = 6;
+}
+
+message IrFnToMffcCorpusAction {
+  ActionId ir_action_id = 1;
+  optional string top_fn_name = 2;
+  optional uint64 max_mffcs = 3;
+  uint64 min_internal_non_literal = 4;
+  optional uint64 max_frontier_non_literal = 5;
+  DsoVersion dso_version = 6;
+  DriverRuntimeSpec runtime = 7;
+}
+
+message ComboVerilogToYosysAbcAigAction {
+  ActionId verilog_action_id = 1;
+  optional string verilog_top_module_name = 2;
+  ScriptRef yosys_script_ref = 3;
+  YosysRuntimeSpec runtime = 4;
+}
+
+message AigToYosysAbcAigAction {
+  ActionId aig_action_id = 1;
+  ScriptRef yosys_script_ref = 2;
+  YosysRuntimeSpec runtime = 3;
+}
+
+message DriverAigToStatsAction {
+  ActionId aig_action_id = 1;
+  DsoVersion dso_version = 2;
+  DriverRuntimeSpec runtime = 3;
+}
+
+message AigStatDiffAction {
+  ActionId opt_ir_action_id = 1;
+  ActionId g8r_aig_stats_action_id = 2;
+  ActionId yosys_abc_aig_stats_action_id = 3;
+}
+
+// The complete semantic input to one hermetic xlsynth-bvc action.
+message ActionSpec {
+  oneof kind {
+    ImportIrPackageFileAction import_ir_package_file = 10;
+    DownloadAndExtractXlsynthReleaseStdlibTarballAction
+        download_and_extract_xlsynth_release_stdlib_tarball = 11;
+    DownloadAndExtractXlsynthSourceSubtreeAction
+        download_and_extract_xlsynth_source_subtree = 12;
+    DriverDslxFnToIrAction driver_dslx_fn_to_ir = 13;
+    DriverIrToOptAction driver_ir_to_opt = 14;
+    DriverIrToDelayInfoAction driver_ir_to_delay_info = 15;
+    DriverIrEquivAction driver_ir_equiv = 16;
+    DriverIrAigEquivAction driver_ir_aig_equiv = 17;
+    DriverIrToG8rAigAction driver_ir_to_g8r_aig = 18;
+    IrFnToCombinationalVerilogAction ir_fn_to_combinational_verilog = 19;
+    IrFnToKBoolConeCorpusAction ir_fn_to_k_bool_cone_corpus = 20;
+    IrFnToMffcCorpusAction ir_fn_to_mffc_corpus = 21;
+    ComboVerilogToYosysAbcAigAction combo_verilog_to_yosys_abc_aig = 22;
+    AigToYosysAbcAigAction aig_to_yosys_abc_aig = 23;
+    DriverAigToStatsAction driver_aig_to_stats = 24;
+    AigStatDiffAction aig_stat_diff = 25;
+  }
+}
+
+// The only protobuf message whose encoded bytes are hashed for an action ID.
+message ActionFingerprint {
+  uint32 identity_schema_version = 1;
+  ActionSpec action = 2;
+}

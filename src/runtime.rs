@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest, Sha256};
+use std::fs;
 use std::path::Path;
 use std::thread;
 
@@ -17,10 +19,42 @@ pub(crate) fn default_driver_image(driver_version: &str) -> String {
     format!("{}:{}", crate::DEFAULT_DOCKER_IMAGE_PREFIX, tag)
 }
 
-pub(crate) fn default_yosys_runtime() -> YosysRuntimeSpec {
+fn sha256_bytes(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+pub(crate) fn runtime_dockerfile_sha256(repo_root: &Path, dockerfile: &str) -> Result<String> {
+    let path = Path::new(dockerfile);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    };
+    let bytes = fs::read(&path)
+        .with_context(|| format!("reading runtime Dockerfile: {}", path.display()))?;
+    Ok(sha256_bytes(&bytes))
+}
+
+pub(crate) fn default_yosys_runtime(repo_root: &Path) -> Result<YosysRuntimeSpec> {
+    crate::service::bind_yosys_runtime_image(
+        repo_root,
+        YosysRuntimeSpec {
+            docker_image: crate::DEFAULT_YOSYS_DOCKER_IMAGE.to_string(),
+            dockerfile: crate::DEFAULT_YOSYS_DOCKERFILE.to_string(),
+            dockerfile_sha256: sha256_bytes(include_bytes!("../docker/yosys-abc.Dockerfile")),
+            docker_image_id: String::new(),
+            upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
+        },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_yosys_runtime() -> YosysRuntimeSpec {
     YosysRuntimeSpec {
         docker_image: crate::DEFAULT_YOSYS_DOCKER_IMAGE.to_string(),
         dockerfile: crate::DEFAULT_YOSYS_DOCKERFILE.to_string(),
+        dockerfile_sha256: sha256_bytes(include_bytes!("../docker/yosys-abc.Dockerfile")),
+        docker_image_id: "e".repeat(64),
         upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
     }
 }
@@ -56,12 +90,11 @@ pub(crate) fn resolve_driver_runtime_for_aig_stats(
         return Ok(source_runtime.clone());
     }
 
-    Ok(DriverRuntimeSpec {
-        driver_version: latest_driver_version.clone(),
-        release_platform: source_runtime.release_platform.clone(),
-        docker_image: default_driver_image(&latest_driver_version),
-        dockerfile: source_runtime.dockerfile.clone(),
-    })
+    bound_driver_runtime_for_driver_version(
+        repo_root,
+        &latest_driver_version,
+        &source_runtime.release_platform,
+    )
 }
 
 pub(crate) fn resolve_driver_runtime_for_dslx_list_fns(
@@ -85,12 +118,36 @@ pub(crate) fn resolve_driver_runtime_for_dslx_list_fns(
         return Ok(source_runtime.clone());
     }
 
-    Ok(DriverRuntimeSpec {
-        driver_version: latest_driver_version.clone(),
-        release_platform: source_runtime.release_platform.clone(),
-        docker_image: default_driver_image(&latest_driver_version),
-        dockerfile: source_runtime.dockerfile.clone(),
-    })
+    bound_driver_runtime_for_driver_version(
+        repo_root,
+        &latest_driver_version,
+        &source_runtime.release_platform,
+    )
+}
+
+fn bound_driver_runtime_for_driver_version(
+    repo_root: &Path,
+    driver_version: &str,
+    release_platform: &str,
+) -> Result<DriverRuntimeSpec> {
+    let xlsynth_version =
+        crate::versioning::resolve_xlsynth_version_for_driver(repo_root, driver_version)?;
+    crate::service::bind_driver_runtime_image(
+        repo_root,
+        DriverRuntimeSpec {
+            driver_version: driver_version.to_string(),
+            release_platform: release_platform.to_string(),
+            docker_image: default_driver_image(driver_version),
+            dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+            dockerfile_sha256: runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?,
+            docker_image_id: String::new(),
+            release_cache_input_sha256: crate::service::driver_release_cache_input_sha256(
+                repo_root,
+                &xlsynth_version,
+                release_platform,
+            )?,
+        },
+    )
 }
 
 pub(crate) fn canonical_stdlib_discovery_runtime_for_version(
@@ -103,12 +160,11 @@ pub(crate) fn canonical_stdlib_discovery_runtime_for_version(
             // Stdlib extraction still works without a direct compat entry; keep
             // discovery/runtime explicit by using the latest known driver runtime.
             let latest_driver_version = crate::versioning::latest_known_driver_version(repo_root)?;
-            Ok(DriverRuntimeSpec {
-                driver_version: latest_driver_version.clone(),
-                release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
-                docker_image: default_driver_image(&latest_driver_version),
-                dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
-            })
+            bound_driver_runtime_for_driver_version(
+                repo_root,
+                &latest_driver_version,
+                crate::DEFAULT_RELEASE_PLATFORM,
+            )
         }
     }
 }
@@ -143,7 +199,7 @@ pub(crate) fn resolve_driver_version(
             .max_by(|a, b| crate::versioning::cmp_dotted_numeric_version(a, b))
             .unwrap_or("unknown");
         bail!(
-            "no compatible driver crate version is known for {}; newest mapped xlsynth version in {} is v{} (run `refresh-version-compat` if needed)",
+            "no compatible driver crate version is known for {}; newest mapped xlsynth version in {} is v{} (update the map out of band with `scripts/sync-version-compat.sh` and redeploy if needed)",
             requested_xlsynth_version,
             crate::VERSION_COMPAT_PATH,
             newest_mapped_xlsynth
@@ -162,17 +218,45 @@ pub(crate) fn default_driver_runtime_for_version(
     requested_xlsynth_version: &str,
 ) -> Result<DriverRuntimeSpec> {
     let driver_version = resolve_driver_version(repo_root, None, requested_xlsynth_version)?;
-    let runtime = DriverRuntimeSpec {
-        driver_version: driver_version.clone(),
-        release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
-        docker_image: default_driver_image(&driver_version),
-        dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
-    };
+    let runtime = crate::service::bind_driver_runtime_image(
+        repo_root,
+        DriverRuntimeSpec {
+            driver_version: driver_version.clone(),
+            release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
+            docker_image: default_driver_image(&driver_version),
+            dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+            dockerfile_sha256: runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?,
+            docker_image_id: String::new(),
+            release_cache_input_sha256: crate::service::driver_release_cache_input_sha256(
+                repo_root,
+                requested_xlsynth_version,
+                crate::DEFAULT_RELEASE_PLATFORM,
+            )?,
+        },
+    )?;
     ensure_driver_runtime_compatibility(repo_root, &runtime, requested_xlsynth_version)?;
     Ok(runtime)
 }
 
 pub(crate) fn explicit_driver_runtime_for_crate_version(
+    repo_root: &Path,
+    crate_version: &str,
+    requested_xlsynth_version: &str,
+) -> Result<DriverRuntimeSpec> {
+    let mut runtime = explicit_driver_runtime_recipe_for_crate_version(
+        repo_root,
+        crate_version,
+        requested_xlsynth_version,
+    )?;
+    runtime.release_cache_input_sha256 = crate::service::driver_release_cache_input_sha256(
+        repo_root,
+        requested_xlsynth_version,
+        &runtime.release_platform,
+    )?;
+    crate::service::bind_driver_runtime_image(repo_root, runtime)
+}
+
+pub(crate) fn explicit_driver_runtime_recipe_for_crate_version(
     repo_root: &Path,
     crate_version: &str,
     requested_xlsynth_version: &str,
@@ -183,6 +267,9 @@ pub(crate) fn explicit_driver_runtime_for_crate_version(
         release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
         docker_image: default_driver_image(&driver_version),
         dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+        dockerfile_sha256: runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?,
+        docker_image_id: String::new(),
+        release_cache_input_sha256: String::new(),
     };
     ensure_driver_runtime_compatibility(repo_root, &runtime, requested_xlsynth_version)?;
     Ok(runtime)
@@ -225,7 +312,7 @@ pub(crate) fn ensure_driver_runtime_compatibility(
     let driver_version = crate::versioning::normalize_tag_version(&runtime.driver_version);
     let entry = compat.get(driver_version).ok_or_else(|| {
         anyhow!(
-            "driver crate version `{}` was not found in compatibility map {}; run `refresh-version-compat` or choose a known version",
+            "driver crate version `{}` was not found in deployed compatibility map {}; update it out of band with `scripts/sync-version-compat.sh` and redeploy, or choose a known version",
             runtime.driver_version,
             crate::VERSION_COMPAT_PATH
         )
@@ -274,4 +361,105 @@ pub(crate) fn ensure_driver_runtime_compatibility(
         requested_xlsynth_version,
         matching_driver_versions.join(", ")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oldest_and_latest_driver_versions(repo_root: &Path) -> (String, String) {
+        let compat = crate::versioning::load_version_compat_map(repo_root).expect("compat map");
+        let oldest = compat
+            .keys()
+            .min_by(|a, b| crate::versioning::cmp_dotted_numeric_version(a, b))
+            .expect("oldest driver")
+            .clone();
+        let latest = compat
+            .keys()
+            .max_by(|a, b| crate::versioning::cmp_dotted_numeric_version(a, b))
+            .expect("latest driver")
+            .clone();
+        assert_ne!(oldest, latest, "fixture needs multiple driver generations");
+        (oldest, latest)
+    }
+
+    fn source_runtime(repo_root: &Path, driver_version: &str) -> DriverRuntimeSpec {
+        let dso = crate::versioning::resolve_xlsynth_version_for_driver(repo_root, driver_version)
+            .expect("source DSO");
+        DriverRuntimeSpec {
+            driver_version: driver_version.to_string(),
+            release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
+            docker_image: default_driver_image(driver_version),
+            dockerfile: "old/deployment.Dockerfile".to_string(),
+            dockerfile_sha256: "a".repeat(64),
+            docker_image_id: "b".repeat(64),
+            release_cache_input_sha256: crate::service::driver_release_cache_input_sha256(
+                repo_root,
+                &dso,
+                crate::DEFAULT_RELEASE_PLATFORM,
+            )
+            .expect("source cache digest"),
+        }
+    }
+
+    fn assert_substitute_runtime_is_self_consistent(
+        repo_root: &Path,
+        source: &DriverRuntimeSpec,
+        resolved: &DriverRuntimeSpec,
+        latest: &str,
+    ) {
+        assert_eq!(resolved.driver_version, latest);
+        assert_eq!(resolved.dockerfile, crate::DEFAULT_DOCKERFILE);
+        assert_ne!(resolved.dockerfile_sha256, source.dockerfile_sha256);
+        let resolved_dso = crate::versioning::resolve_xlsynth_version_for_driver(
+            repo_root,
+            &resolved.driver_version,
+        )
+        .expect("resolved DSO");
+        let expected_digest = crate::service::driver_release_cache_input_sha256(
+            repo_root,
+            &resolved_dso,
+            &resolved.release_platform,
+        )
+        .expect("resolved cache digest");
+        assert_eq!(resolved.release_cache_input_sha256, expected_digest);
+        assert_ne!(
+            resolved.release_cache_input_sha256,
+            source.release_cache_input_sha256
+        );
+    }
+
+    #[test]
+    fn substituted_driver_runtimes_rebind_recipe_and_release_cache_identity() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (oldest, latest) = oldest_and_latest_driver_versions(repo_root);
+        let source = source_runtime(repo_root, &oldest);
+
+        let stats = resolve_driver_runtime_for_aig_stats(repo_root, &source)
+            .expect("substitute AIG stats runtime");
+        assert_substitute_runtime_is_self_consistent(repo_root, &source, &stats, &latest);
+
+        let list_fns = resolve_driver_runtime_for_dslx_list_fns(repo_root, &source)
+            .expect("substitute list-fns runtime");
+        assert_substitute_runtime_is_self_consistent(repo_root, &source, &list_fns, &latest);
+    }
+
+    #[test]
+    fn unknown_stdlib_discovery_version_uses_latest_drivers_own_cache_identity() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime = canonical_stdlib_discovery_runtime_for_version(repo_root, "v999.0.0")
+            .expect("fallback discovery runtime");
+        let runtime_dso = crate::versioning::resolve_xlsynth_version_for_driver(
+            repo_root,
+            &runtime.driver_version,
+        )
+        .expect("runtime DSO");
+        let expected_digest = crate::service::driver_release_cache_input_sha256(
+            repo_root,
+            &runtime_dso,
+            &runtime.release_platform,
+        )
+        .expect("runtime cache digest");
+        assert_eq!(runtime.release_cache_input_sha256, expected_digest);
+    }
 }

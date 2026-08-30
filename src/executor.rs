@@ -4,7 +4,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use reqwest::blocking::Client;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -44,6 +43,7 @@ pub(crate) fn execute_action(
     store: &ArtifactStore,
     action: ActionSpec,
 ) -> Result<(String, ArtifactRef)> {
+    let action = canonicalize_action_for_execution(action)?;
     let action_id = compute_action_id(&action)?;
 
     if store.action_exists(&action_id) {
@@ -67,18 +67,21 @@ pub(crate) fn execute_action(
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version,
             discovery_runtime,
+            stdlib_tarball_sha256,
         } => run_download_stdlib_action(
             store,
             &repo_root,
             &action_id,
             version,
             discovery_runtime.as_ref(),
+            stdlib_tarball_sha256,
             &payload_dir,
         )?,
         ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
             version,
             subtree,
             discovery_runtime,
+            source_commit,
         } => run_download_source_subtree_action(
             store,
             &repo_root,
@@ -86,6 +89,7 @@ pub(crate) fn execute_action(
             version,
             subtree,
             discovery_runtime.as_ref(),
+            source_commit,
             &payload_dir,
         )?,
         ActionSpec::DriverDslxFnToIr {
@@ -338,8 +342,9 @@ fn finish_action_execution(
         suggested_next_actions: outcome.suggested_next_actions,
     };
 
-    let provenance_path = staging_dir.join("provenance.json");
-    let serialized = serde_json::to_string_pretty(&provenance).context("serializing provenance")?;
+    let provenance_path = staging_dir.join("provenance.pb");
+    let serialized =
+        crate::proto::encode_provenance(&provenance).context("encoding protobuf provenance")?;
     fs::write(&provenance_path, serialized)
         .with_context(|| format!("writing provenance file: {}", provenance_path.display()))?;
 
@@ -399,6 +404,10 @@ pub(crate) fn execute_action_batch(
     store: &ArtifactStore,
     actions: Vec<ActionSpec>,
 ) -> Result<Vec<BatchActionExecutionResult>> {
+    let actions = actions
+        .into_iter()
+        .map(canonicalize_action_for_execution)
+        .collect::<Result<Vec<_>>>()?;
     if actions.len() <= 1 {
         return execute_actions_individually(store, actions);
     }
@@ -596,7 +605,7 @@ pub(crate) fn promote_staging_action_dir(staging_dir: &Path, final_dir: &Path) -
                 });
             }
 
-            let final_provenance = final_dir.join("provenance.json");
+            let final_provenance = final_dir.join("provenance.pb");
             if final_provenance.exists() {
                 fs::remove_dir_all(staging_dir).ok();
                 return Ok(());
@@ -621,13 +630,14 @@ pub(crate) fn promote_staging_action_dir(staging_dir: &Path, final_dir: &Path) -
 }
 
 pub(crate) fn compute_action_id(action: &ActionSpec) -> Result<String> {
-    let payload = json!({
-        "schema_version": ACTION_SCHEMA_VERSION,
-        "action": action,
-    });
-    let bytes = serde_json::to_vec(&payload).context("serializing action fingerprint")?;
-    let digest = Sha256::digest(bytes);
-    Ok(hex::encode(digest))
+    Ok(crate::proto::compute_model_action_id_v2(action)?.to_hex())
+}
+
+fn canonicalize_action_for_execution(action: ActionSpec) -> Result<ActionSpec> {
+    let proto = crate::proto::action_spec_to_proto(&action)
+        .context("canonicalizing action before execution")?;
+    crate::proto::action_spec_from_proto(&proto)
+        .context("round-tripping canonical action before execution")
 }
 
 pub(crate) fn make_staging_dir(store: &ArtifactStore, action_id: &str) -> Result<PathBuf> {
@@ -656,14 +666,15 @@ pub(crate) fn run_download_stdlib_action(
     action_id: &str,
     version: &str,
     discovery_runtime: Option<&DriverRuntimeSpec>,
+    expected_sha256: &str,
     payload_dir: &Path,
 ) -> Result<ActionOutcome> {
     let client = Client::builder()
         .build()
         .context("creating reqwest client")?;
-    let base_url = format!("https://github.com/xlsynth/xlsynth/releases/download/{version}");
+    let release_tag = xlsynth_release_tag(version);
+    let base_url = format!("https://github.com/xlsynth/xlsynth/releases/download/{release_tag}");
     let tarball_url = format!("{base_url}/dslx_stdlib.tar.gz");
-    let sha_url = format!("{tarball_url}.sha256");
 
     let tarball_path = payload_dir
         .parent()
@@ -671,16 +682,7 @@ pub(crate) fn run_download_stdlib_action(
         .join("dslx_stdlib.tar.gz");
 
     download_to_file(&client, &tarball_url, &tarball_path)?;
-    let sha_text = client
-        .get(&sha_url)
-        .send()
-        .with_context(|| format!("downloading sha256 file: {sha_url}"))?
-        .error_for_status()
-        .with_context(|| format!("status check for sha256 URL: {sha_url}"))?
-        .text()
-        .context("reading sha256 response body")?;
-
-    let expected_sha = parse_sha256_text(&sha_text)?;
+    let expected_sha = expected_sha256.to_string();
     let actual_sha = sha256_file(&tarball_path)?;
 
     if expected_sha != actual_sha {
@@ -707,7 +709,6 @@ pub(crate) fn run_download_stdlib_action(
         "download".to_string(),
         json!({
             "tarball_url": tarball_url,
-            "sha256_url": sha_url,
             "expected_sha256": expected_sha,
             "actual_sha256": actual_sha,
         }),
@@ -770,13 +771,14 @@ pub(crate) fn run_download_source_subtree_action(
     version: &str,
     subtree: &str,
     discovery_runtime: Option<&DriverRuntimeSpec>,
+    source_commit: &str,
     payload_dir: &Path,
 ) -> Result<ActionOutcome> {
     let normalized_subtree = normalize_subtree_path(subtree)?;
     let client = Client::builder()
         .build()
         .context("creating reqwest client")?;
-    let tarball_url = format!("{XLSYNTH_SOURCE_ARCHIVE_URL_PREFIX}/{version}.tar.gz");
+    let tarball_url = format!("{XLSYNTH_SOURCE_ARCHIVE_URL_PREFIX}/{source_commit}.tar.gz");
     let tarball_path = payload_dir
         .parent()
         .ok_or_else(|| anyhow!("payload path missing parent"))?
@@ -801,6 +803,7 @@ pub(crate) fn run_download_source_subtree_action(
         json!({
             "source_archive_url": tarball_url,
             "source_archive_sha256": source_tarball_sha256,
+            "source_commit": source_commit,
         }),
     );
     details.insert("subtree".to_string(), json!(normalized_subtree.clone()));
@@ -1053,10 +1056,10 @@ test -f /scratch/dslx_list_fns_errors.jsonl
         let mounts = vec![
             DockerMount::read_only(subtree_root, "/inputs/subtree")?,
             DockerMount::read_write(&scratch_dir, "/scratch")?,
-            driver_cache_mount(store)?,
+            driver_cache_mount(store, &discovery_runtime)?,
         ];
         let run_trace = execute_persistent_runner_script(
-            &discovery_runtime.docker_image,
+            &docker_image_content_ref(&discovery_runtime.docker_image_id)?,
             &mounts,
             &env,
             &script,
@@ -1230,17 +1233,6 @@ pub(crate) fn download_to_file(client: &Client, url: &str, path: &Path) -> Resul
     std::io::copy(&mut response, &mut out)
         .with_context(|| format!("streaming URL response into file: {}", path.display()))?;
     Ok(())
-}
-
-pub(crate) fn parse_sha256_text(text: &str) -> Result<String> {
-    let first = text
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| anyhow!("sha256 file did not contain checksum text"))?;
-    if first.len() != 64 || !first.chars().all(|c| c.is_ascii_hexdigit()) {
-        bail!("invalid sha256 checksum format in sha256 file: {first}");
-    }
-    Ok(first.to_ascii_lowercase())
 }
 
 pub(crate) fn extract_tar_gz_safely(tarball_path: &Path, destination: &Path) -> Result<()> {
@@ -1421,11 +1413,16 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml dslx2ir \
     let mounts = vec![
         DockerMount::read_only(&subtree_root, "/inputs/subtree")?,
         DockerMount::read_write(payload_dir, "/outputs")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
 
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace = execute_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        &script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     let ir_output_path = payload_dir.join("package.ir");
@@ -1715,11 +1712,11 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir2opt /inputs/input.ir -
         let mounts = vec![
             DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
             DockerMount::read_write(payload_dir, "/outputs")?,
-            driver_cache_mount(store)?,
+            driver_cache_mount(store, runtime)?,
         ];
 
         let run_trace = execute_persistent_runner_script(
-            &runtime.docker_image,
+            &docker_image_content_ref(&runtime.docker_image_id)?,
             &mounts,
             &env,
             &script,
@@ -2085,11 +2082,16 @@ test -s /outputs/delay_info.textproto
     let mounts = vec![
         DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
         DockerMount::read_write(payload_dir, "/outputs")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
 
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace = execute_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        &script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     Ok(ActionOutcome {
@@ -2171,10 +2173,10 @@ test -s /outputs/ir_equiv.json
         DockerMount::read_only(&lhs_input_path, "/inputs/lhs.ir")?,
         DockerMount::read_only(&rhs_input_path, "/inputs/rhs.ir")?,
         DockerMount::read_write(payload_dir, "/outputs")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
     let run_trace = execute_persistent_runner_script_with_timeout(
-        &runtime.docker_image,
+        &docker_image_content_ref(&runtime.docker_image_id)?,
         &mounts,
         &env,
         &script,
@@ -2375,10 +2377,10 @@ test -s /outputs/ir_aig_equiv.json
         DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
         DockerMount::read_only(&aig_input_path, "/inputs/input.aig")?,
         DockerMount::read_write(payload_dir, "/outputs")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
     let run_trace = execute_persistent_runner_script_with_timeout(
-        &runtime.docker_image,
+        &docker_image_content_ref(&runtime.docker_image_id)?,
         &mounts,
         &env,
         &script,
@@ -2556,7 +2558,7 @@ fn prepare_driver_ir_to_g8r_batch_action(
             ActionSpec::AigToYosysAbcAig {
                 aig_action_id: action_id.to_string(),
                 yosys_script_ref,
-                runtime: default_yosys_runtime(),
+                runtime: default_yosys_runtime(repo_root)?,
             },
         )
     {
@@ -2875,10 +2877,10 @@ fn run_driver_ir_to_g8r_batch_runnable(
 
         let mounts = vec![
             DockerMount::read_write(&batch_root, "/batch")?,
-            driver_cache_mount(store)?,
+            driver_cache_mount(store, runtime)?,
         ];
         let run_trace = execute_persistent_runner_script(
-            &runtime.docker_image,
+            &docker_image_content_ref(&runtime.docker_image_id)?,
             &mounts,
             &env,
             &driver_script(&script_body),
@@ -2998,7 +3000,7 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
             ActionSpec::AigToYosysAbcAig {
                 aig_action_id: action_id.to_string(),
                 yosys_script_ref,
-                runtime: default_yosys_runtime(),
+                runtime: default_yosys_runtime(repo_root)?,
             },
         )
     {
@@ -3260,11 +3262,16 @@ xlsynth-driver ir2g8r ${G8R_EXTRA_FLAGS} /inputs/input.ir --fraig="${FRAIG}" --a
     let mounts = vec![
         DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
         DockerMount::read_write(payload_dir, "/outputs")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
 
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace = execute_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        &script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     Ok(ActionOutcome {
@@ -3322,7 +3329,7 @@ pub(crate) fn run_ir_fn_to_combinational_verilog_action(
                 verilog_action_id: action_id.to_string(),
                 verilog_top_module_name: ir_top.clone(),
                 yosys_script_ref,
-                runtime: default_yosys_runtime(),
+                runtime: default_yosys_runtime(repo_root)?,
             },
         )
     {
@@ -3475,11 +3482,17 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir2combo /inputs/input.ir
     let mounts = vec![
         DockerMount::read_only(&docker_ir_input_path, "/inputs/input.ir")?,
         DockerMount::read_write(payload_dir, "/outputs")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
 
     let run_trace = (|| {
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)
+        execute_persistent_runner_script(
+            &docker_image_content_ref(&runtime.docker_image_id)?,
+            &mounts,
+            &env,
+            &script,
+            action_id,
+        )
     })();
     if let Some(dir) = rewrite_work_dir {
         fs::remove_dir_all(&dir).ok();
@@ -4463,10 +4476,15 @@ test -f /outputs/raw/manifest.jsonl
     let mounts = vec![
         DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
         DockerMount::read_write(&raw_output_dir, "/outputs/raw")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace = execute_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        &script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     let manifest = build_k_bool_cone_corpus_outputs(
@@ -4716,10 +4734,15 @@ test -f /outputs/raw/manifest.jsonl
     let mounts = vec![
         DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
         DockerMount::read_write(&raw_output_dir, "/outputs/raw")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, &script, action_id)?;
+    let run_trace = execute_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        &script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     let manifest = build_mffc_corpus_outputs(
@@ -4886,8 +4909,13 @@ test -s /outputs/result.aig
         DockerMount::read_write(payload_dir, "/outputs")?,
     ];
 
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, script, action_id)?;
+    let run_trace = execute_yosys_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     let output_artifact = ArtifactRef {
@@ -4974,8 +5002,13 @@ test -s /outputs/result.aig
         DockerMount::read_write(payload_dir, "/outputs")?,
     ];
     let env = BTreeMap::new();
-    let run_trace =
-        execute_persistent_runner_script(&runtime.docker_image, &mounts, &env, script, action_id)?;
+    let run_trace = execute_yosys_persistent_runner_script(
+        &docker_image_content_ref(&runtime.docker_image_id)?,
+        &mounts,
+        &env,
+        script,
+        action_id,
+    )?;
     commands.push(run_trace);
 
     let output_artifact = ArtifactRef {
@@ -5127,10 +5160,10 @@ test -s /outputs/stats.raw.json
             let mounts = vec![
                 DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
                 DockerMount::read_write(payload_dir, "/outputs")?,
-                driver_cache_mount(store)?,
+                driver_cache_mount(store, &legacy_ctx.runtime)?,
             ];
             let run_trace = execute_persistent_runner_script(
-                &legacy_ctx.runtime.docker_image,
+                &docker_image_content_ref(&legacy_ctx.runtime.docker_image_id)?,
                 &mounts,
                 &env,
                 &script,
@@ -5157,6 +5190,7 @@ test -s /outputs/stats.raw.json
             repo_root,
             &runtime_xlsynth_version,
             &runtime.release_platform,
+            &runtime.release_cache_input_sha256,
         )? {
             commands.push(trace);
         }
@@ -5178,10 +5212,10 @@ test -s /outputs/stats.json
         let mounts = vec![
             DockerMount::read_only(&aig_input_path, "/inputs/input.aig")?,
             DockerMount::read_write(payload_dir, "/outputs")?,
-            driver_cache_mount(store)?,
+            driver_cache_mount(store, runtime)?,
         ];
         let run_trace = execute_persistent_runner_script(
-            &runtime.docker_image,
+            &docker_image_content_ref(&runtime.docker_image_id)?,
             &mounts,
             &env,
             &script,
@@ -5341,7 +5375,7 @@ mod tests {
         let action_id = compute_action_id(&action).expect("compute action id");
         assert_eq!(
             action_id,
-            "2541d69cb429497c67d00151da6a85074c72bf702a12e280490e040aff9dd946"
+            "bc2736bf20c8c6968041b7cb602e46c7f5ffe5f02d323b9d0a38db28cc07cb73"
         );
     }
 
@@ -5375,6 +5409,40 @@ mod tests {
     }
 
     #[test]
+    fn execution_canonicalizes_the_same_paths_used_for_action_identity() {
+        let runtime = DriverRuntimeSpec {
+            driver_version: "0.31.0".to_string(),
+            release_platform: "ubuntu2004".to_string(),
+            docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
+            dockerfile: "docker\\xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
+        };
+        let action = ActionSpec::DriverDslxFnToIr {
+            dslx_subtree_action_id: "1".repeat(64),
+            dslx_file: "pkg/a\\b.x".to_string(),
+            dslx_fn_name: "main".to_string(),
+            version: "v0.31.0".to_string(),
+            runtime,
+        };
+        let action_id = compute_action_id(&action).expect("action id");
+        let canonical = canonicalize_action_for_execution(action).expect("canonical action");
+        assert_eq!(
+            compute_action_id(&canonical).expect("canonical id"),
+            action_id
+        );
+        let ActionSpec::DriverDslxFnToIr {
+            dslx_file, runtime, ..
+        } = canonical
+        else {
+            panic!("unexpected canonical action kind");
+        };
+        assert_eq!(dslx_file, "pkg/a/b.x");
+        assert_eq!(runtime.dockerfile, "docker/xlsynth-driver.Dockerfile");
+    }
+
+    #[test]
     fn promote_staging_action_dir_replaces_failed_only_final_dir() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5389,14 +5457,14 @@ mod tests {
         let final_dir = root.join("artifacts").join("aa").join("bb").join("action");
         fs::create_dir_all(&staging_dir).expect("create staging dir");
         fs::create_dir_all(&final_dir).expect("create final dir");
-        fs::write(staging_dir.join("provenance.json"), "{\"ok\":true}")
+        fs::write(staging_dir.join("provenance.pb"), "{\"ok\":true}")
             .expect("write staged provenance");
         fs::write(final_dir.join("failed.json"), "{\"error\":\"boom\"}")
             .expect("write failed marker");
 
         promote_staging_action_dir(&staging_dir, &final_dir).expect("promote staging");
 
-        assert!(final_dir.join("provenance.json").exists());
+        assert!(final_dir.join("provenance.pb").exists());
         assert!(!final_dir.join("failed.json").exists());
         assert!(!staging_dir.exists());
         fs::remove_dir_all(&root).ok();
@@ -5417,15 +5485,15 @@ mod tests {
         let final_dir = root.join("artifacts").join("aa").join("bb").join("action");
         fs::create_dir_all(&staging_dir).expect("create staging dir");
         fs::create_dir_all(&final_dir).expect("create final dir");
-        fs::write(staging_dir.join("provenance.json"), "{\"ok\":\"staged\"}")
+        fs::write(staging_dir.join("provenance.pb"), "{\"ok\":\"staged\"}")
             .expect("write staged provenance");
-        fs::write(final_dir.join("provenance.json"), "{\"ok\":\"final\"}")
+        fs::write(final_dir.join("provenance.pb"), "{\"ok\":\"final\"}")
             .expect("write final provenance");
 
         promote_staging_action_dir(&staging_dir, &final_dir).expect("promote staging");
 
         let final_text =
-            fs::read_to_string(final_dir.join("provenance.json")).expect("read final provenance");
+            fs::read_to_string(final_dir.join("provenance.pb")).expect("read final provenance");
         assert_eq!(final_text, "{\"ok\":\"final\"}");
         assert!(!staging_dir.exists());
         fs::remove_dir_all(&root).ok();
@@ -5773,6 +5841,9 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         };
 
         let suggestions = build_k_bool_cone_corpus_suggested_actions(
@@ -5852,6 +5923,9 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.46.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            docker_image_id: "e".repeat(64),
+            dockerfile_sha256: "d".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         };
 
         let suggestions = build_mffc_corpus_suggested_actions(
@@ -5901,7 +5975,10 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
             driver_version: "0.31.0".to_string(),
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
+            docker_image_id: "e".repeat(64),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         };
         let opt_ir_action_id = "f1a545045a06d81c95bd6d70447918805d408b02d4f262b73cf625a4e5feb4ac";
         let no_fraig_aig_action_id =

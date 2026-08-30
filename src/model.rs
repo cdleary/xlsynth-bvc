@@ -11,12 +11,17 @@ pub(crate) struct DriverRuntimeSpec {
     pub(crate) release_platform: String,
     pub(crate) docker_image: String,
     pub(crate) dockerfile: String,
+    pub(crate) docker_image_id: String,
+    pub(crate) dockerfile_sha256: String,
+    pub(crate) release_cache_input_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) struct YosysRuntimeSpec {
     pub(crate) docker_image: String,
     pub(crate) dockerfile: String,
+    pub(crate) dockerfile_sha256: String,
+    pub(crate) docker_image_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) upstream_commit: Option<String>,
 }
@@ -70,11 +75,13 @@ pub(crate) enum ActionSpec {
     DownloadAndExtractXlsynthReleaseStdlibTarball {
         version: String,
         discovery_runtime: Option<DriverRuntimeSpec>,
+        stdlib_tarball_sha256: String,
     },
     DownloadAndExtractXlsynthSourceSubtree {
         version: String,
         subtree: String,
         discovery_runtime: Option<DriverRuntimeSpec>,
+        source_commit: String,
     },
     DriverDslxFnToIr {
         dslx_subtree_action_id: String,
@@ -278,6 +285,13 @@ pub(crate) struct QueueFailed {
     pub(crate) error: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QueueCancellationKind {
+    Dependency,
+    WorkPolicyExcluded,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct QueueCanceled {
     pub(crate) schema_version: u32,
@@ -289,6 +303,9 @@ pub(crate) struct QueueCanceled {
     pub(crate) root_failed_action_id: String,
     pub(crate) action: ActionSpec,
     pub(crate) reason: String,
+    pub(crate) cancellation_kind: QueueCancellationKind,
+    pub(crate) work_policy_rule_id: Option<String>,
+    pub(crate) work_policy_rule_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +317,7 @@ pub(crate) struct QueueRunning {
     pub(crate) priority: i32,
     pub(crate) action: ActionSpec,
     pub(crate) lease_owner: String,
+    pub(crate) lease_token: String,
     pub(crate) lease_acquired_utc: DateTime<Utc>,
     pub(crate) lease_expires_utc: DateTime<Utc>,
 }
@@ -390,6 +408,7 @@ pub(crate) struct EnqueueSuggestedSummary {
     pub(crate) already_canceled_count: usize,
     pub(crate) skipped_blocked_count: usize,
     pub(crate) skipped_not_previously_lossy_k_bool_count: usize,
+    pub(crate) skipped_work_policy_count: usize,
     pub(crate) unknown_queue_state_count: usize,
 }
 
@@ -562,8 +581,6 @@ pub(crate) struct StructuralHashCoverageRecord {
 pub(crate) struct IrFnCorpusStructuralManifest {
     pub(crate) schema_version: u32,
     pub(crate) generated_utc: DateTime<Utc>,
-    pub(crate) store_root: String,
-    pub(crate) output_dir: String,
     pub(crate) recompute_missing_hashes: bool,
     pub(crate) total_actions_scanned: usize,
     pub(crate) total_driver_ir_to_opt_actions: usize,
@@ -594,6 +611,7 @@ pub(crate) struct IrFnCorpusStructuralManifestGroup {
     pub(crate) structural_hash: String,
     pub(crate) member_count: usize,
     pub(crate) relpath: String,
+    pub(crate) content_sha256: String,
     #[serde(default)]
     pub(crate) ir_node_count: Option<u64>,
 }
@@ -671,14 +689,6 @@ pub(crate) struct DiscoveredRelease {
     pub(crate) version: String,
     pub(crate) action_id: String,
     pub(crate) enqueued: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct RefreshVersionCompatSummary {
-    pub(crate) output_path: String,
-    pub(crate) source_url: String,
-    pub(crate) bytes: usize,
-    pub(crate) sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -857,6 +867,9 @@ mod tests {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
     }
 

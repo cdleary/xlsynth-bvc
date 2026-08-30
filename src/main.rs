@@ -10,19 +10,26 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 
+mod analysis;
 mod app;
+mod campaign;
 mod cli;
+mod coordinator;
 mod corpus;
 mod executor;
 mod model;
 mod ops;
+mod proto;
+mod publish;
 mod query;
 mod queue;
 mod runtime;
 mod service;
+mod site;
 mod sled_space;
 mod snapshot;
 mod store;
+mod store_validation;
 mod versioning;
 mod view;
 mod web;
@@ -38,6 +45,7 @@ use crate::model::*;
 use crate::model::{DriverRuntimeSpec, YosysRuntimeSpec};
 use crate::runtime::{
     default_driver_image, ensure_driver_runtime_compatibility, resolve_driver_version,
+    runtime_dockerfile_sha256,
 };
 #[cfg(test)]
 use crate::store::ArtifactStore;
@@ -61,17 +69,17 @@ const DEFAULT_STRUCTURAL_INDEX_MAX_THREADS: usize = 16;
 const DEFAULT_SUGGESTED_ENQUEUE_MAX_DEPTH: u32 = 32;
 const DEFAULT_STDLIB_FN_TIMELINE_ROUTE: &str = "/dslx-fns/float32.x:add";
 const DSLX_PATH_LIST_SEPARATOR: &str = ":";
-const IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION: u32 = 1;
-const WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE: &str = "ir-fn-corpus-structural.v1";
+const IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION: u32 = 2;
+const WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE: &str = "ir-fn-corpus-structural.v2";
 const WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY: &str =
-    "ir-fn-corpus-structural.v1/manifest.json";
+    "ir-fn-corpus-structural.v2/manifest.json";
 const WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME: &str = "ir-fn-corpus-g8r-vs-yosys-abc.v3.json";
 const WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION: u32 = 3;
 const WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME: &str =
     "ir-fn-corpus-g8r-abc-vs-codegen-yosys-abc.v1.json";
 const WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION: u32 = 1;
-const WEB_VERSIONS_SUMMARY_INDEX_FILENAME: &str = "versions-summary.v1.json";
-const WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION: u32 = 1;
+const WEB_VERSIONS_SUMMARY_INDEX_FILENAME: &str = "versions-summary.v4.json";
+const WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION: u32 = 4;
 const WEB_STDLIB_FNS_TREND_G8R_FRAIG_FALSE_INDEX_FILENAME: &str =
     "stdlib-fns-trend-g8r-fraig-false.v1.json";
 const WEB_STDLIB_FNS_TREND_G8R_FRAIG_TRUE_INDEX_FILENAME: &str =
@@ -94,8 +102,8 @@ const VERSION_COMPAT_PATH: &str = "third_party/xlsynth-crate/generated_version_c
 const VENDORED_DOWNLOAD_RELEASE_SCRIPT: &str =
     "third_party/xlsynth-crate/v0.29.0/scripts/download_release.py";
 const DRIVER_RELEASE_CACHE_DIR: &str = "driver-release-cache";
-const DRIVER_RELEASE_CACHE_READY_FILE: &str = ".ready.json";
-const DRIVER_RELEASE_CACHE_LOCK_FILE: &str = ".setup.lock";
+const DRIVER_RELEASE_CACHE_READY_FILE: &str = ".ready.pb";
+const DRIVER_RELEASE_CACHE_LOCK_FILE: &str = ".driver-release-cache.setup.lock";
 const DRIVER_RELEASE_CACHE_SETUP_TIMEOUT_SECS: u64 = 300;
 const DRIVER_RELEASE_CACHE_SETUP_POLL_MILLIS: u64 = 250;
 const DRIVER_RELEASE_CACHE_BINARIES: &str =
@@ -108,7 +116,7 @@ const BVC_QUEUE_ONLY_PREVIOUS_LOSS_K_CONES_ENV: &str = "BVC_QUEUE_ONLY_PREVIOUS_
 const BVC_DISABLE_AUTO_SUGGESTED_ENQUEUE_ENV: &str = "BVC_DISABLE_AUTO_SUGGESTED_ENQUEUE";
 const DASHBOARD_FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="10" fill="#070b12"/><rect x="12" y="14" width="40" height="30" rx="4" fill="#0f1f35" stroke="#35f2b3" stroke-width="2"/><path d="M22 22l8 7-8 7" fill="none" stroke="#35f2b3" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><rect x="34" y="34" width="10" height="3" rx="1.5" fill="#5ec9ff"/><circle cx="18" cy="50" r="2" fill="#35f2b3"/><circle cx="25" cy="50" r="2" fill="#5ec9ff"/><circle cx="32" cy="50" r="2" fill="#35f2b3"/></svg>"##;
 const DRIVER_TOOLS_SETUP_FROM_CACHE_SNIPPET: &str = r#"
-cache_dir="/cache/${XLSYNTH_VERSION}/${XLSYNTH_PLATFORM}"
+cache_dir="/cache-input"
 if [ ! -d "${cache_dir}" ]; then
   echo "missing cached xlsynth release at ${cache_dir}" >&2
   exit 1
@@ -130,11 +138,8 @@ const DEFAULT_K_BOOL_CONE_MAX_IR_OPS: u64 = 16;
 const DEFAULT_MFFC_MIN_INTERNAL_NON_LITERAL: u64 = 4;
 const DELAY_INFO_OUTPUT_FORMAT_TEXTPROTO_V1: &str = "textproto_v1";
 const DSLX_LIST_FNS_LEGACY_SOURCE_DRIVER_MAX: &str = "0.29.0";
-const XLSYNTH_SOURCE_ARCHIVE_URL_PREFIX: &str =
-    "https://github.com/xlsynth/xlsynth/archive/refs/tags";
+const XLSYNTH_SOURCE_ARCHIVE_URL_PREFIX: &str = "https://github.com/xlsynth/xlsynth/archive";
 const MODULE_SUBTREE_ROOT_PATHS: &[&str] = &["xls/modules/add_dual_path"];
-const VERSION_COMPAT_MAIN_URL: &str =
-    "https://raw.githubusercontent.com/xlsynth/xlsynth-crate/main/generated_version_compat.json";
 static DOCKER_RUN_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn driver_ir_aig_equiv_enabled() -> bool {
@@ -204,24 +209,41 @@ impl DriverCli {
         let docker_image = self
             .docker_image
             .unwrap_or_else(|| default_driver_image(&resolved_driver_version));
-        let runtime = DriverRuntimeSpec {
-            driver_version: resolved_driver_version,
-            release_platform: self.release_platform,
-            docker_image,
-            dockerfile: self.dockerfile.to_string_lossy().to_string(),
-        };
+        let dockerfile = self.dockerfile.to_string_lossy().to_string();
+        let runtime = crate::service::bind_driver_runtime_image(
+            repo_root,
+            DriverRuntimeSpec {
+                driver_version: resolved_driver_version,
+                release_platform: self.release_platform.clone(),
+                docker_image,
+                dockerfile_sha256: runtime_dockerfile_sha256(repo_root, &dockerfile)?,
+                docker_image_id: String::new(),
+                release_cache_input_sha256: crate::service::driver_release_cache_input_sha256(
+                    repo_root,
+                    xlsynth_version,
+                    &self.release_platform,
+                )?,
+                dockerfile,
+            },
+        )?;
         ensure_driver_runtime_compatibility(repo_root, &runtime, xlsynth_version)?;
         Ok(runtime)
     }
 }
 
 impl YosysCli {
-    pub(crate) fn into_runtime(self) -> YosysRuntimeSpec {
-        YosysRuntimeSpec {
-            docker_image: self.yosys_docker_image,
-            dockerfile: self.yosys_dockerfile.to_string_lossy().to_string(),
-            upstream_commit: self.yosys_upstream_commit,
-        }
+    pub(crate) fn into_runtime(self, repo_root: &Path) -> Result<YosysRuntimeSpec> {
+        let dockerfile = self.yosys_dockerfile.to_string_lossy().to_string();
+        crate::service::bind_yosys_runtime_image(
+            repo_root,
+            YosysRuntimeSpec {
+                docker_image: self.yosys_docker_image,
+                dockerfile_sha256: runtime_dockerfile_sha256(repo_root, &dockerfile)?,
+                docker_image_id: String::new(),
+                dockerfile,
+                upstream_commit: self.yosys_upstream_commit,
+            },
+        )
     }
 }
 
@@ -288,6 +310,22 @@ mod tests {
             serde_json::to_string_pretty(compat_json).expect("serialize compat"),
         )
         .expect("write compat json");
+        let dockerfile = root.join(DEFAULT_DOCKERFILE);
+        fs::create_dir_all(dockerfile.parent().expect("Dockerfile parent"))
+            .expect("create Dockerfile parent");
+        fs::write(
+            &dockerfile,
+            include_bytes!("../docker/xlsynth-driver.Dockerfile"),
+        )
+        .expect("write test runtime Dockerfile");
+        let cache_script = root.join(VENDORED_DOWNLOAD_RELEASE_SCRIPT);
+        fs::create_dir_all(cache_script.parent().expect("cache script parent"))
+            .expect("create cache script parent");
+        fs::write(
+            &cache_script,
+            include_bytes!("../third_party/xlsynth-crate/v0.29.0/scripts/download_release.py"),
+        )
+        .expect("write test cache setup script");
         root
     }
 
@@ -309,8 +347,8 @@ mod tests {
         builder.finish().expect("finish tarball");
     }
 
-    fn sample_running(action_id: &str) -> QueueRunningWithPath {
-        QueueRunningWithPath {
+    fn sample_running(store: &ArtifactStore, action_id: &str) -> QueueRunningWithPath {
+        let running = QueueRunningWithPath {
             running: QueueRunning {
                 schema_version: ACTION_SCHEMA_VERSION,
                 action_id: action_id.to_string(),
@@ -319,13 +357,24 @@ mod tests {
                 action: ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                     version: "v0.37.0".to_string(),
                     discovery_runtime: None,
+                    stdlib_tarball_sha256: "11".repeat(32),
                 },
                 lease_owner: "worker-test".to_string(),
+                lease_token: "dd".repeat(32),
                 lease_acquired_utc: Utc::now(),
                 lease_expires_utc: Utc::now(),
             },
-            path: PathBuf::from("/tmp/running.json"),
+            path: store.running_queue_path(action_id),
+        };
+        if let Some(parent) = running.path.parent() {
+            fs::create_dir_all(parent).expect("create running queue parent");
         }
+        fs::write(
+            &running.path,
+            crate::proto::encode_queue_running(&running.running).expect("encode running record"),
+        )
+        .expect("write running record");
+        running
     }
 
     #[test]
@@ -557,6 +606,9 @@ mod tests {
             release_platform: DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: default_driver_image("0.31.0"),
             dockerfile: DEFAULT_DOCKERFILE.to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         };
         let action = ActionSpec::DriverIrToG8rAig {
             ir_action_id: "opt-ir-action".to_string(),
@@ -629,8 +681,8 @@ mod tests {
     #[test]
     fn write_failed_record_persists_failed_action_record_without_queue_failed_copy() {
         let (store, root) = make_test_store();
-        let action_id = "abcd1234";
-        let running = sample_running(action_id);
+        let action_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let running = sample_running(&store, action_id);
         write_failed_record(&store, &running, "worker-a", "boom").expect("writing failed record");
 
         assert!(store.failed_action_record_exists(action_id));
@@ -646,10 +698,11 @@ mod tests {
     #[test]
     fn load_failed_queue_records_reads_persisted_records_only() {
         let (store, root) = make_test_store();
-        let action_id = "persisted-1";
+        let action_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version: "v0.37.0".to_string(),
             discovery_runtime: None,
+            stdlib_tarball_sha256: "11".repeat(32),
         };
         let persisted = QueueFailed {
             schema_version: ACTION_SCHEMA_VERSION,
@@ -662,7 +715,7 @@ mod tests {
         };
         write_failed_action_record(&store, &persisted).expect("writing persisted failed record");
 
-        let persisted_only_id = "persisted-only-2";
+        let persisted_only_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let persisted_only = QueueFailed {
             schema_version: ACTION_SCHEMA_VERSION,
             action_id: persisted_only_id.to_string(),

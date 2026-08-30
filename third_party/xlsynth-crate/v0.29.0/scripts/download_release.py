@@ -98,15 +98,20 @@ def parse_xlsynth_release_tag(tag: str) -> Tuple[int, int, int, int]:
     return (int(major), int(minor), int(patch), patch2)
 
 
-def check_sha256sum(artifact_path: str, sha256_path: str) -> bool:
+def check_sha256sum(
+    artifact_path: str, sha256_path: str = None, expected_checksum: str = None
+) -> bool:
     """
     Checks if the artifact at `artifact_path` has the same sha256sum as the file at `sha256_path`.
     """
-    if not os.path.exists(sha256_path) or not os.path.exists(artifact_path):
+    if not os.path.exists(artifact_path):
         return False
 
-    with open(sha256_path, "r") as f:
-        expected_checksum = f.read().strip().split()[0]
+    if expected_checksum is None:
+        if sha256_path is None or not os.path.exists(sha256_path):
+            return False
+        with open(sha256_path, "r") as f:
+            expected_checksum = f.read().strip().split()[0]
 
     hasher = hashlib.sha256()
     with open(artifact_path, "rb") as f:
@@ -118,7 +123,13 @@ def check_sha256sum(artifact_path: str, sha256_path: str) -> bool:
 
 
 def high_integrity_download(
-    base_url, filename, target_dir, max_attempts, is_binary=False, platform=None
+    base_url,
+    filename,
+    target_dir,
+    max_attempts,
+    is_binary=False,
+    platform=None,
+    expected_checksum=None,
 ):
     print(f"Starting download of {filename}...")
     start_time = time.time()
@@ -148,12 +159,14 @@ def high_integrity_download(
 
         headers = get_headers()
 
-        # Download SHA256 file with retry support
-        with request_with_retry(
-            sha256_url, stream=True, headers=headers, max_attempts=max_attempts
-        ) as r:
-            with open(sha256_path, "wb") as f:
-                shutil.copyfileobj(r.raw, f)
+        if expected_checksum is None:
+            # Legacy standalone use resolves the published sidecar. Callers
+            # that plan content-addressed work pass a pinned checksum instead.
+            with request_with_retry(
+                sha256_url, stream=True, headers=headers, max_attempts=max_attempts
+            ) as r:
+                with open(sha256_path, "wb") as f:
+                    shutil.copyfileobj(r.raw, f)
 
         # Skip policy:
         # - For gzipped DSOs: skip if decompressed artifact already exists.
@@ -164,7 +177,7 @@ def high_integrity_download(
                     f"Skipping download of {filename} because decompressed artifact already exists at {target_path}"
                 )
                 return
-            if check_sha256sum(target_path, sha256_path):
+            if check_sha256sum(target_path, sha256_path, expected_checksum):
                 print(
                     f"Skipping download of {filename} because it already exists and has the correct sha256sum"
                 )
@@ -178,7 +191,7 @@ def high_integrity_download(
                 shutil.copyfileobj(r.raw, f)
 
         # Verify checksum
-        if not check_sha256sum(artifact_path, sha256_path):
+        if not check_sha256sum(artifact_path, sha256_path, expected_checksum):
             raise ValueError(f"Checksum mismatch for {filename}")
 
         if is_gz_dso:
@@ -241,6 +254,13 @@ def main():
         type="int",
         default=10,
     )
+    parser.add_option(
+        "--expected_sha256",
+        dest="expected_sha256",
+        action="append",
+        default=[],
+        help="Pin one artifact checksum as FILENAME=SHA256 (repeatable)",
+    )
 
     (options, args) = parser.parse_args()
 
@@ -274,6 +294,21 @@ def main():
     # Tuples of `(artifact_to_download, is_binary)` -- if it's noted to be a binary it is marked
     # as executable.
     artifacts = [(f"{binary}-{options.platform}", True) for binary in binary_names]
+    expected_checksums = {}
+    for item in options.expected_sha256:
+        if "=" not in item:
+            parser.error("--expected_sha256 must be FILENAME=SHA256")
+        filename, checksum = item.split("=", 1)
+        checksum = checksum.lower()
+        if (
+            not filename
+            or len(checksum) != 64
+            or any(c not in "0123456789abcdef" for c in checksum)
+        ):
+            parser.error("--expected_sha256 must contain a valid SHA-256 digest")
+        if filename in expected_checksums:
+            parser.error(f"duplicate expected checksum for {filename}")
+        expected_checksums[filename] = checksum
 
     if options.dso:
         # lib suffix (.so, .dylib, etc.) depends on the platform
@@ -283,6 +318,16 @@ def main():
         if ver_tuple >= (0, 0, 219):
             dso_name += ".gz"
         artifacts.append((dso_name, False))
+    artifacts.append(("dslx_stdlib.tar.gz", False))
+
+    if expected_checksums:
+        expected_filenames = {filename for filename, _ in artifacts}
+        if set(expected_checksums) != expected_filenames:
+            missing = sorted(expected_filenames - set(expected_checksums))
+            extra = sorted(set(expected_checksums) - expected_filenames)
+            parser.error(
+                f"expected checksums must exactly cover downloads; missing={missing}, extra={extra}"
+            )
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -294,17 +339,11 @@ def main():
             options.max_attempts,
             is_binary,
             options.platform,
+            expected_checksums.get(filename),
         )
 
     # Download and extract dslx_stdlib.tar.gz
     stdlib_filename = "dslx_stdlib.tar.gz"
-    high_integrity_download(
-        base_url,
-        stdlib_filename,
-        output_dir,
-        options.max_attempts,
-        is_binary=False,
-    )
     shutil.unpack_archive(os.path.join(output_dir, stdlib_filename), output_dir)
 
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use clap::Parser;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -12,7 +13,14 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::analysis::analyze_campaign_run;
+use crate::campaign::{
+    finalize_campaign_run, load_default_campaign, matching_work_policy_exclusion,
+    pending_campaign_versions, plan_campaign_run, reconcile_campaign_run,
+    work_policy_rule_fingerprint,
+};
 use crate::cli::{Cli, RunAction, TopCommand};
+use crate::coordinator::{CoordinateReleaseOptions, coordinate_release};
 use crate::corpus::{refresh_ir_dir_corpus_status, run_ir_dir_corpus, show_ir_dir_corpus_progress};
 use crate::driver_ir_aig_equiv_enabled;
 use crate::executor::{
@@ -21,6 +29,8 @@ use crate::executor::{
 };
 use crate::model::*;
 use crate::ops::run_workers;
+use crate::proto::v1 as pb;
+use crate::publish::{publish_static_site_with_protected_roots, verify_published_site};
 use crate::query::{
     action_kind_label, build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed,
     enqueue_processing_for_crate_version,
@@ -30,12 +40,17 @@ use crate::queue::*;
 use crate::queue_only_previous_loss_k_cones_enabled;
 use crate::runtime::*;
 use crate::service::*;
+use crate::site::{
+    BuildStaticSiteOptions, build_static_site_with_protected_roots, smoke_static_site,
+    verify_static_site,
+};
 use crate::sled_space::analyze_sled_space;
 use crate::snapshot::{BuildStaticSnapshotOptions, build_static_snapshot, verify_static_snapshot};
 use crate::store::{
     ArtifactStore, backfill_sled_action_file_compression, compact_sled_db,
-    ingest_legacy_failed_records, prune_sled_actions_by_ids, prune_sled_actions_by_relpath_size,
+    prune_sled_actions_by_ids, prune_sled_actions_by_relpath_size,
 };
+use crate::store_validation::{show_queue_record, validate_store};
 use crate::versioning::*;
 use crate::web::{self, types::WebRunnerConfig};
 use crate::{
@@ -49,16 +64,19 @@ static QUEUE_RUNTIME_PREPARE_AT: OnceLock<Mutex<Option<Instant>>> = OnceLock::ne
 static K3_CONE_CANONICAL_CACHE: OnceLock<Mutex<K3ConeCanonicalCache>> = OnceLock::new();
 static K_BOOL_PREVIOUS_LOSS_CACHE: OnceLock<Mutex<KBoolPreviousLossCache>> = OnceLock::new();
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct SuggestedEnqueuePolicy {
     only_previous_loss_k_cones: bool,
+    work_policy: pb::CampaignWorkPolicy,
 }
 
 impl SuggestedEnqueuePolicy {
-    fn from_env() -> Self {
-        Self {
+    fn from_env() -> Result<Self> {
+        let campaign = load_default_campaign()?;
+        Ok(Self {
             only_previous_loss_k_cones: queue_only_previous_loss_k_cones_enabled(),
-        }
+            work_policy: campaign.work_policy.unwrap_or_default(),
+        })
     }
 }
 
@@ -203,11 +221,22 @@ pub(crate) fn run() -> Result<()> {
         );
         return Ok(());
     }
-    let artifacts_via_sled = artifacts_via_sled.ok_or_else(|| {
-        anyhow::anyhow!(
-            "--artifacts-via-sled is required for all commands except `run-ir-dir-corpus`, `show-corpus-progress`, and `refresh-corpus-status`"
-        )
-    })?;
+    let database_free_command = matches!(
+        &command,
+        TopCommand::VerifyStaticSnapshot { .. }
+            | TopCommand::BuildStaticSite { .. }
+            | TopCommand::VerifyStaticSite { .. }
+            | TopCommand::SmokeStaticSite { .. }
+            | TopCommand::PublishStaticSite { .. }
+            | TopCommand::VerifyPublishedSite { .. }
+    );
+    let artifacts_via_sled = match artifacts_via_sled {
+        Some(path) => path,
+        None if database_free_command => store_dir.join(".unused-static-command.sled"),
+        None => {
+            bail!("--artifacts-via-sled is required for commands that access the build store")
+        }
+    };
     if let TopCommand::AnalyzeSledSpace { top, sample } = &command {
         let summary = analyze_sled_space(&artifacts_via_sled, *top, *sample)?;
         println!(
@@ -300,6 +329,84 @@ pub(crate) fn run() -> Result<()> {
         );
         return Ok(());
     }
+    if let TopCommand::BuildStaticSite {
+        snapshot_dir,
+        out_dir,
+        base_url,
+        overwrite,
+    } = &command
+    {
+        let summary = build_static_site_with_protected_roots(
+            &BuildStaticSiteOptions {
+                snapshot_dir: snapshot_dir.clone(),
+                out_dir: out_dir.clone(),
+                base_url: base_url.clone(),
+                overwrite: *overwrite,
+            },
+            &[
+                ("resource checkout", repo_root.as_path()),
+                ("private store", store_dir.as_path()),
+                ("artifact database", artifacts_via_sled.as_path()),
+            ],
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary).expect("serializing build static site summary")
+        );
+        return Ok(());
+    }
+    if let TopCommand::VerifyStaticSite { site_dir } = &command {
+        let summary = verify_static_site(site_dir)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary).expect("serializing verify static site summary")
+        );
+        return Ok(());
+    }
+    if let TopCommand::SmokeStaticSite {
+        site_dir,
+        browser,
+        timeout_seconds,
+    } = &command
+    {
+        let summary = smoke_static_site(site_dir, browser.as_deref(), *timeout_seconds)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .expect("serializing static site browser smoke summary")
+        );
+        return Ok(());
+    }
+    if let TopCommand::PublishStaticSite {
+        site_dir,
+        publish_root,
+    } = &command
+    {
+        let summary = publish_static_site_with_protected_roots(
+            site_dir,
+            publish_root,
+            &[
+                ("resource checkout", repo_root.as_path()),
+                ("private store", store_dir.as_path()),
+                ("artifact database", artifacts_via_sled.as_path()),
+            ],
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .expect("serializing static publication CLI projection")
+        );
+        return Ok(());
+    }
+    if let TopCommand::VerifyPublishedSite { publish_root } = &command {
+        let summary = verify_published_site(publish_root)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .expect("serializing publication verification CLI projection")
+        );
+        return Ok(());
+    }
     if let TopCommand::ServeWeb {
         bind,
         no_runner,
@@ -356,13 +463,113 @@ pub(crate) fn run() -> Result<()> {
             enqueue_processing_for_crate_version(&store, &repo_root, &crate_version, priority)?;
             println!("{}", version_label("crate", &crate_version));
         }
+        TopCommand::PlanCampaignRun { crate_version } => {
+            let summary = plan_campaign_run(&store, &repo_root, &crate_version)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing campaign plan CLI projection")
+            );
+        }
+        TopCommand::ReconcileCampaignRun {
+            crate_version,
+            priority,
+        } => {
+            let summary = reconcile_campaign_run(&store, &repo_root, &crate_version, priority)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing campaign reconcile CLI projection")
+            );
+        }
+        TopCommand::FinalizeCampaignRun { crate_version } => {
+            let summary = finalize_campaign_run(&store, &repo_root, &crate_version)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing campaign finalize CLI projection")
+            );
+        }
+        TopCommand::AnalyzeCampaignRun {
+            crate_version,
+            run_id,
+            baseline_run_id,
+            baseline_crate_version,
+        } => {
+            let summary = analyze_campaign_run(
+                &store,
+                &repo_root,
+                &crate_version,
+                run_id.as_deref(),
+                baseline_run_id.as_deref(),
+                baseline_crate_version.as_deref(),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing campaign analysis CLI projection")
+            );
+        }
+        TopCommand::CoordinateRelease {
+            crate_version,
+            run_id,
+            baseline_run_id,
+            baseline_crate_version,
+            work_dir,
+            base_url,
+            publish_root,
+            workers,
+            priority,
+        } => {
+            let summary = coordinate_release(
+                store,
+                &repo_root,
+                &CoordinateReleaseOptions {
+                    crate_version,
+                    run_id,
+                    baseline_run_id,
+                    baseline_crate_version,
+                    work_dir,
+                    base_url,
+                    publish_root,
+                    workers,
+                    priority,
+                },
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing coordinator CLI projection")
+            );
+        }
+        TopCommand::ListPendingCampaignVersions => {
+            for version in pending_campaign_versions(&store, &repo_root)? {
+                println!("{version}");
+            }
+        }
+        TopCommand::ValidateStore { verify_payloads } => {
+            let summary = validate_store(&store, verify_payloads)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .expect("serializing store validation CLI projection")
+            );
+        }
+        TopCommand::ShowQueueRecord { action_id } => {
+            let record = show_queue_record(&store, &action_id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&record)
+                    .expect("serializing queue record CLI projection")
+            );
+        }
         TopCommand::DrainQueue {
             limit,
             worker_id,
             lease_seconds,
             no_reclaim_expired,
         } => {
-            let worker_id = worker_id.unwrap_or_else(default_worker_id);
+            let worker_id = qualified_worker_id(worker_id.as_deref())?;
             let drained = drain_queue(
                 &store,
                 &repo_root,
@@ -383,7 +590,7 @@ pub(crate) fn run() -> Result<()> {
             exit_when_idle,
             no_reclaim_expired,
         } => {
-            let worker_id = worker_id.unwrap_or_else(default_worker_id);
+            let worker_id = qualified_worker_id(worker_id.as_deref())?;
             let summary = run_workers(
                 Arc::new(store),
                 repo_root.clone(),
@@ -558,6 +765,21 @@ pub(crate) fn run() -> Result<()> {
         TopCommand::VerifyStaticSnapshot { .. } => {
             unreachable!("verify-static-snapshot handled before store initialization")
         }
+        TopCommand::BuildStaticSite { .. } => {
+            unreachable!("build-static-site handled before store initialization")
+        }
+        TopCommand::VerifyStaticSite { .. } => {
+            unreachable!("verify-static-site handled before store initialization")
+        }
+        TopCommand::SmokeStaticSite { .. } => {
+            unreachable!("smoke-static-site handled before store initialization")
+        }
+        TopCommand::PublishStaticSite { .. } => {
+            unreachable!("publish-static-site handled before store initialization")
+        }
+        TopCommand::VerifyPublishedSite { .. } => {
+            unreachable!("verify-published-site handled before store initialization")
+        }
         TopCommand::AnalyzeSledSpace { .. } => {
             unreachable!("analyze-sled-space handled before store initialization")
         }
@@ -721,25 +943,7 @@ pub(crate) fn run() -> Result<()> {
                 serde_json::to_string_pretty(&summary).expect("serializing repair-queue summary")
             );
         }
-        TopCommand::IngestLegacyFailedRecords {
-            dry_run,
-            keep_legacy_files,
-        } => {
-            let summary = ingest_legacy_failed_records(&store, dry_run, keep_legacy_files)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&summary)
-                    .expect("serializing legacy failed-record ingest summary")
-            );
-        }
-        TopCommand::RefreshVersionCompat => {
-            let summary = refresh_version_compat_json()?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&summary)
-                    .expect("serializing version compat refresh summary")
-            );
-        }
+
         TopCommand::DslxToMangledIrFnName {
             dslx_module_name,
             dslx_fn_name,
@@ -795,18 +999,22 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
     match action {
         RunAction::DownloadStdlib { version } => {
             let runtime = canonical_stdlib_discovery_runtime_for_version(repo_root, &version)?;
+            let release_input = crate::proto::release_input_for_dso_version(&version)?;
             Ok(ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
                 version,
                 discovery_runtime: Some(runtime),
+                stdlib_tarball_sha256: release_input.stdlib_tarball_sha256,
             })
         }
         RunAction::DownloadSourceSubtree { version, subtree } => {
             validate_relative_subpath(&subtree)?;
             let runtime = canonical_stdlib_discovery_runtime_for_version(repo_root, &version)?;
+            let release_input = crate::proto::release_input_for_dso_version(&version)?;
             Ok(ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
                 version,
                 subtree,
                 discovery_runtime: Some(runtime),
+                source_commit: release_input.source_commit,
             })
         }
         RunAction::DslxFnToIr {
@@ -941,7 +1149,7 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
             verilog_action_id,
             verilog_top_module_name,
             yosys_script_ref: make_script_ref(repo_root, &yosys_script)?,
-            runtime: yosys.into_runtime(),
+            runtime: yosys.into_runtime(repo_root)?,
         }),
         RunAction::AigToYosysAbcAig {
             aig_action_id,
@@ -950,7 +1158,7 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
         } => Ok(ActionSpec::AigToYosysAbcAig {
             aig_action_id,
             yosys_script_ref: make_script_ref(repo_root, &yosys_script)?,
-            runtime: yosys.into_runtime(),
+            runtime: yosys.into_runtime(repo_root)?,
         }),
         RunAction::AigToStats {
             aig_action_id,
@@ -975,6 +1183,33 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
             g8r_aig_stats_action_id,
             yosys_abc_aig_stats_action_id,
         }),
+    }
+}
+
+fn record_queue_failure_and_cancel(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+    worker_id: &str,
+    error_text: &str,
+) -> Result<Option<usize>> {
+    fail_running_and_cancel_descendants(store, running, worker_id, error_text)
+}
+
+struct RunningBatchRollback<'a> {
+    store: &'a ArtifactStore,
+    running: &'a [QueueRunningWithPath],
+}
+
+impl Drop for RunningBatchRollback<'_> {
+    fn drop(&mut self) {
+        for running in self.running {
+            if let Err(error) = requeue_running_lease_if_current(self.store, running) {
+                eprintln!(
+                    "failed to roll back unfinalized queue lease for {}: {error:#}",
+                    running.action_id()
+                );
+            }
+        }
     }
 }
 
@@ -1022,36 +1257,107 @@ pub(crate) fn drain_queue(
                 .unwrap_or(0);
             let compatible_limit = compatible_batch_claim_limit(max_extra);
             if compatible_limit > 0 {
-                running_batch.extend(claim_compatible_pending_items(
+                let compatible = match claim_compatible_pending_items(
                     store,
                     worker_id,
                     lease_seconds,
                     &batch_key,
                     running_batch[0].priority(),
                     compatible_limit,
-                )?);
+                ) {
+                    Ok(compatible) => compatible,
+                    Err(error) => {
+                        requeue_running_lease_if_current(store, &running_batch[0]).with_context(
+                            || {
+                                format!(
+                                    "rolling back initial claim after compatible-batch scan failed: {error:#}"
+                                )
+                            },
+                        )?;
+                        return Err(error);
+                    }
+                };
+                running_batch.extend(compatible);
             }
         }
+        let _rollback = RunningBatchRollback {
+            store,
+            running: &running_batch,
+        };
 
         if running_batch.len() > 1 {
             let batch_actions = running_batch
                 .iter()
                 .map(|running| running.action().clone())
                 .collect();
-            let batch_results = match execute_action_batch(store, batch_actions) {
+            let fenced_batch_results = with_current_running_leases(store, &running_batch, || {
+                let execution_result = execute_action_batch(store, batch_actions);
+                if let Ok(batch_results) = &execution_result {
+                    let result_by_action_id = batch_results
+                        .iter()
+                        .map(|result| (result.action_id.as_str(), result))
+                        .collect::<HashMap<_, _>>();
+                    for running in &running_batch {
+                        let Some(result) = result_by_action_id.get(running.action_id()) else {
+                            continue;
+                        };
+                        let Some(output_artifact) = result.output_artifact.clone() else {
+                            continue;
+                        };
+                        finalize_successful_queue_action_locked(
+                            store,
+                            running,
+                            output_artifact,
+                            worker_id,
+                            || {
+                                if let Err(err) =
+                                    note_completed_action_for_previous_loss_k_cone_policy(
+                                        store,
+                                        running.action_id(),
+                                    )
+                                {
+                                    eprintln!(
+                                        "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
+                                        running.action_id(),
+                                        err
+                                    );
+                                }
+                                if crate::auto_suggested_enqueue_enabled()
+                                    && let Err(err) = enqueue_suggested_actions(
+                                        store,
+                                        repo_root,
+                                        running.action_id(),
+                                        false,
+                                        1,
+                                        running.priority(),
+                                    )
+                                {
+                                    eprintln!(
+                                        "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
+                                        running.action_id(),
+                                        err
+                                    );
+                                }
+                            },
+                        )?;
+                    }
+                }
+                Ok(execution_result)
+            })?;
+            let Some(batch_results) = fenced_batch_results else {
+                continue;
+            };
+            let batch_results = match batch_results {
                 Ok(results) => results,
                 Err(err) => {
                     let error_text = format!("{:#}", err);
                     for running in &running_batch {
-                        write_failed_record(store, running, worker_id, &error_text)?;
-                        remove_file_if_exists(&running.path)?;
-                        let canceled_now = cancel_downstream_pending_actions(
-                            store,
-                            running.action_id(),
-                            worker_id,
-                        )?;
-                        failed += 1;
-                        canceled += canceled_now;
+                        if let Some(canceled_now) =
+                            record_queue_failure_and_cancel(store, running, worker_id, &error_text)?
+                        {
+                            failed += 1;
+                            canceled += canceled_now;
+                        }
                     }
                     continue;
                 }
@@ -1060,55 +1366,21 @@ pub(crate) fn drain_queue(
                 .into_iter()
                 .map(|result| (result.action_id.clone(), result))
                 .collect();
-            for running in running_batch {
+            for running in &running_batch {
                 let Some(result) = result_by_action_id.get(running.action_id()) else {
                     let error_text = format!(
                         "batch execution omitted result for action {}",
                         running.action_id()
                     );
-                    write_failed_record(store, &running, worker_id, &error_text)?;
-                    remove_file_if_exists(&running.path)?;
-                    let canceled_now =
-                        cancel_downstream_pending_actions(store, running.action_id(), worker_id)?;
-                    failed += 1;
-                    canceled += canceled_now;
+                    if let Some(canceled_now) =
+                        record_queue_failure_and_cancel(store, running, worker_id, &error_text)?
+                    {
+                        failed += 1;
+                        canceled += canceled_now;
+                    }
                     continue;
                 };
-                if let Some(output_artifact) = result.output_artifact.clone() {
-                    finalize_successful_queue_action(
-                        store,
-                        &running,
-                        output_artifact,
-                        worker_id,
-                        || {
-                            if let Err(err) = note_completed_action_for_previous_loss_k_cone_policy(
-                                store,
-                                running.action_id(),
-                            ) {
-                                eprintln!(
-                                    "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
-                                    running.action_id(),
-                                    err
-                                );
-                            }
-                            if crate::auto_suggested_enqueue_enabled()
-                                && let Err(err) = enqueue_suggested_actions(
-                                    store,
-                                    repo_root,
-                                    running.action_id(),
-                                    false,
-                                    1,
-                                    running.priority(),
-                                )
-                            {
-                                eprintln!(
-                                    "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
-                                    running.action_id(),
-                                    err
-                                );
-                            }
-                        },
-                    )?;
+                if result.output_artifact.is_some() {
                     drained += 1;
                 } else {
                     let error_text = result
@@ -1116,72 +1388,80 @@ pub(crate) fn drain_queue(
                         .as_deref()
                         .unwrap_or("batched execution failed without an error payload")
                         .to_string();
-                    write_failed_record(store, &running, worker_id, &error_text)?;
-                    remove_file_if_exists(&running.path)?;
-                    let canceled_now =
-                        cancel_downstream_pending_actions(store, running.action_id(), worker_id)?;
-                    failed += 1;
-                    canceled += canceled_now;
+                    if let Some(canceled_now) =
+                        record_queue_failure_and_cancel(store, running, worker_id, &error_text)?
+                    {
+                        failed += 1;
+                        canceled += canceled_now;
+                    }
                 }
             }
             continue;
         }
 
-        let action_result = execute_action(store, running_batch[0].action().clone());
-        match action_result {
-            Ok((_action_id, output_artifact)) => {
-                finalize_successful_queue_action(
-                    store,
-                    &running_batch[0],
-                    output_artifact,
-                    worker_id,
-                    || {
-                        if let Err(err) = note_completed_action_for_previous_loss_k_cone_policy(
-                            store,
-                            running_batch[0].action_id(),
-                        ) {
-                            eprintln!(
-                                "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
-                                running_batch[0].action_id(),
-                                err
-                            );
-                        }
-                        if crate::auto_suggested_enqueue_enabled()
-                            && let Err(err) = enqueue_suggested_actions(
+        let fenced_action_result = with_current_running_lease(store, &running_batch[0], || {
+            match execute_action(store, running_batch[0].action().clone()) {
+                Ok((_action_id, output_artifact)) => {
+                    finalize_successful_queue_action_locked(
+                        store,
+                        &running_batch[0],
+                        output_artifact,
+                        worker_id,
+                        || {
+                            if let Err(err) = note_completed_action_for_previous_loss_k_cone_policy(
                                 store,
-                                repo_root,
                                 running_batch[0].action_id(),
-                                false,
-                                1,
-                                running_batch[0].priority(),
-                            )
-                        {
-                            eprintln!(
-                                "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
-                                running_batch[0].action_id(),
-                                err
-                            );
-                        }
-                    },
-                )?;
-                drained += 1;
+                            ) {
+                                eprintln!(
+                                    "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
+                                    running_batch[0].action_id(),
+                                    err
+                                );
+                            }
+                            if crate::auto_suggested_enqueue_enabled()
+                                && let Err(err) = enqueue_suggested_actions(
+                                    store,
+                                    repo_root,
+                                    running_batch[0].action_id(),
+                                    false,
+                                    1,
+                                    running_batch[0].priority(),
+                                )
+                            {
+                                eprintln!(
+                                    "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
+                                    running_batch[0].action_id(),
+                                    err
+                                );
+                            }
+                        },
+                    )?;
+                    Ok(Ok(()))
+                }
+                Err(error) => Ok(Err(error)),
             }
+        })?;
+        let Some(action_result) = fenced_action_result else {
+            continue;
+        };
+        match action_result {
+            Ok(()) => drained += 1,
             Err(err) => {
                 let error_text = format!("{:#}", err);
-                write_failed_record(store, &running_batch[0], worker_id, &error_text)?;
-                remove_file_if_exists(&running_batch[0].path)?;
-                let canceled_now = cancel_downstream_pending_actions(
+                if let Some(canceled_now) = record_queue_failure_and_cancel(
                     store,
-                    running_batch[0].action_id(),
+                    &running_batch[0],
                     worker_id,
-                )?;
-                failed += 1;
-                canceled += canceled_now;
-                eprintln!(
-                    "queue action {} failed; marked failed and canceled {} downstream action(s)",
-                    running_batch[0].action_id(),
-                    canceled_now
-                );
+                    &error_text,
+                )? {
+                    failed += 1;
+                    canceled += canceled_now;
+                    eprintln!(
+                        "queue action {} failed; marked failed and canceled {} downstream action(s)",
+                        running_batch[0].action_id(),
+                        canceled_now
+                    );
+                }
             }
         }
     }
@@ -1195,7 +1475,30 @@ pub(crate) fn drain_queue(
     Ok(drained)
 }
 
+#[cfg(test)]
 fn finalize_successful_queue_action<F>(
+    store: &ArtifactStore,
+    running: &QueueRunningWithPath,
+    output_artifact: ArtifactRef,
+    worker_id: &str,
+    before_mark_done: F,
+) -> Result<()>
+where
+    F: FnOnce(),
+{
+    with_current_running_lease(store, running, || {
+        finalize_successful_queue_action_locked(
+            store,
+            running,
+            output_artifact,
+            worker_id,
+            before_mark_done,
+        )
+    })?;
+    Ok(())
+}
+
+fn finalize_successful_queue_action_locked<F>(
     store: &ArtifactStore,
     running: &QueueRunningWithPath,
     output_artifact: ArtifactRef,
@@ -1209,7 +1512,10 @@ where
     // queue status does not briefly report the worker as idle while it is still
     // expanding follow-up work.
     before_mark_done();
+    store.delete_failed_action_record(running.action_id())?;
+    remove_file_if_exists(&store.canceled_queue_path(running.action_id()))?;
     write_done_record(store, running, output_artifact, worker_id)?;
+    remove_file_if_exists(&store.pending_queue_path(running.action_id()))?;
     remove_file_if_exists(&running.path)?;
     Ok(())
 }
@@ -1327,7 +1633,7 @@ pub(crate) fn enqueue_suggested_actions(
         recursive,
         max_depth,
         priority,
-        SuggestedEnqueuePolicy::from_env(),
+        SuggestedEnqueuePolicy::from_env()?,
     )
 }
 
@@ -1360,6 +1666,7 @@ fn enqueue_suggested_actions_with_policy(
     let mut already_canceled_count = 0_usize;
     let mut skipped_blocked_count = 0_usize;
     let mut skipped_not_previously_lossy_k_bool_count = 0_usize;
+    let mut skipped_work_policy_count = 0_usize;
     let unknown_queue_state_count = 0_usize;
 
     while let Some((source_action_id, depth)) = queue.pop_front() {
@@ -1371,7 +1678,7 @@ fn enqueue_suggested_actions_with_policy(
             total_suggestions += 1;
             let action = canonicalize_suggested_action(store, repo_root, &suggested.action);
             let suggested_priority = suggested_action_queue_priority(priority, &action);
-            match classify_suggested_action_skip_reason(store, &action, policy)? {
+            match classify_suggested_action_skip_reason(store, &action, &policy)? {
                 Some(SuggestedActionSkipReason::DisabledDriverIrAigEquiv) => {
                     skipped_blocked_count += 1;
                     continue;
@@ -1385,7 +1692,20 @@ fn enqueue_suggested_actions_with_policy(
             let action_id = compute_action_id(&action)?;
             if store.action_exists(&action_id) {
                 already_done_count += 1;
+            } else if let Some(rule) = matching_work_policy_exclusion(&action, &policy.work_policy)?
+                && write_work_policy_excluded_record(
+                    store,
+                    &action_id,
+                    &source_action_id,
+                    action.clone(),
+                    &rule.rule_id,
+                    &rule.reason,
+                    &work_policy_rule_fingerprint(rule)?,
+                )?
+            {
+                skipped_work_policy_count += 1;
             } else {
+                remove_work_policy_excluded_record(store, &action_id)?;
                 match queue_state_for_action(store, &action_id) {
                     QueueState::Pending => {
                         enqueue_action_with_priority(store, action.clone(), suggested_priority)?;
@@ -1395,7 +1715,33 @@ fn enqueue_suggested_actions_with_policy(
                     QueueState::Failed => already_failed_count += 1,
                     QueueState::Canceled => already_canceled_count += 1,
                     QueueState::None => match classify_action_readiness(store, &action)? {
-                        ActionReadiness::Blocked { .. } => skipped_blocked_count += 1,
+                        ActionReadiness::Blocked { .. } => {
+                            if try_write_dependency_canceled_record(
+                                store,
+                                &action_id,
+                                Utc::now(),
+                                action.clone(),
+                                "suggestion-reconcile",
+                            )? {
+                                skipped_blocked_count += 1;
+                            } else {
+                                match queue_state_for_action(store, &action_id) {
+                                    QueueState::Pending => already_pending_count += 1,
+                                    QueueState::Running { .. } => already_running_count += 1,
+                                    QueueState::Done => already_done_count += 1,
+                                    QueueState::Failed => already_failed_count += 1,
+                                    QueueState::Canceled => already_canceled_count += 1,
+                                    QueueState::None => {
+                                        enqueue_action_with_priority(
+                                            store,
+                                            action.clone(),
+                                            suggested_priority,
+                                        )?;
+                                        enqueued_count += 1;
+                                    }
+                                }
+                            }
+                        }
                         ActionReadiness::Ready | ActionReadiness::NotReady => {
                             enqueue_action_with_priority(store, action, suggested_priority)?;
                             enqueued_count += 1;
@@ -1432,6 +1778,7 @@ fn enqueue_suggested_actions_with_policy(
         already_canceled_count,
         skipped_blocked_count,
         skipped_not_previously_lossy_k_bool_count,
+        skipped_work_policy_count,
         unknown_queue_state_count,
     })
 }
@@ -1445,7 +1792,7 @@ pub(crate) fn enqueue_missing_suggested_actions(
         store,
         repo_root,
         dry_run,
-        SuggestedEnqueuePolicy::from_env(),
+        SuggestedEnqueuePolicy::from_env()?,
     )
 }
 
@@ -1468,6 +1815,7 @@ fn enqueue_missing_suggested_actions_with_policy(
     let mut already_canceled_count = 0_usize;
     let mut skipped_blocked_count = 0_usize;
     let mut skipped_not_previously_lossy_k_bool_count = 0_usize;
+    let mut skipped_work_policy_count = 0_usize;
 
     for entry in audit.entries {
         if entry.completed {
@@ -1475,7 +1823,7 @@ fn enqueue_missing_suggested_actions_with_policy(
         }
         total_missing_entries += 1;
         let action = canonicalize_suggested_action(store, repo_root, &entry.action);
-        match classify_suggested_action_skip_reason(store, &action, policy)? {
+        match classify_suggested_action_skip_reason(store, &action, &policy)? {
             Some(SuggestedActionSkipReason::DisabledDriverIrAigEquiv) => {
                 skipped_blocked_count += 1;
                 continue;
@@ -1496,7 +1844,35 @@ fn enqueue_missing_suggested_actions_with_policy(
             already_done_count += 1;
             continue;
         }
-        match queue_state_for_action(store, &action_id) {
+        if let Some(rule) = matching_work_policy_exclusion(&action, &policy.work_policy)? {
+            let excluded = dry_run
+                || write_work_policy_excluded_record(
+                    store,
+                    &action_id,
+                    &entry.source_action_id,
+                    action.clone(),
+                    &rule.rule_id,
+                    &rule.reason,
+                    &work_policy_rule_fingerprint(rule)?,
+                )?;
+            if excluded {
+                skipped_work_policy_count += 1;
+                continue;
+            }
+        }
+        let stale_work_policy_exclusion = if dry_run {
+            load_queue_canceled_record(store, &action_id)?.is_some_and(|record| {
+                record.cancellation_kind == QueueCancellationKind::WorkPolicyExcluded
+            })
+        } else {
+            remove_work_policy_excluded_record(store, &action_id)?
+        };
+        let queue_state = if stale_work_policy_exclusion {
+            QueueState::None
+        } else {
+            queue_state_for_action(store, &action_id)
+        };
+        match queue_state {
             QueueState::Pending => {
                 already_pending_count += 1;
             }
@@ -1514,7 +1890,29 @@ fn enqueue_missing_suggested_actions_with_policy(
             }
             QueueState::None => match classify_action_readiness(store, &action)? {
                 ActionReadiness::Blocked { .. } => {
-                    skipped_blocked_count += 1;
+                    if dry_run
+                        || try_write_dependency_canceled_record(
+                            store,
+                            &action_id,
+                            Utc::now(),
+                            action.clone(),
+                            "suggestion-reconcile",
+                        )?
+                    {
+                        skipped_blocked_count += 1;
+                    } else {
+                        match queue_state_for_action(store, &action_id) {
+                            QueueState::Pending => already_pending_count += 1,
+                            QueueState::Running { .. } => already_running_count += 1,
+                            QueueState::Done => already_done_count += 1,
+                            QueueState::Failed => already_failed_count += 1,
+                            QueueState::Canceled => already_canceled_count += 1,
+                            QueueState::None => {
+                                enqueue_action(store, action.clone())?;
+                                enqueued_count += 1;
+                            }
+                        }
+                    }
                 }
                 ActionReadiness::Ready | ActionReadiness::NotReady => {
                     if !dry_run {
@@ -1538,7 +1936,8 @@ fn enqueue_missing_suggested_actions_with_policy(
         "already_failed_count": already_failed_count,
         "already_canceled_count": already_canceled_count,
         "skipped_blocked_count": skipped_blocked_count,
-        "skipped_not_previously_lossy_k_bool_count": skipped_not_previously_lossy_k_bool_count
+        "skipped_not_previously_lossy_k_bool_count": skipped_not_previously_lossy_k_bool_count,
+        "skipped_work_policy_count": skipped_work_policy_count
     }))
 }
 
@@ -1557,6 +1956,7 @@ pub(crate) fn recursive_source_action_id_for_suggestion(
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+
 enum SuggestedActionSkipReason {
     DisabledDriverIrAigEquiv,
     NotPreviouslyLossyKBool,
@@ -1565,7 +1965,7 @@ enum SuggestedActionSkipReason {
 fn classify_suggested_action_skip_reason(
     store: &ArtifactStore,
     action: &ActionSpec,
-    policy: SuggestedEnqueuePolicy,
+    policy: &SuggestedEnqueuePolicy,
 ) -> Result<Option<SuggestedActionSkipReason>> {
     if should_skip_suggested_action(action) {
         return Ok(Some(SuggestedActionSkipReason::DisabledDriverIrAigEquiv));
@@ -1583,7 +1983,7 @@ fn should_skip_suggested_action(action: &ActionSpec) -> bool {
 fn should_skip_not_previously_lossy_k_bool_suggested_action(
     store: &ArtifactStore,
     action: &ActionSpec,
-    policy: SuggestedEnqueuePolicy,
+    policy: &SuggestedEnqueuePolicy,
 ) -> Result<bool> {
     if !policy.only_previous_loss_k_cones {
         return Ok(false);
@@ -2480,12 +2880,11 @@ pub(crate) fn enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
             }
             (Some(point), None) => {
                 missing_yosys += 1;
-                let runtime = DriverRuntimeSpec {
-                    driver_version: point.crate_version.clone(),
-                    release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
-                    docker_image: default_driver_image(&point.crate_version),
-                    dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
-                };
+                let runtime = explicit_driver_runtime_for_crate_version(
+                    repo_root,
+                    &point.crate_version,
+                    &point.dso_version,
+                )?;
                 ActionSpec::IrFnToCombinationalVerilog {
                     ir_action_id: point.ir_action_id.clone(),
                     top_fn_name: point.ir_top.clone(),
@@ -2496,12 +2895,11 @@ pub(crate) fn enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
             }
             (None, Some(point)) => {
                 missing_g8r += 1;
-                let runtime = DriverRuntimeSpec {
-                    driver_version: point.crate_version.clone(),
-                    release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
-                    docker_image: default_driver_image(&point.crate_version),
-                    dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
-                };
+                let runtime = explicit_driver_runtime_for_crate_version(
+                    repo_root,
+                    &point.crate_version,
+                    &point.dso_version,
+                )?;
                 ActionSpec::DriverIrToG8rAig {
                     ir_action_id: point.ir_action_id.clone(),
                     top_fn_name: point.ir_top.clone(),
@@ -2861,8 +3259,8 @@ fn promote_mffc_derived_pending_actions(
     let mut pending_paths = list_queue_files(&store.queue_pending_dir())?;
     pending_paths.sort();
     for pending_path in pending_paths {
-        let text = match fs::read_to_string(&pending_path) {
-            Ok(text) => text,
+        let bytes = match fs::read(&pending_path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -2871,7 +3269,7 @@ fn promote_mffc_derived_pending_actions(
             }
         };
         let (action_id, _enqueued_utc, priority, action) =
-            parse_queue_work_item(&text, &pending_path)?;
+            parse_queue_work_item(&bytes, &pending_path)?;
         scanned_pending += 1;
         if !is_mffc_named_action(&action) {
             continue;
@@ -3111,7 +3509,14 @@ mod tests {
             release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: default_driver_image("0.34.0"),
             dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
+    }
+
+    fn test_action_id(seed: &str) -> String {
+        format!("{:x}", Sha256::digest(seed.as_bytes()))
     }
 
     fn make_artifact(action_id: &str, artifact_type: ArtifactType, relpath: &str) -> ArtifactRef {
@@ -3162,8 +3567,8 @@ mod tests {
             fs::write(path, bytes).expect("write staged file");
         }
         fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(&provenance).expect("serialize provenance"),
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
         )
         .expect("write staged provenance");
         store
@@ -3214,10 +3619,13 @@ mod tests {
     ) -> Provenance {
         let source_opt = write_provenance_record(
             store,
-            make_opt_action(&format!("src-ir-{seed}"), runtime),
+            make_opt_action(&test_action_id(&format!("src-ir-{seed}")), runtime),
             make_artifact(
-                &compute_action_id(&make_opt_action(&format!("src-ir-{seed}"), runtime))
-                    .expect("compute source opt action id"),
+                &compute_action_id(&make_opt_action(
+                    &test_action_id(&format!("src-ir-{seed}")),
+                    runtime,
+                ))
+                .expect("compute source opt action id"),
                 ArtifactType::IrPackageFile,
                 "payload/opt.ir",
             ),
@@ -3244,7 +3652,7 @@ mod tests {
         );
 
         let g8r_stats_action = ActionSpec::DriverAigToStats {
-            aig_action_id: format!("g8r-aig-{seed}"),
+            aig_action_id: test_action_id(&format!("g8r-aig-{seed}")),
             version: "v0.39.0".to_string(),
             runtime: runtime.clone(),
         };
@@ -3269,7 +3677,7 @@ mod tests {
         );
 
         let yosys_stats_action = ActionSpec::DriverAigToStats {
-            aig_action_id: format!("yosys-aig-{seed}"),
+            aig_action_id: test_action_id(&format!("yosys-aig-{seed}")),
             version: "v0.39.0".to_string(),
             runtime: runtime.clone(),
         };
@@ -3319,7 +3727,8 @@ mod tests {
         structural_hash: &str,
         seed: &str,
     ) -> (Provenance, SuggestedAction) {
-        let current_opt_action = make_opt_action(&format!("current-ir-{seed}"), runtime);
+        let current_opt_action =
+            make_opt_action(&test_action_id(&format!("current-ir-{seed}")), runtime);
         let current_opt_action_id =
             compute_action_id(&current_opt_action).expect("compute current opt action id");
         let suggestion = make_k_bool_suggestion(&current_opt_action_id, runtime);
@@ -3345,9 +3754,10 @@ mod tests {
     fn finalize_successful_queue_action_keeps_running_visible_until_done_write() {
         let (store, root) = make_test_store("finalize-success-order");
         let runtime = test_runtime();
-        let action = make_opt_action("finalize-success-order-ir", &runtime);
+        let action = make_opt_action(&test_action_id("finalize-success-order-ir"), &runtime);
         let action_id = compute_action_id(&action).expect("compute queue action id");
         let now = Utc::now();
+        let stale_terminal_action = action.clone();
         let running = QueueRunningWithPath {
             running: QueueRunning {
                 schema_version: crate::ACTION_SCHEMA_VERSION,
@@ -3356,6 +3766,7 @@ mod tests {
                 priority: crate::DEFAULT_QUEUE_PRIORITY,
                 action,
                 lease_owner: "worker-1".to_string(),
+                lease_token: "dd".repeat(32),
                 lease_acquired_utc: now,
                 lease_expires_utc: now,
             },
@@ -3366,9 +3777,32 @@ mod tests {
         }
         fs::write(
             &running.path,
-            serde_json::to_string_pretty(&running.running).expect("serialize running queue record"),
+            crate::proto::encode_queue_running(&running.running)
+                .expect("encode running queue record"),
         )
         .expect("write running queue record");
+        store
+            .write_failed_action_record(&QueueFailed {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: action_id.clone(),
+                enqueued_utc: now,
+                failed_utc: now,
+                failed_by: "stale-worker".to_string(),
+                action: stale_terminal_action.clone(),
+                error: "stale failure".to_string(),
+            })
+            .expect("write stale failure");
+        write_canceled_record(
+            &store,
+            &action_id,
+            now,
+            stale_terminal_action,
+            "stale-worker",
+            &action_id,
+            &action_id,
+            "stale cancellation",
+        )
+        .expect("write stale cancellation");
 
         let mut before_mark_done_called = false;
         finalize_successful_queue_action(
@@ -3390,11 +3824,193 @@ mod tests {
 
         assert!(before_mark_done_called);
         assert!(!running.path.exists());
+        assert!(!store.failed_action_record_exists(&action_id));
+        assert!(!store.canceled_queue_path(&action_id).exists());
         let done = load_queue_done_record(&store, &action_id)
             .expect("load done queue record")
             .expect("done queue record exists");
         assert_eq!(done.completed_by, "worker-1");
         assert_eq!(done.output_artifact.relpath, "payload/finalized.ir");
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn enqueue_suggested_actions_records_work_policy_exclusion() {
+        let (store, root) = make_test_store("work-policy-exclusion");
+        let verilog_action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "f".repeat(64),
+            top_fn_name: Some("fma-verilog".to_string()),
+        };
+        let verilog_action_id = compute_action_id(&verilog_action).expect("verilog action id");
+        write_provenance_record(
+            &store,
+            verilog_action,
+            make_artifact(
+                &verilog_action_id,
+                ArtifactType::VerilogFile,
+                "payload/fma.v",
+            ),
+            json!({}),
+            Vec::new(),
+            vec![(
+                "payload/fma.v".to_string(),
+                b"module fma; endmodule".to_vec(),
+            )],
+        );
+        let excluded_action = ActionSpec::ComboVerilogToYosysAbcAig {
+            verilog_action_id,
+            verilog_top_module_name: Some("__float64__fma".to_string()),
+            yosys_script_ref: ScriptRef {
+                path: "flows/yosys_to_aig.ys".to_string(),
+                sha256: "a".repeat(64),
+            },
+            runtime: crate::runtime::test_yosys_runtime(),
+        };
+        let excluded_action_id =
+            compute_action_id(&excluded_action).expect("compute excluded action id");
+        let root_action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "b".repeat(64),
+            top_fn_name: Some("root".to_string()),
+        };
+        let root_action_id = compute_action_id(&root_action).expect("compute root action id");
+        let root_provenance = write_provenance_record(
+            &store,
+            root_action,
+            make_artifact(
+                &root_action_id,
+                ArtifactType::IrPackageFile,
+                "payload/root.ir",
+            ),
+            json!({}),
+            vec![SuggestedAction {
+                reason: "compare Yosys/ABC".to_string(),
+                action_id: excluded_action_id.clone(),
+                action: excluded_action.clone(),
+            }],
+            vec![("payload/root.ir".to_string(), b"package root".to_vec())],
+        );
+        let now = Utc::now();
+        store
+            .write_failed_action_record(&QueueFailed {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: excluded_action_id.clone(),
+                enqueued_utc: now,
+                failed_utc: now,
+                failed_by: "test-worker".to_string(),
+                action: excluded_action,
+                error: "TIMEOUT(900)".to_string(),
+            })
+            .expect("write prior timeout failure");
+
+        let work_policy = load_default_campaign()
+            .expect("load default campaign")
+            .work_policy
+            .expect("campaign work policy");
+        let policy = SuggestedEnqueuePolicy {
+            only_previous_loss_k_cones: false,
+            work_policy,
+        };
+        let summary = enqueue_suggested_actions_with_policy(
+            &store,
+            &root,
+            &root_provenance.action_id,
+            false,
+            1,
+            crate::DEFAULT_QUEUE_PRIORITY,
+            policy.clone(),
+        )
+        .expect("apply campaign work policy");
+
+        assert_eq!(summary.enqueued_count, 0);
+        assert_eq!(summary.skipped_work_policy_count, 1);
+        assert!(!store.failed_action_record_exists(&excluded_action_id));
+        assert_eq!(
+            queue_state_for_action(&store, &excluded_action_id),
+            QueueState::Canceled
+        );
+        let canceled = load_queue_canceled_record(&store, &excluded_action_id)
+            .expect("load canceled record")
+            .expect("canceled record exists");
+        assert_eq!(
+            canceled.cancellation_kind,
+            QueueCancellationKind::WorkPolicyExcluded
+        );
+        assert_eq!(
+            canceled.work_policy_rule_id.as_deref(),
+            Some("exclude-float64-fma-yosys")
+        );
+        let initial_rule_fingerprint = canceled
+            .work_policy_rule_fingerprint
+            .clone()
+            .expect("rule fingerprint");
+        let before = fs::read(store.canceled_queue_path(&excluded_action_id))
+            .expect("read canceled protobuf");
+
+        let second = enqueue_suggested_actions_with_policy(
+            &store,
+            &root,
+            &root_provenance.action_id,
+            false,
+            1,
+            crate::DEFAULT_QUEUE_PRIORITY,
+            policy.clone(),
+        )
+        .expect("reapply campaign work policy");
+        assert_eq!(second.skipped_work_policy_count, 1);
+        assert_eq!(
+            fs::read(store.canceled_queue_path(&excluded_action_id))
+                .expect("reread canceled protobuf"),
+            before
+        );
+
+        let mut changed_policy = policy;
+        changed_policy.work_policy.rules[0].reason =
+            "updated reviewed exclusion reason".to_string();
+        let refreshed = enqueue_suggested_actions_with_policy(
+            &store,
+            &root,
+            &root_provenance.action_id,
+            false,
+            1,
+            crate::DEFAULT_QUEUE_PRIORITY,
+            changed_policy,
+        )
+        .expect("refresh changed campaign work policy");
+        assert_eq!(refreshed.skipped_work_policy_count, 1);
+        let refreshed_canceled = load_queue_canceled_record(&store, &excluded_action_id)
+            .expect("load refreshed canceled record")
+            .expect("refreshed canceled record exists");
+        assert_eq!(
+            refreshed_canceled.reason,
+            "updated reviewed exclusion reason"
+        );
+        assert_ne!(
+            refreshed_canceled.work_policy_rule_fingerprint.as_deref(),
+            Some(initial_rule_fingerprint.as_str())
+        );
+        assert_ne!(
+            fs::read(store.canceled_queue_path(&excluded_action_id))
+                .expect("read refreshed canceled protobuf"),
+            before
+        );
+
+        let readmitted = enqueue_suggested_actions_with_policy(
+            &store,
+            &root,
+            &root_provenance.action_id,
+            false,
+            1,
+            crate::DEFAULT_QUEUE_PRIORITY,
+            SuggestedEnqueuePolicy {
+                only_previous_loss_k_cones: false,
+                work_policy: pb::CampaignWorkPolicy::default(),
+            },
+        )
+        .expect("reconcile after removing campaign exclusion");
+        assert_eq!(readmitted.enqueued_count, 1);
+        assert!(!store.canceled_queue_path(&excluded_action_id).exists());
+        assert!(store.pending_queue_path(&excluded_action_id).exists());
 
         fs::remove_dir_all(root).expect("cleanup temp store");
     }
@@ -3415,6 +4031,7 @@ mod tests {
             crate::DEFAULT_QUEUE_PRIORITY,
             SuggestedEnqueuePolicy {
                 only_previous_loss_k_cones: true,
+                ..Default::default()
             },
         )
         .expect("enqueue suggested actions");
@@ -3488,6 +4105,7 @@ mod tests {
             crate::DEFAULT_QUEUE_PRIORITY,
             SuggestedEnqueuePolicy {
                 only_previous_loss_k_cones: true,
+                ..Default::default()
             },
         )
         .expect("enqueue suggested actions first pass");
@@ -3560,6 +4178,7 @@ mod tests {
             crate::DEFAULT_QUEUE_PRIORITY,
             SuggestedEnqueuePolicy {
                 only_previous_loss_k_cones: true,
+                ..Default::default()
             },
         )
         .expect("enqueue suggested actions second pass");

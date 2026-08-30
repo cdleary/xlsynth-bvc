@@ -108,6 +108,12 @@ pub(crate) fn check_ir_fn_corpus_structural_freshness(
             manifest_location
         ));
     }
+    let structural_entries = store
+        .list_web_index_entries_with_prefix(&ir_fn_corpus_structural_index_prefix())
+        .context("listing structural index entries during freshness check")?;
+    if let Err(error) = validate_ir_fn_corpus_structural_index_closure(&structural_entries) {
+        stale_reasons.push(format!("structural index closure invalid: {error:#}"));
+    }
 
     Ok(CheckIrFnCorpusStructuralFreshnessSummary {
         up_to_date: manifest.is_some() && stale_reasons.is_empty(),
@@ -183,6 +189,156 @@ pub(crate) fn ir_fn_corpus_structural_index_prefix() -> String {
 
 pub(crate) fn ir_fn_corpus_structural_index_location(index_key: &str) -> String {
     format!("sled://web_index_bytes/{}", index_key)
+}
+
+pub(crate) fn validate_ir_fn_corpus_structural_index_closure(
+    entries: &[(String, Vec<u8>)],
+) -> Result<()> {
+    let prefix = ir_fn_corpus_structural_index_prefix();
+    let mut structural_entries: BTreeMap<&str, &[u8]> = BTreeMap::new();
+    for (key, bytes) in entries.iter().filter(|(key, _)| key.starts_with(&prefix)) {
+        if structural_entries.insert(key.as_str(), bytes).is_some() {
+            bail!("duplicate structural index key: {key}");
+        }
+    }
+    if structural_entries.is_empty() {
+        return Ok(());
+    }
+
+    let manifest_key = ir_fn_corpus_structural_manifest_index_key();
+    let manifest_bytes = structural_entries
+        .get(manifest_key)
+        .copied()
+        .ok_or_else(|| anyhow!("structural index has group rows but no manifest"))?;
+    let manifest: IrFnCorpusStructuralManifest = serde_json::from_slice(manifest_bytes)
+        .context("parsing structural index manifest during closure validation")?;
+    if manifest.schema_version != IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION {
+        bail!(
+            "structural manifest schema version mismatch: expected {} got {}",
+            IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
+            manifest.schema_version
+        );
+    }
+    if manifest.distinct_structural_hashes != manifest.groups.len() {
+        bail!(
+            "structural manifest distinct hash count mismatch: declared={} groups={}",
+            manifest.distinct_structural_hashes,
+            manifest.groups.len()
+        );
+    }
+
+    let mut expected_keys = BTreeSet::from([manifest_key.to_string()]);
+    let mut indexed_member_count = 0_usize;
+    let mut previous_hash: Option<&str> = None;
+    for group_meta in &manifest.groups {
+        let structural_hash = normalized_structural_hash(&group_meta.structural_hash)
+            .filter(|hash| hash == &group_meta.structural_hash)
+            .ok_or_else(|| {
+                anyhow!(
+                    "structural manifest group has non-canonical hash: {}",
+                    group_meta.structural_hash
+                )
+            })?;
+        if previous_hash.is_some_and(|previous| previous >= structural_hash.as_str()) {
+            bail!("structural manifest groups must have strictly sorted unique hashes");
+        }
+        previous_hash = Some(&group_meta.structural_hash);
+        if group_meta.member_count == 0 {
+            bail!("structural manifest group {structural_hash} is empty");
+        }
+
+        let expected_relpath = hash_group_relpath(&structural_hash);
+        if group_meta.relpath != expected_relpath {
+            bail!(
+                "structural manifest group relpath mismatch for {}: declared={} expected={}",
+                structural_hash,
+                group_meta.relpath,
+                expected_relpath
+            );
+        }
+        let group_key = ir_fn_corpus_structural_group_index_key(&structural_hash);
+        if !expected_keys.insert(group_key.clone()) {
+            bail!("duplicate structural manifest group key: {group_key}");
+        }
+        let group_bytes = structural_entries
+            .get(group_key.as_str())
+            .copied()
+            .ok_or_else(|| anyhow!("structural manifest group is missing: {group_key}"))?;
+        let actual_sha256 = format!("{:x}", Sha256::digest(group_bytes));
+        if group_meta.content_sha256 != actual_sha256 {
+            bail!(
+                "structural group digest mismatch for {}: declared={} actual={}",
+                structural_hash,
+                group_meta.content_sha256,
+                actual_sha256
+            );
+        }
+
+        let group: IrFnCorpusStructuralGroupFile = serde_json::from_slice(group_bytes)
+            .with_context(|| format!("parsing structural group {group_key}"))?;
+        if group.schema_version != IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION {
+            bail!(
+                "structural group schema version mismatch for {}: expected={} actual={}",
+                structural_hash,
+                IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
+                group.schema_version
+            );
+        }
+        if group.structural_hash != structural_hash {
+            bail!(
+                "structural group hash mismatch for {}: encoded={}",
+                group_key,
+                group.structural_hash
+            );
+        }
+        if group.members.len() != group_meta.member_count {
+            bail!(
+                "structural group member count mismatch for {}: declared={} actual={}",
+                structural_hash,
+                group_meta.member_count,
+                group.members.len()
+            );
+        }
+        let ir_op_counts = group
+            .members
+            .iter()
+            .filter_map(|member| member.ir_op_count)
+            .collect::<BTreeSet<_>>();
+        let actual_ir_node_count = if ir_op_counts.len() == 1 {
+            ir_op_counts.iter().next().copied()
+        } else {
+            None
+        };
+        if group_meta.ir_node_count != actual_ir_node_count {
+            bail!(
+                "structural group node count mismatch for {}: declared={:?} actual={:?}",
+                structural_hash,
+                group_meta.ir_node_count,
+                actual_ir_node_count
+            );
+        }
+        indexed_member_count += group.members.len();
+    }
+
+    if manifest.indexed_actions != indexed_member_count {
+        bail!(
+            "structural manifest indexed action count mismatch: declared={} actual={}",
+            manifest.indexed_actions,
+            indexed_member_count
+        );
+    }
+    let actual_keys = structural_entries
+        .keys()
+        .map(|key| (*key).to_string())
+        .collect::<BTreeSet<_>>();
+    if actual_keys != expected_keys {
+        let missing = expected_keys.difference(&actual_keys).collect::<Vec<_>>();
+        let unexpected = actual_keys.difference(&expected_keys).collect::<Vec<_>>();
+        bail!(
+            "structural index key closure mismatch: missing={missing:?} unexpected={unexpected:?}"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn write_json_pretty_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -683,6 +839,7 @@ pub(crate) fn populate_ir_fn_corpus_structural_index(
             structural_hash: structural_hash.clone(),
             member_count: members.len(),
             relpath,
+            content_sha256: format!("{:x}", Sha256::digest(&group_bytes)),
             ir_node_count,
         });
     }
@@ -694,8 +851,6 @@ pub(crate) fn populate_ir_fn_corpus_structural_index(
     let manifest = IrFnCorpusStructuralManifest {
         schema_version: IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
         generated_utc,
-        store_root: store.root.display().to_string(),
-        output_dir: ir_fn_corpus_structural_index_location(&index_prefix),
         recompute_missing_hashes,
         total_actions_scanned,
         total_driver_ir_to_opt_actions,
@@ -1038,9 +1193,9 @@ pub(crate) fn enqueue_structural_opt_ir_g8r_actions(
     let mut pending_paths = list_queue_files(&store.queue_pending_dir())?;
     pending_paths.sort();
     for path in pending_paths {
-        let text = fs::read_to_string(&path)
+        let bytes = fs::read(&path)
             .with_context(|| format!("reading pending queue record: {}", path.display()))?;
-        let (_action_id, _, _, action) = parse_queue_work_item(&text, &path)?;
+        let (_action_id, _, _, action) = parse_queue_work_item(&bytes, &path)?;
         if let Some(structural_hash) = structural_hash_for_matching_target_g8r_action(
             &action,
             None,
@@ -1060,9 +1215,9 @@ pub(crate) fn enqueue_structural_opt_ir_g8r_actions(
     let mut running_paths = list_queue_files(&store.queue_running_dir())?;
     running_paths.sort();
     for path in running_paths {
-        let text = fs::read_to_string(&path)
+        let bytes = fs::read(&path)
             .with_context(|| format!("reading running queue record: {}", path.display()))?;
-        let (_action_id, _, _, action) = parse_queue_work_item(&text, &path)?;
+        let (_action_id, _, _, action) = parse_queue_work_item(&bytes, &path)?;
         if let Some(structural_hash) = structural_hash_for_matching_target_g8r_action(
             &action,
             None,
@@ -1099,9 +1254,9 @@ pub(crate) fn enqueue_structural_opt_ir_g8r_actions(
     let mut canceled_paths = list_queue_files(&store.queue_canceled_dir())?;
     canceled_paths.sort();
     for path in canceled_paths {
-        let text = fs::read_to_string(&path)
+        let bytes = fs::read(&path)
             .with_context(|| format!("reading canceled queue record: {}", path.display()))?;
-        let canceled: QueueCanceled = serde_json::from_str(&text)
+        let canceled = crate::proto::decode_queue_canceled(&bytes)
             .with_context(|| format!("parsing canceled queue record: {}", path.display()))?;
         if let Some(structural_hash) = structural_hash_for_matching_target_g8r_action(
             &canceled.action,
@@ -1241,6 +1396,9 @@ mod tests {
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
     }
 
@@ -1262,10 +1420,11 @@ mod tests {
     }
 
     fn sample_provenance(
-        action_id: &str,
+        _seed_action_id: &str,
         created_utc: DateTime<Utc>,
         action: ActionSpec,
     ) -> Provenance {
+        let action_id = crate::executor::compute_action_id(&action).expect("compute V2 action id");
         Provenance {
             schema_version: crate::ACTION_SCHEMA_VERSION,
             action_id: action_id.to_string(),
@@ -1279,7 +1438,7 @@ mod tests {
             },
             output_files: Vec::new(),
             commands: Vec::new(),
-            details: serde_json::Value::Null,
+            details: serde_json::json!({}),
             suggested_next_actions: Vec::new(),
         }
     }
@@ -1331,6 +1490,83 @@ mod tests {
     }
 
     #[test]
+    fn structural_index_closure_accepts_exact_group_and_rejects_tamper() {
+        let structural_hash = "7".repeat(64);
+        let group = IrFnCorpusStructuralGroupFile {
+            schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
+            structural_hash: structural_hash.clone(),
+            members: vec![IrFnCorpusStructuralMember {
+                opt_ir_action_id: "1".repeat(64),
+                source_ir_action_id: "2".repeat(64),
+                ir_top: "__sample".to_string(),
+                ir_fn_signature: None,
+                ir_op_count: Some(7),
+                crate_version: "0.31.0".to_string(),
+                dso_version: "0.35.0".to_string(),
+                created_utc: Utc::now(),
+                output_artifact: ArtifactRef {
+                    action_id: "1".repeat(64),
+                    artifact_type: ArtifactType::IrPackageFile,
+                    relpath: "payload/result.ir".to_string(),
+                },
+                output_file_sha256: "3".repeat(64),
+                output_file_bytes: 42,
+                hash_source: "test".to_string(),
+                hash_hint_source_action_ids: Vec::new(),
+                dslx_origin: None,
+                producer_action_kind: Some("driver_ir_to_opt".to_string()),
+            }],
+        };
+        let group_bytes = serde_json::to_vec_pretty(&group).expect("serialize group");
+        let manifest = IrFnCorpusStructuralManifest {
+            schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
+            generated_utc: Utc::now(),
+            recompute_missing_hashes: false,
+            total_actions_scanned: 1,
+            total_driver_ir_to_opt_actions: 1,
+            total_ir_fn_to_k_bool_cone_corpus_actions: 0,
+            indexed_actions: 1,
+            indexed_k_bool_cone_members: 0,
+            distinct_structural_hashes: 1,
+            hash_from_dependency_hint_count: 1,
+            hash_recomputed_count: 0,
+            hash_hint_conflict_count: 0,
+            skipped_missing_output_count: 0,
+            skipped_missing_ir_top_count: 0,
+            skipped_missing_hash_hint_count: 0,
+            skipped_hash_error_count: 0,
+            skipped_k_bool_cone_manifest_errors: 0,
+            skipped_k_bool_cone_empty_count: 0,
+            source_action_set_sha256: Some("4".repeat(64)),
+            groups: vec![IrFnCorpusStructuralManifestGroup {
+                structural_hash: structural_hash.clone(),
+                member_count: 1,
+                relpath: hash_group_relpath(&structural_hash),
+                content_sha256: format!("{:x}", Sha256::digest(&group_bytes)),
+                ir_node_count: Some(7),
+            }],
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("serialize manifest");
+        let group_key = ir_fn_corpus_structural_group_index_key(&structural_hash);
+        let mut entries = vec![
+            (
+                ir_fn_corpus_structural_manifest_index_key().to_string(),
+                manifest_bytes,
+            ),
+            (group_key, group_bytes),
+        ];
+
+        validate_ir_fn_corpus_structural_index_closure(&entries).expect("exact structural closure");
+        entries[1].1.push(b' ');
+        let error = validate_ir_fn_corpus_structural_index_closure(&entries)
+            .expect_err("tampered structural group must fail closure validation");
+        assert!(
+            error.to_string().contains("digest mismatch"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn check_ir_fn_corpus_structural_freshness_detects_missing_manifest() {
         let (store, root) = make_test_store("missing-manifest");
         let summary =
@@ -1371,10 +1607,6 @@ mod tests {
         let manifest = IrFnCorpusStructuralManifest {
             schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
             generated_utc: created + chrono::Duration::seconds(1),
-            store_root: store.root.display().to_string(),
-            output_dir: ir_fn_corpus_structural_index_location(
-                &ir_fn_corpus_structural_index_prefix(),
-            ),
             recompute_missing_hashes: false,
             total_actions_scanned: provenances.len(),
             total_driver_ir_to_opt_actions: 1,
@@ -1394,10 +1626,15 @@ mod tests {
             source_action_set_sha256: Some(source_hash),
             groups: Vec::new(),
         };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("serialize manifest");
+        let manifest_text = std::str::from_utf8(&manifest_bytes).expect("manifest UTF-8");
+        assert!(!manifest_text.contains("store_root"));
+        assert!(!manifest_text.contains("output_dir"));
+        assert!(!manifest_text.contains(&root.display().to_string()));
         store
             .write_web_index_bytes(
                 ir_fn_corpus_structural_manifest_index_key(),
-                &serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+                &manifest_bytes,
             )
             .expect("write manifest");
         let summary =
@@ -1408,6 +1645,61 @@ mod tests {
             summary.stale_reasons
         );
         assert!(summary.stale_reasons.is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn check_ir_fn_corpus_structural_freshness_rejects_missing_manifest_group() {
+        let (store, root) = make_test_store("missing-manifest-group");
+        let source_hash = structural_index_source_action_set_sha256_from_provenances(&[]);
+        let structural_hash = "a".repeat(64);
+        let manifest = IrFnCorpusStructuralManifest {
+            schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
+            generated_utc: Utc::now(),
+            recompute_missing_hashes: false,
+            total_actions_scanned: 0,
+            total_driver_ir_to_opt_actions: 0,
+            total_ir_fn_to_k_bool_cone_corpus_actions: 0,
+            indexed_actions: 1,
+            indexed_k_bool_cone_members: 0,
+            distinct_structural_hashes: 1,
+            hash_from_dependency_hint_count: 1,
+            hash_recomputed_count: 0,
+            hash_hint_conflict_count: 0,
+            skipped_missing_output_count: 0,
+            skipped_missing_ir_top_count: 0,
+            skipped_missing_hash_hint_count: 0,
+            skipped_hash_error_count: 0,
+            skipped_k_bool_cone_manifest_errors: 0,
+            skipped_k_bool_cone_empty_count: 0,
+            source_action_set_sha256: Some(source_hash),
+            groups: vec![IrFnCorpusStructuralManifestGroup {
+                structural_hash: structural_hash.clone(),
+                member_count: 1,
+                relpath: hash_group_relpath(&structural_hash),
+                content_sha256: "0".repeat(64),
+                ir_node_count: None,
+            }],
+        };
+        store
+            .write_web_index_bytes(
+                ir_fn_corpus_structural_manifest_index_key(),
+                &serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+            )
+            .expect("write manifest");
+
+        let summary =
+            check_ir_fn_corpus_structural_freshness(&store).expect("freshness check runs");
+        assert!(!summary.up_to_date);
+        assert!(
+            summary
+                .stale_reasons
+                .iter()
+                .any(|reason| reason.contains("structural manifest group is missing")),
+            "expected missing group reason, got: {:?}",
+            summary.stale_reasons
+        );
+
         fs::remove_dir_all(root).expect("cleanup");
     }
 }
@@ -1766,9 +2058,9 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
     let mut pending_paths = list_queue_files(&store.queue_pending_dir())?;
     pending_paths.sort();
     for path in pending_paths {
-        let text = fs::read_to_string(&path)
+        let bytes = fs::read(&path)
             .with_context(|| format!("reading pending queue record: {}", path.display()))?;
-        let (_action_id, _, queue_priority, action) = parse_queue_work_item(&text, &path)?;
+        let (_action_id, _, queue_priority, action) = parse_queue_work_item(&bytes, &path)?;
         if let Some(structural_hash) = structural_hash_for_matching_target_k_bool_action(
             &action,
             None,
@@ -1795,9 +2087,9 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
     let mut running_paths = list_queue_files(&store.queue_running_dir())?;
     running_paths.sort();
     for path in running_paths {
-        let text = fs::read_to_string(&path)
+        let bytes = fs::read(&path)
             .with_context(|| format!("reading running queue record: {}", path.display()))?;
-        let (_action_id, _, _, action) = parse_queue_work_item(&text, &path)?;
+        let (_action_id, _, _, action) = parse_queue_work_item(&bytes, &path)?;
         if let Some(structural_hash) = structural_hash_for_matching_target_k_bool_action(
             &action,
             None,
@@ -1836,9 +2128,9 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
     let mut canceled_paths = list_queue_files(&store.queue_canceled_dir())?;
     canceled_paths.sort();
     for path in canceled_paths {
-        let text = fs::read_to_string(&path)
+        let bytes = fs::read(&path)
             .with_context(|| format!("reading canceled queue record: {}", path.display()))?;
-        let canceled: QueueCanceled = serde_json::from_str(&text)
+        let canceled = crate::proto::decode_queue_canceled(&bytes)
             .with_context(|| format!("parsing canceled queue record: {}", path.display()))?;
         if let Some(structural_hash) = structural_hash_for_matching_target_k_bool_action(
             &canceled.action,

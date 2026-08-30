@@ -302,7 +302,7 @@ pub(crate) fn run_ir_dir_corpus(
     let driver_runtime = driver.into_runtime(repo_root, version)?;
     let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &driver_runtime)
         .unwrap_or_else(|_| driver_runtime.clone());
-    let yosys_runtime = yosys.into_runtime();
+    let yosys_runtime = yosys.into_runtime(repo_root)?;
     let recipe_preset_name = recipe_preset_label(recipe_preset);
     let yosys_script = resolve_recipe_preset_yosys_script(recipe_preset, yosys_script)?;
     let yosys_script_ref = make_script_ref(repo_root, yosys_script)?;
@@ -1280,10 +1280,11 @@ fn ensure_imported_ir_action(
         }),
         suggested_next_actions: Vec::new(),
     };
-    let provenance_path = staging_dir.join("provenance.json");
+    let provenance_path = staging_dir.join("provenance.pb");
     fs::write(
         &provenance_path,
-        serde_json::to_string_pretty(&provenance).context("serializing imported IR provenance")?,
+        crate::proto::encode_provenance(&provenance)
+            .context("encoding imported IR protobuf provenance")?,
     )
     .with_context(|| format!("writing provenance: {}", provenance_path.display()))?;
     store.promote_staging_action_dir(&action_id, &staging_dir)?;
@@ -1458,12 +1459,12 @@ fn build_sample_record_from_queue_state(
         g8r_aig_status.as_str(),
         combo_verilog_status.as_str(),
     ];
-    let terminal_error = action_error_summary(store, &plan.aig_stat_diff_action_id)
-        .or_else(|| action_error_summary(store, &plan.yosys_abc_stats_action_id))
-        .or_else(|| action_error_summary(store, &plan.yosys_abc_aig_action_id))
-        .or_else(|| action_error_summary(store, &plan.combo_verilog_action_id))
-        .or_else(|| action_error_summary(store, &plan.g8r_stats_action_id))
-        .or_else(|| action_error_summary(store, &plan.g8r_aig_action_id))
+    let terminal_error = queue_files_action_error_summary(store, &plan.aig_stat_diff_action_id)
+        .or_else(|| queue_files_action_error_summary(store, &plan.yosys_abc_stats_action_id))
+        .or_else(|| queue_files_action_error_summary(store, &plan.yosys_abc_aig_action_id))
+        .or_else(|| queue_files_action_error_summary(store, &plan.combo_verilog_action_id))
+        .or_else(|| queue_files_action_error_summary(store, &plan.g8r_stats_action_id))
+        .or_else(|| queue_files_action_error_summary(store, &plan.g8r_aig_action_id))
         .or_else(|| {
             if summarize_sample_status(&statuses, false) == "failed" {
                 persisted_sample.error.clone()
@@ -1560,13 +1561,26 @@ fn queue_or_persisted_action_status_label(
     action_id: &str,
     persisted_status: &str,
 ) -> String {
-    match queue_state_for_action(store, action_id) {
+    let queue_state = queue_state_for_action(store, action_id);
+    match queue_state {
+        crate::queue::QueueState::Done => return "done".to_string(),
+        crate::queue::QueueState::Failed => return "failed".to_string(),
+        crate::queue::QueueState::Canceled => return "canceled".to_string(),
+        _ => {}
+    }
+    if matches!(
+        store.load_failed_action_record_mirror_for_diagnostics(action_id),
+        Ok(Some(_))
+    ) {
+        return "failed".to_string();
+    }
+    match queue_state {
         crate::queue::QueueState::Pending => "pending".to_string(),
         crate::queue::QueueState::Running { .. } => "running".to_string(),
-        crate::queue::QueueState::Done => "done".to_string(),
-        crate::queue::QueueState::Failed => "failed".to_string(),
-        crate::queue::QueueState::Canceled => "canceled".to_string(),
         crate::queue::QueueState::None => persisted_status.to_string(),
+        crate::queue::QueueState::Done
+        | crate::queue::QueueState::Failed
+        | crate::queue::QueueState::Canceled => unreachable!("terminal states returned above"),
     }
 }
 
@@ -1610,6 +1624,16 @@ fn action_status_label(store: &ArtifactStore, action_id: &str) -> String {
 
 fn action_error_summary(store: &ArtifactStore, action_id: &str) -> Option<String> {
     if let Ok(Some(failed)) = load_queue_failed_record(store, action_id) {
+        return Some(summarize_error(&failed.error));
+    }
+    if let Ok(Some(canceled)) = load_queue_canceled_record(store, action_id) {
+        return Some(summarize_error(&canceled.reason));
+    }
+    None
+}
+
+fn queue_files_action_error_summary(store: &ArtifactStore, action_id: &str) -> Option<String> {
+    if let Ok(Some(failed)) = store.load_failed_action_record_mirror_for_diagnostics(action_id) {
         return Some(summarize_error(&failed.error));
     }
     if let Ok(Some(canceled)) = load_queue_canceled_record(store, action_id) {
@@ -2056,6 +2080,9 @@ mod tests {
             release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: crate::runtime::default_driver_image("0.34.0"),
             dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
         }
     }
 
@@ -2067,6 +2094,8 @@ mod tests {
         YosysRuntimeSpec {
             docker_image: crate::DEFAULT_YOSYS_DOCKER_IMAGE.to_string(),
             dockerfile: crate::DEFAULT_YOSYS_DOCKERFILE.to_string(),
+            docker_image_id: "e".repeat(64),
+            dockerfile_sha256: "d".repeat(64),
             upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
         }
     }
@@ -2163,8 +2192,8 @@ mod tests {
             fs::write(path, bytes).expect("write staged file");
         }
         fs::write(
-            staging_dir.join("provenance.json"),
-            serde_json::to_string_pretty(&provenance).expect("serialize provenance"),
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
         )
         .expect("write staged provenance");
         store

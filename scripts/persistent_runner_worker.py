@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import re
+import signal
 import shutil
 import socket
 import subprocess
@@ -17,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 HEARTBEAT_INTERVAL_SECS = 1.0
 OUTPUT_TAIL_MAX_BYTES = 256 * 1024
 DRIVER_PROBED_SUBCOMMANDS = [
@@ -83,7 +84,7 @@ def heartbeat_thread_fn(
     stop_event: threading.Event,
 ) -> None:
     while not stop_event.wait(HEARTBEAT_INTERVAL_SECS):
-        state, current_request_id = state_fn()
+        state, current_request_id, idle_since_unix_seconds = state_fn()
         write_json_atomic(
             heartbeat_path,
             {
@@ -92,6 +93,7 @@ def heartbeat_thread_fn(
                 "runner_key": runner_key,
                 "state": state,
                 "current_request_id": current_request_id,
+                "idle_since_unix_seconds": idle_since_unix_seconds,
                 "started_utc": state_fn.started_utc,
                 "last_heartbeat_utc": utc_now(),
             },
@@ -202,15 +204,22 @@ def process_request(
     results_dir: Path,
     archive_dir: Path,
     heartbeat_state,
-) -> None:
+) -> bool:
     request = json.loads(request_path.read_text(encoding="utf-8"))
+    if request.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported request schema {request.get('schema_version')}; "
+            f"expected {SCHEMA_VERSION}"
+        )
     request_id = request["request_id"]
+    request_token = request["request_token"]
     runner_key = request["runner_key"]
     instance_id = request["runner_instance_id"]
     container_name = request["container_name"]
     timeout_secs = int(request["timeout_secs"])
     heartbeat_state["state"] = "busy"
     heartbeat_state["current_request_id"] = request_id
+    heartbeat_state["idle_since_unix_seconds"] = None
 
     job_root = Path(request["job_root"])
     stdout_log = job_root / "stdout.log"
@@ -238,11 +247,16 @@ def process_request(
                 stderr=stderr_file,
                 env=env,
                 cwd="/",
+                start_new_session=True,
             )
             stop_event = threading.Event()
 
             def running_state():
-                return heartbeat_state["state"], heartbeat_state["current_request_id"]
+                return (
+                    heartbeat_state["state"],
+                    heartbeat_state["current_request_id"],
+                    heartbeat_state["idle_since_unix_seconds"],
+                )
 
             running_state.started_utc = heartbeat_state["started_utc"]
             thread = threading.Thread(
@@ -262,7 +276,10 @@ def process_request(
                 exit_code = proc.returncode
             except subprocess.TimeoutExpired:
                 timed_out = True
-                proc.kill()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 exit_code = proc.wait()
             finally:
                 stop_event.set()
@@ -292,6 +309,7 @@ def process_request(
     result = {
         "schema_version": SCHEMA_VERSION,
         "request_id": request_id,
+        "request_token": request_token,
         "runner_key": runner_key,
         "runner_instance_id": instance_id,
         "container_name": container_name,
@@ -312,8 +330,13 @@ def process_request(
         os.replace(request_path, archived_request)
     except OSError:
         pass
-    heartbeat_state["state"] = "idle"
+    retire = error is not None
+    heartbeat_state["state"] = "retired" if retire else "idle"
     heartbeat_state["current_request_id"] = None
+    heartbeat_state["idle_since_unix_seconds"] = (
+        None if retire else int(time.time())
+    )
+    return not retire
 
 
 def main() -> int:
@@ -346,10 +369,15 @@ def main() -> int:
         "state": "idle",
         "current_request_id": None,
         "started_utc": started_utc,
+        "idle_since_unix_seconds": int(time.time()),
     }
 
     def state_fn():
-        return heartbeat_state["state"], heartbeat_state["current_request_id"]
+        return (
+            heartbeat_state["state"],
+            heartbeat_state["current_request_id"],
+            heartbeat_state["idle_since_unix_seconds"],
+        )
 
     state_fn.started_utc = started_utc
     write_json_atomic(
@@ -392,7 +420,8 @@ def main() -> int:
             if request_path is None:
                 time.sleep(0.2)
                 continue
-            process_request(request_path, results_dir, archive_dir, heartbeat_state)
+            if not process_request(request_path, results_dir, archive_dir, heartbeat_state):
+                break
     finally:
         stop_event.set()
         heartbeat_thread.join(timeout=2.0)

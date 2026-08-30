@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package xlsynth.bvc.v1;
+
+import "google/protobuf/timestamp.proto";
+import "xlsynth/bvc/v1/campaign.proto";
+import "xlsynth/bvc/v1/common.proto";
+
+message PublicationFile {
+  string logical_key = 1;
+  NormalizedRelpath relpath = 2;
+  uint64 bytes = 3;
+  Sha256Digest sha256 = 4;
+  string media_type = 5;
+}
+
+// Fields whose canonical wire encoding determines snapshot_id. Entries must be
+// sorted by logical_key and relpath before encoding.
+message PublicationSnapshotIdentity {
+  uint32 identity_version = 1;
+  uint32 publication_policy_version = 2;
+  optional Sha256Digest source_action_set_sha256 = 3;
+  Sha256Digest schema_descriptor_sha256 = 4;
+  repeated PublicationFile dataset_files = 5;
+}
+
+message PublicationSnapshotManifest {
+  uint32 record_version = 1;
+  Sha256Digest snapshot_id = 2;
+  google.protobuf.Timestamp generated_at = 3;
+  optional string producing_git_commit = 4;
+  optional Sha256Digest source_action_set_sha256 = 5;
+  Sha256Digest schema_descriptor_sha256 = 6;
+  uint32 publication_policy_version = 7;
+  repeated PublicationFile dataset_files = 8;
+  uint64 total_dataset_bytes = 9;
+  repeated Sha256Digest campaign_ids = 10;
+  repeated Sha256Digest run_ids = 11;
+}
+
+message StaticSiteManifest {
+  uint32 record_version = 1;
+  Sha256Digest source_snapshot_id = 2;
+  string base_url = 3;
+  repeated PublicationFile files = 4;
+}
+
+// Public projection of a campaign run. Operational runtimes, local paths,
+// commands, queue leases, and raw error text are deliberately absent.
+message PublicCampaignRun {
+  uint32 record_version = 1;
+  Sha256Digest campaign_id = 2;
+  Sha256Digest run_id = 3;
+  string campaign_name = 4;
+  uint32 campaign_semantic_version = 5;
+  CrateVersion crate_version = 6;
+  DsoVersion dso_version = 7;
+  CampaignRunStatus status = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  repeated ActionId root_action_ids = 10;
+  uint64 completed_root_count = 11;
+  uint64 pending_count = 12;
+  uint64 running_count = 13;
+  uint64 failed_count = 14;
+  uint64 canceled_count = 15;
+  uint64 missing_output_count = 16;
+  uint64 failed_sample_count = 17;
+  repeated IntentionallySkippedSample intentionally_skipped_samples = 18;
+}
