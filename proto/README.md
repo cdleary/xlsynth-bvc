@@ -34,10 +34,11 @@ Generated protobuf structs may represent incomplete states. Every message that
 enters action identity, sled, queue storage, or publication must pass an
 explicit validator.
 
-At the public snapshot/site boundary, successful decoding is not sufficient:
-published protobuf bytes must equal the canonical re-encoding of the validated
-message. This prevents unknown or duplicate wire fields from carrying
-unreviewed bytes into a statically served artifact.
+At the public snapshot/site/publication boundary, successful decoding is not
+sufficient: snapshot manifests, site manifests, run/finding records, immutable
+published catalogs, and current pointers must equal the canonical re-encoding
+of the validated message. This prevents unknown or duplicate wire fields from
+carrying unreviewed bytes into a statically served artifact.
 
 Validators enforce at least:
 
@@ -104,6 +105,10 @@ key/value bag for core action or provenance data. Use typed messages and
 External JSON is parsed by narrow adapter modules and immediately converted to
 protobuf. Static website JSON and CLI JSON are projections from protobuf
 messages; they are not authoritative persisted models.
+
+Browser catalogs and publication pointers are deny-unknown typed projections.
+Their raw bytes must equal the canonical Rust encoding during verification;
+semantic deserialization alone is insufficient.
 
 ## Regeneration and verification
 

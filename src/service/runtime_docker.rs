@@ -24,6 +24,7 @@ fn driver_runtime_fingerprint(runtime: &DriverRuntimeSpec) -> Result<String> {
             &runtime.release_platform,
             &runtime.dockerfile,
             &runtime.dockerfile_sha256,
+            &runtime.release_cache_input_sha256,
         ],
     ))
 }
@@ -39,8 +40,14 @@ fn yosys_runtime_fingerprint(runtime: &YosysRuntimeSpec) -> Result<String> {
     ))
 }
 
-pub(crate) fn driver_cache_mount(store: &ArtifactStore) -> Result<DockerMount> {
-    DockerMount::read_only(&store.driver_release_cache_root(), "/cache")
+pub(crate) fn driver_cache_mount(
+    store: &ArtifactStore,
+    runtime: &DriverRuntimeSpec,
+) -> Result<DockerMount> {
+    DockerMount::read_only(
+        &store.driver_release_cache_dir(&runtime.release_cache_input_sha256)?,
+        "/cache-input",
+    )
 }
 
 pub(crate) fn driver_script(body: &str) -> String {
@@ -84,12 +91,6 @@ const DRIVER_RELEASE_CACHE_PROTO_RELPATHS: [&str; 2] = [
     "xls/estimators/delay_model/delay_info.proto",
     "xls/ir/op.proto",
 ];
-
-fn driver_release_cache_validation_set() -> &'static std::sync::Mutex<HashSet<(PathBuf, String)>> {
-    static SET: std::sync::OnceLock<std::sync::Mutex<HashSet<(PathBuf, String)>>> =
-        std::sync::OnceLock::new();
-    SET.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
-}
 
 fn cache_file_sha256(path: &Path) -> Result<Vec<u8>> {
     let mut file = fs::File::open(path)
@@ -619,20 +620,8 @@ fn driver_release_cache_is_ready(
     if !cache_dir.join(DRIVER_RELEASE_CACHE_READY_FILE).is_file() {
         return false;
     }
-    if driver_release_cache_validation_set()
-        .lock()
-        .map(|set| set.contains(&(cache_dir.to_path_buf(), expected_input_sha256.to_string())))
-        .unwrap_or(false)
-    {
-        return true;
-    }
     match validate_driver_release_cache(cache_dir, version, platform, expected_input_sha256) {
-        Ok(()) => {
-            if let Ok(mut set) = driver_release_cache_validation_set().lock() {
-                set.insert((cache_dir.to_path_buf(), expected_input_sha256.to_string()));
-            }
-            true
-        }
+        Ok(()) => true,
         Err(err) => {
             eprintln!(
                 "ignoring invalid driver release cache {}: {:#}",
@@ -672,7 +661,7 @@ pub(crate) fn ensure_driver_release_cache(
     platform: &str,
     expected_input_sha256: &str,
 ) -> Result<Option<CommandTrace>> {
-    let cache_dir = store.driver_release_cache_dir(version, platform);
+    let cache_dir = store.driver_release_cache_dir(expected_input_sha256)?;
     if driver_release_cache_is_ready(&cache_dir, version, platform, expected_input_sha256) {
         return Ok(None);
     }
@@ -684,7 +673,7 @@ pub(crate) fn ensure_driver_release_cache(
             cache_root.display()
         )
     })?;
-    let lock_key = hex::encode(Sha256::digest(format!("{version}\0{platform}")))[..24].to_string();
+    let lock_key = expected_input_sha256.to_ascii_lowercase();
     let lock_path = cache_root.join(format!("{DRIVER_RELEASE_CACHE_LOCK_FILE}-{lock_key}"));
     let start = Instant::now();
     loop {
@@ -759,6 +748,12 @@ pub(crate) fn ensure_driver_release_cache(
     let setup_result = (|| -> Result<Option<CommandTrace>> {
         if driver_release_cache_is_ready(&cache_dir, version, platform, expected_input_sha256) {
             return Ok(None);
+        }
+        if cache_dir.exists() {
+            bail!(
+                "immutable driver release cache is present but invalid at {}; remove that exact digest directory out of band before retrying",
+                cache_dir.display()
+            );
         }
         remove_path_if_exists(&staging_dir)?;
         fs::create_dir_all(&staging_dir)
@@ -885,7 +880,6 @@ pub(crate) fn ensure_driver_release_cache(
                 format!("creating cache promotion parent: {}", parent.display())
             })?;
         }
-        remove_path_if_exists(&cache_dir)?;
         fs::rename(&staging_dir, &cache_dir).with_context(|| {
             format!(
                 "atomically promoting driver release cache: {} -> {}",
@@ -893,10 +887,6 @@ pub(crate) fn ensure_driver_release_cache(
                 cache_dir.display()
             )
         })?;
-        if let Ok(mut set) = driver_release_cache_validation_set().lock() {
-            set.insert((cache_dir.clone(), expected_input_sha256.to_string()));
-        }
-
         Ok(Some(CommandTrace {
             argv: os_args_to_string("python3", &args),
             exit_code: output.status.code().unwrap_or(1),
@@ -1147,24 +1137,6 @@ fn inspect_image_id(image: &str) -> Result<Option<String>> {
     )?))
 }
 
-fn require_runtime_image_id(image: &str, expected: &str) -> Result<()> {
-    if expected.is_empty() {
-        return Ok(());
-    }
-    let expected = normalize_docker_image_id(expected)?;
-    let actual =
-        inspect_image_id(image)?.with_context(|| format!("docker image `{image}` is missing"))?;
-    if actual != expected {
-        bail!(
-            "docker image `{}` immutable ID mismatch: expected sha256:{} got sha256:{}",
-            image,
-            expected,
-            actual
-        );
-    }
-    Ok(())
-}
-
 pub(crate) fn docker_image_content_ref(image_id: &str) -> Result<String> {
     Ok(format!("sha256:{}", normalize_docker_image_id(image_id)?))
 }
@@ -1187,17 +1159,39 @@ fn require_image_runtime_fingerprint(image: &str, expected: &str) -> Result<()> 
     Ok(())
 }
 
+fn fingerprint_qualified_image_ref(image: &str, kind: &str, fingerprint: &str) -> Result<String> {
+    if image.contains('@') {
+        bail!("runtime image name must be a repository or tag, not a digest reference");
+    }
+    let last_slash = image.rfind('/');
+    let last_colon = image.rfind(':');
+    let (repository, original_tag) = match (last_slash, last_colon) {
+        (_, Some(colon)) if last_slash.is_none_or(|slash| colon > slash) => {
+            (&image[..colon], Some(&image[colon + 1..]))
+        }
+        _ => (image, None),
+    };
+    if repository.is_empty() || original_tag.is_some_and(str::is_empty) || fingerprint.len() != 64 {
+        bail!("cannot construct fingerprint-qualified runtime image reference");
+    }
+    let tag = original_tag
+        .map(|tag| format!("{tag}-bvc-{kind}-{fingerprint}"))
+        .unwrap_or_else(|| format!("bvc-{kind}-{fingerprint}"));
+    Ok(format!("{repository}:{tag}"))
+}
+
 fn driver_image_build_args(
     runtime: &DriverRuntimeSpec,
     dockerfile: PathBuf,
     fingerprint: &str,
+    image_ref: &str,
 ) -> Vec<OsString> {
     vec![
         OsString::from("build"),
         OsString::from("--file"),
         dockerfile.into_os_string(),
         OsString::from("--tag"),
-        OsString::from(runtime.docker_image.clone()),
+        OsString::from(image_ref),
         OsString::from("--build-arg"),
         OsString::from(format!("DRIVER_CRATE_VERSION={}", runtime.driver_version)),
         OsString::from("--build-arg"),
@@ -1210,6 +1204,7 @@ fn yosys_image_build_args(
     runtime: &YosysRuntimeSpec,
     dockerfile: PathBuf,
     fingerprint: &str,
+    image_ref: &str,
 ) -> Result<Vec<OsString>> {
     let commit = runtime
         .upstream_commit
@@ -1221,7 +1216,7 @@ fn yosys_image_build_args(
         OsString::from("--file"),
         dockerfile.into_os_string(),
         OsString::from("--tag"),
-        OsString::from(runtime.docker_image.clone()),
+        OsString::from(image_ref),
         OsString::from("--build-arg"),
         OsString::from(format!("YOSYS_COMMIT={commit}")),
         OsString::from("--build-arg"),
@@ -1236,21 +1231,27 @@ pub(crate) fn ensure_driver_image(
     repo_root: &Path,
     runtime: &DriverRuntimeSpec,
 ) -> Result<Option<CommandTrace>> {
-    let dockerfile =
-        checked_runtime_dockerfile(repo_root, &runtime.dockerfile, &runtime.dockerfile_sha256)?;
     let fingerprint = driver_runtime_fingerprint(runtime)?;
-    if let Some(actual) = inspect_image_runtime_fingerprint(&runtime.docker_image)? {
-        if actual != fingerprint {
-            bail!(
-                "existing driver image `{}` does not match its declared runtime identity",
-                runtime.docker_image
-            );
-        }
-        require_runtime_image_id(&runtime.docker_image, &runtime.docker_image_id)?;
+    if !runtime.docker_image_id.is_empty() {
+        let content_ref = docker_image_content_ref(&runtime.docker_image_id)?;
+        require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
         return Ok(None);
     }
 
-    let build_args = driver_image_build_args(runtime, dockerfile, &fingerprint);
+    let dockerfile =
+        checked_runtime_dockerfile(repo_root, &runtime.dockerfile, &runtime.dockerfile_sha256)?;
+    let build_ref = fingerprint_qualified_image_ref(&runtime.docker_image, "driver", &fingerprint)?;
+    if let Some(actual) = inspect_image_runtime_fingerprint(&build_ref)? {
+        if actual != fingerprint {
+            bail!(
+                "fingerprint-qualified driver image `{}` has the wrong runtime identity",
+                build_ref
+            );
+        }
+        return Ok(None);
+    }
+
+    let build_args = driver_image_build_args(runtime, dockerfile, &fingerprint, &build_ref);
 
     let status = Command::new("docker")
         .args(&build_args)
@@ -1261,13 +1262,12 @@ pub(crate) fn ensure_driver_image(
     if !status.success() {
         bail!(
             "docker image build failed for image `{}` with exit code {:?}",
-            runtime.docker_image,
+            build_ref,
             status.code()
         );
     }
 
-    require_image_runtime_fingerprint(&runtime.docker_image, &fingerprint)?;
-    require_runtime_image_id(&runtime.docker_image, &runtime.docker_image_id)?;
+    require_image_runtime_fingerprint(&build_ref, &fingerprint)?;
     Ok(Some(CommandTrace {
         argv: os_args_to_string("docker", &build_args),
         exit_code: status.code().unwrap_or(1),
@@ -1278,27 +1278,33 @@ pub(crate) fn ensure_yosys_image(
     repo_root: &Path,
     runtime: &YosysRuntimeSpec,
 ) -> Result<Option<CommandTrace>> {
-    let dockerfile =
-        checked_runtime_dockerfile(repo_root, &runtime.dockerfile, &runtime.dockerfile_sha256)?;
     let fingerprint = yosys_runtime_fingerprint(runtime)?;
-    if let Some(actual) = inspect_image_runtime_fingerprint(&runtime.docker_image)? {
-        if actual != fingerprint {
-            bail!(
-                "existing Yosys image `{}` does not match its declared runtime identity",
-                runtime.docker_image
-            );
+    if !runtime.docker_image_id.is_empty() {
+        let content_ref = docker_image_content_ref(&runtime.docker_image_id)?;
+        require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
+        if !image_has_python3(&content_ref)? {
+            bail!("pinned Yosys image `{content_ref}` lacks python3");
         }
-        if !image_has_python3(&runtime.docker_image)? {
-            bail!(
-                "existing Yosys image `{}` lacks python3",
-                runtime.docker_image
-            );
-        }
-        require_runtime_image_id(&runtime.docker_image, &runtime.docker_image_id)?;
         return Ok(None);
     }
 
-    let build_args = yosys_image_build_args(runtime, dockerfile, &fingerprint)?;
+    let dockerfile =
+        checked_runtime_dockerfile(repo_root, &runtime.dockerfile, &runtime.dockerfile_sha256)?;
+    let build_ref = fingerprint_qualified_image_ref(&runtime.docker_image, "yosys", &fingerprint)?;
+    if let Some(actual) = inspect_image_runtime_fingerprint(&build_ref)? {
+        if actual != fingerprint {
+            bail!(
+                "fingerprint-qualified Yosys image `{}` has the wrong runtime identity",
+                build_ref
+            );
+        }
+        if !image_has_python3(&build_ref)? {
+            bail!("fingerprint-qualified Yosys image `{build_ref}` lacks python3");
+        }
+        return Ok(None);
+    }
+
+    let build_args = yosys_image_build_args(runtime, dockerfile, &fingerprint, &build_ref)?;
 
     let status = Command::new("docker")
         .args(&build_args)
@@ -1309,15 +1315,14 @@ pub(crate) fn ensure_yosys_image(
     if !status.success() {
         bail!(
             "docker image build failed for image `{}` with exit code {:?}",
-            runtime.docker_image,
+            build_ref,
             status.code()
         );
     }
 
-    require_image_runtime_fingerprint(&runtime.docker_image, &fingerprint)?;
-    require_runtime_image_id(&runtime.docker_image, &runtime.docker_image_id)?;
-    if !image_has_python3(&runtime.docker_image)? {
-        bail!("built Yosys image `{}` lacks python3", runtime.docker_image);
+    require_image_runtime_fingerprint(&build_ref, &fingerprint)?;
+    if !image_has_python3(&build_ref)? {
+        bail!("built Yosys image `{build_ref}` lacks python3");
     }
     Ok(Some(CommandTrace {
         argv: os_args_to_string("docker", &build_args),
@@ -1355,14 +1360,13 @@ pub(crate) fn bind_driver_runtime_image(
     #[cfg(not(test))]
     {
         ensure_driver_image(repo_root, &runtime)?;
-        let image_id = inspect_image_id(&runtime.docker_image)?.with_context(|| {
-            format!(
-                "driver image `{}` disappeared after preparation",
-                runtime.docker_image
-            )
-        })?;
+        let fingerprint = driver_runtime_fingerprint(&runtime)?;
+        let build_ref =
+            fingerprint_qualified_image_ref(&runtime.docker_image, "driver", &fingerprint)?;
+        let image_id = inspect_image_id(&build_ref)?
+            .with_context(|| format!("driver image `{build_ref}` disappeared after preparation"))?;
         let content_ref = docker_image_content_ref(&image_id)?;
-        require_image_runtime_fingerprint(&content_ref, &driver_runtime_fingerprint(&runtime)?)?;
+        require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
         runtime.docker_image_id = image_id;
         Ok(runtime)
     }
@@ -1386,14 +1390,13 @@ pub(crate) fn bind_yosys_runtime_image(
     #[cfg(not(test))]
     {
         ensure_yosys_image(repo_root, &runtime)?;
-        let image_id = inspect_image_id(&runtime.docker_image)?.with_context(|| {
-            format!(
-                "Yosys image `{}` disappeared after preparation",
-                runtime.docker_image
-            )
-        })?;
+        let fingerprint = yosys_runtime_fingerprint(&runtime)?;
+        let build_ref =
+            fingerprint_qualified_image_ref(&runtime.docker_image, "yosys", &fingerprint)?;
+        let image_id = inspect_image_id(&build_ref)?
+            .with_context(|| format!("Yosys image `{build_ref}` disappeared after preparation"))?;
         let content_ref = docker_image_content_ref(&image_id)?;
-        require_image_runtime_fingerprint(&content_ref, &yosys_runtime_fingerprint(&runtime)?)?;
+        require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
         if !image_has_python3(&content_ref)? {
             bail!("prepared Yosys image `{content_ref}` lacks python3");
         }
@@ -2838,16 +2841,53 @@ mod tests {
         let expected_input_sha256 = driver_release_cache_input_sha256(repo_root, version, platform)
             .expect("cache input digest");
         seed_fake_driver_release_cache(&store, version, platform).expect("seed cache");
-        let cache_dir = store.driver_release_cache_dir(version, platform);
+        let cache_dir = store
+            .driver_release_cache_dir(&expected_input_sha256)
+            .expect("digest-addressed cache dir");
         validate_driver_release_cache(&cache_dir, version, platform, &expected_input_sha256)
             .expect("seeded cache validates");
 
         fs::write(cache_dir.join("delay_info_main"), b"x").expect("truncate cached binary");
         assert!(
-            validate_driver_release_cache(&cache_dir, version, platform, &expected_input_sha256,)
-                .is_err(),
-            "manifest must reject a same-path truncated cache file"
+            !driver_release_cache_is_ready(&cache_dir, version, platform, &expected_input_sha256,),
+            "a cache mutation after prior validation must be detected"
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn invalid_digest_addressed_cache_is_never_replaced_in_place() {
+        let root = make_temp_store_root("cache-immutable-generation");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("ensure store");
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let version = "v0.39.0";
+        let platform = crate::DEFAULT_RELEASE_PLATFORM;
+        let expected_input_sha256 = driver_release_cache_input_sha256(repo_root, version, platform)
+            .expect("cache input digest");
+        let cache_dir = store
+            .driver_release_cache_dir(&expected_input_sha256)
+            .expect("digest-addressed cache dir");
+        fs::create_dir_all(&cache_dir).expect("create invalid immutable generation");
+        let marker = cache_dir.join("operator-marker");
+        fs::write(&marker, "preserve").expect("write marker");
+
+        let error = ensure_driver_release_cache(
+            &store,
+            repo_root,
+            version,
+            platform,
+            &expected_input_sha256,
+        )
+        .expect_err("invalid immutable generation must fail closed");
+        assert!(format!("{error:#}").contains("present but invalid"));
+        assert_eq!(fs::read_to_string(marker).expect("read marker"), "preserve");
+
+        let other = store
+            .driver_release_cache_dir(&"e".repeat(64))
+            .expect("other digest-addressed cache dir");
+        assert_ne!(cache_dir, other);
+        assert!(store.driver_release_cache_dir("../escape").is_err());
         fs::remove_dir_all(root).ok();
     }
 
@@ -2941,6 +2981,12 @@ mod tests {
             driver_fingerprint,
             driver_runtime_fingerprint(&changed_driver).expect("changed driver fingerprint")
         );
+        let mut changed_cache = driver.clone();
+        changed_cache.release_cache_input_sha256 = "d".repeat(64);
+        assert_ne!(
+            driver_fingerprint,
+            driver_runtime_fingerprint(&changed_cache).expect("changed cache fingerprint")
+        );
 
         let yosys = fake_yosys_runtime("yosys:test".to_string());
         let yosys_fingerprint = yosys_runtime_fingerprint(&yosys).expect("yosys fingerprint");
@@ -2957,16 +3003,24 @@ mod tests {
     fn yosys_build_args_pass_exact_declared_commit_and_fingerprint() {
         let runtime = fake_yosys_runtime("yosys:test".to_string());
         let fingerprint = yosys_runtime_fingerprint(&runtime).expect("yosys fingerprint");
-        let args =
-            yosys_image_build_args(&runtime, PathBuf::from(&runtime.dockerfile), &fingerprint)
-                .expect("yosys build args")
-                .into_iter()
-                .map(|value| value.to_string_lossy().to_string())
-                .collect::<Vec<_>>();
+        let build_ref =
+            fingerprint_qualified_image_ref(&runtime.docker_image, "yosys", &fingerprint)
+                .expect("qualified image ref");
+        let args = yosys_image_build_args(
+            &runtime,
+            PathBuf::from(&runtime.dockerfile),
+            &fingerprint,
+            &build_ref,
+        )
+        .expect("yosys build args")
+        .into_iter()
+        .map(|value| value.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
         let commit = runtime.upstream_commit.as_deref().expect("commit");
         assert!(args.contains(&format!("YOSYS_COMMIT={commit}")));
         assert!(args.contains(&format!("YOSYS_COMMIT_PREFIX={}", &commit[..8])));
         assert!(args.contains(&format!("BVC_RUNTIME_FINGERPRINT={fingerprint}")));
+        assert!(args.contains(&build_ref));
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         checked_runtime_dockerfile(root, &runtime.dockerfile, &runtime.dockerfile_sha256)
@@ -3080,7 +3134,9 @@ mod tests {
         platform: &str,
     ) -> Result<()> {
         let repo_root = std::env::current_dir().context("getting repo root for fake cache")?;
-        let cache_dir = store.driver_release_cache_dir(version, platform);
+        let inputs = resolve_driver_release_cache_input_manifest(&repo_root, version, platform)?;
+        let expected_input_sha256 = driver_release_cache_input_sha256_hex(&inputs);
+        let cache_dir = store.driver_release_cache_dir(&expected_input_sha256)?;
         fs::create_dir_all(&cache_dir)
             .with_context(|| format!("creating fake driver cache dir: {}", cache_dir.display()))?;
         let delay_info_main = cache_dir.join("delay_info_main");
@@ -3132,8 +3188,6 @@ mod tests {
         }
         fs::write(cache_dir.join(format!("libxls-{platform}.so")), b"fake-dso")?;
         fs::write(cache_dir.join("dslx_stdlib.tar.gz"), b"fake-stdlib-archive")?;
-        let inputs = resolve_driver_release_cache_input_manifest(&repo_root, version, platform)?;
-        let expected_input_sha256 = driver_release_cache_input_sha256_hex(&inputs);
         let manifest = build_driver_release_cache_manifest(&cache_dir, version, platform, inputs)?;
         write_cache_manifest_atomic(
             &cache_dir.join(crate::DRIVER_RELEASE_CACHE_READY_FILE),
@@ -3336,21 +3390,41 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
         let mut runtime_b =
             fake_driver_runtime("0.35.0", format!("xlsynth-bvc-fake-driver-b:{unique}"));
         let mut yosys_runtime = fake_yosys_runtime(format!("xlsynth-bvc-fake-yosys:{unique}"));
+        let runtime_a_ref = fingerprint_qualified_image_ref(
+            &runtime_a.docker_image,
+            "driver",
+            &driver_runtime_fingerprint(&runtime_a)?,
+        )?;
+        let runtime_b_ref = fingerprint_qualified_image_ref(
+            &runtime_b.docker_image,
+            "driver",
+            &driver_runtime_fingerprint(&runtime_b)?,
+        )?;
+        let yosys_runtime_ref = fingerprint_qualified_image_ref(
+            &yosys_runtime.docker_image,
+            "yosys",
+            &yosys_runtime_fingerprint(&yosys_runtime)?,
+        )?;
         let mut cleanup = DockerCleanup::new(vec![
-            runtime_a.docker_image.clone(),
-            runtime_b.docker_image.clone(),
-            yosys_runtime.docker_image.clone(),
+            runtime_a_ref.clone(),
+            runtime_b_ref.clone(),
+            yosys_runtime_ref.clone(),
         ]);
 
         ensure_driver_image(&repo_root, &runtime_a)?;
-        runtime_a.docker_image_id = inspect_image_id(&runtime_a.docker_image)?
-            .with_context(|| format!("missing built image {}", runtime_a.docker_image))?;
+        runtime_a.docker_image_id = inspect_image_id(&runtime_a_ref)?
+            .with_context(|| format!("missing built image {runtime_a_ref}"))?;
         ensure_driver_image(&repo_root, &runtime_b)?;
-        runtime_b.docker_image_id = inspect_image_id(&runtime_b.docker_image)?
-            .with_context(|| format!("missing built image {}", runtime_b.docker_image))?;
+        runtime_b.docker_image_id = inspect_image_id(&runtime_b_ref)?
+            .with_context(|| format!("missing built image {runtime_b_ref}"))?;
         ensure_yosys_image(&repo_root, &yosys_runtime)?;
-        yosys_runtime.docker_image_id = inspect_image_id(&yosys_runtime.docker_image)?
-            .with_context(|| format!("missing built image {}", yosys_runtime.docker_image))?;
+        yosys_runtime.docker_image_id = inspect_image_id(&yosys_runtime_ref)?
+            .with_context(|| format!("missing built image {yosys_runtime_ref}"))?;
+        runtime_a.docker_image = format!("missing-driver-alias:{unique}");
+        yosys_runtime.docker_image = format!("missing-yosys-alias:{unique}");
+        let missing_recipe_root = store_root.join("missing-read-only-deployment");
+        ensure_driver_image(&missing_recipe_root, &runtime_a)?;
+        ensure_yosys_image(&missing_recipe_root, &yosys_runtime)?;
         seed_fake_driver_release_cache(&store, version, &runtime_a.release_platform)?;
 
         let subtree_action_id = seed_subtree_action(

@@ -223,7 +223,9 @@ dependency order.
 Each action execution has a default 300-second timeout; timed-out actions are
 recorded as failed with an error prefix `TIMEOUT(300)`.
 Before claiming work, `drain-queue` preflights runtime dependencies for pending
-actions (builds required Docker images and fills `bvc-artifacts/driver-release-cache/<dso>/<platform>/`).
+actions (builds required Docker images and fills immutable
+`bvc-artifacts/driver-release-cache/by-input-sha256/<input-manifest-sha256>/`
+generations).
 After setup, action containers run with `--pull never --network none` and consume
 the cached release assets/protos, so workers do not repeatedly hit GitHub during execution.
 

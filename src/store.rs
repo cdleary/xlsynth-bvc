@@ -2686,10 +2686,14 @@ impl ArtifactStore {
         self.root.join(crate::DRIVER_RELEASE_CACHE_DIR)
     }
 
-    pub(crate) fn driver_release_cache_dir(&self, version: &str, platform: &str) -> PathBuf {
-        self.driver_release_cache_root()
-            .join(version)
-            .join(platform)
+    pub(crate) fn driver_release_cache_dir(&self, input_sha256: &str) -> Result<PathBuf> {
+        if input_sha256.len() != 64 || !input_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("driver release-cache input digest must be 64 hexadecimal characters");
+        }
+        Ok(self
+            .driver_release_cache_root()
+            .join("by-input-sha256")
+            .join(input_sha256.to_ascii_lowercase()))
     }
 
     pub(crate) fn queue_root(&self) -> PathBuf {

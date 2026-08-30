@@ -103,15 +103,20 @@ directory. The downloader may create partial files there, but consumers never
 mount that directory. Setup inventories the exact regular-file closure and
 content hashes in a protobuf manifest, validates required binaries, DSO,
 stdlib archive, and schema files, then atomically renames the complete directory
-into its final cache path. A parsed and fully validated manifest, not marker
-existence, is readiness evidence. Cache setup locks contain protobuf owner
-identity and do not age out while the exact local process incarnation is alive.
+into `driver-release-cache/by-input-sha256/<manifest-digest>`. Final cache
+generations are immutable: different input closures coexist, and an invalid
+existing generation fails closed instead of being replaced under live workers.
+The complete manifest and file closure are revalidated before each use; marker
+existence or a pathname-only process cache is never readiness evidence. Each
+container mounts only its action's exact generation, read-only, at
+`/cache-input`. Cache setup locks contain protobuf owner identity and do not age
+out while the exact local process incarnation is alive.
 
 The cache's upstream closure is identity-bearing as well as locally validated.
 Planning records the published SHA-256 checksums for every required binary,
 DSO, and stdlib archive, plus hashes of the required schema files fetched from
-the checked-in source commit and of the checked-in cache setup script, in a sorted canonical
-`DriverReleaseCacheInputManifest`. Its digest is stored in
+the checked-in source commit and of the checked-in cache setup script, in a
+sorted canonical `DriverReleaseCacheInputManifest`. Its digest is stored in
 `DriverRuntimeSpec` and therefore in every driver-backed action ID. Cache
 setup must reproduce that digest, passes the captured checksums to the
 downloader, and persists the input manifest alongside the exact materialized
@@ -120,14 +125,15 @@ under an older action identity.
 
 ## Executable runtime identity
 
-Docker image tags are build inputs and operator-facing names; they are not
-execution identities. Before an action is created, the declared Dockerfile
-recipe is built or verified and the resolved 256-bit OCI image ID is stored in
-the runtime protobuf. That immutable image ID participates in the action ID.
-Fingerprint validation is performed through the immutable
-`sha256:<image-id>` reference resolved from the tag, and execution uses that
-same immutable reference. A concurrent retag cannot pair one image's validated
-recipe with another image's identity.
+Docker image tags are planning inputs and operator-facing names; they are not
+execution identities. An unbound recipe is built or reused only under a
+fingerprint-qualified tag, then its resolved 256-bit OCI image ID is stored in
+the runtime protobuf. The driver fingerprint includes its release-cache input
+digest. That immutable image ID participates in the action ID. Once bound,
+preflight and execution inspect and use only `sha256:<image-id>`; they do not
+consult the current checkout's Dockerfile or the mutable operator tag. Multiple
+recipe generations can therefore coexist and an older queued action remains
+replayable while its pinned image is retained locally.
 
 Persistent runners are keyed by immutable image ID, store root, protocol
 version, and the checked-in worker script bytes. A named container is reused
@@ -148,6 +154,14 @@ publication pipeline selects an allowlisted protobuf snapshot, projects the
 browser datasets, builds a verified static site, and promotes immutable site
 and catalog objects before updating the small current-site pointers. Static web
 serving requires neither the Rust process nor sled.
+
+The browser catalog is a deny-unknown typed JSON projection and must use the
+canonical Rust encoding. Verification reconstructs every fixed HTML page,
+compiled CSS/JavaScript asset, catalog, and embedded snapshot manifest from the
+verified typed inputs and requires byte-for-byte equality. Generated pages use
+a restrictive content-security policy. Published catalog/current protobufs
+must also equal their canonical re-encoding, and the browser current pointer is
+deny-unknown canonical JSON.
 
 The static-site manifest is an exact allowlist, not an extensible inventory.
 Its file set must equal the derived topology of fixed pages and compiled assets,

@@ -156,7 +156,7 @@ Image build (`docker/xlsynth-driver.Dockerfile`):
 Before queue draining, the executor preflights pending work:
 
 - builds required driver/yosys images
-- prepares a per-version/per-platform release cache at `bvc-artifacts/driver-release-cache/<dso_version>/<platform>/` using vendored `download_release.py`
+- prepares an immutable content-addressed release cache at `bvc-artifacts/driver-release-cache/by-input-sha256/<input-manifest-sha256>/` using vendored `download_release.py`
 - fetches delay-info decode protos into that same cache
 
 Planning first creates a canonical protobuf input manifest containing the
@@ -170,14 +170,24 @@ atomically promotes the complete directory. A protobuf owner lock prevents
 parallel setup; the lock cannot age out while its exact local process
 incarnation is alive.
 
-At action execution time, driver containers mount that cache read-only at `/cache`, stage tools into `/tmp/xlsynth-release`, and run with:
+Each input-manifest digest has a separate final directory. Final generations
+are never replaced in place, are fully revalidated before use, and are mounted
+individually read-only at `/cache-input`; different deployment generations can
+therefore coexist without a pathname race.
+
+At action execution time, driver containers mount their exact cache generation
+read-only at `/cache-input`, stage tools into `/tmp/xlsynth-release`, and run
+with:
 
 - `docker run --pull never`
 - `docker run --network none`
 
 This keeps action execution offline after setup and avoids repeated release-asset pulls from GitHub.
-Docker tags are verified build names only. Planning resolves the tag to an immutable image ID,
-stores that ID in the action protobuf, and execution invokes Docker by `sha256:<image-id>`.
+Docker tags are planning names only. Unbound builds use a
+fingerprint-qualified tag; planning resolves that image to an immutable image
+ID and stores it in the action protobuf. Preflight and execution of a bound
+action invoke Docker by `sha256:<image-id>` without consulting the current tag
+or Dockerfile, so retained historical images remain replayable.
 Driver action creation validates `crate_version <-> dso_version` compatibility against `third_party/xlsynth-crate/generated_version_compat.json`.
 There is no hardcoded default driver crate version in Rust code: actions either use an explicit `--driver-version` or resolve to the latest compatible crate version from `generated_version_compat.json` at action creation time.
 Driver action provenance records both labels explicitly as `crate:vX.Y.Z` and `dso:vX.Y.Z`.

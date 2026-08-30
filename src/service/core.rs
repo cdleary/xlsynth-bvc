@@ -337,7 +337,7 @@ test -s /scratch/structural_hash.json
         let mounts = vec![
             DockerMount::read_only(ir_input_path, "/inputs/input.ir")?,
             DockerMount::read_write(&scratch_dir, "/scratch")?,
-            driver_cache_mount(store)?,
+            driver_cache_mount(store, &runtime_for_hash)?,
         ];
         let run_trace = execute_persistent_runner_script(
             &docker_image_content_ref(&runtime_for_hash.docker_image_id)?,

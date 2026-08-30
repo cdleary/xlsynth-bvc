@@ -1044,7 +1044,7 @@ test -f /scratch/dslx_list_fns_errors.jsonl
         let mounts = vec![
             DockerMount::read_only(subtree_root, "/inputs/subtree")?,
             DockerMount::read_write(&scratch_dir, "/scratch")?,
-            driver_cache_mount(store)?,
+            driver_cache_mount(store, &discovery_runtime)?,
         ];
         let run_trace = execute_persistent_runner_script(
             &docker_image_content_ref(&discovery_runtime.docker_image_id)?,
@@ -1401,7 +1401,7 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml dslx2ir \
     let mounts = vec![
         DockerMount::read_only(&subtree_root, "/inputs/subtree")?,
         DockerMount::read_write(payload_dir, "/outputs")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
 
     let run_trace = execute_persistent_runner_script(
@@ -1700,7 +1700,7 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir2opt /inputs/input.ir -
         let mounts = vec![
             DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
             DockerMount::read_write(payload_dir, "/outputs")?,
-            driver_cache_mount(store)?,
+            driver_cache_mount(store, runtime)?,
         ];
 
         let run_trace = execute_persistent_runner_script(
@@ -2070,7 +2070,7 @@ test -s /outputs/delay_info.textproto
     let mounts = vec![
         DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
         DockerMount::read_write(payload_dir, "/outputs")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
 
     let run_trace = execute_persistent_runner_script(
@@ -2161,7 +2161,7 @@ test -s /outputs/ir_equiv.json
         DockerMount::read_only(&lhs_input_path, "/inputs/lhs.ir")?,
         DockerMount::read_only(&rhs_input_path, "/inputs/rhs.ir")?,
         DockerMount::read_write(payload_dir, "/outputs")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
     let run_trace = execute_persistent_runner_script_with_timeout(
         &docker_image_content_ref(&runtime.docker_image_id)?,
@@ -2365,7 +2365,7 @@ test -s /outputs/ir_aig_equiv.json
         DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
         DockerMount::read_only(&aig_input_path, "/inputs/input.aig")?,
         DockerMount::read_write(payload_dir, "/outputs")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
     let run_trace = execute_persistent_runner_script_with_timeout(
         &docker_image_content_ref(&runtime.docker_image_id)?,
@@ -2865,7 +2865,7 @@ fn run_driver_ir_to_g8r_batch_runnable(
 
         let mounts = vec![
             DockerMount::read_write(&batch_root, "/batch")?,
-            driver_cache_mount(store)?,
+            driver_cache_mount(store, runtime)?,
         ];
         let run_trace = execute_persistent_runner_script(
             &docker_image_content_ref(&runtime.docker_image_id)?,
@@ -3250,7 +3250,7 @@ xlsynth-driver ir2g8r ${G8R_EXTRA_FLAGS} /inputs/input.ir --fraig="${FRAIG}" --a
     let mounts = vec![
         DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
         DockerMount::read_write(payload_dir, "/outputs")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
 
     let run_trace = execute_persistent_runner_script(
@@ -3470,7 +3470,7 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir2combo /inputs/input.ir
     let mounts = vec![
         DockerMount::read_only(&docker_ir_input_path, "/inputs/input.ir")?,
         DockerMount::read_write(payload_dir, "/outputs")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
 
     let run_trace = (|| {
@@ -4464,7 +4464,7 @@ test -f /outputs/raw/manifest.jsonl
     let mounts = vec![
         DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
         DockerMount::read_write(&raw_output_dir, "/outputs/raw")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
     let run_trace = execute_persistent_runner_script(
         &docker_image_content_ref(&runtime.docker_image_id)?,
@@ -4722,7 +4722,7 @@ test -f /outputs/raw/manifest.jsonl
     let mounts = vec![
         DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
         DockerMount::read_write(&raw_output_dir, "/outputs/raw")?,
-        driver_cache_mount(store)?,
+        driver_cache_mount(store, runtime)?,
     ];
     let run_trace = execute_persistent_runner_script(
         &docker_image_content_ref(&runtime.docker_image_id)?,
@@ -5148,7 +5148,7 @@ test -s /outputs/stats.raw.json
             let mounts = vec![
                 DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
                 DockerMount::read_write(payload_dir, "/outputs")?,
-                driver_cache_mount(store)?,
+                driver_cache_mount(store, &legacy_ctx.runtime)?,
             ];
             let run_trace = execute_persistent_runner_script(
                 &docker_image_content_ref(&legacy_ctx.runtime.docker_image_id)?,
@@ -5200,7 +5200,7 @@ test -s /outputs/stats.json
         let mounts = vec![
             DockerMount::read_only(&aig_input_path, "/inputs/input.aig")?,
             DockerMount::read_write(payload_dir, "/outputs")?,
-            driver_cache_mount(store)?,
+            driver_cache_mount(store, runtime)?,
         ];
         let run_trace = execute_persistent_runner_script(
             &docker_image_content_ref(&runtime.docker_image_id)?,

@@ -51,6 +51,7 @@ pub(crate) struct VerifyPublishedSiteSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct BrowserCurrentPointer {
     schema_version: u32,
     site_id: String,
@@ -106,6 +107,21 @@ fn required<'a, T>(value: &'a Option<T>, field: &str) -> Result<&'a T> {
     value
         .as_ref()
         .with_context(|| format!("missing required protobuf field {field}"))
+}
+
+fn decode_canonical_protobuf<M>(bytes: &[u8], label: &str) -> Result<M>
+where
+    M: Message + Default,
+{
+    let message = M::decode(bytes).with_context(|| format!("decoding {label}"))?;
+    if message.encode_to_vec() != bytes {
+        bail!("{label} is not canonically encoded");
+    }
+    Ok(message)
+}
+
+fn encode_browser_current_pointer(pointer: &BrowserCurrentPointer) -> Result<Vec<u8>> {
+    serde_json::to_vec_pretty(pointer).context("serializing canonical browser current-site pointer")
 }
 
 fn normalized_relpath(value: &str, field: &str) -> Result<String> {
@@ -373,8 +389,10 @@ pub(crate) fn publish_static_site(
     if catalog_path.exists() {
         let catalog_bytes = fs::read(&catalog_path)
             .with_context(|| format!("reading immutable catalog: {}", catalog_path.display()))?;
-        let existing = pb::PublishedSiteCatalog::decode(catalog_bytes.as_slice())
-            .with_context(|| format!("decoding immutable catalog: {}", catalog_path.display()))?;
+        let existing: pb::PublishedSiteCatalog = decode_canonical_protobuf(
+            &catalog_bytes,
+            &format!("immutable catalog {}", catalog_path.display()),
+        )?;
         validate_catalog(&existing)?;
         catalog.published_at = existing.published_at.clone();
         if existing != catalog {
@@ -403,13 +421,10 @@ pub(crate) fn publish_static_site(
                 pointer_path.display()
             )
         })?;
-        let existing =
-            pb::CurrentSitePointer::decode(existing_bytes.as_slice()).with_context(|| {
-                format!(
-                    "decoding current protobuf pointer: {}",
-                    pointer_path.display()
-                )
-            })?;
+        let existing: pb::CurrentSitePointer = decode_canonical_protobuf(
+            &existing_bytes,
+            &format!("current protobuf pointer {}", pointer_path.display()),
+        )?;
         validate_pointer(&existing)?;
         if existing.site_id == pointer.site_id
             && existing.catalog_relpath == pointer.catalog_relpath
@@ -427,8 +442,7 @@ pub(crate) fn publish_static_site(
     };
     atomic_write(
         &publish_root.join(CURRENT_POINTER_JSON),
-        &serde_json::to_vec_pretty(&browser_pointer)
-            .context("serializing browser current-site pointer")?,
+        &encode_browser_current_pointer(&browser_pointer)?,
     )?;
     verify_published_site(publish_root)?;
     Ok(PublishStaticSiteSummary {
@@ -450,8 +464,8 @@ pub(crate) fn verify_published_site(publish_root: &Path) -> Result<VerifyPublish
 
     let pointer_bytes = fs::read(publish_root.join(CURRENT_POINTER_PROTO))
         .context("reading current protobuf pointer")?;
-    let pointer = pb::CurrentSitePointer::decode(pointer_bytes.as_slice())
-        .context("decoding current protobuf pointer")?;
+    let pointer: pb::CurrentSitePointer =
+        decode_canonical_protobuf(&pointer_bytes, "current protobuf pointer")?;
     validate_pointer(&pointer)?;
     let site_id = digest_hex(
         required(&pointer.site_id, "current.site_id")?,
@@ -469,8 +483,8 @@ pub(crate) fn verify_published_site(publish_root: &Path) -> Result<VerifyPublish
     }
     let catalog_bytes = fs::read(publish_root.join(&catalog_relpath))
         .context("reading current published catalog")?;
-    let catalog = pb::PublishedSiteCatalog::decode(catalog_bytes.as_slice())
-        .context("decoding current published catalog")?;
+    let catalog: pb::PublishedSiteCatalog =
+        decode_canonical_protobuf(&catalog_bytes, "current published catalog")?;
     validate_catalog(&catalog)?;
     if catalog.site_id != pointer.site_id {
         bail!("current pointer site id disagrees with catalog");
@@ -502,11 +516,10 @@ pub(crate) fn verify_published_site(publish_root: &Path) -> Result<VerifyPublish
     {
         bail!("published catalog metadata disagrees with site manifest");
     }
-    let browser: BrowserCurrentPointer = serde_json::from_slice(
-        &fs::read(publish_root.join(CURRENT_POINTER_JSON))
-            .context("reading browser current pointer")?,
-    )
-    .context("decoding browser current pointer")?;
+    let browser_bytes = fs::read(publish_root.join(CURRENT_POINTER_JSON))
+        .context("reading browser current pointer")?;
+    let browser: BrowserCurrentPointer =
+        serde_json::from_slice(&browser_bytes).context("decoding browser current pointer")?;
     let expected_browser = BrowserCurrentPointer {
         schema_version: 1,
         site_id: site_id.clone(),
@@ -515,6 +528,9 @@ pub(crate) fn verify_published_site(publish_root: &Path) -> Result<VerifyPublish
     };
     if browser != expected_browser {
         bail!("browser current pointer disagrees with protobuf pointer/catalog");
+    }
+    if browser_bytes != encode_browser_current_pointer(&expected_browser)? {
+        bail!("browser current pointer is not canonically encoded");
     }
     Ok(VerifyPublishedSiteSummary {
         publish_root: publish_root.display().to_string(),
@@ -609,6 +625,8 @@ mod tests {
         let first_catalog = fs::read(&catalog_path).expect("first catalog");
         let first_pointer =
             fs::read(publish_root.join(CURRENT_POINTER_PROTO)).expect("first current pointer");
+        let first_browser_pointer =
+            fs::read(publish_root.join(CURRENT_POINTER_JSON)).expect("first browser pointer");
 
         let first_snapshot_manifest =
             fs::read(snapshot_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME))
@@ -670,6 +688,47 @@ mod tests {
                 .expect("immutable index");
         assert!(immutable_index.contains("name=\"bvc-site-root\" content=\"./\""));
         assert!(!immutable_index.contains("/xlsynth-bvc/assets/"));
+
+        let mut catalog_with_unknown_field = first_catalog.clone();
+        catalog_with_unknown_field.extend_from_slice(&[0xfa, 0x07, 0x01, b'x']);
+        fs::write(&catalog_path, &catalog_with_unknown_field).expect("write catalog unknown field");
+        let error = verify_published_site(&publish_root)
+            .expect_err("catalog with unknown wire field must fail");
+        assert!(error.to_string().contains("not canonically encoded"));
+        let error = publish_static_site(&site_dir, &publish_root)
+            .expect_err("republish must reject existing catalog unknown wire field");
+        assert!(error.to_string().contains("not canonically encoded"));
+        fs::write(&catalog_path, &first_catalog).expect("restore canonical catalog");
+
+        let pointer_path = publish_root.join(CURRENT_POINTER_PROTO);
+        let mut pointer_with_unknown_field = first_pointer.clone();
+        pointer_with_unknown_field.extend_from_slice(&[0xfa, 0x07, 0x01, b'x']);
+        fs::write(&pointer_path, &pointer_with_unknown_field).expect("write pointer unknown field");
+        let error = verify_published_site(&publish_root)
+            .expect_err("pointer with unknown wire field must fail");
+        assert!(error.to_string().contains("not canonically encoded"));
+        fs::write(&pointer_path, &first_pointer).expect("restore canonical pointer");
+
+        let browser_pointer_path = publish_root.join(CURRENT_POINTER_JSON);
+        let mut browser_value: serde_json::Value =
+            serde_json::from_slice(&first_browser_pointer).expect("decode browser pointer value");
+        browser_value
+            .as_object_mut()
+            .expect("browser pointer object")
+            .insert("private_path".to_string(), "/srv/build/private".into());
+        fs::write(
+            &browser_pointer_path,
+            serde_json::to_vec_pretty(&browser_value).expect("encode browser pointer value"),
+        )
+        .expect("write browser pointer unknown field");
+        let error = verify_published_site(&publish_root)
+            .expect_err("browser pointer unknown field must fail");
+        assert!(
+            format!("{error:#}").contains("unknown field `private_path`"),
+            "unexpected error: {error:#}"
+        );
+        fs::write(&browser_pointer_path, &first_browser_pointer)
+            .expect("restore canonical browser pointer");
 
         let mut mutated_catalog =
             pb::PublishedSiteCatalog::decode(first_catalog.as_slice()).expect("decode catalog");
