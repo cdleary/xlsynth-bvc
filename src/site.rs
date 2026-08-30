@@ -25,15 +25,26 @@ use crate::snapshot::{
 pub(crate) const STATIC_SITE_RECORD_VERSION: u32 = 1;
 pub(crate) const STATIC_SITE_MANIFEST_FILENAME: &str = "site_manifest.v1.pb";
 
-const STYLE_CSS: &str = r#":root{color-scheme:light dark;--bg:#0d1117;--panel:#161b22;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--line:#30363d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}header,main{max-width:1180px;margin:auto;padding:24px}header{border-bottom:1px solid var(--line)}a{color:var(--accent)}h1,h2{font-family:ui-sans-serif,system-ui,sans-serif}.meta,.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.card code{overflow-wrap:anywhere}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:16px 0}select,input{font:inherit;padding:7px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px}pre{max-height:62vh;overflow:auto;background:#010409;padding:14px;border:1px solid var(--line);border-radius:8px}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border:1px solid var(--line);padding:6px;text-align:left;vertical-align:top}th{position:sticky;top:0;background:var(--panel)}.table-wrap{max-height:60vh;overflow:auto}svg{width:100%;height:300px;background:var(--panel);border:1px solid var(--line)}"#;
+const STYLE_CSS: &str = r#":root{color-scheme:light dark;--bg:#0d1117;--panel:#161b22;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--line:#30363d;--good:#3fb950;--bad:#f85149}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}header,main{max-width:1180px;margin:auto;padding:24px}header{border-bottom:1px solid var(--line)}a{color:var(--accent)}h1,h2{font-family:ui-sans-serif,system-ui,sans-serif}.meta,.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.card code{overflow-wrap:anywhere}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:16px 0}select,input{font:inherit;padding:7px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px}pre{max-height:62vh;overflow:auto;background:#010409;padding:14px;border:1px solid var(--line);border-radius:8px}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border:1px solid var(--line);padding:6px;text-align:left;vertical-align:top}th{position:sticky;top:0;background:var(--panel)}.table-wrap{max-height:60vh;overflow:auto}svg{width:100%;height:300px;background:var(--panel);border:1px solid var(--line)}.progression-chart svg{height:auto;min-height:320px}.chart-grid{stroke:var(--line);stroke-width:1}.chart-axis{fill:var(--muted);font-size:12px}.chart-title{fill:var(--text);font-size:13px}.chart-line{fill:none;stroke-width:2.5}.chart-line-median{stroke:var(--accent)}.chart-line-p90{stroke:var(--muted)}.chart-dot-median{fill:var(--accent)}.chart-dot-p90{fill:var(--muted)}.delta-regressed{color:var(--bad)}.delta-improved{color:var(--good)}.delta-same{color:var(--muted)}.stat-value{font:500 24px/1.2 ui-sans-serif,system-ui,sans-serif;margin:.2rem 0}.chart-legend{display:flex;gap:18px;flex-wrap:wrap;margin:.5rem 0 1rem}.legend-swatch{display:inline-block;width:18px;height:3px;vertical-align:middle;margin-right:6px}.legend-median{background:var(--accent)}.legend-p90{background:var(--muted)}"#;
 
 const APP_JS: &str = r#"const base=document.querySelector('meta[name=bvc-site-root]').content;
 const byId=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));
 function arrays(v,out=[],path='$'){if(Array.isArray(v)&&v.length&&typeof v[0]==='object')out.push([path,v]);else if(v&&typeof v==='object')for(const[k,x]of Object.entries(v))arrays(x,out,`${path}.${k}`);return out}
 function renderTable(rows){if(!rows.length)return '<p class=muted>No row arrays found.</p>';const keys=[...new Set(rows.slice(0,200).flatMap(Object.keys))].slice(0,24);return `<div class=table-wrap><table><thead><tr>${keys.map(k=>`<th>${esc(k)}</th>`).join('')}</tr></thead><tbody>${rows.slice(0,500).map(r=>`<tr>${keys.map(k=>`<td>${esc(typeof r[k]==='object'?JSON.stringify(r[k]):r[k]??'')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`}
-function renderPlot(rows){const numeric=[...new Set(rows.slice(0,100).flatMap(r=>Object.keys(r).filter(k=>typeof r[k]==='number')))];if(numeric.length<2)return '';const[xk,yk]=numeric;const pts=rows.filter(r=>Number.isFinite(r[xk])&&Number.isFinite(r[yk])).slice(0,1000);if(!pts.length)return '';const xs=pts.map(r=>r[xk]),ys=pts.map(r=>r[yk]),xmin=Math.min(...xs),xmax=Math.max(...xs),ymin=Math.min(...ys),ymax=Math.max(...ys);const sx=x=>25+550*(x-xmin)/(xmax-xmin||1),sy=y=>275-250*(y-ymin)/(ymax-ymin||1);return `<h2>Numeric preview: ${esc(xk)} vs ${esc(yk)}</h2><svg viewBox='0 0 600 300' role=img aria-label='numeric dataset preview'>${pts.map(r=>`<circle cx='${sx(r[xk])}' cy='${sy(r[yk])}' r='2.5' fill='#58a6ff'/>`).join('')}<text x='300' y='296' fill='#8b949e' text-anchor='middle'>${esc(xk)}</text><text x='8' y='150' fill='#8b949e'>${esc(yk)}</text></svg>`}
-async function main(){const catalog=await fetch(base+'catalog.json').then(r=>{if(!r.ok)throw Error(`catalog ${r.status}`);return r.json()});const select=byId('dataset');if(!select)return;for(const d of catalog.datasets){const o=document.createElement('option');o.value=d.logical_key;o.textContent=`${d.logical_key} (${d.bytes.toLocaleString()} B)`;select.appendChild(o)}const q=new URLSearchParams(location.search).get('key');if(q&&catalog.datasets.some(d=>d.logical_key===q))select.value=q;async function load(){const d=catalog.datasets.find(x=>x.logical_key===select.value);history.replaceState(null,'','?key='+encodeURIComponent(d.logical_key));byId('dataset-meta').textContent=`sha256 ${d.sha256} · ${d.bytes.toLocaleString()} bytes`;const data=await fetch(base+d.url).then(r=>{if(!r.ok)throw Error(`${d.url} ${r.status}`);return r.json()});const found=arrays(data);const rows=found[0]?.[1]||[];byId('plot').innerHTML=renderPlot(rows);byId('table').innerHTML=found.length?`<h2>Rows: ${esc(found[0][0])}</h2>${renderTable(rows)}`:'<p class=muted>No tabular row arrays found.</p>';byId('raw').textContent=JSON.stringify(data,null,2)}select.addEventListener('change',load);if(catalog.datasets.length)await load()}main().catch(e=>{const out=byId('error');if(out)out.textContent=e.stack||e});"#;
+function renderPlot(rows){const numeric=[...new Set(rows.slice(0,100).flatMap(r=>Object.keys(r).filter(k=>typeof r[k]==='number')))];if(numeric.length<2)return '';const[xk,yk]=numeric;const pts=rows.filter(r=>Number.isFinite(r[xk])&&Number.isFinite(r[yk])).slice(0,1000);if(!pts.length)return '';const xs=pts.map(r=>r[xk]),ys=pts.map(r=>r[yk]),xmin=Math.min(...xs),xmax=Math.max(...xs),ymin=Math.min(...ys),ymax=Math.max(...ys);const sx=x=>25+550*(x-xmin)/(xmax-xmin||1),sy=y=>275-250*(y-ymin)/(ymax-ymin||1);return `<h2>Numeric preview: ${esc(xk)} vs ${esc(yk)}</h2><svg viewBox='0 0 600 300' role=img aria-label='numeric dataset preview'>${pts.map(r=>`<circle cx='${sx(r[xk])}' cy='${sy(r[yk])}' r='2.5' fill='var(--accent)'/>`).join('')}<text x='300' y='296' fill='var(--muted)' text-anchor='middle'>${esc(xk)}</text><text x='8' y='150' fill='var(--muted)'>${esc(yk)}</text></svg>`}
+function versionParts(v){return String(v).replace(/^v/,'').split(/[.-]/).map(x=>/^\d+$/.test(x)?Number(x):x)}
+function versionCompare(a,b){const aa=versionParts(a),bb=versionParts(b),n=Math.max(aa.length,bb.length);for(let i=0;i<n;i++){const x=aa[i]??0,y=bb[i]??0;if(x===y)continue;if(typeof x==='number'&&typeof y==='number')return x-y;return String(x).localeCompare(String(y))}return 0}
+function quantile(values,p){if(!values.length)return 0;const sorted=[...values].sort((a,b)=>a-b),at=(sorted.length-1)*p,lo=Math.floor(at),hi=Math.ceil(at);return sorted[lo]+(sorted[hi]-sorted[lo])*(at-lo)}
+function product(v){return Number(v).toLocaleString(undefined,{maximumFractionDigits:2})}
+function subject(sample){return `${sample.fn_key}#${sample.ir_top??'<default>'}`}
+function releaseStats(samples){const grouped=new Map;for(const sample of samples){if(!Number.isFinite(sample.g8r_product_loss))continue;const values=grouped.get(sample.crate_version)||[];values.push(sample.g8r_product_loss);grouped.set(sample.crate_version,values)}return [...grouped].sort((a,b)=>versionCompare(a[0],b[0])).map(([version,values])=>({version,count:values.length,median:quantile(values,.5),p90:quantile(values,.9)}))}
+function progressionChart(stats){if(!stats.length)return '<p class=muted>No release samples found.</p>';const W=960,H=350,L=94,R=28,T=38,B=58,values=stats.flatMap(x=>[x.median,x.p90]),min=Math.min(0,...values),max=Math.max(0,...values),pad=(max-min||1)*.08,ymin=min-pad,ymax=max+pad,x=i=>stats.length===1?(L+W-R)/2:L+i*(W-L-R)/(stats.length-1),y=v=>T+(ymax-v)*(H-T-B)/(ymax-ymin),ticks=5;const grid=Array.from({length:ticks+1},(_,i)=>{const v=ymin+(ymax-ymin)*i/ticks,yy=y(v);return `<line class=chart-grid x1='${L}' x2='${W-R}' y1='${yy}' y2='${yy}'/><text class=chart-axis x='${L-10}' y='${yy+4}' text-anchor='end'>${product(v)}</text>`}).join('');const path=key=>stats.map((s,i)=>`${x(i)},${y(s[key])}`).join(' ');const dots=(key,cls)=>stats.map((s,i)=>`<circle class='${cls}' cx='${x(i)}' cy='${y(s[key])}' r='4'><title>${esc(s.version)} ${key} ${product(s[key])} product units</title></circle>`).join('');const labels=stats.map((s,i)=>`<text class=chart-axis x='${x(i)}' y='${H-24}' text-anchor='middle'>v${esc(s.version)}</text>`).join('');return `<div class=chart-legend><span><i class='legend-swatch legend-median'></i>Median loss</span><span><i class='legend-swatch legend-p90'></i>90th percentile loss</span></div><svg viewBox='0 0 ${W} ${H}' role=img aria-label='G8r product loss progression by crate release'><title>G8r product loss progression by crate release</title><desc>Loss is the absolute difference between G8r and Yosys ABC nodes times levels products.</desc>${grid}<polyline class='chart-line chart-line-p90' points='${path('p90')}'/><polyline class='chart-line chart-line-median' points='${path('median')}'/>${dots('p90','chart-dot-p90')}${dots('median','chart-dot-median')}${labels}<text class=chart-title x='${(L+W-R)/2}' y='${H-4}' text-anchor='middle'>xlsynth-driver crate release</text><text class=chart-title x='16' y='${(T+H-B)/2}' text-anchor='middle' transform='rotate(-90 16 ${(T+H-B)/2})'>G8r − Yosys/ABC product (nodes × levels)</text></svg>`}
+function pairedSamples(samples,baseline,current){const before=new Map(samples.filter(s=>s.crate_version===baseline).map(s=>[subject(s),s])),after=new Map(samples.filter(s=>s.crate_version===current).map(s=>[subject(s),s]));return [...after].filter(([key])=>before.has(key)).map(([key,now])=>{const old=before.get(key),delta=now.g8r_product_loss-old.g8r_product_loss;return {key,old:old.g8r_product_loss,now:now.g8r_product_loss,delta}}).sort((a,b)=>Math.abs(b.delta)-Math.abs(a.delta)||a.key.localeCompare(b.key))}
+function renderPair(samples,stats,baseline,current){const pairs=pairedSamples(samples,baseline,current),before=stats.find(s=>s.version===baseline),after=stats.find(s=>s.version===current),medianDelta=(after?.median??0)-(before?.median??0),regressed=pairs.filter(row=>row.delta>.05).length,improved=pairs.filter(row=>row.delta<-.05).length,same=pairs.length-regressed-improved,changed=pairs.filter(row=>Math.abs(row.delta)>.05),outliers=pairs.filter(row=>row.old>.05&&row.now>.05).sort((a,b)=>b.now-a.now||a.key.localeCompare(b.key));byId('progression-summary').innerHTML=`<article class=card><div class=muted>Release window</div><div class=stat-value>v${esc(baseline)} → v${esc(current)}</div><div class=meta>Compared as separate crate runtimes.</div></article><article class=card><div class=muted>Median product-loss change</div><div class='stat-value ${medianDelta>0?'delta-regressed':medianDelta<0?'delta-improved':'delta-same'}'>${medianDelta>0?'+':''}${product(medianDelta)}</div><div class=meta>${product(before?.median??0)} → ${product(after?.median??0)} nodes × levels</div></article><article class=card><div class=muted>Meaningful changes</div><div class=stat-value><span class=delta-regressed>${regressed.toLocaleString()} worse</span> · <span class=delta-improved>${improved.toLocaleString()} better</span></div><div class=meta>${same.toLocaleString()} within ±0.05 tolerance.</div></article><article class=card><div class=muted>Paired functions</div><div class=stat-value>${pairs.length.toLocaleString()}</div><div class=meta>Matched by DSLX function and IR top.</div></article>`;const changeRows=changed.slice(0,100).map(row=>{const kind=row.delta>0?'regressed':'improved';return `<tr><td>${esc(row.key)}</td><td>${product(row.old)}</td><td>${product(row.now)}</td><td class='delta-${kind}'>${row.delta>0?'+':''}${product(row.delta)}</td><td class='delta-${kind}'>${kind}</td></tr>`}).join(''),changes=changed.length?`<h2>Largest per-function changes</h2><p class=meta>Ordered by absolute nodes × levels product-loss change. Positive is worse; negative is better. The ±0.05 tolerance matches campaign finding classification.</p><div class=table-wrap><table><thead><tr><th>Function</th><th>Baseline product loss</th><th>Current product loss</th><th>Change</th><th>Classification</th></tr></thead><tbody>${changeRows}</tbody></table></div>`:`<h2>Per-function changes</h2><p class=meta>No meaningful changes: all ${pairs.length.toLocaleString()} paired functions are unchanged within the ±0.05 product-loss tolerance.</p>`,outlierRows=outliers.slice(0,20).map(row=>`<tr><td>${esc(row.key)}</td><td>${product(row.old)}</td><td>${product(row.now)}</td></tr>`).join(''),persistent=outliers.length?`<h2>Persistent product-loss outliers</h2><p class=meta>${outliers.length.toLocaleString()} paired functions remain worse than Yosys/ABC in both releases, ordered by current loss.</p><div class=table-wrap><table><thead><tr><th>Function</th><th>Baseline product loss</th><th>Current product loss</th></tr></thead><tbody>${outlierRows}</tbody></table></div>`:'<h2>Persistent product-loss outliers</h2><p class=muted>None in both selected releases.</p>';byId('progression-table').innerHTML=pairs.length?changes+persistent:'<p class=muted>No functions are paired across the selected releases.</p>'}
+async function datasetExplorer(catalog){const select=byId('dataset');if(!select)return;for(const d of catalog.datasets){const o=document.createElement('option');o.value=d.logical_key;o.textContent=`${d.logical_key} (${d.bytes.toLocaleString()} B)`;select.appendChild(o)}const q=new URLSearchParams(location.search).get('key');if(q&&catalog.datasets.some(d=>d.logical_key===q))select.value=q;async function load(){const d=catalog.datasets.find(x=>x.logical_key===select.value);history.replaceState(null,'','?key='+encodeURIComponent(d.logical_key));byId('dataset-meta').textContent=`sha256 ${d.sha256} · ${d.bytes.toLocaleString()} bytes`;const data=await fetch(base+d.url).then(r=>{if(!r.ok)throw Error(`${d.url} ${r.status}`);return r.json()});const found=arrays(data),rows=found[0]?.[1]||[];byId('plot').innerHTML=renderPlot(rows);byId('table').innerHTML=found.length?`<h2>Rows: ${esc(found[0][0])}</h2>${renderTable(rows)}`:'<p class=muted>No tabular row arrays found.</p>';byId('raw').textContent=JSON.stringify(data,null,2)}select.addEventListener('change',load);if(catalog.datasets.length)await load()}
+async function progression(catalog){const root=byId('progression');if(!root)return;const key=root.dataset.datasetKey,dataset=catalog.datasets.find(d=>d.logical_key===key);if(!dataset)throw Error(`required progression dataset is missing: ${key}`);const data=await fetch(base+dataset.url).then(r=>{if(!r.ok)throw Error(`${dataset.url} ${r.status}`);return r.json()}),samples=data.dataset?.samples||[],stats=releaseStats(samples),versions=stats.map(s=>s.version);if(versions.length<2)throw Error('release progression needs at least two crate versions');byId('progression-chart').innerHTML=progressionChart(stats);const baseline=byId('baseline-version'),current=byId('current-version'),options=versions.map(v=>`<option value='${esc(v)}'>v${esc(v)}</option>`).join('');baseline.innerHTML=options;current.innerHTML=options;baseline.value=versions.at(-2);current.value=versions.at(-1);const render=()=>renderPair(samples,stats,baseline.value,current.value);baseline.addEventListener('change',render);current.addEventListener('change',render);render()}
+async function main(){const catalog=await fetch(base+'catalog.json').then(r=>{if(!r.ok)throw Error(`catalog ${r.status}`);return r.json()});await datasetExplorer(catalog);await progression(catalog)}main().catch(e=>{const out=byId('error');if(out)out.textContent=e.stack||e});"#;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BuildStaticSiteOptions {
@@ -416,6 +427,7 @@ fn expected_catalog_site_relpaths(
         "snapshot_manifest.v1.pb".to_string(),
         "index.html".to_string(),
         "runs.html".to_string(),
+        "progression.html".to_string(),
         "dataset.html".to_string(),
         format!("assets/{css_name}"),
         format!("assets/{js_name}"),
@@ -517,6 +529,13 @@ fn actual_site_relpaths(site_dir: &Path) -> Result<BTreeSet<String>> {
     Ok(found)
 }
 
+fn progression_body(root_site_url: &str) -> String {
+    format!(
+        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Release progression</h1><p class=\"meta\">Absolute G8r versus Yosys/ABC nodes × levels product loss across published xlsynth-driver crate runs</p><p id=\"error\" role=\"alert\"></p></header><main id=\"progression\" data-dataset-key=\"{}\"><div class=\"toolbar\"><label>Baseline <select id=\"baseline-version\" aria-label=\"Baseline crate release\"></select></label><label>Current <select id=\"current-version\" aria-label=\"Current crate release\"></select></label></div><section id=\"progression-summary\" class=\"grid\" aria-live=\"polite\"></section><h2>Distribution progression</h2><section id=\"progression-chart\" class=\"progression-chart\" aria-live=\"polite\"><p class=\"muted\">Loading release data…</p></section><section id=\"progression-table\" aria-live=\"polite\"></section></main>",
+        crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
+    )
+}
+
 fn expected_fixed_site_files(
     catalog: &BrowserCatalog,
     snapshot: &crate::snapshot::StaticSnapshotManifest,
@@ -530,6 +549,18 @@ fn expected_fixed_site_files(
     files.insert(
         "snapshot_manifest.v1.pb".to_string(),
         crate::snapshot::encode_static_snapshot_manifest(snapshot)?,
+    );
+
+    files.insert(
+        "progression.html".to_string(),
+        html_shell(
+            "xlsynth-bvc release progression",
+            &root_site_url,
+            &progression_body(&root_site_url),
+            &css_name,
+            Some(&js_name),
+        )
+        .into_bytes(),
     );
 
     for run in &catalog.runs {
@@ -595,7 +626,7 @@ fn expected_fixed_site_files(
             "intentional skips"
         };
         let body = format!(
-            "<header><p><a href=\"{run_site_root_url}runs.html\">← Runs</a></p><h1>{} crate v{}</h1><p class=\"meta\">Campaign {} v{} · DSO v{} · status <strong>{}</strong></p></header><main><div class=\"grid\"><article class=\"card\"><h2>Completion</h2><p>{} roots complete · {} failed · {} canceled</p><p>{} missing outputs · {} failed samples · {} {intentional_skip_label}</p></article><article class=\"card\"><h2>Identity</h2><p>Run <code>{}</code></p><p>Campaign <code>{}</code></p><p><a href=\"{run_site_root_url}{}\">Download public run protobuf</a></p>{findings_download}</article></div><h2>Intentional skips</h2><ul>{intentional_skip_items}</ul><h2>Findings</h2><div class=\"table-wrap\"><table><thead><tr><th>Kind</th><th>Subject</th><th>Baseline loss</th><th>Current loss</th><th>Structural hash</th><th>Evidence actions</th></tr></thead><tbody>{finding_rows}</tbody></table></div><h2>Root actions</h2><ul>{root_actions}</ul><h2>Results</h2><p><a href=\"{run_site_root_url}dataset.html?key={}\">Open g8r versus Yosys/ABC dataset</a></p></main>",
+            "<header><p><a href=\"{run_site_root_url}runs.html\">← Runs</a></p><h1>{} crate v{}</h1><p class=\"meta\">Campaign {} v{} · DSO v{} · status <strong>{}</strong></p></header><main><div class=\"grid\"><article class=\"card\"><h2>Completion</h2><p>{} roots complete · {} failed · {} canceled</p><p>{} missing outputs · {} failed samples · {} {intentional_skip_label}</p></article><article class=\"card\"><h2>Identity</h2><p>Run <code>{}</code></p><p>Campaign <code>{}</code></p><p><a href=\"{run_site_root_url}{}\">Download public run protobuf</a></p>{findings_download}</article></div><h2>Intentional skips</h2><ul>{intentional_skip_items}</ul><h2>Findings</h2><div class=\"table-wrap\"><table><thead><tr><th>Kind</th><th>Subject</th><th>Baseline loss</th><th>Current loss</th><th>Structural hash</th><th>Evidence actions</th></tr></thead><tbody>{finding_rows}</tbody></table></div><h2>Root actions</h2><ul>{root_actions}</ul><h2>Results</h2><p><a href=\"{run_site_root_url}progression.html\">View release progression</a> · <a href=\"{run_site_root_url}dataset.html?key={}\">Open g8r versus Yosys/ABC dataset</a></p></main>",
             escape_html(&run.campaign_name),
             escape_html(&run.crate_version),
             escape_html(&run.campaign_name),
@@ -671,7 +702,7 @@ fn expected_fixed_site_files(
         })
         .collect::<String>();
     let index_body = format!(
-        "<header><h1>xlsynth-bvc results</h1><p class=\"meta\">Snapshot <code>{}</code> · {} runs · {} datasets · generated {}</p></header><main><p>This is a self-contained static publication. The build machine and sled database are not involved at request time.</p><p><a href=\"{root_site_url}runs.html\">Browse campaign runs and versions →</a></p><h2>Datasets</h2><div class=\"grid\">{cards}</div></main>",
+        "<header><h1>xlsynth-bvc results</h1><p class=\"meta\">Snapshot <code>{}</code> · {} runs · {} datasets · generated {}</p></header><main><p>This is a self-contained static publication. The build machine and sled database are not involved at request time.</p><p><a href=\"{root_site_url}progression.html\">View release progression →</a> · <a href=\"{root_site_url}runs.html\">Browse campaign runs and versions</a></p><h2>Datasets</h2><div class=\"grid\">{cards}</div></main>",
         snapshot.snapshot_id,
         catalog.runs.len(),
         catalog.datasets.len(),
@@ -844,6 +875,18 @@ pub(crate) fn build_static_site_with_protected_roots(
         "snapshot_manifest.v1.pb",
         &crate::snapshot::encode_static_snapshot_manifest(&snapshot)?,
     )?;
+    write_file(
+        &options.out_dir,
+        "progression.html",
+        html_shell(
+            "xlsynth-bvc release progression",
+            &root_site_url,
+            &progression_body(&root_site_url),
+            &css_name,
+            Some(&js_name),
+        )
+        .as_bytes(),
+    )?;
 
     for run in &catalog.runs {
         let page_relpath = format!("runs/{}/index.html", run.run_id);
@@ -908,7 +951,7 @@ pub(crate) fn build_static_site_with_protected_roots(
             "intentional skips"
         };
         let body = format!(
-            "<header><p><a href=\"{run_site_root_url}runs.html\">← Runs</a></p><h1>{} crate v{}</h1><p class=\"meta\">Campaign {} v{} · DSO v{} · status <strong>{}</strong></p></header><main><div class=\"grid\"><article class=\"card\"><h2>Completion</h2><p>{} roots complete · {} failed · {} canceled</p><p>{} missing outputs · {} failed samples · {} {intentional_skip_label}</p></article><article class=\"card\"><h2>Identity</h2><p>Run <code>{}</code></p><p>Campaign <code>{}</code></p><p><a href=\"{run_site_root_url}{}\">Download public run protobuf</a></p>{findings_download}</article></div><h2>Intentional skips</h2><ul>{intentional_skip_items}</ul><h2>Findings</h2><div class=\"table-wrap\"><table><thead><tr><th>Kind</th><th>Subject</th><th>Baseline loss</th><th>Current loss</th><th>Structural hash</th><th>Evidence actions</th></tr></thead><tbody>{finding_rows}</tbody></table></div><h2>Root actions</h2><ul>{root_actions}</ul><h2>Results</h2><p><a href=\"{run_site_root_url}dataset.html?key={}\">Open g8r versus Yosys/ABC dataset</a></p></main>",
+            "<header><p><a href=\"{run_site_root_url}runs.html\">← Runs</a></p><h1>{} crate v{}</h1><p class=\"meta\">Campaign {} v{} · DSO v{} · status <strong>{}</strong></p></header><main><div class=\"grid\"><article class=\"card\"><h2>Completion</h2><p>{} roots complete · {} failed · {} canceled</p><p>{} missing outputs · {} failed samples · {} {intentional_skip_label}</p></article><article class=\"card\"><h2>Identity</h2><p>Run <code>{}</code></p><p>Campaign <code>{}</code></p><p><a href=\"{run_site_root_url}{}\">Download public run protobuf</a></p>{findings_download}</article></div><h2>Intentional skips</h2><ul>{intentional_skip_items}</ul><h2>Findings</h2><div class=\"table-wrap\"><table><thead><tr><th>Kind</th><th>Subject</th><th>Baseline loss</th><th>Current loss</th><th>Structural hash</th><th>Evidence actions</th></tr></thead><tbody>{finding_rows}</tbody></table></div><h2>Root actions</h2><ul>{root_actions}</ul><h2>Results</h2><p><a href=\"{run_site_root_url}progression.html\">View release progression</a> · <a href=\"{run_site_root_url}dataset.html?key={}\">Open g8r versus Yosys/ABC dataset</a></p></main>",
             escape_html(&run.campaign_name),
             escape_html(&run.crate_version),
             escape_html(&run.campaign_name),
@@ -986,7 +1029,7 @@ pub(crate) fn build_static_site_with_protected_roots(
         })
         .collect::<String>();
     let index_body = format!(
-        "<header><h1>xlsynth-bvc results</h1><p class=\"meta\">Snapshot <code>{}</code> · {} runs · {} datasets · generated {}</p></header><main><p>This is a self-contained static publication. The build machine and sled database are not involved at request time.</p><p><a href=\"{root_site_url}runs.html\">Browse campaign runs and versions →</a></p><h2>Datasets</h2><div class=\"grid\">{cards}</div></main>",
+        "<header><h1>xlsynth-bvc results</h1><p class=\"meta\">Snapshot <code>{}</code> · {} runs · {} datasets · generated {}</p></header><main><p>This is a self-contained static publication. The build machine and sled database are not involved at request time.</p><p><a href=\"{root_site_url}progression.html\">View release progression →</a> · <a href=\"{root_site_url}runs.html\">Browse campaign runs and versions</a></p><h2>Datasets</h2><div class=\"grid\">{cards}</div></main>",
         snapshot.snapshot_id,
         catalog.runs.len(),
         catalog.datasets.len(),
@@ -1701,6 +1744,7 @@ pub(crate) fn smoke_static_site(
     let pages = [
         ("", "xlsynth-bvc results"),
         ("runs.html", "Campaign runs"),
+        ("progression.html", "Release progression"),
         ("dataset.html", "Dataset explorer"),
     ];
     let result = pages.iter().try_for_each(|(path, expected)| {
@@ -1841,6 +1885,16 @@ mod tests {
             !fs::read_to_string(site_dir.join("dataset.html"))
                 .expect("read HTML")
                 .contains("/api/")
+        );
+        assert!(
+            fs::read_to_string(site_dir.join("progression.html"))
+                .expect("read progression HTML")
+                .contains(crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME)
+        );
+        assert!(
+            fs::read_to_string(site_dir.join("index.html"))
+                .expect("read index HTML")
+                .contains("progression.html")
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -2491,6 +2545,7 @@ mod tests {
         .expect("site");
         verify_static_site(&site_dir).expect("verify run site");
         assert!(site_dir.join("runs.html").exists());
+        assert!(site_dir.join("progression.html").exists());
         assert!(
             site_dir
                 .join("runs")

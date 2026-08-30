@@ -38,6 +38,7 @@ use crate::query::{
 };
 use crate::queue::*;
 use crate::queue_only_previous_loss_k_cones_enabled;
+use crate::queue_progress::{WatchQueueOptions, watch_queue};
 use crate::runtime::*;
 use crate::service::*;
 use crate::site::{
@@ -219,6 +220,26 @@ pub(crate) fn run() -> Result<()> {
             serde_json::to_string_pretty(&report)
                 .expect("serializing refresh-corpus-status report")
         );
+        return Ok(());
+    }
+    if let TopCommand::WatchQueue {
+        interval_seconds,
+        running_limit,
+        once,
+        exit_when_idle,
+        json,
+    } = &command
+    {
+        watch_queue(
+            &store_dir,
+            &WatchQueueOptions {
+                interval: Duration::from_secs_f64(*interval_seconds),
+                running_limit: *running_limit,
+                once: *once,
+                exit_when_idle: *exit_when_idle,
+                json: *json,
+            },
+        )?;
         return Ok(());
     }
     let database_free_command = matches!(
@@ -562,6 +583,9 @@ pub(crate) fn run() -> Result<()> {
                 serde_json::to_string_pretty(&record)
                     .expect("serializing queue record CLI projection")
             );
+        }
+        TopCommand::WatchQueue { .. } => {
+            unreachable!("watch-queue handled before shared store initialization")
         }
         TopCommand::DrainQueue {
             limit,
