@@ -23,6 +23,13 @@ publication are idempotent. The last stage outcome is recorded in the run's
 protobuf coordinator state. Advisory locks disappear when the process exits;
 there is no stale PID lock to remove.
 
+The retry first resumes the unique stored campaign manifest for the requested
+campaign and crate version. It does not re-resolve mutable remote planning
+inputs before finding that manifest. If multiple stored generations exist, the
+command fails closed and prints their IDs; rerun with `--run-id ID` to select
+the intended generation. The initially bound manifest is persisted before the
+coordinator reports its planning stage as successful.
+
 Publication attempts use unique staging directories. While holding the
 publication-root lock, a retry removes abandoned staging entries for the same
 content-addressed site before copying, so a container that restarts as PID 1

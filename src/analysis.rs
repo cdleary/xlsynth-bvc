@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::campaign::{
-    campaign_analysis_path, list_finalized_campaign_runs, load_finalized_campaign_run_for_version,
+    campaign_analysis_path, list_finalized_campaign_runs, load_campaign_run_by_id,
+    load_finalized_campaign_run_for_version, stdlib_root_action_id,
+    stored_action_descends_from_root,
 };
 use crate::proto::v1 as pb;
 use crate::proto::{action_id_to_proto, timestamp_to_proto};
@@ -196,25 +198,112 @@ fn make_finding(
     })
 }
 
-fn previous_finalized_run(
+fn unique_finalized_run_for_version(
     store: &ArtifactStore,
-    current_version: &str,
-) -> Result<Option<pb::CampaignRunManifest>> {
+    campaign_id: &pb::Sha256Digest,
+    version: &str,
+) -> Result<pb::CampaignRunManifest> {
     let mut candidates = list_finalized_campaign_runs(store)?
         .into_iter()
         .filter(|manifest| {
-            manifest.crate_version.as_ref().is_some_and(|version| {
-                cmp_dotted_numeric_version(&version.value, current_version).is_lt()
-            })
+            manifest.campaign_id.as_ref() == Some(campaign_id)
+                && manifest
+                    .crate_version
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.value == version)
         })
         .collect::<Vec<_>>();
-    candidates.sort_by(|a, b| {
-        cmp_dotted_numeric_version(
-            &a.crate_version.as_ref().expect("filtered").value,
-            &b.crate_version.as_ref().expect("filtered").value,
-        )
-    });
-    Ok(candidates.pop())
+    if candidates.is_empty() {
+        bail!("no comparable finalized campaign run exists for crate version {version}");
+    }
+    if candidates.len() > 1 {
+        let ids = candidates
+            .iter()
+            .map(|manifest| {
+                digest_hex(
+                    required(&manifest.run_id, "campaign_run.run_id")?,
+                    "campaign_run.run_id",
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        bail!(
+            "multiple comparable finalized campaign runs exist for crate version {version}: {}",
+            ids.join(", ")
+        );
+    }
+    Ok(candidates.pop().expect("nonempty candidates"))
+}
+
+fn previous_finalized_run(
+    store: &ArtifactStore,
+    current: &pb::CampaignRunManifest,
+) -> Result<Option<pb::CampaignRunManifest>> {
+    let current_version = &required(&current.crate_version, "campaign_run.crate_version")?.value;
+    let campaign_id = required(&current.campaign_id, "campaign_run.campaign_id")?;
+    let mut versions = list_finalized_campaign_runs(store)?
+        .into_iter()
+        .filter(|manifest| manifest.campaign_id.as_ref() == Some(campaign_id))
+        .filter_map(|manifest| manifest.crate_version.map(|version| version.value))
+        .filter(|version| cmp_dotted_numeric_version(version, current_version).is_lt())
+        .collect::<Vec<_>>();
+    versions.sort_by(|a, b| cmp_dotted_numeric_version(a, b));
+    versions.dedup();
+    versions
+        .pop()
+        .map(|version| unique_finalized_run_for_version(store, campaign_id, &version))
+        .transpose()
+}
+
+fn sample_has_root_lineage(
+    store: &ArtifactStore,
+    sample: &StdlibG8rVsYosysSample,
+    root_action_id: &str,
+) -> Result<bool> {
+    for action_id in [
+        &sample.ir_action_id,
+        &sample.g8r_stats_action_id,
+        &sample.yosys_abc_stats_action_id,
+    ] {
+        if !stored_action_descends_from_root(store, action_id, root_action_id)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn samples_for_exact_run<'a>(
+    store: &ArtifactStore,
+    manifest: &pb::CampaignRunManifest,
+    samples: &'a [StdlibG8rVsYosysSample],
+) -> Result<BTreeMap<String, &'a StdlibG8rVsYosysSample>> {
+    let version = &required(&manifest.crate_version, "campaign_run.crate_version")?.value;
+    let root_action_id = stdlib_root_action_id(manifest)?
+        .context("campaign run has no exact stdlib root for analysis")?;
+    let mut selected = BTreeMap::new();
+    for sample in samples
+        .iter()
+        .filter(|sample| normalize_tag_version(&sample.crate_version) == version)
+    {
+        if !sample_has_root_lineage(store, sample, &root_action_id)? {
+            continue;
+        }
+        let key = subject_key(sample);
+        if selected.insert(key.clone(), sample).is_some() {
+            bail!(
+                "campaign run contains duplicate exact-lineage analysis samples for subject {key}"
+            );
+        }
+    }
+    if selected.is_empty() {
+        let run_id = digest_hex(
+            required(&manifest.run_id, "campaign_run.run_id")?,
+            "campaign_run.run_id",
+        )?;
+        bail!(
+            "refusing analysis: run {run_id} has no dataset samples descended from its exact stdlib root {root_action_id}"
+        );
+    }
+    Ok(selected)
 }
 
 fn validate_report(report: &pb::AnalysisReport) -> Result<()> {
@@ -338,17 +427,42 @@ pub(crate) fn analyze_campaign_run(
     store: &ArtifactStore,
     repo_root: &Path,
     crate_version: &str,
+    exact_run_id: Option<&str>,
     baseline_crate_version: Option<&str>,
 ) -> Result<AnalysisSummary> {
-    let current = load_finalized_campaign_run_for_version(store, repo_root, crate_version)?;
+    let current = match exact_run_id {
+        Some(run_id) => {
+            let manifest = load_campaign_run_by_id(store, run_id)?;
+            let status = pb::CampaignRunStatus::try_from(manifest.status)
+                .context("campaign run status is unknown")?;
+            if !matches!(
+                status,
+                pb::CampaignRunStatus::Complete | pb::CampaignRunStatus::Degraded
+            ) {
+                bail!("campaign run {run_id} is not finalized: {status:?}");
+            }
+            manifest
+        }
+        None => load_finalized_campaign_run_for_version(store, repo_root, crate_version)?,
+    };
     let current_version = required(&current.crate_version, "campaign_run.crate_version")?
         .value
         .clone();
+    if normalize_tag_version(crate_version) != current_version {
+        bail!(
+            "selected campaign run crate version {} does not match requested {}",
+            current_version,
+            crate_version
+        );
+    }
+    let campaign_id = required(&current.campaign_id, "campaign_run.campaign_id")?;
     let baseline = match baseline_crate_version {
-        Some(version) => Some(load_finalized_campaign_run_for_version(
-            store, repo_root, version,
+        Some(version) => Some(unique_finalized_run_for_version(
+            store,
+            campaign_id,
+            normalize_tag_version(version),
         )?),
-        None => previous_finalized_run(store, &current_version)?,
+        None => previous_finalized_run(store, &current)?,
     };
     let baseline_version = baseline
         .as_ref()
@@ -356,26 +470,14 @@ pub(crate) fn analyze_campaign_run(
         .map(|version| version.value.clone());
     let dataset = load_stdlib_g8r_vs_yosys_dataset_index(store, false)?
         .context("stdlib g8r-vs-yosys dataset must be rebuilt before analysis")?;
-    let current_by_subject = dataset
-        .samples
-        .iter()
-        .filter(|sample| normalize_tag_version(&sample.crate_version) == current_version)
-        .map(|sample| (subject_key(sample), sample))
-        .collect::<BTreeMap<_, _>>();
-    let baseline_by_subject = baseline_version
-        .as_deref()
-        .map(|version| {
-            dataset
-                .samples
-                .iter()
-                .filter(|sample| normalize_tag_version(&sample.crate_version) == version)
-                .map(|sample| (subject_key(sample), sample))
-                .collect::<BTreeMap<_, _>>()
-        })
+    let current_by_subject = samples_for_exact_run(store, &current, &dataset.samples)?;
+    let baseline_by_subject = baseline
+        .as_ref()
+        .map(|manifest| samples_for_exact_run(store, manifest, &dataset.samples))
+        .transpose()?
         .unwrap_or_default();
     let campaign = required(&current.campaign, "campaign_run.campaign")?;
     let algorithm_version = campaign.analysis_algorithm_version;
-    let campaign_id = required(&current.campaign_id, "campaign_run.campaign_id")?;
     let run_id = required(&current.run_id, "campaign_run.run_id")?;
     let baseline_run_id = baseline
         .as_ref()
@@ -487,11 +589,168 @@ pub(crate) fn analyze_campaign_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ActionSpec, ArtifactRef, ArtifactType, OutputFile, Provenance};
+    use crate::proto::{action_id_to_proto, action_spec_to_proto};
+    use serde_json::json;
 
     fn digest(byte: u8) -> pb::Sha256Digest {
         pb::Sha256Digest {
             value: vec![byte; 32],
         }
+    }
+
+    fn test_runtime() -> crate::model::DriverRuntimeSpec {
+        crate::model::DriverRuntimeSpec {
+            driver_version: "0.31.0".to_string(),
+            release_platform: "test".to_string(),
+            docker_image: "test:image".to_string(),
+            dockerfile: "docker/test.Dockerfile".to_string(),
+            docker_image_id: "a".repeat(64),
+            dockerfile_sha256: "b".repeat(64),
+            release_cache_input_sha256: "c".repeat(64),
+        }
+    }
+
+    fn promote_test_action(store: &ArtifactStore, action: ActionSpec) -> String {
+        let action_id = crate::executor::compute_action_id(&action).expect("action id");
+        let bytes = action_id.as_bytes();
+        let staging = store
+            .staging_dir()
+            .join(format!("{action_id}-analysis-test"));
+        fs::create_dir_all(staging.join("payload")).expect("create staging payload");
+        fs::write(staging.join("payload/result"), bytes).expect("write result");
+        let provenance = Provenance {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id: action_id.clone(),
+            created_utc: Utc::now(),
+            action,
+            dependencies: Vec::new(),
+            output_artifact: ArtifactRef {
+                action_id: action_id.clone(),
+                artifact_type: ArtifactType::IrPackageFile,
+                relpath: "payload/result".to_string(),
+            },
+            output_files: vec![OutputFile {
+                path: "payload/result".to_string(),
+                bytes: bytes.len() as u64,
+                sha256: hex::encode(Sha256::digest(bytes)),
+            }],
+            commands: Vec::new(),
+            details: json!({"test": true}),
+            suggested_next_actions: Vec::new(),
+        };
+        fs::write(
+            staging.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
+        )
+        .expect("write provenance");
+        store
+            .promote_staging_action_dir(&action_id, &staging)
+            .expect("promote action");
+        action_id
+    }
+
+    fn test_lineage(
+        store: &ArtifactStore,
+        root_seed: u8,
+    ) -> (pb::CampaignRunManifest, StdlibG8rVsYosysSample) {
+        let root_action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+            version: "v0.30.0".to_string(),
+            discovery_runtime: Some(test_runtime()),
+            stdlib_tarball_sha256: format!("{root_seed:064x}"),
+        };
+        let root_id = promote_test_action(store, root_action.clone());
+        let ir_id = promote_test_action(
+            store,
+            ActionSpec::DriverDslxFnToIr {
+                dslx_subtree_action_id: root_id.clone(),
+                dslx_file: "xls/dslx/stdlib/test.x".to_string(),
+                dslx_fn_name: "subject".to_string(),
+                version: "v0.30.0".to_string(),
+                runtime: test_runtime(),
+            },
+        );
+        let g8r_id = promote_test_action(
+            store,
+            ActionSpec::DriverIrToOpt {
+                ir_action_id: ir_id.clone(),
+                top_fn_name: Some("g8r".to_string()),
+                version: "v0.30.0".to_string(),
+                runtime: test_runtime(),
+            },
+        );
+        let yosys_id = promote_test_action(
+            store,
+            ActionSpec::DriverIrToOpt {
+                ir_action_id: ir_id.clone(),
+                top_fn_name: Some("yosys".to_string()),
+                version: "v0.30.0".to_string(),
+                runtime: test_runtime(),
+            },
+        );
+        let manifest = pb::CampaignRunManifest {
+            run_id: Some(digest(root_seed)),
+            crate_version: Some(pb::CrateVersion {
+                value: "0.31.0".to_string(),
+            }),
+            root_actions: vec![pb::CampaignRootAction {
+                action_id: Some(action_id_to_proto(&root_id, "root id").expect("root proto")),
+                action: Some(action_spec_to_proto(&root_action).expect("root action proto")),
+            }],
+            ..Default::default()
+        };
+        let sample = StdlibG8rVsYosysSample {
+            fn_key: "stdlib::subject".to_string(),
+            crate_version: "0.31.0".to_string(),
+            dso_version: "0.30.0".to_string(),
+            ir_action_id: ir_id,
+            ir_top: None,
+            structural_hash: None,
+            ir_node_count: 1,
+            g8r_nodes: 1.0,
+            g8r_levels: 1.0,
+            yosys_abc_nodes: 1.0,
+            yosys_abc_levels: 1.0,
+            g8r_product: 1.0,
+            yosys_abc_product: 1.0,
+            g8r_product_loss: root_seed as f64,
+            g8r_stats_action_id: g8r_id,
+            yosys_abc_stats_action_id: yosys_id,
+        };
+        (manifest, sample)
+    }
+
+    #[test]
+    fn exact_run_samples_reject_same_version_rows_from_another_root() {
+        let root = std::env::temp_dir().join(format!(
+            "xlsynth-bvc-analysis-lineage-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let (old_manifest, old_sample) = test_lineage(&store, 1);
+        let (new_manifest, new_sample) = test_lineage(&store, 2);
+        let samples = vec![old_sample.clone(), new_sample.clone()];
+
+        let selected =
+            samples_for_exact_run(&store, &new_manifest, &samples).expect("new exact lineage");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected["stdlib::subject#<default>"].ir_action_id,
+            new_sample.ir_action_id
+        );
+        let old_selected =
+            samples_for_exact_run(&store, &old_manifest, &samples).expect("old exact lineage");
+        assert_eq!(
+            old_selected["stdlib::subject#<default>"].ir_action_id,
+            old_sample.ir_action_id
+        );
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

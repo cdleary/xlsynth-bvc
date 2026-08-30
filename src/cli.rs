@@ -82,6 +82,9 @@ pub enum TopCommand {
     AnalyzeCampaignRun {
         #[arg(long)]
         crate_version: String,
+        /// Select one exact stored run when more than one generation exists.
+        #[arg(long)]
+        run_id: Option<String>,
         #[arg(long)]
         baseline_crate_version: Option<String>,
     },
@@ -89,6 +92,9 @@ pub enum TopCommand {
     CoordinateRelease {
         #[arg(long)]
         crate_version: String,
+        /// Resume one exact stored run; otherwise a unique stored run is resumed automatically.
+        #[arg(long)]
+        run_id: Option<String>,
         #[arg(long)]
         baseline_crate_version: Option<String>,
         #[arg(long, value_name = "DIR", default_value = "bvc-publication-work")]

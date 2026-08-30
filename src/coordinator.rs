@@ -13,7 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::analysis::analyze_campaign_run;
-use crate::campaign::{finalize_campaign_run, plan_campaign_run, reconcile_campaign_run};
+use crate::campaign::{
+    compute_campaign_id, finalize_stored_campaign_run, list_campaign_runs, load_campaign_run_by_id,
+    load_default_campaign, persist_campaign_run_plan, reconcile_stored_campaign_run,
+    summarize_campaign_run,
+};
 use crate::ops::run_workers;
 use crate::proto::v1 as pb;
 use crate::proto::{encode_provenance, timestamp_from_proto, timestamp_to_proto};
@@ -26,6 +30,7 @@ use crate::service::{
 use crate::site::{BuildStaticSiteOptions, build_static_site, verify_static_site};
 use crate::snapshot::{BuildStaticSnapshotOptions, build_static_snapshot, verify_static_snapshot};
 use crate::store::ArtifactStore;
+use crate::versioning::normalize_tag_version;
 use crate::{
     DEFAULT_QUEUE_LEASE_SECONDS, DEFAULT_WEB_RUNNER_DRAIN_BATCH_SIZE,
     DEFAULT_WEB_RUNNER_POLL_MILLIS,
@@ -40,6 +45,7 @@ static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 pub(crate) struct CoordinateReleaseOptions {
     pub(crate) crate_version: String,
+    pub(crate) run_id: Option<String>,
     pub(crate) baseline_crate_version: Option<String>,
     pub(crate) work_dir: PathBuf,
     pub(crate) base_url: String,
@@ -385,6 +391,63 @@ fn coordinator_worker_id_prefix(run_id: &str) -> String {
     format!("{}:campaign:{}", default_worker_id(), &run_id[..12])
 }
 
+fn select_or_plan_campaign_run(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    crate_version: &str,
+    exact_run_id: Option<&str>,
+) -> Result<pb::CampaignRunManifest> {
+    let requested_version = normalize_tag_version(crate_version);
+    let campaign_id = compute_campaign_id(&load_default_campaign()?)?;
+    if let Some(run_id) = exact_run_id {
+        let manifest = load_campaign_run_by_id(store, run_id)?;
+        if manifest.campaign_id.as_ref() != Some(&campaign_id)
+            || manifest
+                .crate_version
+                .as_ref()
+                .is_none_or(|version| version.value != requested_version)
+        {
+            bail!(
+                "stored campaign run {run_id} does not match the current campaign and requested crate version {requested_version}"
+            );
+        }
+        return Ok(manifest);
+    }
+
+    let mut candidates = list_campaign_runs(store)?
+        .into_iter()
+        .filter(|manifest| {
+            manifest.campaign_id.as_ref() == Some(&campaign_id)
+                && manifest
+                    .crate_version
+                    .as_ref()
+                    .is_some_and(|version| version.value == requested_version)
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() > 1 {
+        let ids = candidates
+            .iter()
+            .map(|manifest| {
+                digest_hex(
+                    required(&manifest.run_id, "campaign_run.run_id")?,
+                    "campaign_run.run_id",
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        bail!(
+            "multiple stored campaign runs match crate version {requested_version}; resume one explicitly with --run-id: {}",
+            ids.join(", ")
+        );
+    }
+    if let Some(manifest) = candidates.pop() {
+        return Ok(manifest);
+    }
+
+    // Live planning is only permitted when there is no stored identity to resume.
+    // Persist the fully bound runtime and roots before the coordinator records success.
+    persist_campaign_run_plan(store, repo_root, requested_version)
+}
+
 pub(crate) fn coordinate_release(
     store: ArtifactStore,
     repo_root: &Path,
@@ -394,7 +457,13 @@ pub(crate) fn coordinate_release(
         bail!("coordinator workers must be greater than zero");
     }
     let _lock = CoordinatorLock::acquire(&store)?;
-    let plan = plan_campaign_run(&store, repo_root, &options.crate_version)?;
+    let manifest = select_or_plan_campaign_run(
+        &store,
+        repo_root,
+        &options.crate_version,
+        options.run_id.as_deref(),
+    )?;
+    let plan = summarize_campaign_run(&store, &manifest, true)?;
     let path = state_path(&store, &plan.run_id);
     let mut state = load_or_new_state(&path, &plan.run_id, &plan.crate_version)?;
     record_stage(
@@ -415,12 +484,8 @@ pub(crate) fn coordinate_release(
         pb::CoordinatorStage::Reconciled,
         pb::CoordinatorStageStatus::FailedTransient,
         || {
-            let summary = reconcile_campaign_run(
-                &store,
-                repo_root,
-                &options.crate_version,
-                options.priority,
-            )?;
+            let summary =
+                reconcile_stored_campaign_run(&store, repo_root, &manifest, options.priority)?;
             let text = format!(
                 "status={} pending={} running={}",
                 summary.status, summary.pending_count, summary.running_count
@@ -522,7 +587,8 @@ pub(crate) fn coordinate_release(
         pb::CoordinatorStage::Finalized,
         pb::CoordinatorStageStatus::FailedDeterministic,
         || {
-            let summary = finalize_campaign_run(&store, repo_root, &options.crate_version)?;
+            let current = load_campaign_run_by_id(&store, &plan.run_id)?;
+            let summary = finalize_stored_campaign_run(&store, &current)?;
             if !matches!(summary.status.as_str(), "complete" | "degraded") {
                 bail!(
                     "campaign finalization refused publication: status={} missing_outputs={:?}",
@@ -551,6 +617,7 @@ pub(crate) fn coordinate_release(
                 &store,
                 repo_root,
                 &options.crate_version,
+                Some(&plan.run_id),
                 options.baseline_crate_version.as_deref(),
             )?;
             let text = format!("findings={}", summary.finding_count);
@@ -688,6 +755,42 @@ mod tests {
             prefix,
             format!("{}:campaign:{}", default_worker_id(), &run_id[..12])
         );
+    }
+
+    #[test]
+    fn stored_campaign_run_is_selected_before_live_planning_inputs() {
+        let root = temp_path("stored-resume");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let repo_root = std::env::current_dir().expect("current repo root");
+        let version = crate::versioning::load_version_compat_map(&repo_root)
+            .expect("version map")
+            .into_keys()
+            .next()
+            .expect("known version");
+        let persisted = persist_campaign_run_plan(&store, &repo_root, &version)
+            .expect("persist fully bound plan");
+        let expected_run_id = digest_hex(
+            required(&persisted.run_id, "campaign_run.run_id").expect("run id"),
+            "campaign_run.run_id",
+        )
+        .expect("run id hex");
+
+        let unavailable_resource_root = root.join("resource-root-is-offline");
+        let selected =
+            select_or_plan_campaign_run(&store, &unavailable_resource_root, &version, None)
+                .expect("resume without live resource inputs");
+        assert_eq!(selected.run_id, persisted.run_id);
+        let explicit = select_or_plan_campaign_run(
+            &store,
+            &unavailable_resource_root,
+            &version,
+            Some(&expected_run_id),
+        )
+        .expect("explicit offline resume");
+        assert_eq!(explicit.run_id, persisted.run_id);
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

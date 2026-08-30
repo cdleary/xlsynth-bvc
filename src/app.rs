@@ -476,12 +476,14 @@ pub(crate) fn run() -> Result<()> {
         }
         TopCommand::AnalyzeCampaignRun {
             crate_version,
+            run_id,
             baseline_crate_version,
         } => {
             let summary = analyze_campaign_run(
                 &store,
                 &repo_root,
                 &crate_version,
+                run_id.as_deref(),
                 baseline_crate_version.as_deref(),
             )?;
             println!(
@@ -492,6 +494,7 @@ pub(crate) fn run() -> Result<()> {
         }
         TopCommand::CoordinateRelease {
             crate_version,
+            run_id,
             baseline_crate_version,
             work_dir,
             base_url,
@@ -504,6 +507,7 @@ pub(crate) fn run() -> Result<()> {
                 &repo_root,
                 &CoordinateReleaseOptions {
                     crate_version,
+                    run_id,
                     baseline_crate_version,
                     work_dir,
                     base_url,

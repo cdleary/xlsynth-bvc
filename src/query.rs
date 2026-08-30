@@ -6695,21 +6695,18 @@ pub(crate) fn enqueue_processing_for_crate_version(
     };
 
     let roots = canonical_root_actions_for_crate_version(repo_root, &crate_version, &dso)?;
+    enqueue_processing_for_root_actions(store, repo_root, roots, priority)
+}
+
+pub(crate) fn enqueue_processing_for_root_actions(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    roots: Vec<ActionSpec>,
+    priority: i32,
+) -> Result<()> {
     for root_action in roots {
         let root_action_id = compute_action_id(&root_action)?;
-        store.delete_failed_action_record(&root_action_id)?;
-        for terminal_path in [store.canceled_queue_path(&root_action_id)] {
-            if terminal_path.exists() {
-                fs::remove_file(&terminal_path).with_context(|| {
-                    format!(
-                        "removing terminal queue record for retry: {}",
-                        terminal_path.display()
-                    )
-                })?;
-            }
-        }
-
-        enqueue_action_with_priority(store, root_action.clone(), priority)?;
+        retry_action_with_priority(store, root_action.clone(), priority)?;
         if store.action_exists(&root_action_id) {
             maybe_refresh_dslx_root_for_suggestion_discovery(store, repo_root, &root_action_id)?;
             let _ = app::enqueue_suggested_actions(

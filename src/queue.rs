@@ -296,6 +296,16 @@ pub(crate) fn enqueue_action_with_priority(
     priority: i32,
 ) -> Result<String> {
     let action_id = crate::executor::compute_action_id(&action)?;
+    let _transition_lock = QueueTransitionLock::acquire(store, &action_id)?;
+    enqueue_action_with_priority_locked(store, action, priority, action_id)
+}
+
+fn enqueue_action_with_priority_locked(
+    store: &ArtifactStore,
+    action: ActionSpec,
+    priority: i32,
+    action_id: String,
+) -> Result<String> {
     if store.action_exists(&action_id) {
         return Ok(action_id);
     }
@@ -344,6 +354,23 @@ pub(crate) fn enqueue_action_with_priority(
     };
     write_bytes_atomic(&pending_path, &encode_queue_item(&item)?)?;
     Ok(action_id)
+}
+
+pub(crate) fn retry_action_with_priority(
+    store: &ArtifactStore,
+    action: ActionSpec,
+    priority: i32,
+) -> Result<String> {
+    let action_id = crate::executor::compute_action_id(&action)?;
+    let _transition_lock = QueueTransitionLock::acquire(store, &action_id)?;
+    if !store.running_queue_path(&action_id).exists()
+        && !store.done_queue_path(&action_id).exists()
+        && !store.action_exists(&action_id)
+    {
+        store.delete_failed_action_record(&action_id)?;
+        remove_file_if_exists(&store.canceled_queue_path(&action_id))?;
+    }
+    enqueue_action_with_priority_locked(store, action, priority, action_id)
 }
 
 pub(crate) fn enqueue_action(store: &ArtifactStore, action: ActionSpec) -> Result<String> {
@@ -1075,6 +1102,7 @@ fn try_write_dependency_canceled_for_pending(
     root_failed_action_id: &str,
     reason: &str,
 ) -> Result<bool> {
+    let _transition_lock = QueueTransitionLock::acquire(store, action_id)?;
     let Some(reservation_path) =
         reserve_pending_for_terminal_transition(store, pending_path, action_id)?
     else {
@@ -1104,6 +1132,7 @@ pub(crate) fn write_work_policy_excluded_record(
     reason: &str,
     rule_fingerprint: &str,
 ) -> Result<bool> {
+    let _transition_lock = QueueTransitionLock::acquire(store, action_id)?;
     if store.action_exists(action_id)
         || store.running_queue_path(action_id).exists()
         || store.done_queue_path(action_id).exists()
@@ -1176,6 +1205,7 @@ pub(crate) fn remove_work_policy_excluded_record(
     store: &ArtifactStore,
     action_id: &str,
 ) -> Result<bool> {
+    let _transition_lock = QueueTransitionLock::acquire(store, action_id)?;
     let Some(existing) = load_queue_canceled_record(store, action_id)? else {
         return Ok(false);
     };
@@ -1638,6 +1668,8 @@ mod tests {
     use crate::model::{ArtifactType, G8rLoweringMode, OutputFile, Provenance};
     use serde_json::json;
     use sha2::{Digest, Sha256};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_test_store() -> (ArtifactStore, PathBuf) {
@@ -1750,6 +1782,67 @@ mod tests {
         assert!(!store.pending_queue_path(&action_id).exists());
         assert!(store.running_queue_path(&action_id).exists());
 
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn work_policy_cancellation_is_serialized_with_claims() {
+        let (store, root) = make_test_store();
+        let store = Arc::new(store);
+        for iteration in 0..32 {
+            let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+                version: format!("v0.37.{iteration}"),
+                discovery_runtime: None,
+                stdlib_tarball_sha256: format!("{iteration:064x}"),
+            };
+            let action_id =
+                enqueue_action(store.as_ref(), action.clone()).expect("enqueue race action");
+            let pending_path = store.pending_queue_path(&action_id);
+            let barrier = Arc::new(Barrier::new(3));
+
+            let claim_store = store.clone();
+            let claim_barrier = barrier.clone();
+            let claim_pending = pending_path.clone();
+            let claim = thread::spawn(move || {
+                claim_barrier.wait();
+                try_claim_pending_item(claim_store.as_ref(), &claim_pending, "race-worker", 60)
+                    .expect("claim transition")
+            });
+
+            let cancel_store = store.clone();
+            let cancel_barrier = barrier.clone();
+            let cancel_action_id = action_id.clone();
+            let cancel_action = action.clone();
+            let cancel = thread::spawn(move || {
+                cancel_barrier.wait();
+                write_work_policy_excluded_record(
+                    cancel_store.as_ref(),
+                    &cancel_action_id,
+                    &"d".repeat(64),
+                    cancel_action,
+                    "test-rule",
+                    "excluded for race test",
+                    &"f".repeat(64),
+                )
+                .expect("policy transition")
+            });
+
+            barrier.wait();
+            let claimed = claim.join().expect("claim thread");
+            let canceled = cancel.join().expect("cancel thread");
+            assert_ne!(claimed.is_some(), canceled);
+            assert!(
+                !(store.running_queue_path(&action_id).exists()
+                    && store.canceled_queue_path(&action_id).exists())
+            );
+            assert!(!store.pending_queue_path(&action_id).exists());
+
+            remove_file_if_exists(&store.running_queue_path(&action_id))
+                .expect("clear winning running state");
+            remove_file_if_exists(&store.canceled_queue_path(&action_id))
+                .expect("clear winning canceled state");
+        }
+        drop(store);
         fs::remove_dir_all(root).expect("cleanup temp store");
     }
 

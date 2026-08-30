@@ -51,6 +51,15 @@ restarted container can be rerun: advisory locks are released by process exit,
 stale application-owned staging is recoverable, and persisted checkpoints and
 content identities make normal retries idempotent.
 
+Release coordination persists the fully bound campaign manifest, including its
+runtime and exact root actions, before recording planning success. A rerun
+selects a matching stored manifest before consulting compatibility sidecars,
+resolving remote releases, or building a mutable Docker tag. More than one
+stored generation for the same campaign and crate version is an ambiguity and
+fails closed unless the operator supplies `--run-id`. Every analysis sample
+must transitively descend from the selected run's exact stdlib root; same-version
+rows from another root generation are never attributed to that run.
+
 Fresh-store bootstrap follows the same process-restart contract. Initialization
 serializes through an advisory lock and promotes a fully encoded format marker
 from application-owned staging, so an interrupted initializer leaves the final
@@ -90,13 +99,15 @@ occurs, a worker cancels descendants only when its failed terminal transition
 remains authoritative; a failure that loses to committed success performs no
 downstream cancellation.
 
-Each claim also receives a unique lease token. Success and failure commits take
-an advisory per-action transition lock and compare that exact token with the
-current running record before changing terminal state, removing the lease, or
-enqueuing/canceling descendants. An expired worker therefore cannot commit
-against a reclaimed incarnation of the same action. The operating system
-releases the transition lock when a process dies, preserving process-restart
-recovery.
+Each claim also receives a unique lease token. Claims, enqueues, retries,
+work-policy cancellation/removal, and success or failure commits all take the
+same advisory per-action transition lock. Lease-bound commits additionally
+compare the exact token with the current running record before changing
+terminal state, removing the lease, or enqueuing/canceling descendants. An
+expired worker therefore cannot commit against a reclaimed incarnation of the
+same action, and policy reconciliation cannot create active/terminal overlap.
+The operating system releases the transition lock when a process dies,
+preserving process-restart recovery.
 
 Driver release caches are built entirely in a unique private-state staging
 directory. The downloader may create partial files there, but consumers never

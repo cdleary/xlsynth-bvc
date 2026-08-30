@@ -21,7 +21,7 @@ use crate::proto::{
 };
 use crate::query::{
     canonical_root_actions_for_crate_version, canonical_root_actions_for_runtime,
-    enqueue_processing_for_crate_version, is_timeout_error, load_stdlib_g8r_vs_yosys_dataset_index,
+    enqueue_processing_for_root_actions, is_timeout_error, load_stdlib_g8r_vs_yosys_dataset_index,
     load_versions_cards_index, stdlib_enumeration_status_from_provenance,
 };
 use crate::queue::{
@@ -611,9 +611,7 @@ pub(crate) fn validate_campaign_run_file(path: &Path) -> Result<()> {
     load_manifest(path).map(|_| ())
 }
 
-pub(crate) fn list_finalized_campaign_runs(
-    store: &ArtifactStore,
-) -> Result<Vec<pb::CampaignRunManifest>> {
+pub(crate) fn list_campaign_runs(store: &ArtifactStore) -> Result<Vec<pb::CampaignRunManifest>> {
     let root = store.campaign_runs_dir();
     if !root.exists() {
         return Ok(Vec::new());
@@ -626,15 +624,7 @@ pub(crate) fn list_finalized_campaign_runs(
         {
             continue;
         }
-        let manifest = load_manifest(entry.path())?;
-        let status = pb::CampaignRunStatus::try_from(manifest.status)
-            .context("campaign run status is unknown")?;
-        if matches!(
-            status,
-            pb::CampaignRunStatus::Complete | pb::CampaignRunStatus::Degraded
-        ) {
-            manifests.push(manifest);
-        }
+        manifests.push(load_manifest(entry.path())?);
     }
     manifests.sort_by(|a, b| {
         a.run_id
@@ -643,6 +633,33 @@ pub(crate) fn list_finalized_campaign_runs(
             .cmp(&b.run_id.as_ref().map(|id| id.value.as_slice()))
     });
     Ok(manifests)
+}
+
+pub(crate) fn list_finalized_campaign_runs(
+    store: &ArtifactStore,
+) -> Result<Vec<pb::CampaignRunManifest>> {
+    list_campaign_runs(store).map(|manifests| {
+        manifests
+            .into_iter()
+            .filter(|manifest| {
+                matches!(
+                    pb::CampaignRunStatus::try_from(manifest.status),
+                    Ok(pb::CampaignRunStatus::Complete | pb::CampaignRunStatus::Degraded)
+                )
+            })
+            .collect()
+    })
+}
+
+pub(crate) fn load_campaign_run_by_id(
+    store: &ArtifactStore,
+    run_id: &str,
+) -> Result<pb::CampaignRunManifest> {
+    let bytes = hex::decode(run_id).context("decoding campaign run id as hex")?;
+    let digest = pb::Sha256Digest { value: bytes };
+    validate_digest(&digest, "campaign run id")?;
+    let path = campaign_run_path(store, &digest)?;
+    load_manifest(&path)
 }
 
 pub(crate) fn pending_campaign_versions(
@@ -692,29 +709,40 @@ pub(crate) fn pending_campaign_versions(
 
 pub(crate) fn load_finalized_campaign_run_for_version(
     store: &ArtifactStore,
-    repo_root: &Path,
+    _repo_root: &Path,
     crate_version: &str,
 ) -> Result<pb::CampaignRunManifest> {
-    let planned = new_manifest(repo_root, crate_version)?;
-    let existing = load_existing_manifest(store, &planned)?.with_context(|| {
-        format!(
+    let crate_version = normalize_version(crate_version, "crate_version")?;
+    let campaign_id = compute_campaign_id(&load_default_campaign()?)?;
+    let mut candidates = list_finalized_campaign_runs(store)?
+        .into_iter()
+        .filter(|manifest| {
+            manifest.campaign_id.as_ref() == Some(&campaign_id)
+                && manifest
+                    .crate_version
+                    .as_ref()
+                    .is_some_and(|version| version.value == crate_version)
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        bail!(
             "campaign run for crate version {} has not been reconciled/finalized",
             crate_version
-        )
-    })?;
-    let status = pb::CampaignRunStatus::try_from(existing.status)
-        .context("campaign run status is unknown")?;
-    if !matches!(
-        status,
-        pb::CampaignRunStatus::Complete | pb::CampaignRunStatus::Degraded
-    ) {
-        bail!(
-            "campaign run for crate version {} is not finalized: {:?}",
-            crate_version,
-            status
         );
     }
-    Ok(existing)
+    if candidates.len() > 1 {
+        let ids = candidates
+            .iter()
+            .filter_map(|manifest| manifest.run_id.as_ref())
+            .map(|id| digest_hex(id, "campaign_run.run_id"))
+            .collect::<Result<Vec<_>>>()?;
+        bail!(
+            "multiple finalized campaign runs exist for crate version {}; select an exact run id: {}",
+            crate_version,
+            ids.join(", ")
+        );
+    }
+    Ok(candidates.pop().expect("nonempty candidates"))
 }
 
 fn load_existing_manifest(
@@ -848,7 +876,7 @@ where
     Ok(false)
 }
 
-fn stored_action_descends_from_root(
+pub(crate) fn stored_action_descends_from_root(
     store: &ArtifactStore,
     start_action_id: &str,
     root_action_id: &str,
@@ -889,7 +917,7 @@ fn stdlib_dataset_has_root_lineage(
     Ok(true)
 }
 
-fn stdlib_root_action_id(manifest: &pb::CampaignRunManifest) -> Result<Option<String>> {
+pub(crate) fn stdlib_root_action_id(manifest: &pb::CampaignRunManifest) -> Result<Option<String>> {
     let mut roots = Vec::new();
     for root in &manifest.root_actions {
         let action =
@@ -1185,22 +1213,26 @@ fn evaluated_manifest(
     repo_root: &Path,
     crate_version: &str,
 ) -> Result<pb::CampaignRunManifest> {
-    let mut planned = new_manifest(repo_root, crate_version)?;
+    let planned = new_manifest(repo_root, crate_version)?;
     let existing = load_existing_manifest(store, &planned)?;
-    if let Some(existing) = &existing {
-        planned.created_at = existing.created_at.clone();
+    evaluate_stored_manifest(store, existing.unwrap_or(planned))
+}
+
+fn evaluate_stored_manifest(
+    store: &ArtifactStore,
+    mut manifest: pb::CampaignRunManifest,
+) -> Result<pb::CampaignRunManifest> {
+    validate_manifest(&manifest)?;
+    let previous_status = manifest.status;
+    let previous_completion = manifest.completion.clone();
+    let completion = evaluate_completion(store, &manifest)?;
+    manifest.status = completion.status;
+    manifest.completion = Some(completion);
+    if manifest.status != previous_status || manifest.completion != previous_completion {
+        manifest.updated_at = Some(timestamp_to_proto(&Utc::now()));
     }
-    let completion = evaluate_completion(store, &planned)?;
-    planned.status = completion.status;
-    planned.completion = Some(completion);
-    planned.updated_at = existing
-        .filter(|existing| {
-            existing.status == planned.status && existing.completion == planned.completion
-        })
-        .and_then(|existing| existing.updated_at)
-        .or_else(|| Some(timestamp_to_proto(&Utc::now())));
-    validate_manifest(&planned)?;
-    Ok(planned)
+    validate_manifest(&manifest)?;
+    Ok(manifest)
 }
 
 fn status_label(raw: i32) -> Result<String> {
@@ -1300,6 +1332,54 @@ pub(crate) fn plan_campaign_run(
     summary(&manifest, &path, false)
 }
 
+pub(crate) fn summarize_campaign_run(
+    store: &ArtifactStore,
+    manifest: &pb::CampaignRunManifest,
+    persisted: bool,
+) -> Result<CampaignRunSummary> {
+    let path = campaign_run_path(store, required(&manifest.run_id, "campaign_run.run_id")?)?;
+    summary(manifest, &path, persisted)
+}
+
+pub(crate) fn persist_campaign_run_plan(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    crate_version: &str,
+) -> Result<pb::CampaignRunManifest> {
+    let manifest = evaluated_manifest(store, repo_root, crate_version)?;
+    write_manifest(store, &manifest)?;
+    Ok(manifest)
+}
+
+pub(crate) fn reconcile_stored_campaign_run(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    manifest: &pb::CampaignRunManifest,
+    priority: i32,
+) -> Result<CampaignRunSummary> {
+    validate_manifest(manifest)?;
+    let roots = manifest
+        .root_actions
+        .iter()
+        .map(|root| {
+            action_spec_from_proto(required(&root.action, "campaign_run.root_actions.action")?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    enqueue_processing_for_root_actions(store, repo_root, roots, priority)?;
+    let evaluated = evaluate_stored_manifest(store, manifest.clone())?;
+    let path = write_manifest(store, &evaluated)?;
+    summary(&evaluated, &path, true)
+}
+
+pub(crate) fn finalize_stored_campaign_run(
+    store: &ArtifactStore,
+    manifest: &pb::CampaignRunManifest,
+) -> Result<CampaignRunSummary> {
+    let evaluated = evaluate_stored_manifest(store, manifest.clone())?;
+    let path = write_manifest(store, &evaluated)?;
+    summary(&evaluated, &path, true)
+}
+
 pub(crate) fn reconcile_campaign_run(
     store: &ArtifactStore,
     repo_root: &Path,
@@ -1307,13 +1387,8 @@ pub(crate) fn reconcile_campaign_run(
     priority: i32,
 ) -> Result<CampaignRunSummary> {
     let planned = new_manifest(repo_root, crate_version)?;
-    let canonical_crate = required(&planned.crate_version, "campaign_run.crate_version")?
-        .value
-        .clone();
-    enqueue_processing_for_crate_version(store, repo_root, &canonical_crate, priority)?;
-    let manifest = evaluated_manifest(store, repo_root, &canonical_crate)?;
-    let path = write_manifest(store, &manifest)?;
-    summary(&manifest, &path, true)
+    let manifest = load_existing_manifest(store, &planned)?.unwrap_or(planned);
+    reconcile_stored_campaign_run(store, repo_root, &manifest, priority)
 }
 
 pub(crate) fn finalize_campaign_run(
