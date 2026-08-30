@@ -461,21 +461,13 @@ pub(crate) fn claim_next_pending_item(
                 );
             }
             ActionReadiness::NotReady => continue,
-            ActionReadiness::Blocked {
-                dependency_action_id,
-                root_failed_action_id,
-                reason,
-            } => {
-                try_write_dependency_canceled_for_pending(
+            ActionReadiness::Blocked { .. } => {
+                try_write_dependency_canceled_record(
                     store,
-                    &pending_path,
                     &action_id,
                     enqueued_utc,
                     action,
                     worker_id,
-                    &dependency_action_id,
-                    &root_failed_action_id,
-                    &reason,
                 )?;
                 continue;
             }
@@ -586,21 +578,13 @@ pub(crate) fn claim_compatible_pending_items(
                 );
             }
             ActionReadiness::NotReady => continue,
-            ActionReadiness::Blocked {
-                dependency_action_id,
-                root_failed_action_id,
-                reason,
-            } => {
-                try_write_dependency_canceled_for_pending(
+            ActionReadiness::Blocked { .. } => {
+                try_write_dependency_canceled_record(
                     store,
-                    &pending_path,
                     &action_id,
                     enqueued_utc,
                     action,
                     worker_id,
-                    &dependency_action_id,
-                    &root_failed_action_id,
-                    &reason,
                 )?;
             }
         }
@@ -1090,23 +1074,40 @@ fn reserve_pending_for_terminal_transition(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn try_write_dependency_canceled_for_pending(
+pub(crate) fn try_write_dependency_canceled_record(
     store: &ArtifactStore,
-    pending_path: &Path,
     action_id: &str,
     enqueued_utc: DateTime<Utc>,
     action: ActionSpec,
     worker_id: &str,
-    canceled_due_to_action_id: &str,
-    root_failed_action_id: &str,
-    reason: &str,
 ) -> Result<bool> {
     let _transition_lock = QueueTransitionLock::acquire(store, action_id)?;
-    let Some(reservation_path) =
-        reserve_pending_for_terminal_transition(store, pending_path, action_id)?
+    if crate::executor::compute_action_id(&action)? != action_id {
+        bail!("dependency cancellation action does not match action id {action_id}");
+    }
+    if terminal_queue_state_for_action(store, action_id).is_some()
+        || store.running_queue_path(action_id).exists()
+    {
+        return Ok(false);
+    }
+    let ActionReadiness::Blocked {
+        dependency_action_id,
+        root_failed_action_id,
+        reason,
+    } = classify_action_readiness(store, &action)?
     else {
         return Ok(false);
+    };
+
+    let pending_path = store.pending_queue_path(action_id);
+    let reservation_path = if pending_path.exists() {
+        let Some(path) = reserve_pending_for_terminal_transition(store, &pending_path, action_id)?
+        else {
+            return Ok(false);
+        };
+        Some(path)
+    } else {
+        None
     };
     write_canceled_record(
         store,
@@ -1114,12 +1115,14 @@ fn try_write_dependency_canceled_for_pending(
         enqueued_utc,
         action,
         worker_id,
-        canceled_due_to_action_id,
-        root_failed_action_id,
-        reason,
+        &dependency_action_id,
+        &root_failed_action_id,
+        &reason,
     )?;
-    remove_file_if_exists(pending_path)?;
-    remove_file_if_exists(&reservation_path)?;
+    if let Some(reservation_path) = reservation_path {
+        remove_file_if_exists(&pending_path)?;
+        remove_file_if_exists(&reservation_path)?;
+    }
     Ok(true)
 }
 
@@ -1244,24 +1247,19 @@ pub(crate) fn cancel_downstream_pending_actions(
             if blocked_ids.contains(&action_id) {
                 continue;
             }
-            let Some(dep) = action_dependency_action_ids(&action)
+            let has_blocked_dependency = action_dependency_action_ids(&action)
                 .into_iter()
-                .find(|dep_id| blocked_ids.contains(*dep_id))
-                .map(ToOwned::to_owned)
-            else {
+                .any(|dep_id| blocked_ids.contains(dep_id));
+            if !has_blocked_dependency {
                 continue;
-            };
+            }
 
-            if try_write_dependency_canceled_for_pending(
+            if try_write_dependency_canceled_record(
                 store,
-                &pending_path,
                 &action_id,
                 enqueued_utc,
                 action,
                 worker_id,
-                &dep,
-                root_failed_action_id,
-                "dependency failed or was canceled",
             )? {
                 blocked_ids.insert(action_id);
                 canceled += 1;
@@ -1842,6 +1840,76 @@ mod tests {
             remove_file_if_exists(&store.canceled_queue_path(&action_id))
                 .expect("clear winning canceled state");
         }
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn dependency_cancellation_is_serialized_with_retry() {
+        let (store, root) = make_test_store();
+        let store = Arc::new(store);
+        let dependency_action_id = "1".repeat(64);
+        let failed_record = QueueFailed {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id: dependency_action_id.clone(),
+            enqueued_utc: Utc::now(),
+            failed_utc: Utc::now(),
+            failed_by: "dependency-worker".to_string(),
+            action: terminal_test_action(),
+            error: "dependency failed".to_string(),
+        };
+        write_failed_action_record(store.as_ref(), &failed_record)
+            .expect("write failed dependency");
+
+        for iteration in 0..32 {
+            let action = ActionSpec::DriverIrToOpt {
+                ir_action_id: dependency_action_id.clone(),
+                top_fn_name: Some(format!("race_{iteration}")),
+                version: "v0.37.0".to_string(),
+                runtime: sample_runtime(),
+            };
+            let action_id = crate::executor::compute_action_id(&action).expect("action id");
+            let barrier = Arc::new(Barrier::new(3));
+
+            let retry_store = store.clone();
+            let retry_barrier = barrier.clone();
+            let retry_action = action.clone();
+            let retry = thread::spawn(move || {
+                retry_barrier.wait();
+                retry_action_with_priority(retry_store.as_ref(), retry_action, 0)
+                    .expect("retry transition")
+            });
+
+            let cancel_store = store.clone();
+            let cancel_barrier = barrier.clone();
+            let cancel_action_id = action_id.clone();
+            let cancel_action = action.clone();
+            let cancel = thread::spawn(move || {
+                cancel_barrier.wait();
+                try_write_dependency_canceled_record(
+                    cancel_store.as_ref(),
+                    &cancel_action_id,
+                    Utc::now(),
+                    cancel_action,
+                    "dependency-reconcile",
+                )
+                .expect("dependency-cancel transition")
+            });
+
+            barrier.wait();
+            assert_eq!(retry.join().expect("retry thread"), action_id);
+            let _ = cancel.join().expect("cancel thread");
+            let pending = store.pending_queue_path(&action_id).exists();
+            let canceled = store.canceled_queue_path(&action_id).exists();
+            assert_ne!(pending, canceled);
+            assert!(!store.running_queue_path(&action_id).exists());
+
+            remove_file_if_exists(&store.pending_queue_path(&action_id))
+                .expect("clear pending winner");
+            remove_file_if_exists(&store.canceled_queue_path(&action_id))
+                .expect("clear canceled winner");
+        }
+
         drop(store);
         fs::remove_dir_all(root).expect("cleanup temp store");
     }

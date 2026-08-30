@@ -8,9 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-use crate::analysis::decode_analysis_report;
+use crate::analysis::{decode_analysis_report, validate_analysis_report_against_store};
 use crate::campaign::{
-    CAMPAIGN_ANALYSIS_FILENAME, CAMPAIGN_RUN_MANIFEST_FILENAME, validate_campaign_run_file,
+    CAMPAIGN_ANALYSIS_FILENAME, CAMPAIGN_RUN_MANIFEST_FILENAME, campaign_analysis_path,
+    validate_campaign_run_file,
 };
 use crate::coordinator::{COORDINATOR_LOCK_FILENAME, decode_coordinator_state};
 use crate::executor::compute_action_id;
@@ -175,10 +176,11 @@ fn validate_queue_dir<T>(
     Ok(action_ids)
 }
 
-fn validate_campaign_records(root: &Path) -> Result<(usize, usize)> {
+fn validate_campaign_records(store: &ArtifactStore) -> Result<(usize, usize)> {
+    let root = store.campaign_runs_dir();
     let mut campaign_runs = 0_usize;
     let mut analyses = 0_usize;
-    for path in list_regular_files(root)? {
+    for path in list_regular_files(&root)? {
         match path.file_name().and_then(|value| value.to_str()) {
             Some(CAMPAIGN_RUN_MANIFEST_FILENAME) => {
                 validate_campaign_run_file(&path)?;
@@ -187,8 +189,24 @@ fn validate_campaign_records(root: &Path) -> Result<(usize, usize)> {
             Some(CAMPAIGN_ANALYSIS_FILENAME) => {
                 let bytes = fs::read(&path)
                     .with_context(|| format!("reading campaign analysis: {}", path.display()))?;
-                decode_analysis_report(&bytes)
+                let report = decode_analysis_report(&bytes)
                     .with_context(|| format!("validating campaign analysis: {}", path.display()))?;
+                validate_analysis_report_against_store(store, &report).with_context(|| {
+                    format!("validating campaign analysis lineage: {}", path.display())
+                })?;
+                let expected_path = campaign_analysis_path(
+                    store,
+                    report
+                        .run_id
+                        .as_ref()
+                        .context("campaign analysis missing run_id")?,
+                )?;
+                if path != expected_path {
+                    bail!(
+                        "campaign analysis path does not match its embedded run_id: {}",
+                        path.display()
+                    );
+                }
                 analyses += 1;
             }
             _ => bail!(
@@ -316,8 +334,7 @@ pub(crate) fn validate_store(
         }
     }
 
-    let (campaign_run_records, analysis_records) =
-        validate_campaign_records(&store.campaign_runs_dir())?;
+    let (campaign_run_records, analysis_records) = validate_campaign_records(store)?;
     let coordinator_records = validate_coordinator_records(&store.coordinator_dir())?;
     let mut verified_payload_files = 0_usize;
     let mut verified_payload_bytes = 0_u64;

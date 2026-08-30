@@ -318,11 +318,123 @@ fn validate_pointer(pointer: &pb::CurrentSitePointer) -> Result<()> {
     Ok(())
 }
 
+fn normalized_absolute_path(path: &Path) -> Result<std::path::PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("getting current directory for publication path validation")?
+            .join(path)
+    };
+    let mut existing = absolute.as_path();
+    while !existing.exists() {
+        existing = existing.parent().with_context(|| {
+            format!(
+                "publication path has no existing ancestor: {}",
+                absolute.display()
+            )
+        })?;
+    }
+    let mut resolved = fs::canonicalize(existing)
+        .with_context(|| format!("canonicalizing publication path: {}", existing.display()))?;
+    for component in absolute
+        .strip_prefix(existing)
+        .context("resolving publication path suffix")?
+        .components()
+    {
+        match component {
+            Component::Normal(part) => resolved.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("unexpected absolute component in publication path suffix")
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn reject_publication_root_overlap(
+    site_dir: &Path,
+    publish_root: &Path,
+    protected_roots: &[(&str, &Path)],
+) -> Result<()> {
+    let publication = normalized_absolute_path(publish_root)?;
+    let source_site = normalized_absolute_path(site_dir)?;
+    if paths_overlap(&publication, &source_site) {
+        bail!(
+            "publication root must not overlap the source site: publication={} source_site={}",
+            publication.display(),
+            source_site.display()
+        );
+    }
+    for (label, root) in protected_roots {
+        let protected = normalized_absolute_path(root)?;
+        if paths_overlap(&publication, &protected) {
+            bail!(
+                "publication root must not overlap {label}: publication={} protected={}",
+                publication.display(),
+                protected.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_publication_top_level(publish_root: &Path) -> Result<()> {
+    if !publish_root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(publish_root)
+        .with_context(|| format!("reading publication root: {}", publish_root.display()))?
+    {
+        let entry = entry.context("reading publication root entry")?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let file_type = entry.file_type().with_context(|| {
+            format!("reading publication entry type: {}", entry.path().display())
+        })?;
+        let valid_type = match name.as_ref() {
+            ".staging" | "sites" | "catalogs" => file_type.is_dir(),
+            PUBLICATION_LOCK_FILENAME
+            | "index.html"
+            | CURRENT_POINTER_PROTO
+            | CURRENT_POINTER_JSON => file_type.is_file(),
+            _ => false,
+        };
+        if !valid_type {
+            bail!(
+                "publication root contains an unexpected top-level entry: {}",
+                entry.path().display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn publish_static_site(
     site_dir: &Path,
     publish_root: &Path,
 ) -> Result<PublishStaticSiteSummary> {
+    publish_static_site_with_protected_roots(site_dir, publish_root, &[])
+}
+
+pub(crate) fn publish_static_site_with_protected_roots(
+    site_dir: &Path,
+    publish_root: &Path,
+    protected_roots: &[(&str, &Path)],
+) -> Result<PublishStaticSiteSummary> {
+    reject_publication_root_overlap(site_dir, publish_root, protected_roots)?;
+    validate_publication_top_level(publish_root)?;
     let _lock = PublicationLock::acquire(publish_root)?;
+    validate_publication_top_level(publish_root)?;
     let (site_manifest, manifest_bytes, site_id_digest) = site_identity(site_dir)?;
     let site_id = digest_hex(&site_id_digest, "site_id")?;
     let snapshot_id = digest_hex(
@@ -456,6 +568,7 @@ pub(crate) fn publish_static_site(
 }
 
 pub(crate) fn verify_published_site(publish_root: &Path) -> Result<VerifyPublishedSiteSummary> {
+    validate_publication_top_level(publish_root)?;
     let landing =
         fs::read(publish_root.join("index.html")).context("reading published root index")?;
     if landing != PUBLISHED_ROOT_INDEX_HTML.as_bytes() {
@@ -564,6 +677,59 @@ mod tests {
 
     fn empty_versions_index_bytes() -> &'static [u8] {
         br#"{"schema_version":4,"generated_utc":"2026-08-29T12:00:00Z","report":{"cards":[],"unattributed_actions":[]}}"#
+    }
+
+    #[test]
+    fn publication_rejects_source_and_protected_root_overlap_before_mutation() {
+        let root = temp_path("overlap");
+        let site_dir = root.join("site");
+        fs::create_dir_all(&site_dir).expect("create source site");
+
+        for publish_root in [&site_dir, &site_dir.join("published"), &root] {
+            let error = publish_static_site(&site_dir, publish_root)
+                .expect_err("source-site overlap must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not overlap the source site")
+            );
+            assert!(!publish_root.join(PUBLICATION_LOCK_FILENAME).exists());
+        }
+
+        let protected = root.join("private-store");
+        fs::create_dir_all(&protected).expect("create protected root");
+        let publish_root = protected.join("published");
+        let error = publish_static_site_with_protected_roots(
+            &site_dir,
+            &publish_root,
+            &[("private store", protected.as_path())],
+        )
+        .expect_err("protected-root overlap must fail");
+        assert!(error.to_string().contains("must not overlap private store"));
+        assert!(!publish_root.exists());
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn publication_rejects_unknown_top_level_entries_before_locking() {
+        let root = temp_path("top-level-closure");
+        let site_dir = root.join("site");
+        let publish_root = root.join("published");
+        fs::create_dir_all(&site_dir).expect("create source site");
+        fs::create_dir_all(&publish_root).expect("create publication root");
+        fs::write(publish_root.join("private.db"), b"private")
+            .expect("seed unknown publication entry");
+
+        let error = publish_static_site(&site_dir, &publish_root)
+            .expect_err("unknown top-level entry must fail");
+        assert!(error.to_string().contains("unexpected top-level entry"));
+        assert!(!publish_root.join(PUBLICATION_LOCK_FILENAME).exists());
+        let error = verify_published_site(&publish_root)
+            .expect_err("verification must reject unknown top-level entry");
+        assert!(error.to_string().contains("unexpected top-level entry"));
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::campaign::{
 use crate::ops::run_workers;
 use crate::proto::v1 as pb;
 use crate::proto::{encode_provenance, timestamp_from_proto, timestamp_to_proto};
-use crate::publish::{publish_static_site, verify_published_site};
+use crate::publish::{publish_static_site_with_protected_roots, verify_published_site};
 use crate::query::rebuild_web_indices;
 use crate::service::{
     check_ir_fn_corpus_structural_freshness, default_worker_id,
@@ -681,7 +681,19 @@ pub(crate) fn coordinate_release(
             pb::CoordinatorStage::Published,
             pb::CoordinatorStageStatus::FailedTransient,
             || {
-                let summary = publish_static_site(&site_dir, publish_root)?;
+                let summary = publish_static_site_with_protected_roots(
+                    &site_dir,
+                    publish_root,
+                    &[
+                        ("resource checkout", repo_root),
+                        ("private store", store.root.as_path()),
+                        (
+                            "artifact backend storage",
+                            store.artifact_backend_storage_path(),
+                        ),
+                        ("coordinator work directory", options.work_dir.as_path()),
+                    ],
+                )?;
                 verify_published_site(publish_root)?;
                 let text = format!(
                     "site_id={} relpath={} reused={}",

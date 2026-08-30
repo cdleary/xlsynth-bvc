@@ -30,7 +30,7 @@ use crate::executor::{
 use crate::model::*;
 use crate::ops::run_workers;
 use crate::proto::v1 as pb;
-use crate::publish::{publish_static_site, verify_published_site};
+use crate::publish::{publish_static_site_with_protected_roots, verify_published_site};
 use crate::query::{
     action_kind_label, build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_seed,
     enqueue_processing_for_crate_version,
@@ -374,7 +374,15 @@ pub(crate) fn run() -> Result<()> {
         publish_root,
     } = &command
     {
-        let summary = publish_static_site(site_dir, publish_root)?;
+        let summary = publish_static_site_with_protected_roots(
+            site_dir,
+            publish_root,
+            &[
+                ("resource checkout", repo_root.as_path()),
+                ("private store", store_dir.as_path()),
+                ("artifact database", artifacts_via_sled.as_path()),
+            ],
+        )?;
         println!(
             "{}",
             serde_json::to_string_pretty(&summary)
@@ -1609,22 +1617,32 @@ fn enqueue_suggested_actions_with_policy(
                     QueueState::Failed => already_failed_count += 1,
                     QueueState::Canceled => already_canceled_count += 1,
                     QueueState::None => match classify_action_readiness(store, &action)? {
-                        ActionReadiness::Blocked {
-                            dependency_action_id,
-                            root_failed_action_id,
-                            reason,
-                        } => {
-                            write_canceled_record(
+                        ActionReadiness::Blocked { .. } => {
+                            if try_write_dependency_canceled_record(
                                 store,
                                 &action_id,
                                 Utc::now(),
                                 action.clone(),
                                 "suggestion-reconcile",
-                                &dependency_action_id,
-                                &root_failed_action_id,
-                                &reason,
-                            )?;
-                            skipped_blocked_count += 1;
+                            )? {
+                                skipped_blocked_count += 1;
+                            } else {
+                                match queue_state_for_action(store, &action_id) {
+                                    QueueState::Pending => already_pending_count += 1,
+                                    QueueState::Running { .. } => already_running_count += 1,
+                                    QueueState::Done => already_done_count += 1,
+                                    QueueState::Failed => already_failed_count += 1,
+                                    QueueState::Canceled => already_canceled_count += 1,
+                                    QueueState::None => {
+                                        enqueue_action_with_priority(
+                                            store,
+                                            action.clone(),
+                                            suggested_priority,
+                                        )?;
+                                        enqueued_count += 1;
+                                    }
+                                }
+                            }
                         }
                         ActionReadiness::Ready | ActionReadiness::NotReady => {
                             enqueue_action_with_priority(store, action, suggested_priority)?;
@@ -1773,24 +1791,30 @@ fn enqueue_missing_suggested_actions_with_policy(
                 already_canceled_count += 1;
             }
             QueueState::None => match classify_action_readiness(store, &action)? {
-                ActionReadiness::Blocked {
-                    dependency_action_id,
-                    root_failed_action_id,
-                    reason,
-                } => {
-                    if !dry_run {
-                        write_canceled_record(
+                ActionReadiness::Blocked { .. } => {
+                    if dry_run
+                        || try_write_dependency_canceled_record(
                             store,
                             &action_id,
                             Utc::now(),
                             action.clone(),
                             "suggestion-reconcile",
-                            &dependency_action_id,
-                            &root_failed_action_id,
-                            &reason,
-                        )?;
+                        )?
+                    {
+                        skipped_blocked_count += 1;
+                    } else {
+                        match queue_state_for_action(store, &action_id) {
+                            QueueState::Pending => already_pending_count += 1,
+                            QueueState::Running { .. } => already_running_count += 1,
+                            QueueState::Done => already_done_count += 1,
+                            QueueState::Failed => already_failed_count += 1,
+                            QueueState::Canceled => already_canceled_count += 1,
+                            QueueState::None => {
+                                enqueue_action(store, action.clone())?;
+                                enqueued_count += 1;
+                            }
+                        }
                     }
-                    skipped_blocked_count += 1;
                 }
                 ActionReadiness::Ready | ActionReadiness::NotReady => {
                     if !dry_run {

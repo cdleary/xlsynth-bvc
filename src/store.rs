@@ -2589,6 +2589,13 @@ pub(crate) struct ArtifactStore {
 }
 
 impl ArtifactStore {
+    pub(crate) fn artifact_backend_storage_path(&self) -> &Path {
+        match &self.artifact_backend_selection {
+            ArtifactBackendSelection::Sled { db_path } => db_path,
+            ArtifactBackendSelection::Snapshot { snapshot_dir } => snapshot_dir,
+        }
+    }
+
     fn list_cache_ttl_from_env() -> Duration {
         let secs = std::env::var("BVC_STORE_LIST_CACHE_TTL_SECS")
             .ok()

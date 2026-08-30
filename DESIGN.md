@@ -100,8 +100,11 @@ remains authoritative; a failure that loses to committed success performs no
 downstream cancellation.
 
 Each claim also receives a unique lease token. Claims, enqueues, retries,
-work-policy cancellation/removal, and success or failure commits all take the
-same advisory per-action transition lock. Lease-bound commits additionally
+dependency cancellation, work-policy cancellation/removal, and success or
+failure commits all take the same advisory per-action transition lock.
+Dependency cancellation rechecks terminal/active state and dependency readiness
+while holding that lock; callers do not write dependency-canceled records
+directly. Lease-bound commits additionally
 compare the exact token with the current running record before changing
 terminal state, removing the lease, or enqueuing/canceling descendants. An
 expired worker therefore cannot commit against a reclaimed incarnation of the
@@ -200,11 +203,27 @@ snapshot and site verification require raw bytes to equal the validated
 message's canonical encoding. Unknown, duplicate, or otherwise ignored wire
 fields therefore cannot carry unreviewed private bytes into the site.
 
+Analysis reports are not trusted merely because their protobuf is internally
+canonical. Before persistence, store validation, and snapshot construction,
+the report is rebound to its exact finalized current and baseline manifests.
+Every evidence action must exist, match the artifact digest declared by its
+stored provenance, and transitively descend from the corresponding manifest's
+exact stdlib root. Offline snapshot verification cannot traverse private
+provenance, so it requires the report's current run and any baseline run to be
+present as campaign-compatible public run records in the same snapshot.
+
 Snapshot and site closure verification reject symlinks and special filesystem
 nodes. Destructive overwrite is rejected before deletion when the output
 equals, contains, or otherwise overlaps a protected input/resource boundary.
 Every site dataset's length and SHA-256 must match the corresponding embedded
 source-snapshot entry, not only its relative path.
+
+Static publication applies the same isolation before creating its root or lock:
+the public root may not equal, contain, or be contained by the source site,
+resource checkout, private store/database, or coordinator work directory. Its
+top level is a fixed closure of the publication lock/staging directories,
+immutable `sites/` and `catalogs/`, root loader, and current pointers; unknown
+entries and wrong filesystem-node types fail verification.
 
 Raw executor and discovery error strings are private operational data. Public
 failure and enumeration records use fixed enums and structured counters, such

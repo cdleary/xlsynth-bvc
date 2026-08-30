@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
-use crate::analysis::decode_analysis_report;
+use crate::analysis::{decode_analysis_report, validate_analysis_report_against_store};
 use crate::campaign::{campaign_analysis_path, list_finalized_campaign_runs};
 use crate::query::{
     build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_bytes,
@@ -459,6 +459,46 @@ fn validate_public_run(run: &pb::PublicCampaignRun) -> Result<()> {
         }
         if skipped.rule_id.trim().is_empty() || skipped.reason.trim().is_empty() {
             bail!("public intentional skip requires a rule id and reason");
+        }
+    }
+    Ok(())
+}
+
+fn validate_analysis_public_run_bindings(
+    decoded_runs: &std::collections::BTreeMap<String, pb::PublicCampaignRun>,
+    reports: &[pb::AnalysisReport],
+) -> Result<()> {
+    for report in reports {
+        let run_id = digest_to_hex(
+            report
+                .run_id
+                .as_ref()
+                .context("analysis report missing run_id")?,
+            "analysis.run_id",
+        )?;
+        let current = decoded_runs
+            .get(&run_id)
+            .with_context(|| format!("analysis current run is not published: {run_id}"))?;
+        if current.campaign_id != report.campaign_id
+            || current.crate_version != report.crate_version
+        {
+            bail!("analysis identity does not match published current run {run_id}");
+        }
+        match (&report.baseline_run_id, &report.baseline_crate_version) {
+            (Some(baseline_run_id), Some(baseline_version)) => {
+                let baseline_id = digest_to_hex(baseline_run_id, "analysis.baseline_run_id")?;
+                let baseline = decoded_runs.get(&baseline_id).with_context(|| {
+                    format!("analysis baseline run is not published: {baseline_id}")
+                })?;
+                if baseline.run_id.as_ref() != Some(baseline_run_id)
+                    || baseline.campaign_id != report.campaign_id
+                    || baseline.crate_version.as_ref() != Some(baseline_version)
+                {
+                    bail!("analysis baseline identity does not match published run {baseline_id}");
+                }
+            }
+            (None, None) => {}
+            _ => bail!("analysis baseline run id and crate version must be present together"),
         }
     }
     Ok(())
@@ -1019,6 +1059,9 @@ pub(crate) fn build_static_snapshot(
                 format!("reading campaign analysis: {}", analysis_path.display())
             })?;
             let analysis = decode_analysis_report(&analysis_bytes)?;
+            validate_analysis_report_against_store(store, &analysis).with_context(|| {
+                format!("validating analysis lineage before snapshot for run {run_id}")
+            })?;
             observe_proto_generated_utc(
                 &mut latest_source_generated_utc,
                 analysis.generated_at.as_ref(),
@@ -1090,6 +1133,8 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
     let mut declared_relpaths = std::collections::BTreeSet::new();
     let mut decoded_campaign_ids = std::collections::BTreeSet::new();
     let mut decoded_run_ids = std::collections::BTreeSet::new();
+    let mut decoded_runs = std::collections::BTreeMap::new();
+    let mut decoded_analysis_reports = Vec::new();
     let mut structural_index_entries = Vec::new();
     declared_relpaths.insert(STATIC_SNAPSHOT_MANIFEST_FILENAME.to_string());
     for entry in &manifest.dataset_files {
@@ -1189,7 +1234,8 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
                 );
             }
             decoded_campaign_ids.insert(campaign_id);
-            decoded_run_ids.insert(run_id);
+            decoded_run_ids.insert(run_id.clone());
+            decoded_runs.insert(run_id, public_run);
         } else if entry.index_key.starts_with("runs/") && entry.index_key.ends_with("/findings.pb")
         {
             let report = decode_analysis_report(&bytes)?;
@@ -1212,6 +1258,7 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
                     entry.index_key
                 );
             }
+            decoded_analysis_reports.push(report);
         } else if entry.index_key.starts_with("runs/") {
             bail!("unknown run publication file: {}", entry.index_key);
         }
@@ -1226,6 +1273,8 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
 
     crate::service::validate_ir_fn_corpus_structural_index_closure(&structural_index_entries)
         .context("validating structural index closure in static snapshot")?;
+
+    validate_analysis_public_run_bindings(&decoded_runs, &decoded_analysis_reports)?;
 
     if decoded_campaign_ids.into_iter().collect::<Vec<_>>() != manifest.campaign_ids
         || decoded_run_ids.into_iter().collect::<Vec<_>>() != manifest.run_ids
@@ -1360,6 +1409,62 @@ mod tests {
 
     fn test_repo_root() -> PathBuf {
         std::env::current_dir().expect("current directory")
+    }
+
+    #[test]
+    fn offline_analysis_requires_published_current_and_compatible_baseline_runs() {
+        let digest = |byte| pb::Sha256Digest {
+            value: vec![byte; 32],
+        };
+        let campaign_id = digest(1);
+        let current_run_id = digest(2);
+        let baseline_run_id = digest(3);
+        let current_version = pb::CrateVersion {
+            value: "0.40.0".to_string(),
+        };
+        let baseline_version = pb::CrateVersion {
+            value: "0.39.0".to_string(),
+        };
+        let current = pb::PublicCampaignRun {
+            campaign_id: Some(campaign_id.clone()),
+            run_id: Some(current_run_id.clone()),
+            crate_version: Some(current_version.clone()),
+            ..Default::default()
+        };
+        let baseline = pb::PublicCampaignRun {
+            campaign_id: Some(campaign_id.clone()),
+            run_id: Some(baseline_run_id.clone()),
+            crate_version: Some(baseline_version.clone()),
+            ..Default::default()
+        };
+        let current_id = digest_to_hex(&current_run_id, "current id").expect("current id");
+        let baseline_id = digest_to_hex(&baseline_run_id, "baseline id").expect("baseline id");
+        let mut runs = std::collections::BTreeMap::from([
+            (current_id, current),
+            (baseline_id.clone(), baseline),
+        ]);
+        let report = pb::AnalysisReport {
+            campaign_id: Some(campaign_id),
+            run_id: Some(current_run_id),
+            baseline_run_id: Some(baseline_run_id),
+            crate_version: Some(current_version),
+            baseline_crate_version: Some(baseline_version),
+            ..Default::default()
+        };
+        validate_analysis_public_run_bindings(&runs, std::slice::from_ref(&report))
+            .expect("published current and baseline bind");
+
+        let removed = runs.remove(&baseline_id).expect("remove baseline");
+        let error = validate_analysis_public_run_bindings(&runs, std::slice::from_ref(&report))
+            .expect_err("missing published baseline must fail");
+        assert!(format!("{error:#}").contains("baseline run is not published"));
+
+        let mut incompatible = removed;
+        incompatible.campaign_id = Some(digest(9));
+        runs.insert(baseline_id, incompatible);
+        let error = validate_analysis_public_run_bindings(&runs, &[report])
+            .expect_err("incompatible published baseline must fail");
+        assert!(format!("{error:#}").contains("baseline identity does not match"));
     }
 
     #[test]

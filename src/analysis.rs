@@ -17,7 +17,7 @@ use crate::campaign::{
     stored_action_descends_from_root,
 };
 use crate::proto::v1 as pb;
-use crate::proto::{action_id_to_proto, timestamp_to_proto};
+use crate::proto::{action_id_to_hex, action_id_to_proto, timestamp_to_proto};
 use crate::query::load_stdlib_g8r_vs_yosys_dataset_index;
 use crate::store::ArtifactStore;
 use crate::versioning::{cmp_dotted_numeric_version, normalize_tag_version};
@@ -108,18 +108,27 @@ fn finding_id(identity: &pb::FindingIdentity) -> Result<pb::Sha256Digest> {
     })
 }
 
-fn artifact_digest(store: &ArtifactStore, action_id: &str) -> Option<pb::Sha256Digest> {
-    let provenance = store.load_provenance(action_id).ok()?;
-    let output = provenance.output_files.first()?;
-    let bytes = hex::decode(&output.sha256).ok()?;
-    (bytes.len() == 32).then_some(pb::Sha256Digest { value: bytes })
+fn artifact_digest(store: &ArtifactStore, action_id: &str) -> Result<pb::Sha256Digest> {
+    let provenance = store
+        .load_provenance(action_id)
+        .with_context(|| format!("loading analysis evidence action {action_id}"))?;
+    let output = provenance
+        .output_files
+        .first()
+        .with_context(|| format!("analysis evidence action {action_id} has no output files"))?;
+    let bytes = hex::decode(&output.sha256)
+        .with_context(|| format!("decoding analysis evidence digest for action {action_id}"))?;
+    if bytes.len() != 32 {
+        bail!("analysis evidence digest for action {action_id} is not SHA-256");
+    }
+    Ok(pb::Sha256Digest { value: bytes })
 }
 
 fn evidence(store: &ArtifactStore, role: &str, action_id: &str) -> Result<pb::FindingEvidence> {
     Ok(pb::FindingEvidence {
         role: role.to_string(),
         action_id: Some(action_id_to_proto(action_id, "finding.evidence.action_id")?),
-        artifact_sha256: artifact_digest(store, action_id),
+        artifact_sha256: Some(artifact_digest(store, action_id)?),
     })
 }
 
@@ -409,6 +418,159 @@ pub(crate) fn decode_analysis_report(bytes: &[u8]) -> Result<pb::AnalysisReport>
     Ok(report)
 }
 
+fn require_finalized_manifest(manifest: &pb::CampaignRunManifest, label: &str) -> Result<()> {
+    let status = pb::CampaignRunStatus::try_from(manifest.status)
+        .with_context(|| format!("{label} campaign run status is unknown"))?;
+    if !matches!(
+        status,
+        pb::CampaignRunStatus::Complete | pb::CampaignRunStatus::Degraded
+    ) {
+        bail!("{label} campaign run is not finalized: {status:?}");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_analysis_report_against_store(
+    store: &ArtifactStore,
+    report: &pb::AnalysisReport,
+) -> Result<()> {
+    validate_report(report)?;
+    let run_id = digest_hex(
+        required(&report.run_id, "analysis.run_id")?,
+        "analysis.run_id",
+    )?;
+    let current = load_campaign_run_by_id(store, &run_id)
+        .with_context(|| format!("loading analysis campaign run {run_id}"))?;
+    require_finalized_manifest(&current, "analysis current")?;
+    if current.run_id != report.run_id
+        || current.campaign_id != report.campaign_id
+        || current.crate_version != report.crate_version
+    {
+        bail!("analysis identity does not match its current campaign run {run_id}");
+    }
+    let current_campaign = required(&current.campaign, "campaign_run.campaign")?;
+    if current_campaign.analysis_algorithm_version != report.analysis_algorithm_version {
+        bail!("analysis algorithm version does not match its current campaign run");
+    }
+    let current_root = stdlib_root_action_id(&current)?
+        .context("analysis current campaign run has no exact stdlib root")?;
+
+    let baseline = match (&report.baseline_run_id, &report.baseline_crate_version) {
+        (Some(baseline_run_id), Some(baseline_version)) => {
+            let baseline_id = digest_hex(baseline_run_id, "analysis.baseline_run_id")?;
+            let manifest = load_campaign_run_by_id(store, &baseline_id)
+                .with_context(|| format!("loading analysis baseline campaign run {baseline_id}"))?;
+            require_finalized_manifest(&manifest, "analysis baseline")?;
+            if manifest.run_id.as_ref() != Some(baseline_run_id)
+                || manifest.campaign_id != report.campaign_id
+                || manifest.crate_version.as_ref() != Some(baseline_version)
+            {
+                bail!("analysis baseline identity is not campaign-compatible");
+            }
+            Some(manifest)
+        }
+        (None, None) => None,
+        _ => bail!("analysis baseline run id and crate version must be present together"),
+    };
+    let baseline_root = match baseline.as_ref() {
+        Some(manifest) => Some(
+            stdlib_root_action_id(manifest)?
+                .context("analysis baseline campaign run has no exact stdlib root")?,
+        ),
+        None => None,
+    };
+
+    for finding in &report.findings {
+        let identity = required(&finding.identity, "analysis.finding.identity")?;
+        let kind =
+            pb::FindingKind::try_from(identity.kind).context("analysis finding kind is unknown")?;
+        let metric = required(&identity.metric, "analysis.finding.metric")?;
+        if metric.current_microunits.is_none() {
+            bail!("analysis finding is missing its current metric value");
+        }
+        let mut current_ir = false;
+        let mut current_g8r = false;
+        let mut current_yosys = false;
+        let mut baseline_g8r = false;
+        let mut baseline_yosys = false;
+        for evidence in &finding.evidence {
+            let action_id = action_id_to_hex(
+                required(&evidence.action_id, "analysis.finding.evidence.action_id")?,
+                "analysis.finding.evidence.action_id",
+            )?;
+            if !store.action_exists(&action_id) {
+                bail!(
+                    "analysis evidence action does not exist: role={} action_id={action_id}",
+                    evidence.role
+                );
+            }
+            let declared = required(
+                &evidence.artifact_sha256,
+                "analysis.finding.evidence.artifact_sha256",
+            )?;
+            let actual = artifact_digest(store, &action_id)?;
+            if declared != &actual {
+                bail!(
+                    "analysis evidence digest disagrees with stored provenance: role={} action_id={action_id}",
+                    evidence.role
+                );
+            }
+            let lineage_root = match evidence.role.as_str() {
+                "current_ir" => {
+                    current_ir = true;
+                    &current_root
+                }
+                "current_g8r_stats" => {
+                    current_g8r = true;
+                    &current_root
+                }
+                "current_yosys_abc_stats" => {
+                    current_yosys = true;
+                    &current_root
+                }
+                "baseline_g8r_stats" => {
+                    baseline_g8r = true;
+                    baseline_root
+                        .as_ref()
+                        .context("baseline evidence exists without a baseline campaign run")?
+                }
+                "baseline_yosys_abc_stats" => {
+                    baseline_yosys = true;
+                    baseline_root
+                        .as_ref()
+                        .context("baseline evidence exists without a baseline campaign run")?
+                }
+                role => bail!("analysis evidence has unsupported role {role}"),
+            };
+            if !stored_action_descends_from_root(store, &action_id, lineage_root)? {
+                bail!(
+                    "analysis evidence action is outside exact run lineage: role={} action_id={action_id} root_action_id={lineage_root}",
+                    evidence.role
+                );
+            }
+        }
+        if !(current_ir && current_g8r && current_yosys) {
+            bail!("analysis finding is missing required current evidence roles");
+        }
+        if baseline_g8r != baseline_yosys {
+            bail!("analysis finding baseline evidence roles must be present together");
+        }
+        if metric.baseline_microunits.is_some() != baseline_g8r {
+            bail!("analysis finding baseline metric and evidence must be present together");
+        }
+        if matches!(
+            kind,
+            pb::FindingKind::Regression
+                | pb::FindingKind::Improvement
+                | pb::FindingKind::PersistentOutlier
+        ) && !baseline_g8r
+        {
+            bail!("comparative analysis finding is missing baseline evidence");
+        }
+    }
+    Ok(())
+}
+
 fn preserve_generated_at_if_unchanged(
     existing: &pb::AnalysisReport,
     mut candidate: pb::AnalysisReport,
@@ -566,6 +728,7 @@ pub(crate) fn analyze_campaign_run(
         let existing = decode_analysis_report(&bytes)?;
         report = preserve_generated_at_if_unchanged(&existing, report);
     }
+    validate_analysis_report_against_store(store, &report)?;
     write_report(&path, &report)?;
     let mut by_kind = BTreeMap::new();
     for finding in &report.findings {
@@ -589,8 +752,12 @@ pub(crate) fn analyze_campaign_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::campaign::{campaign_run_path, persist_campaign_run_plan};
     use crate::model::{ActionSpec, ArtifactRef, ArtifactType, OutputFile, Provenance};
-    use crate::proto::{action_id_to_proto, action_spec_to_proto};
+    use crate::proto::{
+        action_id_to_hex, action_id_to_proto, action_spec_from_proto, action_spec_to_proto,
+        driver_runtime_from_proto,
+    };
     use serde_json::json;
 
     fn digest(byte: u8) -> pb::Sha256Digest {
@@ -749,6 +916,177 @@ mod tests {
             old_selected["stdlib::subject#<default>"].ir_action_id,
             old_sample.ir_action_id
         );
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn persisted_analysis_evidence_must_match_digest_and_exact_run_lineage() {
+        let root = std::env::temp_dir().join(format!(
+            "xlsynth-bvc-analysis-persisted-lineage-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let repo_root = std::env::current_dir().expect("repo root");
+        let version = crate::versioning::load_version_compat_map(&repo_root)
+            .expect("version map")
+            .into_keys()
+            .next()
+            .expect("known version");
+        let mut manifest =
+            persist_campaign_run_plan(&store, &repo_root, &version).expect("persist campaign plan");
+        let root_action_id = stdlib_root_action_id(&manifest)
+            .expect("stdlib root lookup")
+            .expect("stdlib root");
+        let root_action = manifest
+            .root_actions
+            .iter()
+            .find(|root| {
+                root.action_id.as_ref().is_some_and(|id| {
+                    action_id_to_hex(id, "test root id").is_ok_and(|value| value == root_action_id)
+                })
+            })
+            .and_then(|root| root.action.as_ref())
+            .map(action_spec_from_proto)
+            .transpose()
+            .expect("decode root action")
+            .expect("root action spec");
+        assert_eq!(promote_test_action(&store, root_action), root_action_id);
+
+        let runtime = driver_runtime_from_proto(
+            manifest
+                .driver_runtime
+                .as_ref()
+                .expect("manifest driver runtime"),
+            "test driver runtime",
+        )
+        .expect("decode driver runtime");
+        let action_version = format!("v{version}");
+        let ir_action_id = promote_test_action(
+            &store,
+            ActionSpec::DriverDslxFnToIr {
+                dslx_subtree_action_id: root_action_id,
+                dslx_file: "xls/dslx/stdlib/test.x".to_string(),
+                dslx_fn_name: "subject".to_string(),
+                version: action_version.clone(),
+                runtime: runtime.clone(),
+            },
+        );
+        let g8r_action_id = promote_test_action(
+            &store,
+            ActionSpec::DriverIrToOpt {
+                ir_action_id: ir_action_id.clone(),
+                top_fn_name: Some("g8r".to_string()),
+                version: action_version.clone(),
+                runtime: runtime.clone(),
+            },
+        );
+        let yosys_action_id = promote_test_action(
+            &store,
+            ActionSpec::DriverIrToOpt {
+                ir_action_id: ir_action_id.clone(),
+                top_fn_name: Some("yosys".to_string()),
+                version: action_version,
+                runtime,
+            },
+        );
+        let sample = StdlibG8rVsYosysSample {
+            fn_key: "stdlib::subject".to_string(),
+            crate_version: version.clone(),
+            dso_version: manifest
+                .dso_version
+                .as_ref()
+                .expect("dso version")
+                .value
+                .clone(),
+            ir_action_id,
+            ir_top: None,
+            structural_hash: Some("a".repeat(64)),
+            ir_node_count: 1,
+            g8r_nodes: 2.0,
+            g8r_levels: 2.0,
+            yosys_abc_nodes: 1.0,
+            yosys_abc_levels: 1.0,
+            g8r_product: 4.0,
+            yosys_abc_product: 1.0,
+            g8r_product_loss: 3.0,
+            g8r_stats_action_id: g8r_action_id,
+            yosys_abc_stats_action_id: yosys_action_id,
+        };
+
+        manifest.status = pb::CampaignRunStatus::Complete as i32;
+        let root_count = manifest.root_actions.len() as u64;
+        let completion = manifest.completion.as_mut().expect("completion");
+        completion.status = pb::CampaignRunStatus::Complete as i32;
+        completion.root_action_count = root_count;
+        completion.completed_root_count = root_count;
+        let manifest_path =
+            campaign_run_path(&store, manifest.run_id.as_ref().expect("manifest run id"))
+                .expect("manifest path");
+        fs::write(&manifest_path, manifest.encode_to_vec()).expect("finalize manifest fixture");
+
+        let campaign_id = manifest.campaign_id.as_ref().expect("campaign id");
+        let run_id = manifest.run_id.as_ref().expect("run id");
+        let finding = make_finding(
+            &store,
+            campaign_id,
+            run_id,
+            None,
+            manifest
+                .campaign
+                .as_ref()
+                .expect("campaign")
+                .analysis_algorithm_version,
+            pb::FindingKind::StructuralHashLoss,
+            &sample,
+            None,
+        )
+        .expect("finding");
+        let report = pb::AnalysisReport {
+            record_version: ANALYSIS_RECORD_VERSION,
+            campaign_id: Some(campaign_id.clone()),
+            run_id: Some(run_id.clone()),
+            baseline_run_id: None,
+            crate_version: manifest.crate_version.clone(),
+            baseline_crate_version: None,
+            analysis_algorithm_version: manifest
+                .campaign
+                .as_ref()
+                .expect("campaign")
+                .analysis_algorithm_version,
+            generated_at: Some(timestamp_to_proto(&Utc::now())),
+            findings: vec![finding],
+        };
+        validate_analysis_report_against_store(&store, &report)
+            .expect("exact-lineage report validates");
+
+        let (_, foreign_sample) = test_lineage(&store, 9);
+        let mut wrong_lineage = report.clone();
+        let current_ir = wrong_lineage.findings[0]
+            .evidence
+            .iter_mut()
+            .find(|evidence| evidence.role == "current_ir")
+            .expect("current IR evidence");
+        *current_ir =
+            evidence(&store, "current_ir", &foreign_sample.ir_action_id).expect("foreign evidence");
+        let error = validate_analysis_report_against_store(&store, &wrong_lineage)
+            .expect_err("foreign lineage must fail");
+        assert!(format!("{error:#}").contains("outside exact run lineage"));
+
+        let mut wrong_digest = report;
+        wrong_digest.findings[0].evidence[0]
+            .artifact_sha256
+            .as_mut()
+            .expect("evidence digest")
+            .value[0] ^= 1;
+        let error = validate_analysis_report_against_store(&store, &wrong_digest)
+            .expect_err("wrong evidence digest must fail");
+        assert!(format!("{error:#}").contains("disagrees with stored provenance"));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
