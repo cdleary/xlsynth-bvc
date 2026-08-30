@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use fs2::FileExt;
 use prost::Message;
@@ -9,10 +9,11 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::analysis::analyze_campaign_run;
+use crate::analysis::{analyze_campaign_run, select_analysis_baseline};
 use crate::campaign::{
     compute_campaign_id, finalize_stored_campaign_run, list_campaign_runs, load_campaign_run_by_id,
     load_default_campaign, persist_campaign_run_plan, reconcile_stored_campaign_run,
@@ -27,7 +28,9 @@ use crate::service::{
     check_ir_fn_corpus_structural_freshness, default_worker_id,
     populate_ir_fn_corpus_structural_index,
 };
-use crate::site::{BuildStaticSiteOptions, build_static_site, verify_static_site};
+use crate::site::{
+    BuildStaticSiteOptions, build_static_site_with_protected_roots, verify_static_site,
+};
 use crate::snapshot::{BuildStaticSnapshotOptions, build_static_snapshot, verify_static_snapshot};
 use crate::store::ArtifactStore;
 use crate::versioning::normalize_tag_version;
@@ -36,16 +39,16 @@ use crate::{
     DEFAULT_WEB_RUNNER_POLL_MILLIS,
 };
 
-const COORDINATOR_RECORD_VERSION: u32 = 1;
+const COORDINATOR_RECORD_VERSION: u32 = 2;
 const INDEXED_SOURCE_FINGERPRINT_DOMAIN: &[u8] = b"xlsynth-bvc/indexed-source/v1\0";
 const INDEXED_OUTPUT_FINGERPRINT_DOMAIN: &[u8] = b"xlsynth-bvc/indexed-output/v1\0";
 pub(crate) const COORDINATOR_LOCK_FILENAME: &str = "coordinator.lock";
-static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub(crate) struct CoordinateReleaseOptions {
     pub(crate) crate_version: String,
     pub(crate) run_id: Option<String>,
+    pub(crate) baseline_run_id: Option<String>,
     pub(crate) baseline_crate_version: Option<String>,
     pub(crate) work_dir: PathBuf,
     pub(crate) base_url: String,
@@ -179,6 +182,16 @@ fn validate_state(state: &pb::CoordinatorState) -> Result<()> {
     if let Some(fingerprint) = &state.indexed_output_fingerprint {
         digest_hex(fingerprint, "coordinator.indexed_output_fingerprint")?;
     }
+    match (&state.baseline_run_id, &state.baseline_crate_version) {
+        (Some(run_id), Some(version)) => {
+            digest_hex(run_id, "coordinator.baseline_run_id")?;
+            if version.value.is_empty() {
+                bail!("coordinator baseline crate version must not be empty");
+            }
+        }
+        (None, None) => {}
+        _ => bail!("coordinator baseline run id and crate version must be present together"),
+    }
     Ok(())
 }
 
@@ -188,37 +201,21 @@ pub(crate) fn decode_coordinator_state(bytes: &[u8]) -> Result<pb::CoordinatorSt
     Ok(state)
 }
 
-fn atomic_write_state(path: &Path, state: &pb::CoordinatorState) -> Result<()> {
+fn atomic_write_state(
+    store: &ArtifactStore,
+    path: &Path,
+    state: &pb::CoordinatorState,
+) -> Result<()> {
     validate_state(state)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("coordinator state path has no parent"))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("creating coordinator state parent: {}", parent.display()))?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let nonce = WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
-    let temp = parent.join(format!(
-        ".coordinator.pb.tmp-{}-{timestamp}-{nonce}",
-        std::process::id()
-    ));
-    fs::write(&temp, state.encode_to_vec())
-        .with_context(|| format!("writing coordinator temp state: {}", temp.display()))?;
-    fs::rename(&temp, path).with_context(|| {
-        format!(
-            "atomically promoting coordinator state: {} -> {}",
-            temp.display(),
-            path.display()
-        )
-    })
+    store.write_record_atomic("coordinator", path, &state.encode_to_vec())
 }
 
 fn load_or_new_state(
     path: &Path,
     run_id: &str,
     crate_version: &str,
+    baseline_run_id: Option<&str>,
+    baseline_crate_version: Option<&str>,
 ) -> Result<pb::CoordinatorState> {
     if path.exists() {
         let bytes = fs::read(path)
@@ -232,6 +229,23 @@ fn load_or_new_state(
             || required(&state.crate_version, "coordinator.crate_version")?.value != crate_version
         {
             bail!("coordinator state identity does not match requested run");
+        }
+        let stored_baseline_run_id = state
+            .baseline_run_id
+            .as_ref()
+            .map(|id| digest_hex(id, "coordinator.baseline_run_id"))
+            .transpose()?;
+        let stored_baseline_version = state
+            .baseline_crate_version
+            .as_ref()
+            .map(|version| version.value.as_str());
+        if stored_baseline_run_id.as_deref() != baseline_run_id
+            || stored_baseline_version != baseline_crate_version
+        {
+            bail!(
+                "coordinator state baseline binding does not match the selected baseline; resume with --baseline-run-id {}",
+                stored_baseline_run_id.as_deref().unwrap_or("<none>")
+            );
         }
         return Ok(state);
     }
@@ -249,10 +263,52 @@ fn load_or_new_state(
         published_site_id: None,
         indexed_source_fingerprint: None,
         indexed_output_fingerprint: None,
+        baseline_run_id: baseline_run_id
+            .map(|run_id| digest_from_hex(run_id, "baseline_run_id"))
+            .transpose()?,
+        baseline_crate_version: baseline_crate_version.map(|version| pb::CrateVersion {
+            value: version.to_string(),
+        }),
     })
 }
 
+fn checkpointed_baseline_binding(
+    path: &Path,
+    requested_baseline_run_id: Option<&str>,
+    requested_baseline_crate_version: Option<&str>,
+) -> Result<Option<Option<(String, String)>>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes =
+        fs::read(path).with_context(|| format!("reading coordinator state: {}", path.display()))?;
+    let state = decode_coordinator_state(&bytes)
+        .with_context(|| format!("validating coordinator state: {}", path.display()))?;
+    let stored_run_id = state
+        .baseline_run_id
+        .as_ref()
+        .map(|id| digest_hex(id, "coordinator.baseline_run_id"))
+        .transpose()?;
+    let stored_version = state
+        .baseline_crate_version
+        .as_ref()
+        .map(|version| version.value.clone());
+    if requested_baseline_run_id
+        .is_some_and(|requested| stored_run_id.as_deref() != Some(requested))
+        || requested_baseline_crate_version.is_some_and(|requested| {
+            stored_version.as_deref() != Some(normalize_tag_version(requested))
+        })
+    {
+        bail!(
+            "requested baseline does not match the coordinator checkpoint binding ({})",
+            stored_run_id.as_deref().unwrap_or("no baseline")
+        );
+    }
+    Ok(Some(stored_run_id.zip(stored_version)))
+}
+
 fn record_stage(
+    store: &ArtifactStore,
     state: &mut pb::CoordinatorState,
     path: &Path,
     stage: pb::CoordinatorStage,
@@ -273,10 +329,11 @@ fn record_stage(
     state.stage_results.sort_by_key(|result| result.stage);
     state.current_stage = stage as i32;
     state.updated_at = Some(timestamp_to_proto(&Utc::now()));
-    atomic_write_state(path, state)
+    atomic_write_state(store, path, state)
 }
 
 fn stage<T>(
+    store: &ArtifactStore,
     state: &mut pb::CoordinatorState,
     path: &Path,
     stage_name: pb::CoordinatorStage,
@@ -287,6 +344,7 @@ fn stage<T>(
     match operation() {
         Ok((value, summary)) => {
             record_stage(
+                store,
                 state,
                 path,
                 stage_name,
@@ -298,6 +356,7 @@ fn stage<T>(
         }
         Err(error) => {
             record_stage(
+                store,
                 state,
                 path,
                 stage_name,
@@ -473,8 +532,40 @@ pub(crate) fn coordinate_release(
     )?;
     let plan = summarize_campaign_run(&store, &manifest, true)?;
     let path = state_path(&store, &plan.run_id);
-    let mut state = load_or_new_state(&path, &plan.run_id, &plan.crate_version)?;
+    let baseline = match checkpointed_baseline_binding(
+        &path,
+        options.baseline_run_id.as_deref(),
+        options.baseline_crate_version.as_deref(),
+    )? {
+        Some(Some((run_id, version))) => {
+            select_analysis_baseline(&store, &manifest, Some(&run_id), Some(&version))?
+        }
+        Some(None) => None,
+        None => select_analysis_baseline(
+            &store,
+            &manifest,
+            options.baseline_run_id.as_deref(),
+            options.baseline_crate_version.as_deref(),
+        )?,
+    };
+    let baseline_run_id = baseline
+        .as_ref()
+        .and_then(|manifest| manifest.run_id.as_ref())
+        .map(|id| digest_hex(id, "baseline_run_id"))
+        .transpose()?;
+    let baseline_crate_version = baseline
+        .as_ref()
+        .and_then(|manifest| manifest.crate_version.as_ref())
+        .map(|version| version.value.clone());
+    let mut state = load_or_new_state(
+        &path,
+        &plan.run_id,
+        &plan.crate_version,
+        baseline_run_id.as_deref(),
+        baseline_crate_version.as_deref(),
+    )?;
     record_stage(
+        &store,
         &mut state,
         &path,
         pb::CoordinatorStage::Planned,
@@ -487,6 +578,7 @@ pub(crate) fn coordinate_release(
     )?;
 
     let reconciled = stage(
+        &store,
         &mut state,
         &path,
         pb::CoordinatorStage::Reconciled,
@@ -505,6 +597,7 @@ pub(crate) fn coordinate_release(
     let store = Arc::new(store);
     let worker_id = coordinator_worker_id_prefix(&plan.run_id);
     let workers = stage(
+        &store,
         &mut state,
         &path,
         pb::CoordinatorStage::Drained,
@@ -545,6 +638,7 @@ pub(crate) fn coordinate_release(
         &current_indexed_output_fingerprint,
     );
     let verified_indexed_output_fingerprint = stage(
+        &store,
         &mut state,
         &path,
         pb::CoordinatorStage::Indexed,
@@ -587,9 +681,10 @@ pub(crate) fn coordinate_release(
     )?;
     state.indexed_source_fingerprint = Some(current_indexed_source_fingerprint);
     state.indexed_output_fingerprint = Some(verified_indexed_output_fingerprint);
-    atomic_write_state(&path, &state)?;
+    atomic_write_state(&store, &path, &state)?;
 
     let finalized = stage(
+        &store,
         &mut state,
         &path,
         pb::CoordinatorStage::Finalized,
@@ -616,6 +711,7 @@ pub(crate) fn coordinate_release(
     )?;
 
     let analysis = stage(
+        &store,
         &mut state,
         &path,
         pb::CoordinatorStage::Analyzed,
@@ -626,7 +722,8 @@ pub(crate) fn coordinate_release(
                 repo_root,
                 &options.crate_version,
                 Some(&plan.run_id),
-                options.baseline_crate_version.as_deref(),
+                baseline_run_id.as_deref(),
+                baseline_crate_version.as_deref(),
             )?;
             let text = format!("findings={}", summary.finding_count);
             Ok((summary, text))
@@ -636,6 +733,7 @@ pub(crate) fn coordinate_release(
     let snapshot_dir = options.work_dir.join("snapshots").join(&plan.run_id);
     state.snapshot_dir = snapshot_dir.display().to_string();
     let snapshot = stage(
+        &store,
         &mut state,
         &path,
         pb::CoordinatorStage::SnapshotVerified,
@@ -662,17 +760,28 @@ pub(crate) fn coordinate_release(
     let site_dir = options.work_dir.join("sites").join(&plan.run_id);
     state.site_dir = site_dir.display().to_string();
     stage(
+        &store,
         &mut state,
         &path,
         pb::CoordinatorStage::SiteVerified,
         pb::CoordinatorStageStatus::FailedTransient,
         || {
-            build_static_site(&BuildStaticSiteOptions {
-                snapshot_dir: snapshot_dir.clone(),
-                out_dir: site_dir.clone(),
-                base_url: options.base_url.clone(),
-                overwrite: true,
-            })?;
+            build_static_site_with_protected_roots(
+                &BuildStaticSiteOptions {
+                    snapshot_dir: snapshot_dir.clone(),
+                    out_dir: site_dir.clone(),
+                    base_url: options.base_url.clone(),
+                    overwrite: true,
+                },
+                &[
+                    ("resource checkout", repo_root),
+                    ("private store", store.root.as_path()),
+                    (
+                        "artifact backend storage",
+                        store.artifact_backend_storage_path(),
+                    ),
+                ],
+            )?;
             let summary = verify_static_site(&site_dir)?;
             let text = format!(
                 "snapshot_id={} files={} bytes={}",
@@ -684,6 +793,7 @@ pub(crate) fn coordinate_release(
 
     let published_site_id = if let Some(publish_root) = &options.publish_root {
         let published = stage(
+            &store,
             &mut state,
             &path,
             pb::CoordinatorStage::Published,
@@ -711,7 +821,7 @@ pub(crate) fn coordinate_release(
             },
         )?;
         state.published_site_id = Some(digest_from_hex(&published.site_id, "published_site_id")?);
-        atomic_write_state(&path, &state)?;
+        atomic_write_state(&store, &path, &state)?;
         Some(published.site_id)
     } else {
         None
@@ -890,6 +1000,67 @@ mod tests {
             &state,
             pb::CoordinatorStage::SnapshotVerified
         ));
+    }
+
+    #[test]
+    fn coordinator_checkpoint_rejects_baseline_generation_drift() {
+        let root = temp_path("baseline-binding");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let run_id = "1".repeat(64);
+        let baseline_run_id = "2".repeat(64);
+        let path = state_path(&store, &run_id);
+        let state = load_or_new_state(
+            &path,
+            &run_id,
+            "0.40.0",
+            Some(&baseline_run_id),
+            Some("0.39.0"),
+        )
+        .expect("new bound state");
+        atomic_write_state(&store, &path, &state).expect("persist bound state");
+
+        load_or_new_state(
+            &path,
+            &run_id,
+            "0.40.0",
+            Some(&baseline_run_id),
+            Some("0.39.0"),
+        )
+        .expect("same baseline resumes");
+        assert_eq!(
+            checkpointed_baseline_binding(&path, None, None).expect("read checkpointed baseline"),
+            Some(Some((baseline_run_id.clone(), "0.39.0".to_string())))
+        );
+        let error = load_or_new_state(
+            &path,
+            &run_id,
+            "0.40.0",
+            Some(&"3".repeat(64)),
+            Some("0.39.0"),
+        )
+        .expect_err("baseline generation drift must fail");
+        assert!(format!("{error:#}").contains("baseline binding"));
+
+        let no_baseline_run_id = "4".repeat(64);
+        let no_baseline_path = state_path(&store, &no_baseline_run_id);
+        let no_baseline =
+            load_or_new_state(&no_baseline_path, &no_baseline_run_id, "0.40.0", None, None)
+                .expect("new no-baseline state");
+        atomic_write_state(&store, &no_baseline_path, &no_baseline)
+            .expect("persist no-baseline state");
+        assert_eq!(
+            checkpointed_baseline_binding(&no_baseline_path, None, None)
+                .expect("read no-baseline checkpoint"),
+            Some(None),
+            "newly appearing history must not change a checkpointed no-baseline choice"
+        );
+        let error = checkpointed_baseline_binding(&no_baseline_path, None, Some("0.39.0"))
+            .expect_err("an explicit baseline cannot replace a checkpointed no-baseline choice");
+        assert!(format!("{error:#}").contains("does not match"));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

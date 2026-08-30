@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use prost::Message;
 use serde::Serialize;
@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::campaign::{
@@ -17,7 +17,9 @@ use crate::campaign::{
     stored_action_descends_from_root,
 };
 use crate::proto::v1 as pb;
-use crate::proto::{action_id_to_hex, action_id_to_proto, timestamp_to_proto};
+use crate::proto::{
+    action_id_to_hex, action_id_to_proto, timestamp_from_proto, timestamp_to_proto,
+};
 use crate::query::load_stdlib_g8r_vs_yosys_dataset_index;
 use crate::store::ArtifactStore;
 use crate::versioning::{cmp_dotted_numeric_version, normalize_tag_version};
@@ -29,7 +31,6 @@ const FINDING_ID_DOMAIN: &[u8] = b"xlsynth-bvc/finding/v1\0";
 const METRIC_SCALE: f64 = 1_000_000.0;
 const CHANGE_THRESHOLD_MICRO: i64 = 50_000;
 const OUTLIER_THRESHOLD_MICRO: i64 = 50_000;
-static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AnalysisSummary {
@@ -207,12 +208,12 @@ fn make_finding(
     })
 }
 
-fn unique_finalized_run_for_version(
+fn preferred_finalized_run_for_version(
     store: &ArtifactStore,
     campaign_id: &pb::Sha256Digest,
     version: &str,
 ) -> Result<pb::CampaignRunManifest> {
-    let mut candidates = list_finalized_campaign_runs(store)?
+    let candidates = list_finalized_campaign_runs(store)?
         .into_iter()
         .filter(|manifest| {
             manifest.campaign_id.as_ref() == Some(campaign_id)
@@ -225,22 +226,22 @@ fn unique_finalized_run_for_version(
     if candidates.is_empty() {
         bail!("no comparable finalized campaign run exists for crate version {version}");
     }
-    if candidates.len() > 1 {
-        let ids = candidates
-            .iter()
-            .map(|manifest| {
-                digest_hex(
-                    required(&manifest.run_id, "campaign_run.run_id")?,
-                    "campaign_run.run_id",
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        bail!(
-            "multiple comparable finalized campaign runs exist for crate version {version}: {}",
-            ids.join(", ")
-        );
+    let mut preferred = None;
+    for manifest in candidates {
+        let created_at = timestamp_from_proto(&manifest.created_at, "campaign_run.created_at")?;
+        let run_id = digest_hex(
+            required(&manifest.run_id, "campaign_run.run_id")?,
+            "campaign_run.run_id",
+        )?;
+        let key = (created_at, run_id);
+        if preferred
+            .as_ref()
+            .is_none_or(|(preferred_key, _)| key > *preferred_key)
+        {
+            preferred = Some((key, manifest));
+        }
     }
-    Ok(candidates.pop().expect("nonempty candidates"))
+    Ok(preferred.expect("nonempty candidates").1)
 }
 
 fn previous_finalized_run(
@@ -259,8 +260,55 @@ fn previous_finalized_run(
     versions.dedup();
     versions
         .pop()
-        .map(|version| unique_finalized_run_for_version(store, campaign_id, &version))
+        .map(|version| preferred_finalized_run_for_version(store, campaign_id, &version))
         .transpose()
+}
+
+pub(crate) fn select_analysis_baseline(
+    store: &ArtifactStore,
+    current: &pb::CampaignRunManifest,
+    exact_baseline_run_id: Option<&str>,
+    baseline_crate_version: Option<&str>,
+) -> Result<Option<pb::CampaignRunManifest>> {
+    let current_version = &required(&current.crate_version, "campaign_run.crate_version")?.value;
+    let campaign_id = required(&current.campaign_id, "campaign_run.campaign_id")?;
+    let requested_version = baseline_crate_version.map(normalize_tag_version);
+
+    let baseline = match exact_baseline_run_id {
+        Some(run_id) => Some(
+            load_campaign_run_by_id(store, run_id)
+                .with_context(|| format!("loading selected baseline campaign run {run_id}"))?,
+        ),
+        None => match requested_version {
+            Some(version) => Some(preferred_finalized_run_for_version(
+                store,
+                campaign_id,
+                version,
+            )?),
+            None => previous_finalized_run(store, current)?,
+        },
+    };
+    let Some(baseline) = baseline else {
+        return Ok(None);
+    };
+    require_finalized_manifest(&baseline, "analysis baseline")?;
+    if baseline.campaign_id.as_ref() != Some(campaign_id) {
+        bail!("selected baseline campaign run is from a different campaign");
+    }
+    let selected_version = &required(&baseline.crate_version, "baseline.crate_version")?.value;
+    if let Some(requested_version) = requested_version
+        && selected_version != requested_version
+    {
+        bail!(
+            "selected baseline run crate version {selected_version} does not match requested {requested_version}"
+        );
+    }
+    if !cmp_dotted_numeric_version(selected_version, current_version).is_lt() {
+        bail!(
+            "selected baseline crate version {selected_version} must precede current crate version {current_version}"
+        );
+    }
+    Ok(Some(baseline))
 }
 
 fn sample_has_root_lineage(
@@ -490,31 +538,9 @@ fn validate_report(report: &pb::AnalysisReport) -> Result<()> {
     Ok(())
 }
 
-fn write_report(path: &Path, report: &pb::AnalysisReport) -> Result<()> {
+fn write_report(store: &ArtifactStore, path: &Path, report: &pb::AnalysisReport) -> Result<()> {
     validate_report(report)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("analysis path has no parent"))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("creating analysis directory: {}", parent.display()))?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let nonce = WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
-    let temp = parent.join(format!(
-        ".analysis.pb.tmp-{}-{timestamp}-{nonce}",
-        std::process::id()
-    ));
-    fs::write(&temp, report.encode_to_vec())
-        .with_context(|| format!("writing analysis temp file: {}", temp.display()))?;
-    fs::rename(&temp, path).with_context(|| {
-        format!(
-            "atomically promoting analysis report: {} -> {}",
-            temp.display(),
-            path.display()
-        )
-    })
+    store.write_record_atomic("analysis", path, &report.encode_to_vec())
 }
 
 pub(crate) fn decode_analysis_report(bytes: &[u8]) -> Result<pb::AnalysisReport> {
@@ -707,6 +733,7 @@ pub(crate) fn analyze_campaign_run(
     repo_root: &Path,
     crate_version: &str,
     exact_run_id: Option<&str>,
+    exact_baseline_run_id: Option<&str>,
     baseline_crate_version: Option<&str>,
 ) -> Result<AnalysisSummary> {
     let current = match exact_run_id {
@@ -734,15 +761,12 @@ pub(crate) fn analyze_campaign_run(
             crate_version
         );
     }
-    let campaign_id = required(&current.campaign_id, "campaign_run.campaign_id")?;
-    let baseline = match baseline_crate_version {
-        Some(version) => Some(unique_finalized_run_for_version(
-            store,
-            campaign_id,
-            normalize_tag_version(version),
-        )?),
-        None => previous_finalized_run(store, &current)?,
-    };
+    let baseline = select_analysis_baseline(
+        store,
+        &current,
+        exact_baseline_run_id,
+        baseline_crate_version,
+    )?;
     let baseline_version = baseline
         .as_ref()
         .and_then(|manifest| manifest.crate_version.as_ref())
@@ -768,7 +792,7 @@ pub(crate) fn analyze_campaign_run(
         report = preserve_generated_at_if_unchanged(&existing, report);
     }
     validate_analysis_report_against_store(store, &report)?;
-    write_report(&path, &report)?;
+    write_report(store, &path, &report)?;
     let mut by_kind = BTreeMap::new();
     for finding in &report.findings {
         let kind = pb::FindingKind::try_from(required(&finding.identity, "finding.identity")?.kind)
@@ -815,6 +839,52 @@ mod tests {
             dockerfile_sha256: "b".repeat(64),
             release_cache_input_sha256: "c".repeat(64),
         }
+    }
+
+    fn mutable_resource_root(label: &str) -> std::path::PathBuf {
+        let source_root = std::env::current_dir().expect("current dir");
+        let root = std::env::temp_dir().join(format!(
+            "xlsynth-bvc-analysis-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        for relpath in [
+            crate::VERSION_COMPAT_PATH,
+            crate::DEFAULT_DOCKERFILE,
+            crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
+        ] {
+            let target = root.join(relpath);
+            fs::create_dir_all(target.parent().expect("resource parent"))
+                .expect("create resource parent");
+            fs::copy(source_root.join(relpath), &target).expect("copy resource input");
+        }
+        root
+    }
+
+    fn persist_finalized_fixture(
+        store: &ArtifactStore,
+        mut manifest: pb::CampaignRunManifest,
+        created_at_seconds: i64,
+    ) -> pb::CampaignRunManifest {
+        manifest.status = pb::CampaignRunStatus::Complete as i32;
+        manifest.created_at = Some(prost_types::Timestamp {
+            seconds: created_at_seconds,
+            nanos: 0,
+        });
+        manifest.updated_at = manifest.created_at;
+        manifest.completion = Some(pb::CompletionReport {
+            status: pb::CampaignRunStatus::Complete as i32,
+            root_action_count: manifest.root_actions.len() as u64,
+            completed_root_count: manifest.root_actions.len() as u64,
+            ..Default::default()
+        });
+        let path = campaign_run_path(store, manifest.run_id.as_ref().expect("fixture run id"))
+            .expect("fixture path");
+        fs::write(path, manifest.encode_to_vec()).expect("write finalized fixture");
+        manifest
     }
 
     fn promote_test_action(store: &ArtifactStore, action: ActionSpec) -> String {
@@ -957,6 +1027,65 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn baseline_selection_prefers_latest_generation_and_exact_id_overrides_it() {
+        let root = std::env::temp_dir().join(format!(
+            "xlsynth-bvc-analysis-baseline-generation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let repo_root = mutable_resource_root("baseline-generation-resources");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("store layout");
+        let version = crate::versioning::load_version_compat_map(&repo_root)
+            .expect("version map")
+            .into_keys()
+            .next()
+            .expect("known version");
+        let old = persist_campaign_run_plan(&store, &repo_root, &version)
+            .expect("persist old generation");
+        let old = persist_finalized_fixture(&store, old, 100);
+
+        let setup_script = repo_root.join(crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT);
+        let mut bytes = fs::read(&setup_script).expect("read setup script");
+        bytes.extend_from_slice(b"\n# analysis baseline generation two\n");
+        fs::write(&setup_script, bytes).expect("change runtime input");
+        let latest = persist_campaign_run_plan(&store, &repo_root, &version)
+            .expect("persist latest generation");
+        let latest = persist_finalized_fixture(&store, latest, 200);
+
+        let current = pb::CampaignRunManifest {
+            campaign_id: old.campaign_id.clone(),
+            crate_version: Some(pb::CrateVersion {
+                value: "999.0.0".to_string(),
+            }),
+            ..Default::default()
+        };
+        let implicit = select_analysis_baseline(&store, &current, None, Some(&version))
+            .expect("implicit generation selection")
+            .expect("baseline exists");
+        assert_eq!(implicit.run_id, latest.run_id);
+
+        let old_run_id = digest_hex(old.run_id.as_ref().expect("old run id"), "old run id")
+            .expect("old run id hex");
+        let exact = select_analysis_baseline(&store, &current, Some(&old_run_id), Some(&version))
+            .expect("exact generation selection")
+            .expect("baseline exists");
+        assert_eq!(exact.run_id, old.run_id);
+
+        let wrong_version =
+            select_analysis_baseline(&store, &current, Some(&old_run_id), Some("998.0.0"))
+                .expect_err("exact selector must validate requested version");
+        assert!(format!("{wrong_version:#}").contains("does not match requested"));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup store");
+        fs::remove_dir_all(repo_root).expect("cleanup resources");
     }
 
     #[test]

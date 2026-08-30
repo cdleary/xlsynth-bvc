@@ -85,6 +85,9 @@ pub enum TopCommand {
         /// Select one exact stored run when more than one generation exists.
         #[arg(long)]
         run_id: Option<String>,
+        /// Select one exact finalized baseline generation.
+        #[arg(long)]
+        baseline_run_id: Option<String>,
         #[arg(long)]
         baseline_crate_version: Option<String>,
     },
@@ -95,6 +98,9 @@ pub enum TopCommand {
         /// Resume one exact stored run; otherwise a unique stored run is resumed automatically.
         #[arg(long)]
         run_id: Option<String>,
+        /// Bind analysis to one exact finalized baseline generation.
+        #[arg(long)]
+        baseline_run_id: Option<String>,
         #[arg(long)]
         baseline_crate_version: Option<String>,
         #[arg(long, value_name = "DIR", default_value = "bvc-publication-work")]
@@ -123,6 +129,7 @@ pub enum TopCommand {
     DrainQueue {
         #[arg(long)]
         limit: Option<usize>,
+        /// Optional human-readable label appended to the process-fenced worker identity.
         #[arg(long)]
         worker_id: Option<String>,
         #[arg(long, default_value_t = crate::DEFAULT_QUEUE_LEASE_SECONDS)]
@@ -133,6 +140,7 @@ pub enum TopCommand {
     RunWorkers {
         #[arg(long, default_value_t = crate::runtime::default_web_runner_workers())]
         workers: usize,
+        /// Optional human-readable label appended to the process-fenced worker identity.
         #[arg(long)]
         worker_id: Option<String>,
         #[arg(long, default_value_t = crate::DEFAULT_QUEUE_LEASE_SECONDS)]

@@ -1425,6 +1425,7 @@ const PERSISTENT_RUNNER_SCHEMA_VERSION: u32 = 2;
 const PERSISTENT_RUNNER_ROOT_DIR: &str = "persistent-runners";
 const PERSISTENT_RUNNER_RUNNERS_DIR: &str = "runners";
 const PERSISTENT_RUNNER_REQUEST_TIMEOUT_GRACE_SECS: u64 = 15;
+const PERSISTENT_RUNNER_POST_RESULT_IDLE_TIMEOUT_SECS: u64 = 5;
 const PERSISTENT_RUNNER_HEARTBEAT_STALE_SECS: u64 = 15;
 const PERSISTENT_RUNNER_POOL_SIZE_ENV: &str = "XLSYNTH_BVC_PERSISTENT_RUNNER_POOL_SIZE";
 const PERSISTENT_RUNNER_DRIVER_POOL_SIZE_ENV: &str =
@@ -1575,8 +1576,57 @@ struct SelectedPersistentRunner {
     runner_key: String,
     runner_instance_id: String,
     container_name: String,
+    container_id: String,
     paths: PersistentRunnerPaths,
     _slot_guard: PersistentRunnerSlotGuard,
+}
+
+struct PersistentRunnerFailureRetirement {
+    container_name: String,
+    container_id: String,
+    armed: bool,
+}
+
+impl PersistentRunnerFailureRetirement {
+    fn new(runner: &SelectedPersistentRunner) -> Self {
+        Self {
+            container_name: runner.container_name.clone(),
+            container_id: runner.container_id.clone(),
+            armed: true,
+        }
+    }
+
+    fn retire_now(&mut self) -> String {
+        match cleanup_persistent_runner_container_if_id(&self.container_name, &self.container_id) {
+            Ok(true) => {
+                self.armed = false;
+                "removed failed persistent runner".to_string()
+            }
+            Ok(false) => {
+                self.armed = false;
+                "selected persistent runner was already absent or replaced".to_string()
+            }
+            Err(error) => format!("cleanup_failed(error={error:#})"),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PersistentRunnerFailureRetirement {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) =
+                cleanup_persistent_runner_container_if_id(&self.container_name, &self.container_id)
+        {
+            log::warn!(
+                "failed retiring persistent runner {} after request failure: {error:#}",
+                self.container_name
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2102,6 +2152,30 @@ fn docker_container_image_id(container_name: &str) -> Result<Option<String>> {
     )?))
 }
 
+fn docker_container_id(container_name: &str) -> Result<Option<String>> {
+    let output = Command::new("docker")
+        .args(["inspect", "--format", "{{.Id}}", container_name])
+        .output()
+        .with_context(|| format!("inspecting docker container id: {container_name}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.to_ascii_lowercase().contains("no such") {
+            return Ok(None);
+        }
+        bail!(
+            "failed to inspect docker container {}: {}",
+            container_name,
+            first_line(&stderr)
+        );
+    }
+    Ok(Some(
+        String::from_utf8(output.stdout)
+            .context("decoding docker container ID")?
+            .trim()
+            .to_string(),
+    ))
+}
+
 fn count_json_files(path: &Path) -> Result<usize> {
     if !path.exists() {
         return Ok(0);
@@ -2179,6 +2253,20 @@ fn cleanup_persistent_runner_container(container_name: &str) -> Result<()> {
         container_name,
         first_line(&String::from_utf8_lossy(&output.stderr))
     );
+}
+
+fn cleanup_persistent_runner_container_if_id(
+    container_name: &str,
+    expected_container_id: &str,
+) -> Result<bool> {
+    let Some(current_container_id) = docker_container_id(container_name)? else {
+        return Ok(false);
+    };
+    if current_container_id != expected_container_id {
+        return Ok(false);
+    }
+    cleanup_persistent_runner_container(container_name)?;
+    Ok(true)
 }
 
 fn ensure_persistent_runner_started(
@@ -2423,6 +2511,8 @@ fn select_persistent_runner_locked(
         return Ok(Some(SelectedPersistentRunner {
             runner_key: status.runner_key,
             runner_instance_id: heartbeat.runner_instance_id,
+            container_id: docker_container_id(&status.container_name)?
+                .context("idle persistent runner disappeared during selection")?,
             container_name: status.container_name,
             paths: status.paths,
             _slot_guard: slot_guard,
@@ -2446,6 +2536,8 @@ fn select_persistent_runner_locked(
             return Ok(Some(SelectedPersistentRunner {
                 runner_key: status.runner_key,
                 runner_instance_id: heartbeat.runner_instance_id,
+                container_id: docker_container_id(&status.container_name)?
+                    .context("idle persistent runner disappeared during selection")?,
                 container_name: status.container_name,
                 paths: status.paths,
                 _slot_guard: slot_guard,
@@ -2469,6 +2561,8 @@ fn select_persistent_runner_locked(
         return Ok(Some(SelectedPersistentRunner {
             runner_key: status.runner_key,
             runner_instance_id: heartbeat.runner_instance_id,
+            container_id: docker_container_id(&status.container_name)?
+                .context("new persistent runner disappeared during selection")?,
             container_name: status.container_name,
             paths: status.paths,
             _slot_guard: slot_guard,
@@ -2631,6 +2725,7 @@ fn execute_persistent_runner_script_with_timeout_and_family(
         ];
         (runner, result_path, command_argv, writebacks)
     };
+    let mut failure_retirement = PersistentRunnerFailureRetirement::new(&runner);
 
     let deadline = Instant::now()
         + Duration::from_secs(timeout_secs + PERSISTENT_RUNNER_REQUEST_TIMEOUT_GRACE_SECS);
@@ -2650,6 +2745,15 @@ fn execute_persistent_runner_script_with_timeout_and_family(
                 request_id
             );
         }
+        if docker_container_id(&runner.container_name)?.as_deref()
+            != Some(runner.container_id.as_str())
+        {
+            bail!(
+                "persistent runner container identity changed before producing result (container={} request_id={})",
+                runner.container_name,
+                request_id
+            );
+        }
         if read_persistent_runner_heartbeat(&runner.paths)?
             .is_some_and(|heartbeat| heartbeat.runner_instance_id != runner.runner_instance_id)
         {
@@ -2664,7 +2768,7 @@ fn execute_persistent_runner_script_with_timeout_and_family(
             && let Ok(age) = std::time::SystemTime::now().duration_since(modified)
             && age.as_secs() > PERSISTENT_RUNNER_HEARTBEAT_STALE_SECS
         {
-            let cleanup_summary = cleanup_timed_out_container(&runner.container_name);
+            let cleanup_summary = failure_retirement.retire_now();
             bail!(
                 "persistent runner heartbeat stale for request {} (container={}) cleanup: {}",
                 request_id,
@@ -2673,7 +2777,7 @@ fn execute_persistent_runner_script_with_timeout_and_family(
             );
         }
         if Instant::now() >= deadline {
-            let cleanup_summary = cleanup_timed_out_container(&runner.container_name);
+            let cleanup_summary = failure_retirement.retire_now();
             bail!(
                 "TIMEOUT({}) waiting for persistent runner result (container={} request_id={}) cleanup: {}",
                 timeout_secs,
@@ -2724,7 +2828,7 @@ fn execute_persistent_runner_script_with_timeout_and_family(
                 }
             })
             .unwrap_or("no stderr/stdout details");
-        let cleanup_summary = cleanup_timed_out_container(&runner.container_name);
+        let cleanup_summary = failure_retirement.retire_now();
         cleanup_request_files();
         bail!(
             "persistent runner request failed (exit={:?}): {}\ncontainer cleanup: {}\ncommand:\n{}\nstdout:\n{}\nstderr:\n{}",
@@ -2737,9 +2841,39 @@ fn execute_persistent_runner_script_with_timeout_and_family(
         );
     }
 
+    let idle_deadline =
+        Instant::now() + Duration::from_secs(PERSISTENT_RUNNER_POST_RESULT_IDLE_TIMEOUT_SECS);
+    loop {
+        if read_persistent_runner_heartbeat(&runner.paths)?.is_some_and(|heartbeat| {
+            heartbeat.runner_instance_id == runner.runner_instance_id
+                && heartbeat.state == "idle"
+                && heartbeat.current_request_id.is_none()
+        }) {
+            break;
+        }
+        if docker_container_id(&runner.container_name)?.as_deref()
+            != Some(runner.container_id.as_str())
+        {
+            bail!(
+                "persistent runner container identity changed after result publication (container={} request_id={})",
+                runner.container_name,
+                request_id
+            );
+        }
+        if Instant::now() >= idle_deadline {
+            bail!(
+                "persistent runner did not return to idle after result publication (container={} request_id={})",
+                runner.container_name,
+                request_id
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
     let writeback_result = writebacks.iter().try_for_each(sync_external_writeback);
     cleanup_request_files();
     writeback_result?;
+    failure_retirement.disarm();
 
     Ok(CommandTrace {
         argv: command_argv,
@@ -2787,34 +2921,6 @@ fn bounded_capture_to_string(capture: BoundedOutputCapture, max_bytes: usize) ->
         format!("[truncated to last {} bytes]\n{}", max_bytes, decoded)
     } else {
         decoded.into_owned()
-    }
-}
-
-pub(crate) fn cleanup_timed_out_container(container_name: &str) -> String {
-    let rm_args = vec![
-        "rm".to_string(),
-        "-f".to_string(),
-        container_name.to_string(),
-    ];
-    let rm_output = Command::new("docker").args(&rm_args).output();
-    match rm_output {
-        Ok(output) => {
-            if output.status.success() {
-                "removed timed-out container".to_string()
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if stderr.contains("No such container") {
-                    "container already absent".to_string()
-                } else {
-                    format!(
-                        "cleanup_failed(exit={:?}, stderr={})",
-                        output.status.code(),
-                        first_line(&stderr)
-                    )
-                }
-            }
-        }
-        Err(err) => format!("cleanup_failed(error={})", err),
     }
 }
 
@@ -3167,19 +3273,9 @@ mod tests {
             .unwrap_or(false)
     }
 
-    fn docker_container_id(container_name: &str) -> Result<String> {
-        let output = Command::new("docker")
-            .args(["inspect", "--format", "{{.Id}}", container_name])
-            .output()
-            .with_context(|| format!("inspecting docker container id: {container_name}"))?;
-        if !output.status.success() {
-            bail!(
-                "failed to inspect docker container {}: {}",
-                container_name,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    fn required_docker_container_id(container_name: &str) -> Result<String> {
+        docker_container_id(container_name)?
+            .with_context(|| format!("docker container disappeared: {container_name}"))
     }
 
     #[cfg(unix)]
@@ -3765,8 +3861,8 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
         assert!(docker_container_is_running(&container_a)?);
         assert!(docker_container_is_running(&container_b)?);
         assert!(docker_container_is_running(&container_y)?);
-        let container_a_id_before = docker_container_id(&container_a)?;
-        let container_b_id_before = docker_container_id(&container_b)?;
+        let container_a_id_before = required_docker_container_id(&container_a)?;
+        let container_b_id_before = required_docker_container_id(&container_b)?;
 
         let delay_b = ActionSpec::DriverIrToDelayInfo {
             ir_action_id: opt_b_id.clone(),
@@ -3786,8 +3882,14 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
 
         let drained_second = drain_queue(&store, &repo_root, None, worker_id, 300, false, None)?;
         assert_eq!(drained_second, 2);
-        assert_eq!(docker_container_id(&container_a)?, container_a_id_before);
-        assert_eq!(docker_container_id(&container_b)?, container_b_id_before);
+        assert_eq!(
+            required_docker_container_id(&container_a)?,
+            container_a_id_before
+        );
+        assert_eq!(
+            required_docker_container_id(&container_b)?,
+            container_b_id_before
+        );
         assert!(store.action_exists(&delay_b_id));
         assert!(store.action_exists(&stats_g8r_c_id));
 
@@ -3838,7 +3940,75 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
             "clean"
         );
         assert!(docker_container_is_running(&container_a)?);
-        assert_ne!(docker_container_id(&container_a)?, container_a_id_before);
+        assert_ne!(
+            required_docker_container_id(&container_a)?,
+            container_a_id_before
+        );
+        let container_a_id_after_timeout = required_docker_container_id(&container_a)?;
+
+        let protocol_marker = store.staging_dir().join("protocol-failure-started");
+        let protocol_image = image_a.clone();
+        let protocol_output = timeout_output.clone();
+        let protocol_request = thread::spawn(move || {
+            execute_persistent_runner_script_with_timeout(
+                &protocol_image,
+                &[DockerMount::read_write(&protocol_output, "/outputs")?],
+                &BTreeMap::new(),
+                "touch /store-root/.staging/protocol-failure-started; sleep 30",
+                "protocol-failure-retirement",
+                30,
+            )
+        });
+        let protocol_deadline = Instant::now() + Duration::from_secs(5);
+        while !protocol_marker.exists() && Instant::now() < protocol_deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            protocol_marker.exists(),
+            "protocol-failure request never started"
+        );
+        let mut request_id = None;
+        let active_heartbeat_deadline = Instant::now() + Duration::from_secs(5);
+        while request_id.is_none() && Instant::now() < active_heartbeat_deadline {
+            request_id = read_persistent_runner_heartbeat(&runner_a_paths)?
+                .and_then(|heartbeat| heartbeat.current_request_id);
+            if request_id.is_none() {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let request_id = request_id.context("protocol-failure heartbeat never became active")?;
+        fs::write(
+            runner_a_paths
+                .results_dir
+                .join(format!("{request_id}.json")),
+            b"{",
+        )?;
+        let protocol_error = protocol_request
+            .join()
+            .expect("join protocol-failure request")
+            .expect_err("malformed persistent result must fail");
+        assert!(format!("{protocol_error:#}").contains("parsing runner result file"));
+        assert!(
+            docker_container_id(&container_a)?.is_none(),
+            "protocol-invalid result must retire the selected container"
+        );
+
+        execute_persistent_runner_script_with_timeout(
+            &image_a,
+            &[DockerMount::read_write(&timeout_output, "/outputs")?],
+            &BTreeMap::new(),
+            "printf recovered > /outputs/protocol-recovered.txt",
+            "post-protocol-replacement",
+            30,
+        )?;
+        assert_eq!(
+            fs::read_to_string(timeout_output.join("protocol-recovered.txt"))?,
+            "recovered"
+        );
+        assert_ne!(
+            required_docker_container_id(&container_a)?,
+            container_a_id_after_timeout
+        );
 
         let delayed_text = fs::read_to_string(
             store.resolve_artifact_ref_path(&store.load_provenance(&delay_a_id)?.output_artifact),

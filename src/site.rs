@@ -250,7 +250,11 @@ fn normalized_absolute_path(path: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn reject_site_output_overlap(out_dir: &Path, snapshot_dir: &Path) -> Result<()> {
+fn reject_site_output_overlap(
+    out_dir: &Path,
+    snapshot_dir: &Path,
+    protected_roots: &[(&str, &Path)],
+) -> Result<()> {
     let output = normalized_absolute_path(out_dir)?;
     let snapshot = normalized_absolute_path(snapshot_dir)?;
     if output.starts_with(&snapshot) || snapshot.starts_with(&output) {
@@ -259,6 +263,16 @@ fn reject_site_output_overlap(out_dir: &Path, snapshot_dir: &Path) -> Result<()>
             output.display(),
             snapshot.display()
         );
+    }
+    for (label, root) in protected_roots {
+        let protected = normalized_absolute_path(root)?;
+        if output.starts_with(&protected) || protected.starts_with(&output) {
+            bail!(
+                "static site output must not overlap {label}: output={} protected={}",
+                output.display(),
+                protected.display()
+            );
+        }
     }
     Ok(())
 }
@@ -706,14 +720,22 @@ fn verify_exact_fixed_site_files(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn build_static_site(
     options: &BuildStaticSiteOptions,
+) -> Result<BuildStaticSiteSummary> {
+    build_static_site_with_protected_roots(options, &[])
+}
+
+pub(crate) fn build_static_site_with_protected_roots(
+    options: &BuildStaticSiteOptions,
+    protected_roots: &[(&str, &Path)],
 ) -> Result<BuildStaticSiteSummary> {
     verify_static_snapshot(&options.snapshot_dir).context("verifying source snapshot")?;
     let snapshot = load_static_snapshot_manifest(&options.snapshot_dir)?;
     let base_url = normalize_base_url(&options.base_url)?;
     let root_site_url = site_root_url("index.html")?;
-    reject_site_output_overlap(&options.out_dir, &options.snapshot_dir)?;
+    reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected_roots)?;
     ensure_empty_output_dir(&options.out_dir, options.overwrite)?;
 
     let (css_name, js_name) = static_site_asset_names();
@@ -2073,6 +2095,36 @@ mod tests {
             format!("{error:#}").contains("unknown field `private_path`"),
             "unexpected error: {error:#}"
         );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn site_output_rejects_protected_root_ancestors_and_descendants() {
+        let root = temp_root();
+        let snapshot_dir = root.join("snapshot");
+        fs::create_dir_all(&snapshot_dir).expect("create snapshot placeholder");
+        for label in [
+            "resource checkout",
+            "private store",
+            "artifact backend storage",
+        ] {
+            let container = root.join(label.replace(' ', "-"));
+            let protected = container.join("protected");
+            fs::create_dir_all(&protected).expect("create protected root");
+
+            for output in [container.clone(), protected.join("generated-site")] {
+                let error = reject_site_output_overlap(
+                    &output,
+                    &snapshot_dir,
+                    &[(label, protected.as_path())],
+                )
+                .expect_err("bidirectional protected-root overlap must fail");
+                assert!(
+                    format!("{error:#}").contains(&format!("must not overlap {label}")),
+                    "unexpected error for {label}: {error:#}"
+                );
+            }
+        }
         fs::remove_dir_all(root).expect("cleanup");
     }
 

@@ -98,6 +98,7 @@ const STORE_FORMAT_MARKER: &str = "store-format.pb";
 const STORE_FORMAT_INIT_LOCK: &str = ".store-format-init.lock";
 const STORE_FORMAT_MARKER_STAGING: &str = ".store-format.pb.staging";
 static FAILED_ACTION_MIRROR_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
+static ATOMIC_RECORD_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn ensure_store_format_marker(store_root: &Path) -> Result<()> {
     fs::create_dir_all(store_root)
@@ -2712,6 +2713,75 @@ impl ArtifactStore {
 
     pub(crate) fn staging_dir(&self) -> PathBuf {
         self.root.join(".staging")
+    }
+
+    pub(crate) fn write_record_atomic(
+        &self,
+        domain: &str,
+        destination: &Path,
+        contents: &[u8],
+    ) -> Result<()> {
+        if domain.is_empty()
+            || !domain
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            bail!("atomic record domain must be a nonempty ASCII identifier");
+        }
+        if !destination.starts_with(&self.root) {
+            bail!(
+                "atomic record destination must be inside the private store: {}",
+                destination.display()
+            );
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| anyhow!("atomic record destination has no parent"))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating atomic record parent: {}", parent.display()))?;
+        let staging = self.staging_dir().join("atomic-records").join(domain);
+        fs::create_dir_all(&staging)
+            .with_context(|| format!("creating atomic record staging: {}", staging.display()))?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let nonce = ATOMIC_RECORD_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let filename = destination
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("record.pb");
+        let temp = staging.join(format!(
+            "{filename}.tmp-{}-{timestamp}-{nonce}",
+            std::process::id()
+        ));
+        fs::write(&temp, contents)
+            .with_context(|| format!("writing atomic record staging file: {}", temp.display()))?;
+        match fs::rename(&temp, destination) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("recreating atomic record parent: {}", parent.display())
+                })?;
+                fs::rename(&temp, destination).with_context(|| {
+                    format!(
+                        "promoting staged record after parent recreation: {} -> {}",
+                        temp.display(),
+                        destination.display()
+                    )
+                })
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                Err(error).with_context(|| {
+                    format!(
+                        "atomically promoting staged record: {} -> {}",
+                        temp.display(),
+                        destination.display()
+                    )
+                })
+            }
+        }
     }
 
     pub(crate) fn driver_release_cache_root(&self) -> PathBuf {

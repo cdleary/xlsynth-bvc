@@ -34,6 +34,23 @@ pub(crate) fn default_worker_id() -> String {
     )
 }
 
+pub(crate) fn qualified_worker_id(label: Option<&str>) -> Result<String> {
+    let base = default_worker_id();
+    let Some(label) = label else {
+        return Ok(base);
+    };
+    let label = label.trim();
+    if label.is_empty()
+        || label.len() > 64
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("worker label must be 1-64 ASCII letters, digits, '.', '_', or '-'");
+    }
+    Ok(format!("{base}:label:{label}"))
+}
+
 pub(crate) fn default_completed_by() -> String {
     "unknown".to_string()
 }
@@ -980,6 +997,18 @@ pub(crate) fn summarize_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_worker_label_retains_live_process_fencing_prefix() {
+        let default = default_worker_id();
+        let qualified = qualified_worker_id(Some("worker-a")).expect("qualified worker id");
+        assert_eq!(qualified, format!("{default}:label:worker-a"));
+        assert_eq!(
+            qualified.split(':').take(3).collect::<Vec<_>>(),
+            default.split(':').take(3).collect::<Vec<_>>()
+        );
+        assert!(qualified_worker_id(Some("line\nbreak")).is_err());
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_test_store() -> (ArtifactStore, PathBuf) {

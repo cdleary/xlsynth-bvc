@@ -53,12 +53,17 @@ content identities make normal retries idempotent.
 
 Release coordination persists the fully bound campaign manifest, including its
 runtime and exact root actions, before recording planning success. A rerun
-selects a matching stored manifest before consulting compatibility sidecars,
-resolving remote releases, or building a mutable Docker tag. More than one
-stored generation for the same campaign and crate version is an ambiguity and
-fails closed unless the operator supplies `--run-id`. Every analysis sample
-must transitively descend from the selected run's exact stdlib root; same-version
-rows from another root generation are never attributed to that run.
+resumes a unique in-progress manifest before consulting live planning inputs;
+multiple in-progress generations fail closed unless the operator supplies
+`--run-id`. Finalized generations remain history. When analysis needs a
+baseline version with multiple finalized generations, the deterministic
+implicit choice is the generation with the latest `created_at` (run ID breaks
+timestamp ties), while `--baseline-run-id` selects an exact override. The
+coordinator persists the resolved baseline run ID and crate version in its
+protobuf state and rejects a resume that would change that binding. Every
+analysis sample must transitively descend from the selected run's exact stdlib
+root; same-version rows from another root generation are never attributed to
+that run.
 
 Fresh-store bootstrap follows the same process-restart contract. Initialization
 serializes through an advisory lock and promotes a fully encoded format marker
@@ -94,10 +99,12 @@ Lease expiry is a recovery signal, not permission to duplicate live local work. 
 local lease owner includes its PID and Linux process-start ticks; reclamation
 keeps the lease while that exact process incarnation exists, even after the
 nominal expiry time, and immediately recovers it after the owner dies. Foreign
-or legacy owners remain expiry-based. If duplicate execution nevertheless
-occurs, a worker cancels descendants only when its failed terminal transition
-remains authoritative; a failure that loses to committed success performs no
-downstream cancellation.
+or legacy owners remain expiry-based. A caller-supplied `--worker-id` is only a
+validated display label appended after the mandatory host/PID/start-time
+identity; it can never replace the process-fencing prefix. If duplicate
+execution nevertheless occurs, a worker cancels descendants only when its
+failed terminal transition remains authoritative; a failure that loses to
+committed success performs no downstream cancellation.
 
 Each claim also receives a unique lease token. Claims, enqueues, retries,
 dependency cancellation, work-policy cancellation/removal, and success or
@@ -166,7 +173,12 @@ cross-process advisory reservation covers one pool slot for the complete
 request lifecycle. Saturated callers wait for a slot instead of publishing
 work behind a busy container, so retirement cannot abandon unrelated requests.
 Every actual container start has a unique instance identity; result and
-heartbeat checks fence a request to that exact incarnation.
+heartbeat checks fence a request to that exact incarnation. The host also
+captures Docker's exact container ID when selecting a slot. From request
+publication until successful result validation and writeback, an armed cleanup
+guard retires only that captured container ID on every error path, including
+result read/parse failures, protocol identity mismatches, incarnation changes,
+timeouts, failed commands, and writeback failures.
 
 Pending-version discovery compares the current campaign, crate/DSO mapping,
 Docker recipe digest, release-cache input digest, and canonical root actions;
@@ -234,12 +246,18 @@ passes the same path and control-character rejection used by other public
 projections. Offline snapshot verification cannot traverse private provenance,
 so it requires the report's current run and any baseline run to be present as
 campaign-compatible public run records in the same snapshot.
+Intentional-skip rule IDs and reasons pass that same public-text validator;
+absolute host paths, control characters, and oversized text cannot cross the
+snapshot boundary.
 
 Snapshot and site closure verification reject symlinks and special filesystem
 nodes. Destructive overwrite is rejected before deletion when the output
 equals, contains, or is contained by a protected input/resource boundary.
 Snapshot output must not overlap either the private store root or its artifact
 backend storage, including when an external Sled database is configured.
+Standalone and coordinator static-site output applies the same bidirectional
+check to the source snapshot, resource checkout, private store, and artifact
+backend before `--overwrite` can remove anything.
 Every site dataset's length and SHA-256 must match the corresponding embedded
 source-snapshot entry, not only its relative path.
 
@@ -280,6 +298,14 @@ catalog and root-pointer writes also stage beneath `.staging`, never beside a
 root destination. A retry removes abandoned atomic-write files under the lock,
 so process interruption cannot create an unexpected top-level entry that
 wedges later publication.
+
+Canonical queue, campaign, analysis, and coordinator records use a shared
+store-local atomic writer. Temporary bytes are created only under
+`STORE/.staging/atomic-records/<domain>/` and renamed into their canonical
+record paths. Process termination may leave an abandoned staging file, but it
+cannot introduce a non-protobuf sibling into a validator-scanned record tree;
+validation and a later retry ignore that debris. Staging retention/cleanup is
+operational hygiene and is not used as correctness or ownership evidence.
 
 ## Content-addressed store invariant
 

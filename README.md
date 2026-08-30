@@ -153,6 +153,9 @@ cargo run --bin xlsynth_bvc -- \
   drain-queue --worker-id corpus-a --lease-seconds 1800
 ```
 
+The optional `--worker-id` value is a display label; the persisted lease owner
+always retains the host/PID/process-start fencing prefix.
+
 Or drain it with multiple local workers without `serve-web`:
 
 ```bash

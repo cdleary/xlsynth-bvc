@@ -468,6 +468,16 @@ fn validate_public_run(run: &pb::PublicCampaignRun) -> Result<()> {
         if skipped.rule_id.trim().is_empty() || skipped.reason.trim().is_empty() {
             bail!("public intentional skip requires a rule id and reason");
         }
+        crate::query::validate_safe_public_text(
+            "public intentional skip rule id",
+            &skipped.rule_id,
+            128,
+        )?;
+        crate::query::validate_safe_public_text(
+            "public intentional skip reason",
+            &skipped.reason,
+            512,
+        )?;
     }
     Ok(())
 }
@@ -1473,6 +1483,42 @@ mod tests {
         let error = validate_analysis_public_run_bindings(&runs, &[report])
             .expect_err("incompatible published baseline must fail");
         assert!(format!("{error:#}").contains("baseline identity does not match"));
+    }
+
+    #[test]
+    fn public_intentional_skip_text_cannot_leak_host_paths_or_controls() {
+        let mut run = pb::PublicCampaignRun {
+            record_version: 1,
+            campaign_id: Some(pb::Sha256Digest { value: vec![1; 32] }),
+            run_id: Some(pb::Sha256Digest { value: vec![2; 32] }),
+            campaign_name: "release-qor".to_string(),
+            campaign_semantic_version: 1,
+            crate_version: Some(pb::CrateVersion {
+                value: "0.40.0".to_string(),
+            }),
+            dso_version: Some(pb::DsoVersion {
+                value: "0.39.0".to_string(),
+            }),
+            status: pb::CampaignRunStatus::Complete as i32,
+            updated_at: Some(crate::proto::timestamp_to_proto(&Utc::now())),
+            root_action_ids: vec![pb::ActionId { value: vec![3; 32] }],
+            intentionally_skipped_samples: vec![pb::IntentionallySkippedSample {
+                action_id: Some(pb::ActionId { value: vec![4; 32] }),
+                rule_id: "slow-fma".to_string(),
+                reason: "/srv/private/build/float64/fma.ir".to_string(),
+            }],
+            ..Default::default()
+        };
+        let path_error = validate_public_run(&run)
+            .expect_err("absolute host path in public skip reason must fail");
+        assert!(format!("{path_error:#}").contains("absolute host path"));
+
+        run.intentionally_skipped_samples[0].reason =
+            "excluded by declared work policy".to_string();
+        run.intentionally_skipped_samples[0].rule_id = "slow\nrule".to_string();
+        let control_error =
+            validate_public_run(&run).expect_err("control character in rule id must fail");
+        assert!(format!("{control_error:#}").contains("control"));
     }
 
     #[test]

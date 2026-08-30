@@ -41,7 +41,8 @@ use crate::queue_only_previous_loss_k_cones_enabled;
 use crate::runtime::*;
 use crate::service::*;
 use crate::site::{
-    BuildStaticSiteOptions, build_static_site, smoke_static_site, verify_static_site,
+    BuildStaticSiteOptions, build_static_site_with_protected_roots, smoke_static_site,
+    verify_static_site,
 };
 use crate::sled_space::analyze_sled_space;
 use crate::snapshot::{BuildStaticSnapshotOptions, build_static_snapshot, verify_static_snapshot};
@@ -335,12 +336,19 @@ pub(crate) fn run() -> Result<()> {
         overwrite,
     } = &command
     {
-        let summary = build_static_site(&BuildStaticSiteOptions {
-            snapshot_dir: snapshot_dir.clone(),
-            out_dir: out_dir.clone(),
-            base_url: base_url.clone(),
-            overwrite: *overwrite,
-        })?;
+        let summary = build_static_site_with_protected_roots(
+            &BuildStaticSiteOptions {
+                snapshot_dir: snapshot_dir.clone(),
+                out_dir: out_dir.clone(),
+                base_url: base_url.clone(),
+                overwrite: *overwrite,
+            },
+            &[
+                ("resource checkout", repo_root.as_path()),
+                ("private store", store_dir.as_path()),
+                ("artifact database", artifacts_via_sled.as_path()),
+            ],
+        )?;
         println!(
             "{}",
             serde_json::to_string_pretty(&summary).expect("serializing build static site summary")
@@ -485,6 +493,7 @@ pub(crate) fn run() -> Result<()> {
         TopCommand::AnalyzeCampaignRun {
             crate_version,
             run_id,
+            baseline_run_id,
             baseline_crate_version,
         } => {
             let summary = analyze_campaign_run(
@@ -492,6 +501,7 @@ pub(crate) fn run() -> Result<()> {
                 &repo_root,
                 &crate_version,
                 run_id.as_deref(),
+                baseline_run_id.as_deref(),
                 baseline_crate_version.as_deref(),
             )?;
             println!(
@@ -503,6 +513,7 @@ pub(crate) fn run() -> Result<()> {
         TopCommand::CoordinateRelease {
             crate_version,
             run_id,
+            baseline_run_id,
             baseline_crate_version,
             work_dir,
             base_url,
@@ -516,6 +527,7 @@ pub(crate) fn run() -> Result<()> {
                 &CoordinateReleaseOptions {
                     crate_version,
                     run_id,
+                    baseline_run_id,
                     baseline_crate_version,
                     work_dir,
                     base_url,
@@ -557,7 +569,7 @@ pub(crate) fn run() -> Result<()> {
             lease_seconds,
             no_reclaim_expired,
         } => {
-            let worker_id = worker_id.unwrap_or_else(default_worker_id);
+            let worker_id = qualified_worker_id(worker_id.as_deref())?;
             let drained = drain_queue(
                 &store,
                 &repo_root,
@@ -578,7 +590,7 @@ pub(crate) fn run() -> Result<()> {
             exit_when_idle,
             no_reclaim_expired,
         } => {
-            let worker_id = worker_id.unwrap_or_else(default_worker_id);
+            let worker_id = qualified_worker_id(worker_id.as_deref())?;
             let summary = run_workers(
                 Arc::new(store),
                 repo_root.clone(),

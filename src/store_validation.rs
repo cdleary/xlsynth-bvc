@@ -599,7 +599,7 @@ mod tests {
 
         let run_id = hex::decode(&campaign.run_id).expect("decode run id");
         let state = pb::CoordinatorState {
-            record_version: 1,
+            record_version: 2,
             run_id: Some(pb::Sha256Digest { value: run_id }),
             crate_version: Some(pb::CrateVersion { value: version }),
             current_stage: pb::CoordinatorStage::Planned as i32,
@@ -610,6 +610,8 @@ mod tests {
             published_site_id: None,
             indexed_source_fingerprint: None,
             indexed_output_fingerprint: None,
+            baseline_run_id: None,
+            baseline_crate_version: None,
         };
         let state_path = store.coordinator_dir().join("aa/bb/state.pb");
         fs::create_dir_all(state_path.parent().expect("state parent"))
@@ -617,6 +619,18 @@ mod tests {
         fs::write(&state_path, state.encode_to_vec()).expect("write coordinator state");
         fs::write(store.coordinator_dir().join(COORDINATOR_LOCK_FILENAME), "")
             .expect("write coordinator lock");
+
+        for domain in ["queue", "campaign", "analysis", "coordinator"] {
+            let debris = store
+                .staging_dir()
+                .join("atomic-records")
+                .join(domain)
+                .join("interrupted-record.tmp");
+            fs::create_dir_all(debris.parent().expect("debris parent"))
+                .expect("create atomic debris directory");
+            fs::write(&debris, b"interrupted protobuf write")
+                .expect("seed interrupted atomic write");
+        }
 
         let summary = validate_store(&store, false).expect("validate records");
         assert_eq!(summary.campaign_run_records, 1);

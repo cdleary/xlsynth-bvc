@@ -70,4 +70,6 @@ message CoordinatorState {
   optional Sha256Digest published_site_id = 9;
   optional Sha256Digest indexed_source_fingerprint = 10;
   optional Sha256Digest indexed_output_fingerprint = 11;
+  optional Sha256Digest baseline_run_id = 12;
+  optional CrateVersion baseline_crate_version = 13;
 }

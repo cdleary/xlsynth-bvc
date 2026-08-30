@@ -23,12 +23,19 @@ publication are idempotent. The last stage outcome is recorded in the run's
 protobuf coordinator state. Advisory locks disappear when the process exits;
 there is no stale PID lock to remove.
 
-The retry first resumes the unique stored campaign manifest for the requested
-campaign and crate version. It does not re-resolve mutable remote planning
-inputs before finding that manifest. If multiple stored generations exist, the
-command fails closed and prints their IDs; rerun with `--run-id ID` to select
-the intended generation. The initially bound manifest is persisted before the
-coordinator reports its planning stage as successful.
+The retry first resumes the unique in-progress campaign manifest for the
+requested campaign and crate version. It does not re-resolve mutable planning
+inputs before finding that manifest. If multiple in-progress generations
+exist, rerun with `--run-id ID` to select the intended generation. Finalized
+generations remain history; when none is in progress the coordinator binds the
+currently declared runtime generation. The initially bound manifest is
+persisted before the coordinator reports its planning stage as successful.
+
+The coordinator also checkpoints the exact analysis baseline run ID and crate
+version. An implicit baseline uses the latest-created finalized generation for
+the preceding/requested version. Use `--baseline-run-id ID` for an exact
+override. A retry fails rather than changing the checkpointed baseline; resume
+with the baseline ID named by the diagnostic.
 
 Publication attempts use unique staging directories. While holding the
 publication-root lock, a retry removes abandoned staging entries for the same

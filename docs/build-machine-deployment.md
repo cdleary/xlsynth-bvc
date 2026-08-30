@@ -20,6 +20,12 @@ output bytes. Rebuilt Sled indexes are flushed before checkpoint success. The
 remaining content-producing stages preserve or derive stable timestamps when
 their inputs are unchanged.
 
+If a baseline crate version has more than one finalized runtime generation,
+analysis deterministically uses its latest-created generation. Pass
+`--baseline-run-id ID` to select another exact generation. The resolved run ID
+and version are part of the coordinator checkpoint, so retries cannot silently
+change the comparison.
+
 This is a process-restart guarantee, not an end-to-end power-loss durability
 guarantee. Sudden host power loss, kernel failure, filesystem corruption, and
 storage rollback require operator validation and may require restoring or

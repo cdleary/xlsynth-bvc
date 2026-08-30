@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use prost::Message;
 use serde::Serialize;
@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -48,7 +48,6 @@ const CAMPAIGN_RUN_ID_DOMAIN: &[u8] = b"xlsynth-bvc/campaign-run/v1\0";
 const WORK_POLICY_RULE_FINGERPRINT_DOMAIN: &[u8] = b"xlsynth-bvc/work-policy-rule/v1\0";
 pub(crate) const CAMPAIGN_RUN_MANIFEST_FILENAME: &str = "run-manifest.pb";
 pub(crate) const CAMPAIGN_ANALYSIS_FILENAME: &str = "analysis.pb";
-static MANIFEST_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CampaignRunSummary {
@@ -782,29 +781,7 @@ fn load_existing_manifest(
 fn write_manifest(store: &ArtifactStore, manifest: &pb::CampaignRunManifest) -> Result<PathBuf> {
     validate_manifest(manifest)?;
     let path = campaign_run_path(store, required(&manifest.run_id, "campaign_run.run_id")?)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("campaign run path has no parent"))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("creating campaign run directory: {}", parent.display()))?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let nonce = MANIFEST_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
-    let temp = parent.join(format!(
-        ".{CAMPAIGN_RUN_MANIFEST_FILENAME}.tmp-{}-{timestamp}-{nonce}",
-        std::process::id()
-    ));
-    fs::write(&temp, manifest.encode_to_vec())
-        .with_context(|| format!("writing campaign run temp manifest: {}", temp.display()))?;
-    fs::rename(&temp, &path).with_context(|| {
-        format!(
-            "atomically promoting campaign run manifest: {} -> {}",
-            temp.display(),
-            path.display()
-        )
-    })?;
+    store.write_record_atomic("campaign", &path, &manifest.encode_to_vec())?;
     Ok(path)
 }
 

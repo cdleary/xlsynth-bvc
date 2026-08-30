@@ -23,7 +23,6 @@ use crate::proto::{
 use crate::store::ArtifactStore;
 
 static CLAIM_SCAN_CURSOR: AtomicUsize = AtomicUsize::new(0);
-static QUEUE_WRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static QUEUE_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct QueueTransitionLock {
@@ -76,56 +75,8 @@ fn new_queue_lease_token(action_id: &str, worker_id: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn write_bytes_atomic(path: &Path, contents: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("path missing parent: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("creating parent directory: {}", parent.display()))?;
-    let filename = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("queue_record");
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let nonce = QUEUE_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(
-        ".{filename}.tmp-{}-{ts}-{nonce}",
-        std::process::id()
-    ));
-    fs::write(&tmp_path, contents)
-        .with_context(|| format!("writing temp queue record: {}", tmp_path.display()))?;
-    match fs::rename(&tmp_path, path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Handle rare races where parent directories are pruned externally.
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "recreating parent directory for queue record promotion: {}",
-                    parent.display()
-                )
-            })?;
-            fs::rename(&tmp_path, path).with_context(|| {
-                format!(
-                    "atomically promoting queue record after parent recreation: {} -> {}",
-                    tmp_path.display(),
-                    path.display()
-                )
-            })
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp_path);
-            Err(e).with_context(|| {
-                format!(
-                    "atomically promoting queue record: {} -> {}",
-                    tmp_path.display(),
-                    path.display()
-                )
-            })
-        }
-    }
+fn write_bytes_atomic(store: &ArtifactStore, path: &Path, contents: &[u8]) -> Result<()> {
+    store.write_record_atomic("queue", path, contents)
 }
 
 pub(crate) fn quarantine_corrupt_queue_file(path: &Path, reason: &str) -> Result<()> {
@@ -334,7 +285,7 @@ fn enqueue_action_with_priority_locked(
             && item.priority < priority
         {
             item.priority = priority;
-            write_bytes_atomic(&pending_path, &encode_queue_item(&item)?)?;
+            write_bytes_atomic(store, &pending_path, &encode_queue_item(&item)?)?;
         }
         return Ok(action_id);
     }
@@ -352,7 +303,7 @@ fn enqueue_action_with_priority_locked(
         priority,
         action,
     };
-    write_bytes_atomic(&pending_path, &encode_queue_item(&item)?)?;
+    write_bytes_atomic(store, &pending_path, &encode_queue_item(&item)?)?;
     Ok(action_id)
 }
 
@@ -807,7 +758,7 @@ pub(crate) fn try_claim_pending_item(
         lease_acquired_utc,
         lease_expires_utc,
     };
-    write_bytes_atomic(&running_path, &encode_queue_running(&running)?)?;
+    write_bytes_atomic(store, &running_path, &encode_queue_running(&running)?)?;
     Ok(Some(QueueRunningWithPath {
         running,
         path: running_path,
@@ -832,7 +783,7 @@ pub(crate) fn write_done_record(
         fs::create_dir_all(parent)
             .with_context(|| format!("creating done queue dir: {}", parent.display()))?;
     }
-    write_bytes_atomic(&done_path, &encode_queue_done(&done)?)?;
+    write_bytes_atomic(store, &done_path, &encode_queue_done(&done)?)?;
     Ok(())
 }
 
@@ -935,7 +886,7 @@ pub(crate) fn requeue_running_lease_if_current(
                 priority: running.priority(),
                 action: running.action().clone(),
             };
-            write_bytes_atomic(&pending_path, &encode_queue_item(&pending)?)?;
+            write_bytes_atomic(store, &pending_path, &encode_queue_item(&pending)?)?;
         }
         remove_file_if_exists(&running.path)?;
         Ok(true)
@@ -1070,7 +1021,7 @@ pub(crate) fn write_canceled_record(
         fs::create_dir_all(parent)
             .with_context(|| format!("creating canceled queue dir: {}", parent.display()))?;
     }
-    write_bytes_atomic(&canceled_path, &encode_queue_canceled(&canceled)?)?;
+    write_bytes_atomic(store, &canceled_path, &encode_queue_canceled(&canceled)?)?;
     Ok(())
 }
 
@@ -1227,7 +1178,7 @@ pub(crate) fn write_work_policy_excluded_record(
             .with_context(|| format!("creating canceled queue dir: {}", parent.display()))?;
     }
 
-    write_bytes_atomic(&canceled_path, &encode_queue_canceled(&canceled)?)?;
+    write_bytes_atomic(store, &canceled_path, &encode_queue_canceled(&canceled)?)?;
     store.delete_failed_action_record(action_id)?;
     if let Some(reservation_path) = reservation_path {
         remove_file_if_exists(&pending_path)?;
@@ -1385,7 +1336,7 @@ pub(crate) fn reclaim_expired_running_leases(store: &ArtifactStore) -> Result<us
                 .with_context(|| format!("creating pending queue dir: {}", parent.display()))?;
         }
         if !pending_path.exists() {
-            write_bytes_atomic(&pending_path, &encode_queue_item(&pending)?)?;
+            write_bytes_atomic(store, &pending_path, &encode_queue_item(&pending)?)?;
         }
         remove_file_if_exists(&running_path)?;
         reclaimed += 1;
@@ -2538,6 +2489,7 @@ mod tests {
         current.lease_acquired_utc = Utc::now();
         current.lease_expires_utc = Utc::now() + chrono::Duration::seconds(900);
         write_bytes_atomic(
+            &store,
             &stale.path,
             &encode_queue_running(&current).expect("encode new lease"),
         )
