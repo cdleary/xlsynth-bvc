@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -27,7 +27,8 @@ pub(crate) fn watch_interval(interval_seconds: f64) -> Result<Duration> {
     if !interval_seconds.is_finite() || interval_seconds <= 0.0 {
         bail!("--interval-seconds must be finite and greater than zero");
     }
-    Ok(Duration::from_secs_f64(interval_seconds))
+    Duration::try_from_secs_f64(interval_seconds)
+        .map_err(|_| anyhow!("--interval-seconds is too large to represent"))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -427,7 +428,7 @@ mod tests {
 
     #[test]
     fn watch_interval_rejects_values_that_duration_cannot_construct() {
-        for value in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e300] {
             assert!(watch_interval(value).is_err(), "accepted {value}");
         }
         assert_eq!(
