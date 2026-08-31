@@ -2551,6 +2551,143 @@ pub(crate) fn build_mffc_ir_index_bytes_for_paired_index(
                     }
                 }
             }
+            ActionSpec::IrFnToKBoolConeCorpus {
+                ir_action_id: expected_source_ir_action_id,
+                top_fn_name: expected_source_ir_top,
+                version,
+                runtime,
+                ..
+            } => {
+                let expected_crate_version = normalize_tag_version(&runtime.driver_version);
+                let expected_dso_version = normalize_tag_version(version);
+                let manifest_relpath = provenance
+                    .details
+                    .get("output_manifest_relpath")
+                    .and_then(|value| value.as_str())
+                    .context("k-bool-cone corpus provenance has no output manifest")?;
+                let manifest_ref = ArtifactRef {
+                    action_id: ir_action_id.clone(),
+                    artifact_type: ArtifactType::IrPackageFile,
+                    relpath: manifest_relpath.to_string(),
+                };
+                let manifest_path = store.resolve_artifact_ref_path(&manifest_ref);
+                let manifest: KBoolConeCorpusManifest =
+                    serde_json::from_slice(&fs::read(&manifest_path).with_context(|| {
+                        format!("reading k-bool-cone manifest: {}", manifest_path.display())
+                    })?)
+                    .with_context(|| {
+                        format!("parsing k-bool-cone manifest: {}", manifest_path.display())
+                    })?;
+                if manifest.schema_version != 1 {
+                    bail!(
+                        "unsupported k-bool-cone manifest schema_version={} for action {}",
+                        manifest.schema_version,
+                        ir_action_id
+                    );
+                }
+                if manifest.source_ir_action_id != *expected_source_ir_action_id
+                    || expected_source_ir_top
+                        .as_ref()
+                        .is_some_and(|top| top != &manifest.source_ir_top)
+                {
+                    bail!(
+                        "k-bool-cone manifest source identity disagrees with action {}",
+                        ir_action_id
+                    );
+                }
+                let source_provenance = store
+                    .load_provenance(&manifest.source_ir_action_id)
+                    .with_context(|| {
+                        format!(
+                            "loading source IR provenance {} while exporting k-bool-cone IR",
+                            manifest.source_ir_action_id
+                        )
+                    })?;
+                generated_utc = generated_utc.max(source_provenance.created_utc);
+                let source_structural_hash = source_provenance
+                    .details
+                    .get("output_ir_fn_structural_hash")
+                    .and_then(|value| value.as_str())
+                    .and_then(normalize_structural_hash_hex)
+                    .with_context(|| {
+                        format!(
+                            "source IR action {} has no valid output structural hash",
+                            manifest.source_ir_action_id
+                        )
+                    })?;
+                let source_ir_action_id = manifest.source_ir_action_id.clone();
+                let source_ir_top = manifest.source_ir_top.clone();
+                let mut manifest_entries = BTreeMap::new();
+                for entry in manifest.entries {
+                    let fn_name = entry.fn_name.clone();
+                    if manifest_entries.insert(fn_name.clone(), entry).is_some() {
+                        bail!(
+                            "k-bool-cone manifest action {ir_action_id} has duplicate top {fn_name}"
+                        );
+                    }
+                }
+                let package_ref = ArtifactRef {
+                    action_id: ir_action_id.clone(),
+                    artifact_type: ArtifactType::IrPackageFile,
+                    relpath: manifest.output_ir_relpath,
+                };
+                let package_path = store.resolve_artifact_ref_path(&package_ref);
+                let package_text = fs::read_to_string(&package_path).with_context(|| {
+                    format!("reading k-bool-cone IR package: {}", package_path.display())
+                })?;
+                for (ir_top, (crate_version, dso_version, _canonical_hash)) in requested_tops {
+                    if crate_version != expected_crate_version
+                        || dso_version != expected_dso_version
+                    {
+                        bail!(
+                            "paired MFFC sample release identity disagrees with k-bool-cone action {} top {}",
+                            ir_action_id,
+                            ir_top
+                        );
+                    }
+                    let manifest_entry = manifest_entries.get(&ir_top).with_context(|| {
+                        format!(
+                            "k-bool-cone manifest action {ir_action_id} is missing requested top {ir_top}"
+                        )
+                    })?;
+                    let ir_text = extract_ir_fn_block_by_name(&package_text, &ir_top)
+                        .with_context(|| {
+                            format!(
+                                "extracting k-bool-cone IR top {ir_top} from action {ir_action_id}"
+                            )
+                        })?;
+                    let root_ir_text_id = extract_ir_ret_text_id(&ir_text).with_context(|| {
+                        format!(
+                            "extracting root text id from k-bool-cone action {ir_action_id} top {ir_top}"
+                        )
+                    })?;
+                    let side = MffcIrSide {
+                        ir_action_id: ir_action_id.clone(),
+                        ir_top: ir_top.clone(),
+                        extracted_package_sha256: normalize_structural_hash_hex(
+                            &manifest_entry.structural_hash,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "k-bool-cone manifest action {ir_action_id} top {ir_top} has invalid package SHA-256"
+                            )
+                        })?,
+                        source_ir_action_id: source_ir_action_id.clone(),
+                        source_ir_top: source_ir_top.clone(),
+                        source_structural_hash: source_structural_hash.clone(),
+                        dso_version,
+                        root_ir_text_id,
+                        mffc_structure: None,
+                        ir_text,
+                    };
+                    let identity = (ir_action_id.clone(), ir_top.clone(), crate_version);
+                    if sides_by_identity.insert(identity, side).is_some() {
+                        bail!(
+                            "duplicate exported k-bool-cone side for action {ir_action_id} top {ir_top}"
+                        );
+                    }
+                }
+            }
             ActionSpec::DriverIrToOpt {
                 top_fn_name,
                 version,
@@ -2588,6 +2725,40 @@ pub(crate) fn build_mffc_ir_index_bytes_for_paired_index(
                             ir_top
                         );
                     }
+                    let ir_text = extract_ir_fn_block_by_name(&package_text, &ir_top)
+                        .with_context(|| {
+                            format!("extracting paired IR top {ir_top} from action {ir_action_id}")
+                        })?;
+                    let root_ir_text_id = extract_ir_ret_text_id(&ir_text).with_context(|| {
+                        format!(
+                            "extracting root text id from paired IR action {ir_action_id} top {ir_top}"
+                        )
+                    })?;
+                    let side = MffcIrSide {
+                        ir_action_id: ir_action_id.clone(),
+                        ir_top: ir_top.clone(),
+                        extracted_package_sha256: package_sha256.clone(),
+                        source_ir_action_id: ir_action_id.clone(),
+                        source_ir_top: ir_top.clone(),
+                        source_structural_hash: canonical_hash,
+                        dso_version,
+                        root_ir_text_id,
+                        mffc_structure: None,
+                        ir_text,
+                    };
+                    let identity = (ir_action_id.clone(), ir_top.clone(), crate_version);
+                    if sides_by_identity.insert(identity, side).is_some() {
+                        bail!("duplicate exported IR side for action {ir_action_id} top {ir_top}");
+                    }
+                }
+            }
+            _ if provenance.output_artifact.artifact_type == ArtifactType::IrPackageFile => {
+                let package_path = store.resolve_artifact_ref_path(&provenance.output_artifact);
+                let package_text = fs::read_to_string(&package_path).with_context(|| {
+                    format!("reading paired IR package: {}", package_path.display())
+                })?;
+                let package_sha256 = sha256_file(&package_path)?;
+                for (ir_top, (crate_version, dso_version, canonical_hash)) in requested_tops {
                     let ir_text = extract_ir_fn_block_by_name(&package_text, &ir_top)
                         .with_context(|| {
                             format!("extracting paired IR top {ir_top} from action {ir_action_id}")
@@ -8513,29 +8684,71 @@ mod tests {
             &serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
         );
 
-        let yosys_fn_name = "__source_equivalent".to_string();
+        let yosys_package_sha256 = "2".repeat(64);
+        let yosys_fn_name = format!("__k3_cone_{}", &yosys_package_sha256[..16]);
         let yosys_action_id = materialize_test_provenance(
             &store,
-            "yosys-opt",
-            ActionSpec::DriverIrToOpt {
+            "yosys-kbool",
+            ActionSpec::IrFnToKBoolConeCorpus {
                 ir_action_id: source_ir_action_id.clone(),
-                top_fn_name: Some(yosys_fn_name.clone()),
+                top_fn_name: Some("__source".to_string()),
+                k: 3,
+                max_ir_ops: None,
                 version: "0.35.0".to_string(),
                 runtime: test_runtime(),
             },
             ArtifactType::IrPackageFile,
-            "payload/package.opt.ir",
+            "payload/k_bool_cones_k3.ir",
         );
+        let mut yosys_provenance = store
+            .load_provenance(&yosys_action_id)
+            .expect("load Yosys k-bool provenance");
+        yosys_provenance.details = json!({
+            "output_manifest_relpath": "payload/k_bool_cones_k3_manifest.json",
+        });
+        store
+            .write_provenance(&yosys_provenance)
+            .expect("update Yosys k-bool provenance");
         overwrite_test_artifact(
             &store,
             &yosys_action_id,
             ArtifactType::IrPackageFile,
-            "payload/package.opt.ir",
+            "payload/k_bool_cones_k3.ir",
             &format!(
-                "package optimized\n\nfn {yosys_fn_name}(x: bits[1]) -> bits[1] {{\n  ret not.9: bits[1] = not(x, id=9)\n}}"
+                "package k_bool_cones_k3\n\nfn {yosys_fn_name}(x: bits[1]) -> bits[1] {{\n  ret not.9: bits[1] = not(x, id=9)\n}}"
             ),
         );
-
+        let yosys_manifest = KBoolConeCorpusManifest {
+            schema_version: 1,
+            source_ir_action_id: source_ir_action_id.clone(),
+            source_ir_top: "__source".to_string(),
+            k: 3,
+            max_ir_ops: None,
+            total_manifest_rows: 1,
+            emitted_cone_files: 1,
+            deduped_unique_cones: 1,
+            filtered_out_ir_op_count: 0,
+            output_ir_relpath: "payload/k_bool_cones_k3.ir".to_string(),
+            entries: vec![KBoolConeCorpusEntry {
+                structural_hash: yosys_package_sha256.clone(),
+                fn_name: yosys_fn_name.clone(),
+                source_index: 0,
+                sink_node_index: 7,
+                frontier_leaf_indices: vec![1, 2],
+                frontier_non_literal_count: 2,
+                included_node_count: 17,
+                ir_fn_signature: None,
+                ir_op_count: Some(1),
+            }],
+        };
+        overwrite_test_artifact(
+            &store,
+            &yosys_action_id,
+            ArtifactType::IrPackageFile,
+            "payload/k_bool_cones_k3_manifest.json",
+            &serde_json::to_string_pretty(&yosys_manifest)
+                .expect("serialize Yosys k-bool manifest"),
+        );
         let g8r_stats_action_id = "e".repeat(64);
         let yosys_stats_action_id = "f".repeat(64);
         let sample = StdlibG8rVsYosysSample {
@@ -8629,12 +8842,15 @@ mod tests {
         assert!(entry.g8r.ir_text.contains("identity(x, id=3)"));
         assert_eq!(entry.yosys_abc.ir_action_id, yosys_action_id);
         assert_eq!(entry.yosys_abc.ir_top, yosys_fn_name);
-        assert_eq!(entry.yosys_abc.extracted_package_sha256.len(), 64);
-        assert_eq!(entry.yosys_abc.source_ir_action_id, yosys_action_id);
-        assert_eq!(entry.yosys_abc.source_ir_top, yosys_fn_name);
+        assert_eq!(
+            entry.yosys_abc.extracted_package_sha256,
+            yosys_package_sha256
+        );
+        assert_eq!(entry.yosys_abc.source_ir_action_id, source_ir_action_id);
+        assert_eq!(entry.yosys_abc.source_ir_top, "__source");
         assert_eq!(
             entry.yosys_abc.source_structural_hash,
-            canonical_structural_hash
+            source_structural_hash
         );
         assert_eq!(entry.yosys_abc.root_ir_text_id, 9);
         assert!(entry.yosys_abc.mffc_structure.is_none());
