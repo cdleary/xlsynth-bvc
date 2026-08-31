@@ -34,8 +34,9 @@ use crate::{
     WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
     WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
     WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
-    WEB_STDLIB_FILE_ACTION_GRAPH_INDEX_FILENAME, WEB_STDLIB_FILE_ACTION_GRAPH_INDEX_SCHEMA_VERSION,
-    WEB_STDLIB_FN_TIMELINE_INDEX_FILENAME, WEB_STDLIB_FN_TIMELINE_INDEX_SCHEMA_VERSION,
+    WEB_IR_FN_CORPUS_MFFC_IR_INDEX_SCHEMA_VERSION, WEB_STDLIB_FILE_ACTION_GRAPH_INDEX_FILENAME,
+    WEB_STDLIB_FILE_ACTION_GRAPH_INDEX_SCHEMA_VERSION, WEB_STDLIB_FN_TIMELINE_INDEX_FILENAME,
+    WEB_STDLIB_FN_TIMELINE_INDEX_SCHEMA_VERSION,
     WEB_STDLIB_FNS_TREND_G8R_FRAIG_FALSE_INDEX_FILENAME,
     WEB_STDLIB_FNS_TREND_G8R_FRAIG_TRUE_INDEX_FILENAME, WEB_STDLIB_FNS_TREND_INDEX_SCHEMA_VERSION,
     WEB_STDLIB_FNS_TREND_YOSYS_ABC_INDEX_FILENAME,
@@ -1224,6 +1225,31 @@ struct IrFnCorpusG8rVsYosysIndexFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MffcIrIndexFile {
+    pub(crate) schema_version: u32,
+    pub(crate) generated_utc: DateTime<Utc>,
+    pub(crate) entries: Vec<MffcIrIndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MffcIrIndexEntry {
+    pub(crate) ir_action_id: String,
+    pub(crate) ir_top: String,
+    pub(crate) structural_hash: String,
+    pub(crate) crate_version: String,
+    pub(crate) dso_version: String,
+    pub(crate) rank: u64,
+    pub(crate) root_text_id: u64,
+    pub(crate) frontier_leaf_indices: Vec<u64>,
+    pub(crate) frontier_non_literal_count: u64,
+    pub(crate) internal_non_literal_count: u64,
+    pub(crate) included_node_count: u64,
+    pub(crate) score_numerator: u64,
+    pub(crate) score_denominator: u64,
+    pub(crate) ir_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct VersionsSummaryIndexFile {
     schema_version: u32,
     generated_utc: DateTime<Utc>,
@@ -2222,6 +2248,144 @@ pub(crate) fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_byte
         },
         bytes,
     ))
+}
+
+pub(crate) fn build_mffc_ir_index_bytes_for_paired_index(
+    store: &ArtifactStore,
+    comparison_index_bytes: &[u8],
+) -> Result<(usize, Vec<u8>)> {
+    let comparison: IrFnCorpusG8rVsYosysIndexFile = serde_json::from_slice(comparison_index_bytes)
+        .context("parsing paired corpus index while exporting MFFC IR")?;
+    if comparison.schema_version
+        != WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION
+    {
+        bail!(
+            "paired corpus index schema mismatch while exporting MFFC IR: expected={} got={}",
+            WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
+            comparison.schema_version
+        );
+    }
+
+    let mut wanted: BTreeMap<String, BTreeMap<String, (String, String)>> = BTreeMap::new();
+    for sample in comparison.dataset.samples {
+        let Some(ir_top) = sample.ir_top.filter(|value| value.starts_with("__mffc_")) else {
+            continue;
+        };
+        let identity = (sample.crate_version, sample.dso_version);
+        if let Some(existing) = wanted
+            .entry(sample.ir_action_id.clone())
+            .or_default()
+            .insert(ir_top.clone(), identity.clone())
+            && existing != identity
+        {
+            bail!(
+                "paired corpus index has conflicting release identity for action {} top {}",
+                sample.ir_action_id,
+                ir_top
+            );
+        }
+    }
+
+    let mut generated_utc = DateTime::from_timestamp(0, 0).expect("Unix epoch is representable");
+    let mut entries = Vec::new();
+    for (ir_action_id, requested_tops) in wanted {
+        let provenance = store.load_provenance(&ir_action_id).with_context(|| {
+            format!("loading MFFC corpus provenance while exporting IR: {ir_action_id}")
+        })?;
+        generated_utc = generated_utc.max(provenance.created_utc);
+        let ActionSpec::IrFnToMffcCorpus {
+            version, runtime, ..
+        } = &provenance.action
+        else {
+            bail!("paired MFFC sample source is not an MFFC corpus action: {ir_action_id}");
+        };
+        let expected_crate_version = normalize_tag_version(&runtime.driver_version);
+        let expected_dso_version = normalize_tag_version(version);
+
+        let manifest_relpath = provenance
+            .details
+            .get("output_manifest_relpath")
+            .and_then(|value| value.as_str())
+            .unwrap_or("payload/mffcs_manifest.json");
+        let manifest_ref = ArtifactRef {
+            action_id: ir_action_id.clone(),
+            artifact_type: ArtifactType::IrPackageFile,
+            relpath: manifest_relpath.to_string(),
+        };
+        let manifest_path = store.resolve_artifact_ref_path(&manifest_ref);
+        let manifest: MffcCorpusManifest = serde_json::from_slice(
+            &fs::read(&manifest_path)
+                .with_context(|| format!("reading MFFC manifest: {}", manifest_path.display()))?,
+        )
+        .with_context(|| format!("parsing MFFC manifest: {}", manifest_path.display()))?;
+        if manifest.schema_version != 1 {
+            bail!(
+                "unsupported MFFC manifest schema_version={} for action {}",
+                manifest.schema_version,
+                ir_action_id
+            );
+        }
+        let manifest_entries = manifest
+            .entries
+            .into_iter()
+            .map(|entry| (entry.fn_name.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let package_ref = ArtifactRef {
+            action_id: ir_action_id.clone(),
+            artifact_type: ArtifactType::IrPackageFile,
+            relpath: manifest.output_ir_relpath,
+        };
+        let package_path = store.resolve_artifact_ref_path(&package_ref);
+        let package_text = fs::read_to_string(&package_path)
+            .with_context(|| format!("reading MFFC IR package: {}", package_path.display()))?;
+
+        for (ir_top, (crate_version, dso_version)) in requested_tops {
+            if crate_version != expected_crate_version || dso_version != expected_dso_version {
+                bail!(
+                    "paired MFFC sample release identity disagrees with source action {} top {}",
+                    ir_action_id,
+                    ir_top
+                );
+            }
+            let manifest_entry = manifest_entries.get(&ir_top).with_context(|| {
+                format!("MFFC manifest action {ir_action_id} is missing requested top {ir_top}")
+            })?;
+            let ir_text =
+                extract_ir_fn_block_by_name(&package_text, &ir_top).with_context(|| {
+                    format!("extracting MFFC IR top {ir_top} from action {ir_action_id}")
+                })?;
+            entries.push(MffcIrIndexEntry {
+                ir_action_id: ir_action_id.clone(),
+                ir_top,
+                structural_hash: manifest_entry.structural_hash.clone(),
+                crate_version,
+                dso_version,
+                rank: manifest_entry.rank,
+                root_text_id: manifest_entry.root_text_id,
+                frontier_leaf_indices: manifest_entry.frontier_leaf_indices.clone(),
+                frontier_non_literal_count: manifest_entry.frontier_non_literal_count,
+                internal_non_literal_count: manifest_entry.internal_non_literal_count,
+                included_node_count: manifest_entry.included_node_count,
+                score_numerator: manifest_entry.score_numerator,
+                score_denominator: manifest_entry.score_denominator,
+                ir_text,
+            });
+        }
+    }
+    entries.sort_by(|a, b| {
+        a.crate_version
+            .cmp(&b.crate_version)
+            .then(a.ir_action_id.cmp(&b.ir_action_id))
+            .then(a.ir_top.cmp(&b.ir_top))
+    });
+    let entry_count = entries.len();
+    let bytes = serde_json::to_vec(&MffcIrIndexFile {
+        schema_version: WEB_IR_FN_CORPUS_MFFC_IR_INDEX_SCHEMA_VERSION,
+        generated_utc,
+        entries,
+    })
+    .context("serializing public MFFC IR index")?;
+    Ok((entry_count, bytes))
 }
 
 pub(crate) fn rebuild_web_indices(
@@ -7937,6 +8101,127 @@ mod tests {
             Some(17)
         );
         assert_eq!(by_structural_hash.get(&structural_hash).copied(), Some(17));
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn mffc_ir_index_exports_only_paired_function_blocks() {
+        let (store, root) = make_test_store("mffc-ir-index");
+        let source_ir_action_id = "b".repeat(64);
+        let structural_hash = "c".repeat(64);
+        let fn_name = format!("__mffc_{}", &structural_hash[..16]);
+        let action_id = materialize_test_provenance(
+            &store,
+            "a",
+            ActionSpec::IrFnToMffcCorpus {
+                ir_action_id: source_ir_action_id.clone(),
+                top_fn_name: Some("__source".to_string()),
+                max_mffcs: None,
+                min_internal_non_literal: 4,
+                max_frontier_non_literal: None,
+                version: "0.35.0".to_string(),
+                runtime: test_runtime(),
+            },
+            ArtifactType::IrPackageFile,
+            "payload/mffcs.ir",
+        );
+        let ir_text = format!(
+            "package mffcs\n\nfn {fn_name}(x: bits[1]) -> bits[1] {{\n  ret identity.1: bits[1] = identity(x, id=1)\n}}"
+        );
+        overwrite_test_artifact(
+            &store,
+            &action_id,
+            ArtifactType::IrPackageFile,
+            "payload/mffcs.ir",
+            &ir_text,
+        );
+        let manifest = MffcCorpusManifest {
+            schema_version: 1,
+            source_ir_action_id,
+            source_ir_top: "__source".to_string(),
+            max_mffcs: None,
+            min_internal_non_literal: 4,
+            max_frontier_non_literal: None,
+            total_manifest_rows: 1,
+            emitted_mffc_files: 1,
+            deduped_unique_mffcs: 1,
+            output_ir_relpath: "payload/mffcs.ir".to_string(),
+            entries: vec![MffcCorpusEntry {
+                structural_hash: structural_hash.clone(),
+                fn_name: fn_name.clone(),
+                source_index: 0,
+                rank: 3,
+                root_node_index: 7,
+                root_text_id: 7,
+                frontier_leaf_indices: vec![1, 2],
+                frontier_non_literal_count: 2,
+                internal_non_literal_count: 12,
+                included_node_count: 17,
+                score_numerator: 12,
+                score_denominator: 17,
+                ir_fn_signature: None,
+                ir_op_count: Some(1),
+            }],
+        };
+        overwrite_test_artifact(
+            &store,
+            &action_id,
+            ArtifactType::IrPackageFile,
+            "payload/mffcs_manifest.json",
+            &serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        );
+        let sample = StdlibG8rVsYosysSample {
+            fn_key: "source".to_string(),
+            crate_version: "0.31.0".to_string(),
+            dso_version: "0.35.0".to_string(),
+            stdlib_root_action_id: None,
+            ir_action_id: action_id.clone(),
+            ir_top: Some(fn_name.clone()),
+            structural_hash: Some("d".repeat(64)),
+            ir_node_count: 1,
+            g8r_nodes: 2.0,
+            g8r_levels: 3.0,
+            yosys_abc_nodes: 1.0,
+            yosys_abc_levels: 2.0,
+            g8r_product: 6.0,
+            yosys_abc_product: 2.0,
+            g8r_product_loss: 4.0,
+            g8r_stats_action_id: "e".repeat(64),
+            yosys_abc_stats_action_id: "f".repeat(64),
+        };
+        let comparison = IrFnCorpusG8rVsYosysIndexFile {
+            schema_version:
+                crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
+            generated_utc: Utc::now(),
+            dataset: StdlibG8rVsYosysDataset {
+                fraig: false,
+                samples: vec![sample],
+                min_ir_nodes: 1,
+                max_ir_nodes: 1,
+                g8r_only_count: 0,
+                yosys_only_count: 0,
+                available_crate_versions: vec!["0.31.0".to_string()],
+            },
+            g8r_points: Vec::new(),
+            yosys_points: Vec::new(),
+        };
+        let (count, bytes) = build_mffc_ir_index_bytes_for_paired_index(
+            &store,
+            &serde_json::to_vec(&comparison).expect("serialize comparison"),
+        )
+        .expect("build MFFC IR index");
+        assert_eq!(count, 1);
+        let index: MffcIrIndexFile = serde_json::from_slice(&bytes).expect("parse MFFC IR index");
+        assert_eq!(index.entries[0].ir_action_id, action_id);
+        assert_eq!(index.entries[0].ir_top, fn_name);
+        assert_eq!(index.entries[0].structural_hash, structural_hash);
+        assert!(index.entries[0].ir_text.contains("identity(x, id=1)"));
+        crate::query::canonicalize_public_web_index_json(
+            crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME,
+            &bytes,
+        )
+        .expect("public MFFC IR index validates");
 
         fs::remove_dir_all(root).expect("cleanup temp store");
     }

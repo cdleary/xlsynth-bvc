@@ -8,6 +8,7 @@ use std::path::{Component, Path};
 
 const MAX_PUBLIC_LABEL_BYTES: usize = 512;
 const MAX_PUBLIC_SIGNATURE_BYTES: usize = 4096;
+const MAX_PUBLIC_MFFC_IR_BYTES: usize = 2 * 1024 * 1024;
 
 pub(crate) fn validate_safe_public_text(field: &str, value: &str, max_bytes: usize) -> Result<()> {
     if value.is_empty() || value.trim() != value || value.len() > max_bytes {
@@ -600,6 +601,56 @@ fn validate_structural_group(group: &IrFnCorpusStructuralGroupFile) -> Result<()
     Ok(())
 }
 
+fn validate_mffc_ir_index(index: &MffcIrIndexFile) -> Result<()> {
+    if index.schema_version != crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_SCHEMA_VERSION {
+        bail!("MFFC IR index schema version mismatch");
+    }
+    let mut previous_key: Option<(&str, &str, &str)> = None;
+    for entry in &index.entries {
+        validate_hex_digest("mffc_ir.ir_action_id", &entry.ir_action_id)?;
+        validate_hex_digest("mffc_ir.structural_hash", &entry.structural_hash)?;
+        validate_version("mffc_ir.crate_version", &entry.crate_version)?;
+        validate_version("mffc_ir.dso_version", &entry.dso_version)?;
+        validate_safe_public_text("mffc_ir.ir_top", &entry.ir_top, MAX_PUBLIC_LABEL_BYTES)?;
+        let Some(hash_prefix) = entry.ir_top.strip_prefix("__mffc_") else {
+            bail!("MFFC IR top does not use the public synthetic-name prefix");
+        };
+        if hash_prefix.len() != 16 || !entry.structural_hash.starts_with(hash_prefix) {
+            bail!("MFFC IR top does not match its structural hash");
+        }
+        if entry.included_node_count == 0
+            || entry.score_denominator == 0
+            || entry
+                .frontier_leaf_indices
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            bail!("MFFC IR entry has inconsistent structural metadata");
+        }
+        if entry.ir_text.is_empty()
+            || entry.ir_text.len() > MAX_PUBLIC_MFFC_IR_BYTES
+            || entry.ir_text.contains(['\0', '\r'])
+        {
+            bail!("MFFC IR text is empty, oversized, or contains forbidden control data");
+        }
+        let extracted = extract_ir_fn_block_by_name(&entry.ir_text, &entry.ir_top)
+            .context("validating public MFFC IR function block")?;
+        if extracted != entry.ir_text {
+            bail!("MFFC IR text contains data outside its selected function block");
+        }
+        let key = (
+            entry.crate_version.as_str(),
+            entry.ir_action_id.as_str(),
+            entry.ir_top.as_str(),
+        );
+        if previous_key.is_some_and(|previous| previous >= key) {
+            bail!("MFFC IR entries are not strictly sorted and unique");
+        }
+        previous_key = Some(key);
+    }
+    Ok(())
+}
+
 pub(crate) fn canonicalize_public_web_index_json(index_key: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     match index_key {
         crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME => {
@@ -676,6 +727,13 @@ pub(crate) fn canonicalize_public_web_index_json(index_key: &str, bytes: &[u8]) 
                 },
             )
         }
+        crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME => canonicalize_typed::<MffcIrIndexFile>(
+            index_key,
+            bytes,
+            false,
+            false,
+            validate_mffc_ir_index,
+        ),
         crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY => {
             canonicalize_typed::<IrFnCorpusStructuralManifest>(
                 index_key,
@@ -768,6 +826,14 @@ mod tests {
             value["yosys_points"] = json!([]);
         }
         value
+    }
+
+    fn empty_mffc_ir_value() -> Value {
+        json!({
+            "schema_version": crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_SCHEMA_VERSION,
+            "generated_utc": "2026-08-29T12:00:00Z",
+            "entries": []
+        })
     }
 
     fn structural_group_fixture() -> (String, Vec<u8>) {
@@ -892,13 +958,17 @@ mod tests {
                 .unwrap(),
             ),
             (
+                crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME.to_string(),
+                serde_json::to_vec(&empty_mffc_ir_value()).unwrap(),
+            ),
+            (
                 crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY.to_string(),
                 serde_json::to_vec_pretty(&manifest).unwrap(),
             ),
         ];
         cases.push((group_key, group_bytes));
 
-        assert_eq!(cases.len(), 10);
+        assert_eq!(cases.len(), 11);
         for (key, bytes) in cases {
             let canonical = canonicalize_public_web_index_json(&key, &bytes)
                 .unwrap_or_else(|error| panic!("{key}: {error:#}"));
