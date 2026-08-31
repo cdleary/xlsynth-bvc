@@ -1617,6 +1617,51 @@ mod tests {
     }
 
     #[test]
+    fn skipped_snapshot_includes_mffc_ir_from_canonical_rebuild() {
+        let root = make_temp_dir("skip-rebuild-mffc-ir");
+        let store = ArtifactStore::new(root.join("store"));
+        store.ensure_layout().expect("ensure layout");
+        crate::service::populate_ir_fn_corpus_structural_index(
+            &store,
+            &test_repo_root(),
+            &root.join("unused-structural-output"),
+            false,
+            1,
+        )
+        .expect("seed empty structural index");
+        let rebuild = crate::query::rebuild_web_indices(&store, &test_repo_root())
+            .expect("run canonical coordinator index rebuild");
+        assert_eq!(rebuild.ir_fn_corpus_mffc_ir.entry_count, 0);
+        assert!(
+            store
+                .load_web_index_bytes(WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME)
+                .expect("load MFFC IR web index")
+                .is_some()
+        );
+
+        let out_dir = root.join("snapshot-out");
+        build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: out_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build coordinator-style snapshot");
+        let manifest = load_static_snapshot_manifest(&out_dir).expect("load snapshot manifest");
+        assert!(
+            manifest
+                .dataset_files
+                .iter()
+                .any(|entry| { entry.index_key == WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME })
+        );
+        verify_static_snapshot(&out_dir).expect("verify coordinator-style snapshot");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn default_snapshot_rebuild_is_content_idempotent() {
         let root = make_temp_dir("default-rebuild-idempotent");
         let store = ArtifactStore::new(root.join("store"));

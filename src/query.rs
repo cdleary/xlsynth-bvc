@@ -34,7 +34,7 @@ use crate::{
     WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
     WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
     WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
-    WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+    WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION, WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME,
     WEB_IR_FN_CORPUS_MFFC_IR_INDEX_SCHEMA_VERSION, WEB_STDLIB_FILE_ACTION_GRAPH_INDEX_FILENAME,
     WEB_STDLIB_FILE_ACTION_GRAPH_INDEX_SCHEMA_VERSION, WEB_STDLIB_FN_TIMELINE_INDEX_FILENAME,
     WEB_STDLIB_FN_TIMELINE_INDEX_SCHEMA_VERSION,
@@ -1823,6 +1823,15 @@ pub(crate) struct WebIndicesRebuildSummary {
     pub(crate) stdlib_g8r_vs_yosys: Vec<StdlibG8rVsYosysIndexSummary>,
     pub(crate) ir_fn_corpus_g8r_vs_yosys: IrFnCorpusG8rVsYosysIndexSummary,
     pub(crate) ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc: IrFnCorpusG8rVsYosysIndexSummary,
+    pub(crate) ir_fn_corpus_mffc_ir: MffcIrIndexSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct MffcIrIndexSummary {
+    pub(crate) index_path: String,
+    pub(crate) entry_count: usize,
+    pub(crate) index_bytes: u64,
+    pub(crate) elapsed_ms: u64,
 }
 
 #[allow(dead_code)]
@@ -2645,6 +2654,24 @@ pub(crate) fn build_mffc_ir_index_bytes_for_paired_index(
     Ok((entry_count, bytes))
 }
 
+fn rebuild_mffc_ir_index_for_paired_index(
+    store: &ArtifactStore,
+    comparison_index_bytes: &[u8],
+) -> Result<MffcIrIndexSummary> {
+    let started = Instant::now();
+    let (entry_count, bytes) =
+        build_mffc_ir_index_bytes_for_paired_index(store, comparison_index_bytes)?;
+    store
+        .write_web_index_bytes(WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME, &bytes)
+        .context("writing MFFC IR web index")?;
+    Ok(MffcIrIndexSummary {
+        index_path: store.web_index_location(WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME),
+        entry_count,
+        index_bytes: bytes.len() as u64,
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    })
+}
+
 pub(crate) fn rebuild_web_indices(
     store: &ArtifactStore,
     repo_root: &Path,
@@ -2741,6 +2768,19 @@ pub(crate) fn rebuild_web_indices(
         ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc.crate_versions,
         format_progress_duration(phase_frontend_started.elapsed().as_secs_f64())
     );
+    let phase_mffc_ir_started = Instant::now();
+    warn!("rebuild-web-indices phase=ir-fn-corpus-mffc-ir begin");
+    let comparison_index_bytes = store
+        .load_web_index_bytes(WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME)?
+        .context("rebuilt paired corpus index is unavailable for MFFC IR export")?;
+    let ir_fn_corpus_mffc_ir =
+        rebuild_mffc_ir_index_for_paired_index(store, &comparison_index_bytes)?;
+    warn!(
+        "rebuild-web-indices phase=ir-fn-corpus-mffc-ir done entries={} bytes={} elapsed={}",
+        ir_fn_corpus_mffc_ir.entry_count,
+        ir_fn_corpus_mffc_ir.index_bytes,
+        format_progress_duration(phase_mffc_ir_started.elapsed().as_secs_f64())
+    );
     warn!(
         "rebuild-web-indices done elapsed={}",
         format_progress_duration(started.elapsed().as_secs_f64())
@@ -2754,6 +2794,7 @@ pub(crate) fn rebuild_web_indices(
         stdlib_g8r_vs_yosys,
         ir_fn_corpus_g8r_vs_yosys,
         ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc,
+        ir_fn_corpus_mffc_ir,
     })
 }
 
