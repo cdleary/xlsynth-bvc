@@ -3748,6 +3748,27 @@ fn max_ir_text_id(ir_text: &str) -> u64 {
     ids.into_iter().max().unwrap_or(0)
 }
 
+pub(crate) fn extract_ir_ret_text_id(ir_fn_text: &str) -> Result<u64> {
+    let mut ret_text_id = None;
+    for line in ir_fn_text.lines() {
+        if !line.trim_start().starts_with("ret ") {
+            continue;
+        }
+        let mut ids = Vec::new();
+        append_ir_text_ids_from_line(line, &mut ids);
+        if ids.len() != 1 {
+            bail!(
+                "IR return node must contain exactly one text id, found {}",
+                ids.len()
+            );
+        }
+        if ret_text_id.replace(ids[0]).is_some() {
+            bail!("IR function contains multiple return nodes");
+        }
+    }
+    ret_text_id.context("IR function has no return node with a text id")
+}
+
 pub(crate) fn rewrite_ir_node_name_suffixes_with_offset(
     ir_text: &str,
     offset: u64,
@@ -5539,6 +5560,15 @@ fn __k3_cone_bbbb(y: bits[1] id=1) -> bits[1] {
         assert!(block.starts_with("fn __k3_cone_bbbb("));
         assert!(block.contains("ret y.2"));
         assert!(!block.contains("__k3_cone_aaaa"));
+    }
+
+    #[test]
+    fn extract_ir_ret_text_id_reads_the_exported_root() {
+        let input = r#"fn __mffc_test(x: bits[1] id=2) -> bits[1] {
+  not.6: bits[1] = not(x, id=6)
+  ret identity.7: bits[1] = identity(not.6, id=7)
+}"#;
+        assert_eq!(extract_ir_ret_text_id(input).expect("return text id"), 7);
     }
 
     #[test]

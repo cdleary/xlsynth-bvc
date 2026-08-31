@@ -15,16 +15,17 @@ use crate::campaign::{campaign_analysis_path, list_finalized_campaign_runs};
 use crate::query::{
     build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_bytes,
     build_ir_fn_corpus_g8r_vs_yosys_dataset_index_bytes,
-    rebuild_stdlib_fn_version_timeline_dataset_index, rebuild_stdlib_fns_trend_dataset_index,
-    rebuild_stdlib_g8r_vs_yosys_dataset_index, rebuild_versions_cards_index,
+    build_mffc_ir_index_bytes_for_paired_index, rebuild_stdlib_fn_version_timeline_dataset_index,
+    rebuild_stdlib_fns_trend_dataset_index, rebuild_stdlib_g8r_vs_yosys_dataset_index,
+    rebuild_versions_cards_index,
 };
 use crate::store::ArtifactStore;
 use crate::view::StdlibTrendKind;
 use crate::{
     WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
-    WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME, WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY,
-    WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE, WEB_STDLIB_FN_TIMELINE_INDEX_FILENAME,
-    WEB_STDLIB_FNS_TREND_G8R_FRAIG_FALSE_INDEX_FILENAME,
+    WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME, WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME,
+    WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY, WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE,
+    WEB_STDLIB_FN_TIMELINE_INDEX_FILENAME, WEB_STDLIB_FNS_TREND_G8R_FRAIG_FALSE_INDEX_FILENAME,
     WEB_STDLIB_FNS_TREND_YOSYS_ABC_INDEX_FILENAME,
     WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
     WEB_STDLIB_G8R_VS_YOSYS_FRAIG_TRUE_INDEX_FILENAME, WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
@@ -33,7 +34,7 @@ use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
-pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 7;
+pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 8;
 pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.pb";
 pub(crate) const STATIC_SNAPSHOT_WEB_INDEX_DIR: &str = "web_index";
 
@@ -254,6 +255,7 @@ pub(crate) fn should_include_snapshot_index_key(index_key: &str) -> bool {
             | WEB_STDLIB_G8R_VS_YOSYS_FRAIG_TRUE_INDEX_FILENAME
             | WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
             | WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
+            | WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME
             | WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY
     ) || is_public_structural_group_index_key(index_key)
 }
@@ -262,7 +264,8 @@ fn should_copy_snapshot_store_index(index_key: &str, direct_heavy_indices_writte
     should_include_snapshot_index_key(index_key)
         && (!direct_heavy_indices_written
             || (index_key != WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
-                && index_key != WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME))
+                && index_key != WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
+                && index_key != WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME))
 }
 
 fn write_snapshot_dataset_entry(
@@ -574,7 +577,7 @@ fn rebuild_snapshot_web_indices(
     warn!("rebuild-snapshot-web-indices phase=ir-fn-corpus-g8r-vs-yosys-abc begin");
     let (ir_fn_corpus_g8r_vs_yosys, ir_fn_corpus_g8r_vs_yosys_bytes, seed_ir_node_count_cache) =
         build_ir_fn_corpus_g8r_vs_yosys_dataset_index_bytes(store, repo_root)?;
-    let mut direct_files = Vec::with_capacity(2);
+    let mut direct_files = Vec::with_capacity(3);
     direct_files.push(write_snapshot_dataset_entry(
         out_dir,
         WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
@@ -606,6 +609,22 @@ fn rebuild_snapshot_web_indices(
         ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc.sample_count,
         ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc.crate_versions,
         ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc.index_bytes
+    );
+
+    warn!("rebuild-snapshot-web-indices phase=ir-fn-corpus-mffc-ir begin");
+    let (mffc_ir_entry_count, mffc_ir_bytes) = build_mffc_ir_index_bytes_for_paired_index(
+        store,
+        &ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_bytes,
+    )?;
+    direct_files.push(write_snapshot_dataset_entry(
+        out_dir,
+        WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME,
+        &mffc_ir_bytes,
+    )?);
+    warn!(
+        "rebuild-snapshot-web-indices phase=ir-fn-corpus-mffc-ir done entries={} direct_bytes={}",
+        mffc_ir_entry_count,
+        mffc_ir_bytes.len()
     );
 
     warn!("rebuild-snapshot-web-indices done");
@@ -1598,6 +1617,51 @@ mod tests {
     }
 
     #[test]
+    fn skipped_snapshot_includes_mffc_ir_from_canonical_rebuild() {
+        let root = make_temp_dir("skip-rebuild-mffc-ir");
+        let store = ArtifactStore::new(root.join("store"));
+        store.ensure_layout().expect("ensure layout");
+        crate::service::populate_ir_fn_corpus_structural_index(
+            &store,
+            &test_repo_root(),
+            &root.join("unused-structural-output"),
+            false,
+            1,
+        )
+        .expect("seed empty structural index");
+        let rebuild = crate::query::rebuild_web_indices(&store, &test_repo_root())
+            .expect("run canonical coordinator index rebuild");
+        assert_eq!(rebuild.ir_fn_corpus_mffc_ir.entry_count, 0);
+        assert!(
+            store
+                .load_web_index_bytes(WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME)
+                .expect("load MFFC IR web index")
+                .is_some()
+        );
+
+        let out_dir = root.join("snapshot-out");
+        build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: out_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build coordinator-style snapshot");
+        let manifest = load_static_snapshot_manifest(&out_dir).expect("load snapshot manifest");
+        assert!(
+            manifest
+                .dataset_files
+                .iter()
+                .any(|entry| { entry.index_key == WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME })
+        );
+        verify_static_snapshot(&out_dir).expect("verify coordinator-style snapshot");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn default_snapshot_rebuild_is_content_idempotent() {
         let root = make_temp_dir("default-rebuild-idempotent");
         let store = ArtifactStore::new(root.join("store"));
@@ -2070,6 +2134,9 @@ mod tests {
         ));
         assert!(should_include_snapshot_index_key(
             WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
+        ));
+        assert!(should_include_snapshot_index_key(
+            WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME
         ));
         assert!(should_include_snapshot_index_key(
             WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY

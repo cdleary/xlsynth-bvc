@@ -31,7 +31,10 @@ use crate::service::{
 use crate::site::{
     BuildStaticSiteOptions, build_static_site_with_protected_roots, verify_static_site,
 };
-use crate::snapshot::{BuildStaticSnapshotOptions, build_static_snapshot, verify_static_snapshot};
+use crate::snapshot::{
+    BuildStaticSnapshotOptions, PUBLICATION_POLICY_VERSION, build_static_snapshot,
+    verify_static_snapshot,
+};
 use crate::store::ArtifactStore;
 use crate::versioning::normalize_tag_version;
 use crate::{
@@ -406,6 +409,9 @@ fn indexed_output_fingerprint(store: &ArtifactStore) -> Result<pb::Sha256Digest>
 
     let mut hasher = Sha256::new();
     hasher.update(INDEXED_OUTPUT_FINGERPRINT_DOMAIN);
+    // A disclosure-policy change must invalidate an older reusable index checkpoint even when
+    // the store still contains exactly the previous policy's dataset set.
+    hasher.update(PUBLICATION_POLICY_VERSION.to_be_bytes());
     for (index_key, bytes) in entries {
         hasher.update((index_key.len() as u64).to_be_bytes());
         hasher.update(index_key.as_bytes());
