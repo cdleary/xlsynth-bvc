@@ -340,7 +340,8 @@ fn render_queue_progress(snapshot: &QueueProgressSnapshot, running_limit: usize)
         for action in snapshot.pending_actions.iter().take(6) {
             out.push_str(&format!(
                 "  {:<38} {:>7}\n",
-                action.action_kind, action.count
+                sanitize_terminal_text(&action.action_kind),
+                action.count
             ));
         }
         out.push('\n');
@@ -355,7 +356,8 @@ fn render_queue_progress(snapshot: &QueueProgressSnapshot, running_limit: usize)
         for artifact in snapshot.completed_artifacts.iter().take(6) {
             out.push_str(&format!(
                 "  {:<24} {:>7}\n",
-                artifact.artifact_type, artifact.count
+                sanitize_terminal_text(&artifact.artifact_type),
+                artifact.count
             ));
         }
     }
@@ -366,18 +368,22 @@ fn render_queue_progress(snapshot: &QueueProgressSnapshot, running_limit: usize)
     } else {
         out.push_str("Running actions\n");
         for action in snapshot.running_actions.iter().take(running_limit) {
+            let action_id = sanitize_terminal_text(&action.action_id);
+            let action_kind = sanitize_terminal_text(&action.action_kind);
+            let subject = sanitize_terminal_text(&action.subject);
             let version = action
                 .driver_version
                 .as_deref()
+                .map(sanitize_terminal_text)
                 .map(|value| format!(" driver={value}"))
                 .unwrap_or_default();
             out.push_str(&format!(
                 "  {}  {:<38} {:>6}s{}  {}\n",
-                short_id(&action.action_id),
-                action.action_kind,
+                short_id(&action_id),
+                action_kind,
                 action.running_seconds,
                 version,
-                truncate(&action.subject, 72)
+                truncate(&subject, 72)
             ));
         }
         let hidden = snapshot.running_actions.len().saturating_sub(running_limit);
@@ -393,6 +399,19 @@ fn render_queue_progress(snapshot: &QueueProgressSnapshot, running_limit: usize)
 
 fn short_id(value: &str) -> &str {
     value.get(..12).unwrap_or(value)
+}
+
+fn sanitize_terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn truncate(value: &str, maximum_chars: usize) -> String {
@@ -502,6 +521,51 @@ mod tests {
     fn truncate_adds_ellipsis_only_when_needed() {
         assert_eq!(truncate("short", 6), "short");
         assert_eq!(truncate("seven!!", 6), "seven…");
+    }
+
+    #[test]
+    fn render_queue_progress_sanitizes_untrusted_terminal_fields() {
+        let now = Utc::now();
+        let snapshot = QueueProgressSnapshot {
+            updated_utc: now,
+            pending: 1,
+            pending_expanders: 0,
+            pending_actions: vec![ActionKindProgress {
+                action_kind: "pending\x1b[2J\nkind".to_string(),
+                count: 1,
+            }],
+            running: 1,
+            running_expanders: 0,
+            done: 1,
+            canceled: 0,
+            pending_is_lower_bound: false,
+            malformed_records: 0,
+            completions_last_minute: 1,
+            completion_bins_last_ten_minutes: vec![0; 10],
+            completed_artifacts: vec![CompletedArtifactProgress {
+                artifact_type: "artifact\rtype".to_string(),
+                count: 1,
+            }],
+            running_actions: vec![RunningActionProgress {
+                action_id: "1234567890ab\x07cdef".to_string(),
+                action_kind: "running\taction".to_string(),
+                subject: "safe\x1b[2Jspoof\nnext\tfield\u{009b}csi".to_string(),
+                driver_version: Some("0.68.0\rspoof".to_string()),
+                lease_owner: "worker".to_string(),
+                running_seconds: 17,
+                lease_expires_utc: now,
+            }],
+        };
+
+        let rendered = render_queue_progress(&snapshot, 8);
+
+        assert!(!rendered.contains("\x1b[2J"));
+        assert!(rendered.contains("safe�[2Jspoof�next�field�csi"));
+        assert!(
+            rendered
+                .chars()
+                .all(|character| character == '\n' || !character.is_control())
+        );
     }
 
     #[test]
