@@ -609,9 +609,19 @@ fn validate_mffc_ir_index(index: &MffcIrIndexFile) -> Result<()> {
     for entry in &index.entries {
         validate_hex_digest("mffc_ir.ir_action_id", &entry.ir_action_id)?;
         validate_hex_digest("mffc_ir.structural_hash", &entry.structural_hash)?;
+        validate_hex_digest("mffc_ir.source_ir_action_id", &entry.source_ir_action_id)?;
+        validate_hex_digest(
+            "mffc_ir.source_structural_hash",
+            &entry.source_structural_hash,
+        )?;
         validate_version("mffc_ir.crate_version", &entry.crate_version)?;
         validate_version("mffc_ir.dso_version", &entry.dso_version)?;
         validate_safe_public_text("mffc_ir.ir_top", &entry.ir_top, MAX_PUBLIC_LABEL_BYTES)?;
+        validate_safe_public_text(
+            "mffc_ir.source_ir_top",
+            &entry.source_ir_top,
+            MAX_PUBLIC_LABEL_BYTES,
+        )?;
         let Some(hash_prefix) = entry.ir_top.strip_prefix("__mffc_") else {
             bail!("MFFC IR top does not use the public synthetic-name prefix");
         };
@@ -621,7 +631,7 @@ fn validate_mffc_ir_index(index: &MffcIrIndexFile) -> Result<()> {
         if entry.included_node_count == 0
             || entry.score_denominator == 0
             || entry
-                .frontier_leaf_indices
+                .frontier_node_indices
                 .windows(2)
                 .any(|pair| pair[0] >= pair[1])
         {
@@ -630,8 +640,11 @@ fn validate_mffc_ir_index(index: &MffcIrIndexFile) -> Result<()> {
         if entry.ir_text.is_empty()
             || entry.ir_text.len() > MAX_PUBLIC_MFFC_IR_BYTES
             || entry.ir_text.contains(['\0', '\r'])
+            || !contains_ir_text_id(&entry.ir_text, entry.root_ir_text_id)
         {
-            bail!("MFFC IR text is empty, oversized, or contains forbidden control data");
+            bail!(
+                "MFFC IR text is empty, oversized, contains forbidden control data, or omits its root text id"
+            );
         }
         let extracted = extract_ir_fn_block_by_name(&entry.ir_text, &entry.ir_top)
             .context("validating public MFFC IR function block")?;

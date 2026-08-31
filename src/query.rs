@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use crate::app;
 use crate::executor::{
-    compute_action_id, discover_dslx_fn_to_ir_suggestions, extract_ir_fn_block_by_name,
+    compute_action_id, contains_ir_text_id, discover_dslx_fn_to_ir_suggestions,
+    extract_ir_fn_block_by_name, max_ir_text_id,
 };
 use crate::model::*;
 use crate::proto::{decode_queue_canceled, decode_queue_running};
@@ -1236,11 +1237,15 @@ pub(crate) struct MffcIrIndexEntry {
     pub(crate) ir_action_id: String,
     pub(crate) ir_top: String,
     pub(crate) structural_hash: String,
+    pub(crate) source_ir_action_id: String,
+    pub(crate) source_ir_top: String,
+    pub(crate) source_structural_hash: String,
     pub(crate) crate_version: String,
     pub(crate) dso_version: String,
     pub(crate) rank: u64,
-    pub(crate) root_text_id: u64,
-    pub(crate) frontier_leaf_indices: Vec<u64>,
+    pub(crate) root_node_index: u64,
+    pub(crate) root_ir_text_id: u64,
+    pub(crate) frontier_node_indices: Vec<u64>,
     pub(crate) frontier_non_literal_count: u64,
     pub(crate) internal_non_literal_count: u64,
     pub(crate) included_node_count: u64,
@@ -2294,7 +2299,11 @@ pub(crate) fn build_mffc_ir_index_bytes_for_paired_index(
         })?;
         generated_utc = generated_utc.max(provenance.created_utc);
         let ActionSpec::IrFnToMffcCorpus {
-            version, runtime, ..
+            ir_action_id: expected_source_ir_action_id,
+            top_fn_name: expected_source_ir_top,
+            version,
+            runtime,
+            ..
         } = &provenance.action
         else {
             bail!("paired MFFC sample source is not an MFFC corpus action: {ir_action_id}");
@@ -2325,6 +2334,44 @@ pub(crate) fn build_mffc_ir_index_bytes_for_paired_index(
                 ir_action_id
             );
         }
+        if manifest.source_ir_action_id != *expected_source_ir_action_id
+            || expected_source_ir_top
+                .as_ref()
+                .is_some_and(|top| top != &manifest.source_ir_top)
+        {
+            bail!(
+                "MFFC manifest source identity disagrees with action {}",
+                ir_action_id
+            );
+        }
+        let source_provenance = store
+            .load_provenance(&manifest.source_ir_action_id)
+            .with_context(|| {
+                format!(
+                    "loading source IR provenance {} while exporting MFFC IR",
+                    manifest.source_ir_action_id
+                )
+            })?;
+        generated_utc = generated_utc.max(source_provenance.created_utc);
+        let source_structural_hash = source_provenance
+            .details
+            .get("output_ir_fn_structural_hash")
+            .and_then(|value| value.as_str())
+            .and_then(normalize_structural_hash_hex)
+            .with_context(|| {
+                format!(
+                    "source IR action {} has no valid output structural hash",
+                    manifest.source_ir_action_id
+                )
+            })?;
+        let source_ir_action_id = manifest.source_ir_action_id.clone();
+        let source_ir_top = manifest.source_ir_top.clone();
+        let output_ir_relpath = manifest.output_ir_relpath.clone();
+        let manifest_entry_order = manifest
+            .entries
+            .iter()
+            .map(|entry| entry.fn_name.clone())
+            .collect::<Vec<_>>();
         let manifest_entries = manifest
             .entries
             .into_iter()
@@ -2333,11 +2380,28 @@ pub(crate) fn build_mffc_ir_index_bytes_for_paired_index(
         let package_ref = ArtifactRef {
             action_id: ir_action_id.clone(),
             artifact_type: ArtifactType::IrPackageFile,
-            relpath: manifest.output_ir_relpath,
+            relpath: output_ir_relpath,
         };
         let package_path = store.resolve_artifact_ref_path(&package_ref);
         let package_text = fs::read_to_string(&package_path)
             .with_context(|| format!("reading MFFC IR package: {}", package_path.display()))?;
+        let mut next_text_id_offset = 0u64;
+        let mut text_id_offsets = BTreeMap::new();
+        for fn_name in manifest_entry_order {
+            let ir_text =
+                extract_ir_fn_block_by_name(&package_text, &fn_name).with_context(|| {
+                    format!("extracting MFFC IR top {fn_name} from action {ir_action_id}")
+                })?;
+            if text_id_offsets
+                .insert(fn_name.clone(), next_text_id_offset)
+                .is_some()
+            {
+                bail!("MFFC manifest action {ir_action_id} has duplicate top {fn_name}");
+            }
+            next_text_id_offset = max_ir_text_id(&ir_text).checked_add(1).with_context(|| {
+                format!("MFFC IR text-id offset overflow in action {ir_action_id}")
+            })?;
+        }
 
         for (ir_top, (crate_version, dso_version)) in requested_tops {
             if crate_version != expected_crate_version || dso_version != expected_dso_version {
@@ -2354,15 +2418,27 @@ pub(crate) fn build_mffc_ir_index_bytes_for_paired_index(
                 extract_ir_fn_block_by_name(&package_text, &ir_top).with_context(|| {
                     format!("extracting MFFC IR top {ir_top} from action {ir_action_id}")
                 })?;
+            let root_ir_text_id = manifest_entry
+                .root_text_id
+                .checked_add(*text_id_offsets.get(&ir_top).with_context(|| {
+                    format!("MFFC action {ir_action_id} has no text-id offset for top {ir_top}")
+                })?)
+                .with_context(|| {
+                    format!("MFFC root text-id overflow in action {ir_action_id} top {ir_top}")
+                })?;
             entries.push(MffcIrIndexEntry {
                 ir_action_id: ir_action_id.clone(),
                 ir_top,
                 structural_hash: manifest_entry.structural_hash.clone(),
+                source_ir_action_id: source_ir_action_id.clone(),
+                source_ir_top: source_ir_top.clone(),
+                source_structural_hash: source_structural_hash.clone(),
                 crate_version,
                 dso_version,
                 rank: manifest_entry.rank,
-                root_text_id: manifest_entry.root_text_id,
-                frontier_leaf_indices: manifest_entry.frontier_leaf_indices.clone(),
+                root_node_index: manifest_entry.root_node_index,
+                root_ir_text_id,
+                frontier_node_indices: manifest_entry.frontier_leaf_indices.clone(),
                 frontier_non_literal_count: manifest_entry.frontier_non_literal_count,
                 internal_non_literal_count: manifest_entry.internal_non_literal_count,
                 included_node_count: manifest_entry.included_node_count,
@@ -8108,7 +8184,31 @@ mod tests {
     #[test]
     fn mffc_ir_index_exports_only_paired_function_blocks() {
         let (store, root) = make_test_store("mffc-ir-index");
-        let source_ir_action_id = "b".repeat(64);
+        let source_structural_hash = "d".repeat(64);
+        let source_ir_action_id = materialize_test_provenance(
+            &store,
+            "source",
+            ActionSpec::DriverIrToOpt {
+                ir_action_id: "b".repeat(64),
+                top_fn_name: Some("__source".to_string()),
+                version: "0.35.0".to_string(),
+                runtime: test_runtime(),
+            },
+            ArtifactType::IrPackageFile,
+            "payload/source.ir",
+        );
+        let mut source_provenance = store
+            .load_provenance(&source_ir_action_id)
+            .expect("load source provenance");
+        source_provenance.details = json!({
+            "output_ir_fn_structural_hash": source_structural_hash.clone(),
+        });
+        store
+            .write_provenance(&source_provenance)
+            .expect("update source provenance");
+
+        let first_structural_hash = "1".repeat(64);
+        let first_fn_name = format!("__mffc_{}", &first_structural_hash[..16]);
         let structural_hash = "c".repeat(64);
         let fn_name = format!("__mffc_{}", &structural_hash[..16]);
         let action_id = materialize_test_provenance(
@@ -8127,7 +8227,7 @@ mod tests {
             "payload/mffcs.ir",
         );
         let ir_text = format!(
-            "package mffcs\n\nfn {fn_name}(x: bits[1]) -> bits[1] {{\n  ret identity.1: bits[1] = identity(x, id=1)\n}}"
+            "package mffcs\n\nfn {first_fn_name}(x: bits[1]) -> bits[1] {{\n  ret identity.1: bits[1] = identity(x, id=1)\n}}\n\nfn {fn_name}(x: bits[1]) -> bits[1] {{\n  ret identity.3: bits[1] = identity(x, id=3)\n}}"
         );
         overwrite_test_artifact(
             &store,
@@ -8138,31 +8238,49 @@ mod tests {
         );
         let manifest = MffcCorpusManifest {
             schema_version: 1,
-            source_ir_action_id,
+            source_ir_action_id: source_ir_action_id.clone(),
             source_ir_top: "__source".to_string(),
             max_mffcs: None,
             min_internal_non_literal: 4,
             max_frontier_non_literal: None,
-            total_manifest_rows: 1,
-            emitted_mffc_files: 1,
-            deduped_unique_mffcs: 1,
+            total_manifest_rows: 2,
+            emitted_mffc_files: 2,
+            deduped_unique_mffcs: 2,
             output_ir_relpath: "payload/mffcs.ir".to_string(),
-            entries: vec![MffcCorpusEntry {
-                structural_hash: structural_hash.clone(),
-                fn_name: fn_name.clone(),
-                source_index: 0,
-                rank: 3,
-                root_node_index: 7,
-                root_text_id: 7,
-                frontier_leaf_indices: vec![1, 2],
-                frontier_non_literal_count: 2,
-                internal_non_literal_count: 12,
-                included_node_count: 17,
-                score_numerator: 12,
-                score_denominator: 17,
-                ir_fn_signature: None,
-                ir_op_count: Some(1),
-            }],
+            entries: vec![
+                MffcCorpusEntry {
+                    structural_hash: first_structural_hash,
+                    fn_name: first_fn_name,
+                    source_index: 0,
+                    rank: 0,
+                    root_node_index: 3,
+                    root_text_id: 1,
+                    frontier_leaf_indices: vec![0],
+                    frontier_non_literal_count: 1,
+                    internal_non_literal_count: 1,
+                    included_node_count: 2,
+                    score_numerator: 1,
+                    score_denominator: 2,
+                    ir_fn_signature: None,
+                    ir_op_count: Some(1),
+                },
+                MffcCorpusEntry {
+                    structural_hash: structural_hash.clone(),
+                    fn_name: fn_name.clone(),
+                    source_index: 1,
+                    rank: 3,
+                    root_node_index: 7,
+                    root_text_id: 1,
+                    frontier_leaf_indices: vec![1, 2],
+                    frontier_non_literal_count: 2,
+                    internal_non_literal_count: 12,
+                    included_node_count: 17,
+                    score_numerator: 12,
+                    score_denominator: 17,
+                    ir_fn_signature: None,
+                    ir_op_count: Some(1),
+                },
+            ],
         };
         overwrite_test_artifact(
             &store,
@@ -8178,7 +8296,7 @@ mod tests {
             stdlib_root_action_id: None,
             ir_action_id: action_id.clone(),
             ir_top: Some(fn_name.clone()),
-            structural_hash: Some("d".repeat(64)),
+            structural_hash: Some(structural_hash.clone()),
             ir_node_count: 1,
             g8r_nodes: 2.0,
             g8r_levels: 3.0,
@@ -8216,7 +8334,16 @@ mod tests {
         assert_eq!(index.entries[0].ir_action_id, action_id);
         assert_eq!(index.entries[0].ir_top, fn_name);
         assert_eq!(index.entries[0].structural_hash, structural_hash);
-        assert!(index.entries[0].ir_text.contains("identity(x, id=1)"));
+        assert_eq!(index.entries[0].source_ir_action_id, source_ir_action_id);
+        assert_eq!(index.entries[0].source_ir_top, "__source");
+        assert_eq!(
+            index.entries[0].source_structural_hash,
+            source_structural_hash
+        );
+        assert_eq!(index.entries[0].root_node_index, 7);
+        assert_eq!(index.entries[0].root_ir_text_id, 3);
+        assert_eq!(index.entries[0].frontier_node_indices, vec![1, 2]);
+        assert!(index.entries[0].ir_text.contains("identity(x, id=3)"));
         crate::query::canonicalize_public_web_index_json(
             crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME,
             &bytes,

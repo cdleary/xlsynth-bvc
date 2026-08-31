@@ -3740,12 +3740,20 @@ pub(crate) fn find_duplicate_ir_text_ids(ir_fn_text: &str) -> Vec<u64> {
     duplicates.into_iter().collect()
 }
 
-fn max_ir_text_id(ir_text: &str) -> u64 {
+pub(crate) fn max_ir_text_id(ir_text: &str) -> u64 {
     let mut ids = Vec::new();
     for line in ir_text.lines() {
         append_ir_text_ids_from_line(line, &mut ids);
     }
     ids.into_iter().max().unwrap_or(0)
+}
+
+pub(crate) fn contains_ir_text_id(ir_text: &str, wanted: u64) -> bool {
+    let mut ids = Vec::new();
+    for line in ir_text.lines() {
+        append_ir_text_ids_from_line(line, &mut ids);
+    }
+    ids.contains(&wanted)
 }
 
 pub(crate) fn rewrite_ir_node_name_suffixes_with_offset(
