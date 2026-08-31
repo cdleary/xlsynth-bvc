@@ -605,56 +605,76 @@ fn validate_mffc_ir_index(index: &MffcIrIndexFile) -> Result<()> {
     if index.schema_version != crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_SCHEMA_VERSION {
         bail!("MFFC IR index schema version mismatch");
     }
-    let mut previous_key: Option<(&str, &str, &str)> = None;
-    for entry in &index.entries {
-        validate_hex_digest("mffc_ir.ir_action_id", &entry.ir_action_id)?;
-        validate_hex_digest("mffc_ir.structural_hash", &entry.structural_hash)?;
-        validate_hex_digest("mffc_ir.source_ir_action_id", &entry.source_ir_action_id)?;
+    fn validate_side(label: &str, side: &MffcIrSide) -> Result<()> {
+        validate_hex_digest(&format!("mffc_ir.{label}.ir_action_id"), &side.ir_action_id)?;
         validate_hex_digest(
-            "mffc_ir.source_structural_hash",
-            &entry.source_structural_hash,
+            &format!("mffc_ir.{label}.extracted_package_sha256"),
+            &side.extracted_package_sha256,
         )?;
-        validate_version("mffc_ir.crate_version", &entry.crate_version)?;
-        validate_version("mffc_ir.dso_version", &entry.dso_version)?;
-        validate_safe_public_text("mffc_ir.ir_top", &entry.ir_top, MAX_PUBLIC_LABEL_BYTES)?;
+        validate_hex_digest(
+            &format!("mffc_ir.{label}.source_ir_action_id"),
+            &side.source_ir_action_id,
+        )?;
+        validate_hex_digest(
+            &format!("mffc_ir.{label}.source_structural_hash"),
+            &side.source_structural_hash,
+        )?;
+        validate_version(&format!("mffc_ir.{label}.dso_version"), &side.dso_version)?;
         validate_safe_public_text(
-            "mffc_ir.source_ir_top",
-            &entry.source_ir_top,
+            &format!("mffc_ir.{label}.ir_top"),
+            &side.ir_top,
             MAX_PUBLIC_LABEL_BYTES,
         )?;
-        let Some(hash_prefix) = entry.ir_top.strip_prefix("__mffc_") else {
-            bail!("MFFC IR top does not use the public synthetic-name prefix");
-        };
-        if hash_prefix.len() != 16 || !entry.structural_hash.starts_with(hash_prefix) {
-            bail!("MFFC IR top does not match its structural hash");
+        validate_safe_public_text(
+            &format!("mffc_ir.{label}.source_ir_top"),
+            &side.source_ir_top,
+            MAX_PUBLIC_LABEL_BYTES,
+        )?;
+        if let Some(structure) = &side.mffc_structure {
+            let Some(hash_prefix) = side.ir_top.strip_prefix("__mffc_") else {
+                bail!("MFFC IR top does not use the public synthetic-name prefix");
+            };
+            if hash_prefix.len() != 16 || !side.extracted_package_sha256.starts_with(hash_prefix) {
+                bail!("MFFC IR top does not match its extracted-package SHA-256");
+            }
+            if structure.included_node_count == 0
+                || structure.score_denominator == 0
+                || structure
+                    .source_frontier_node_indices
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+            {
+                bail!("MFFC IR entry has inconsistent structural metadata");
+            }
         }
-        if entry.included_node_count == 0
-            || entry.score_denominator == 0
-            || entry
-                .source_frontier_node_indices
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
+        if side.ir_text.is_empty()
+            || side.ir_text.len() > MAX_PUBLIC_MFFC_IR_BYTES
+            || side.ir_text.contains(['\0', '\r'])
         {
-            bail!("MFFC IR entry has inconsistent structural metadata");
+            bail!("MFFC IR text is empty, oversized, or contains forbidden control data");
         }
-        if entry.ir_text.is_empty()
-            || entry.ir_text.len() > MAX_PUBLIC_MFFC_IR_BYTES
-            || entry.ir_text.contains(['\0', '\r'])
-            || !contains_ir_text_id(&entry.ir_text, entry.root_ir_text_id)
-        {
-            bail!(
-                "MFFC IR text is empty, oversized, contains forbidden control data, or omits its root text id"
-            );
-        }
-        let extracted = extract_ir_fn_block_by_name(&entry.ir_text, &entry.ir_top)
+        let extracted = extract_ir_fn_block_by_name(&side.ir_text, &side.ir_top)
             .context("validating public MFFC IR function block")?;
-        if extracted != entry.ir_text {
+        if extracted != side.ir_text {
             bail!("MFFC IR text contains data outside its selected function block");
         }
+        let actual_root_text_id = extract_ir_ret_text_id(&side.ir_text)
+            .context("validating public MFFC IR root text id")?;
+        if actual_root_text_id != side.root_ir_text_id {
+            bail!("MFFC IR root text id does not identify the return node");
+        }
+        Ok(())
+    }
+
+    let mut previous_key: Option<(&str, &str)> = None;
+    for entry in &index.entries {
+        validate_hex_digest("mffc_ir.mffc_structural_hash", &entry.mffc_structural_hash)?;
+        validate_version("mffc_ir.crate_version", &entry.crate_version)?;
+        validate_side("g8r", &entry.g8r)?;
+        validate_side("yosys_abc", &entry.yosys_abc)?;
         let key = (
             entry.crate_version.as_str(),
-            entry.ir_action_id.as_str(),
-            entry.ir_top.as_str(),
+            entry.mffc_structural_hash.as_str(),
         );
         if previous_key.is_some_and(|previous| previous >= key) {
             bail!("MFFC IR entries are not strictly sorted and unique");

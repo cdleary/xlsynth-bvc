@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use crate::app;
 use crate::executor::{
-    compute_action_id, contains_ir_text_id, discover_dslx_fn_to_ir_suggestions,
-    extract_ir_fn_block_by_name, extract_ir_ret_text_id,
+    compute_action_id, discover_dslx_fn_to_ir_suggestions, extract_ir_fn_block_by_name,
+    extract_ir_ret_text_id,
 };
 use crate::model::*;
 use crate::proto::{decode_queue_canceled, decode_queue_running};
@@ -1229,30 +1229,43 @@ struct IrFnCorpusG8rVsYosysIndexFile {
 pub(crate) struct MffcIrIndexFile {
     pub(crate) schema_version: u32,
     pub(crate) generated_utc: DateTime<Utc>,
-    pub(crate) entries: Vec<MffcIrIndexEntry>,
+    pub(crate) entries: Vec<MffcIrComparisonEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct MffcIrIndexEntry {
+pub(crate) struct MffcIrComparisonEntry {
+    pub(crate) crate_version: String,
+    pub(crate) mffc_structural_hash: String,
+    pub(crate) g8r: MffcIrSide,
+    pub(crate) yosys_abc: MffcIrSide,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MffcIrSide {
     pub(crate) ir_action_id: String,
     pub(crate) ir_top: String,
-    pub(crate) structural_hash: String,
+    pub(crate) extracted_package_sha256: String,
     pub(crate) source_ir_action_id: String,
     pub(crate) source_ir_top: String,
     pub(crate) source_structural_hash: String,
-    pub(crate) crate_version: String,
     pub(crate) dso_version: String,
+    pub(crate) root_ir_text_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mffc_structure: Option<MffcIrStructure>,
+    pub(crate) ir_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MffcIrStructure {
     pub(crate) rank: u64,
     pub(crate) source_root_node_index: u64,
     pub(crate) source_root_text_id: u64,
-    pub(crate) root_ir_text_id: u64,
     pub(crate) source_frontier_node_indices: Vec<u64>,
     pub(crate) frontier_non_literal_count: u64,
     pub(crate) internal_non_literal_count: u64,
     pub(crate) included_node_count: u64,
     pub(crate) score_numerator: u64,
     pub(crate) score_denominator: u64,
-    pub(crate) ir_text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2272,161 +2285,355 @@ pub(crate) fn build_mffc_ir_index_bytes_for_paired_index(
         );
     }
 
-    let mut wanted: BTreeMap<String, BTreeMap<String, (String, String)>> = BTreeMap::new();
-    for sample in comparison.dataset.samples {
-        let Some(ir_top) = sample.ir_top.filter(|value| value.starts_with("__mffc_")) else {
-            continue;
-        };
-        let identity = (sample.crate_version, sample.dso_version);
-        if let Some(existing) = wanted
-            .entry(sample.ir_action_id.clone())
-            .or_default()
-            .insert(ir_top.clone(), identity.clone())
-            && existing != identity
-        {
-            bail!(
-                "paired corpus index has conflicting release identity for action {} top {}",
-                sample.ir_action_id,
-                ir_top
-            );
+    let mut g8r_by_entity = BTreeMap::new();
+    for row in comparison.g8r_points {
+        let structural_hash = normalize_structural_hash_hex(&row.structural_hash)
+            .context("paired corpus G8r point has an invalid structural hash")?;
+        if row.crate_version != row.point.crate_version {
+            bail!("paired corpus G8r point has conflicting crate-version identity");
+        }
+        let key = (structural_hash, row.crate_version);
+        if g8r_by_entity.insert(key, row.point).is_some() {
+            bail!("paired corpus index has duplicate G8r entity points");
+        }
+    }
+    let mut yosys_by_entity = BTreeMap::new();
+    for row in comparison.yosys_points {
+        let structural_hash = normalize_structural_hash_hex(&row.structural_hash)
+            .context("paired corpus Yosys/ABC point has an invalid structural hash")?;
+        if row.crate_version != row.point.crate_version {
+            bail!("paired corpus Yosys/ABC point has conflicting crate-version identity");
+        }
+        let key = (structural_hash, row.crate_version);
+        if yosys_by_entity.insert(key, row.point).is_some() {
+            bail!("paired corpus index has duplicate Yosys/ABC entity points");
         }
     }
 
+    type SideIdentity = (String, String, String);
+    struct PairRequest {
+        crate_version: String,
+        mffc_structural_hash: String,
+        g8r: SideIdentity,
+        yosys_abc: SideIdentity,
+    }
+
+    let mut wanted: BTreeMap<String, BTreeMap<String, (String, String, String)>> = BTreeMap::new();
+    let mut pair_requests = Vec::new();
+    for sample in comparison.dataset.samples {
+        let Some(sample_top) = sample
+            .ir_top
+            .as_deref()
+            .filter(|value| value.starts_with("__mffc_"))
+        else {
+            continue;
+        };
+        let mffc_structural_hash = sample
+            .structural_hash
+            .as_deref()
+            .and_then(normalize_structural_hash_hex)
+            .context("paired MFFC sample has no valid canonical structural hash")?;
+        let entity_key = (mffc_structural_hash.clone(), sample.crate_version.clone());
+        let g8r = g8r_by_entity
+            .get(&entity_key)
+            .context("paired MFFC sample is missing its G8r entity point")?;
+        let yosys_abc = yosys_by_entity
+            .get(&entity_key)
+            .context("paired MFFC sample is missing its Yosys/ABC entity point")?;
+        if sample.ir_action_id != g8r.ir_action_id
+            || sample_top != g8r.ir_top.as_deref().unwrap_or("")
+            || sample.g8r_stats_action_id != g8r.stats_action_id
+            || sample.yosys_abc_stats_action_id != yosys_abc.stats_action_id
+        {
+            bail!("paired MFFC sample disagrees with its concrete entity points");
+        }
+
+        let yosys_ir_top = yosys_abc
+            .ir_top
+            .as_deref()
+            .context("paired MFFC Yosys/ABC point has no IR top")?;
+        let mut identities = Vec::new();
+        for (point, ir_top) in [(g8r, sample_top), (yosys_abc, yosys_ir_top)] {
+            let release_identity = (
+                sample.crate_version.clone(),
+                point.dso_version.clone(),
+                mffc_structural_hash.clone(),
+            );
+            if let Some(existing) = wanted
+                .entry(point.ir_action_id.clone())
+                .or_default()
+                .insert(ir_top.to_string(), release_identity.clone())
+                && existing != release_identity
+            {
+                bail!(
+                    "paired corpus index has conflicting release identity for action {} top {}",
+                    point.ir_action_id,
+                    ir_top
+                );
+            }
+            identities.push((
+                point.ir_action_id.clone(),
+                ir_top.to_string(),
+                sample.crate_version.clone(),
+            ));
+        }
+        pair_requests.push(PairRequest {
+            crate_version: sample.crate_version,
+            mffc_structural_hash,
+            g8r: identities.remove(0),
+            yosys_abc: identities.remove(0),
+        });
+    }
+
     let mut generated_utc = DateTime::from_timestamp(0, 0).expect("Unix epoch is representable");
-    let mut entries = Vec::new();
+    let mut sides_by_identity: BTreeMap<SideIdentity, MffcIrSide> = BTreeMap::new();
     for (ir_action_id, requested_tops) in wanted {
         let provenance = store.load_provenance(&ir_action_id).with_context(|| {
             format!("loading MFFC corpus provenance while exporting IR: {ir_action_id}")
         })?;
         generated_utc = generated_utc.max(provenance.created_utc);
-        let ActionSpec::IrFnToMffcCorpus {
-            ir_action_id: expected_source_ir_action_id,
-            top_fn_name: expected_source_ir_top,
-            version,
-            runtime,
-            ..
-        } = &provenance.action
-        else {
-            bail!("paired MFFC sample source is not an MFFC corpus action: {ir_action_id}");
-        };
-        let expected_crate_version = normalize_tag_version(&runtime.driver_version);
-        let expected_dso_version = normalize_tag_version(version);
-
-        let manifest_relpath = provenance
-            .details
-            .get("output_manifest_relpath")
-            .and_then(|value| value.as_str())
-            .unwrap_or("payload/mffcs_manifest.json");
-        let manifest_ref = ArtifactRef {
-            action_id: ir_action_id.clone(),
-            artifact_type: ArtifactType::IrPackageFile,
-            relpath: manifest_relpath.to_string(),
-        };
-        let manifest_path = store.resolve_artifact_ref_path(&manifest_ref);
-        let manifest: MffcCorpusManifest = serde_json::from_slice(
-            &fs::read(&manifest_path)
-                .with_context(|| format!("reading MFFC manifest: {}", manifest_path.display()))?,
-        )
-        .with_context(|| format!("parsing MFFC manifest: {}", manifest_path.display()))?;
-        if manifest.schema_version != 1 {
-            bail!(
-                "unsupported MFFC manifest schema_version={} for action {}",
-                manifest.schema_version,
-                ir_action_id
-            );
-        }
-        if manifest.source_ir_action_id != *expected_source_ir_action_id
-            || expected_source_ir_top
-                .as_ref()
-                .is_some_and(|top| top != &manifest.source_ir_top)
-        {
-            bail!(
-                "MFFC manifest source identity disagrees with action {}",
-                ir_action_id
-            );
-        }
-        let source_provenance = store
-            .load_provenance(&manifest.source_ir_action_id)
-            .with_context(|| {
-                format!(
-                    "loading source IR provenance {} while exporting MFFC IR",
-                    manifest.source_ir_action_id
-                )
-            })?;
-        generated_utc = generated_utc.max(source_provenance.created_utc);
-        let source_structural_hash = source_provenance
-            .details
-            .get("output_ir_fn_structural_hash")
-            .and_then(|value| value.as_str())
-            .and_then(normalize_structural_hash_hex)
-            .with_context(|| {
-                format!(
-                    "source IR action {} has no valid output structural hash",
-                    manifest.source_ir_action_id
-                )
-            })?;
-        let source_ir_action_id = manifest.source_ir_action_id.clone();
-        let source_ir_top = manifest.source_ir_top.clone();
-        let output_ir_relpath = manifest.output_ir_relpath.clone();
-        let manifest_entries = manifest
-            .entries
-            .into_iter()
-            .map(|entry| (entry.fn_name.clone(), entry))
-            .collect::<BTreeMap<_, _>>();
-        let package_ref = ArtifactRef {
-            action_id: ir_action_id.clone(),
-            artifact_type: ArtifactType::IrPackageFile,
-            relpath: output_ir_relpath,
-        };
-        let package_path = store.resolve_artifact_ref_path(&package_ref);
-        let package_text = fs::read_to_string(&package_path)
-            .with_context(|| format!("reading MFFC IR package: {}", package_path.display()))?;
-        for (ir_top, (crate_version, dso_version)) in requested_tops {
-            if crate_version != expected_crate_version || dso_version != expected_dso_version {
-                bail!(
-                    "paired MFFC sample release identity disagrees with source action {} top {}",
-                    ir_action_id,
-                    ir_top
-                );
-            }
-            let manifest_entry = manifest_entries.get(&ir_top).with_context(|| {
-                format!("MFFC manifest action {ir_action_id} is missing requested top {ir_top}")
-            })?;
-            let ir_text =
-                extract_ir_fn_block_by_name(&package_text, &ir_top).with_context(|| {
-                    format!("extracting MFFC IR top {ir_top} from action {ir_action_id}")
+        match &provenance.action {
+            ActionSpec::IrFnToMffcCorpus {
+                ir_action_id: expected_source_ir_action_id,
+                top_fn_name: expected_source_ir_top,
+                version,
+                runtime,
+                ..
+            } => {
+                let expected_crate_version = normalize_tag_version(&runtime.driver_version);
+                let expected_dso_version = normalize_tag_version(version);
+                let manifest_relpath = provenance
+                    .details
+                    .get("output_manifest_relpath")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("payload/mffcs_manifest.json");
+                let manifest_ref = ArtifactRef {
+                    action_id: ir_action_id.clone(),
+                    artifact_type: ArtifactType::IrPackageFile,
+                    relpath: manifest_relpath.to_string(),
+                };
+                let manifest_path = store.resolve_artifact_ref_path(&manifest_ref);
+                let manifest: MffcCorpusManifest =
+                    serde_json::from_slice(&fs::read(&manifest_path).with_context(|| {
+                        format!("reading MFFC manifest: {}", manifest_path.display())
+                    })?)
+                    .with_context(|| {
+                        format!("parsing MFFC manifest: {}", manifest_path.display())
+                    })?;
+                if manifest.schema_version != 1 {
+                    bail!(
+                        "unsupported MFFC manifest schema_version={} for action {}",
+                        manifest.schema_version,
+                        ir_action_id
+                    );
+                }
+                if manifest.source_ir_action_id != *expected_source_ir_action_id
+                    || expected_source_ir_top
+                        .as_ref()
+                        .is_some_and(|top| top != &manifest.source_ir_top)
+                {
+                    bail!(
+                        "MFFC manifest source identity disagrees with action {}",
+                        ir_action_id
+                    );
+                }
+                let source_provenance = store
+                    .load_provenance(&manifest.source_ir_action_id)
+                    .with_context(|| {
+                        format!(
+                            "loading source IR provenance {} while exporting MFFC IR",
+                            manifest.source_ir_action_id
+                        )
+                    })?;
+                generated_utc = generated_utc.max(source_provenance.created_utc);
+                let source_structural_hash = source_provenance
+                    .details
+                    .get("output_ir_fn_structural_hash")
+                    .and_then(|value| value.as_str())
+                    .and_then(normalize_structural_hash_hex)
+                    .with_context(|| {
+                        format!(
+                            "source IR action {} has no valid output structural hash",
+                            manifest.source_ir_action_id
+                        )
+                    })?;
+                let source_ir_action_id = manifest.source_ir_action_id.clone();
+                let source_ir_top = manifest.source_ir_top.clone();
+                let mut manifest_entries = BTreeMap::new();
+                for entry in manifest.entries {
+                    let fn_name = entry.fn_name.clone();
+                    if manifest_entries.insert(fn_name.clone(), entry).is_some() {
+                        bail!("MFFC manifest action {ir_action_id} has duplicate top {fn_name}");
+                    }
+                }
+                let package_ref = ArtifactRef {
+                    action_id: ir_action_id.clone(),
+                    artifact_type: ArtifactType::IrPackageFile,
+                    relpath: manifest.output_ir_relpath,
+                };
+                let package_path = store.resolve_artifact_ref_path(&package_ref);
+                let package_text = fs::read_to_string(&package_path).with_context(|| {
+                    format!("reading MFFC IR package: {}", package_path.display())
                 })?;
-            let root_ir_text_id = extract_ir_ret_text_id(&ir_text).with_context(|| {
-                format!("extracting root text id from MFFC action {ir_action_id} top {ir_top}")
-            })?;
-            entries.push(MffcIrIndexEntry {
-                ir_action_id: ir_action_id.clone(),
-                ir_top,
-                structural_hash: manifest_entry.structural_hash.clone(),
-                source_ir_action_id: source_ir_action_id.clone(),
-                source_ir_top: source_ir_top.clone(),
-                source_structural_hash: source_structural_hash.clone(),
-                crate_version,
-                dso_version,
-                rank: manifest_entry.rank,
-                source_root_node_index: manifest_entry.root_node_index,
-                source_root_text_id: manifest_entry.root_text_id,
-                root_ir_text_id,
-                source_frontier_node_indices: manifest_entry.frontier_leaf_indices.clone(),
-                frontier_non_literal_count: manifest_entry.frontier_non_literal_count,
-                internal_non_literal_count: manifest_entry.internal_non_literal_count,
-                included_node_count: manifest_entry.included_node_count,
-                score_numerator: manifest_entry.score_numerator,
-                score_denominator: manifest_entry.score_denominator,
-                ir_text,
-            });
+                for (ir_top, (crate_version, dso_version, canonical_hash)) in requested_tops {
+                    if crate_version != expected_crate_version
+                        || dso_version != expected_dso_version
+                    {
+                        bail!(
+                            "paired MFFC sample release identity disagrees with source action {} top {}",
+                            ir_action_id,
+                            ir_top
+                        );
+                    }
+                    let manifest_entry = manifest_entries.get(&ir_top).with_context(|| {
+                        format!(
+                            "MFFC manifest action {ir_action_id} is missing requested top {ir_top}"
+                        )
+                    })?;
+                    let ir_text = extract_ir_fn_block_by_name(&package_text, &ir_top)
+                        .with_context(|| {
+                            format!("extracting MFFC IR top {ir_top} from action {ir_action_id}")
+                        })?;
+                    let root_ir_text_id = extract_ir_ret_text_id(&ir_text).with_context(|| {
+                        format!(
+                            "extracting root text id from MFFC action {ir_action_id} top {ir_top}"
+                        )
+                    })?;
+                    let side = MffcIrSide {
+                        ir_action_id: ir_action_id.clone(),
+                        ir_top: ir_top.clone(),
+                        extracted_package_sha256: normalize_structural_hash_hex(
+                            &manifest_entry.structural_hash,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "MFFC manifest action {ir_action_id} top {ir_top} has invalid package SHA-256"
+                            )
+                        })?,
+                        source_ir_action_id: source_ir_action_id.clone(),
+                        source_ir_top: source_ir_top.clone(),
+                        source_structural_hash: source_structural_hash.clone(),
+                        dso_version,
+                        root_ir_text_id,
+                        mffc_structure: Some(MffcIrStructure {
+                            rank: manifest_entry.rank,
+                            source_root_node_index: manifest_entry.root_node_index,
+                            source_root_text_id: manifest_entry.root_text_id,
+                            source_frontier_node_indices: manifest_entry
+                                .frontier_leaf_indices
+                                .clone(),
+                            frontier_non_literal_count: manifest_entry
+                                .frontier_non_literal_count,
+                            internal_non_literal_count: manifest_entry.internal_non_literal_count,
+                            included_node_count: manifest_entry.included_node_count,
+                            score_numerator: manifest_entry.score_numerator,
+                            score_denominator: manifest_entry.score_denominator,
+                        }),
+                        ir_text,
+                    };
+                    if canonical_hash.is_empty() {
+                        bail!("paired MFFC sample has an empty canonical structural hash");
+                    }
+                    let identity = (ir_action_id.clone(), ir_top.clone(), crate_version);
+                    if sides_by_identity.insert(identity, side).is_some() {
+                        bail!(
+                            "duplicate exported MFFC side for action {ir_action_id} top {ir_top}"
+                        );
+                    }
+                }
+            }
+            ActionSpec::DriverIrToOpt {
+                top_fn_name,
+                version,
+                runtime,
+                ..
+            } => {
+                let expected_crate_version = normalize_tag_version(&runtime.driver_version);
+                let expected_dso_version = normalize_tag_version(version);
+                let package_path = store.resolve_artifact_ref_path(&provenance.output_artifact);
+                let package_text = fs::read_to_string(&package_path).with_context(|| {
+                    format!("reading paired IR package: {}", package_path.display())
+                })?;
+                let package_sha256 = sha256_file(&package_path)?;
+                for (ir_top, (crate_version, dso_version, canonical_hash)) in requested_tops {
+                    if crate_version != expected_crate_version
+                        || dso_version != expected_dso_version
+                        || top_fn_name.as_ref().is_some_and(|top| top != &ir_top)
+                    {
+                        bail!(
+                            "paired MFFC sample release identity disagrees with IR action {} top {}",
+                            ir_action_id,
+                            ir_top
+                        );
+                    }
+                    if let Some(provenance_hash) = provenance
+                        .details
+                        .get("output_ir_fn_structural_hash")
+                        .and_then(|value| value.as_str())
+                        .and_then(normalize_structural_hash_hex)
+                        && provenance_hash != canonical_hash
+                    {
+                        bail!(
+                            "paired MFFC sample structural identity disagrees with IR action {} top {}",
+                            ir_action_id,
+                            ir_top
+                        );
+                    }
+                    let ir_text = extract_ir_fn_block_by_name(&package_text, &ir_top)
+                        .with_context(|| {
+                            format!("extracting paired IR top {ir_top} from action {ir_action_id}")
+                        })?;
+                    let root_ir_text_id = extract_ir_ret_text_id(&ir_text).with_context(|| {
+                        format!(
+                            "extracting root text id from paired IR action {ir_action_id} top {ir_top}"
+                        )
+                    })?;
+                    let side = MffcIrSide {
+                        ir_action_id: ir_action_id.clone(),
+                        ir_top: ir_top.clone(),
+                        extracted_package_sha256: package_sha256.clone(),
+                        source_ir_action_id: ir_action_id.clone(),
+                        source_ir_top: ir_top.clone(),
+                        source_structural_hash: canonical_hash,
+                        dso_version,
+                        root_ir_text_id,
+                        mffc_structure: None,
+                        ir_text,
+                    };
+                    let identity = (ir_action_id.clone(), ir_top.clone(), crate_version);
+                    if sides_by_identity.insert(identity, side).is_some() {
+                        bail!("duplicate exported IR side for action {ir_action_id} top {ir_top}");
+                    }
+                }
+            }
+            _ => bail!("paired MFFC sample source is not an exportable IR action: {ir_action_id}"),
         }
+    }
+    let mut entries = Vec::with_capacity(pair_requests.len());
+    for request in pair_requests {
+        let g8r = sides_by_identity.get(&request.g8r).with_context(|| {
+            format!(
+                "missing exported G8r MFFC side for action {} top {}",
+                request.g8r.0, request.g8r.1
+            )
+        })?;
+        let yosys_abc = sides_by_identity.get(&request.yosys_abc).with_context(|| {
+            format!(
+                "missing exported Yosys/ABC MFFC side for action {} top {}",
+                request.yosys_abc.0, request.yosys_abc.1
+            )
+        })?;
+        entries.push(MffcIrComparisonEntry {
+            crate_version: request.crate_version,
+            mffc_structural_hash: request.mffc_structural_hash,
+            g8r: g8r.clone(),
+            yosys_abc: yosys_abc.clone(),
+        });
     }
     entries.sort_by(|a, b| {
         a.crate_version
             .cmp(&b.crate_version)
-            .then(a.ir_action_id.cmp(&b.ir_action_id))
-            .then(a.ir_top.cmp(&b.ir_top))
+            .then(a.mffc_structural_hash.cmp(&b.mffc_structural_hash))
     });
     let entry_count = entries.len();
     let bytes = serde_json::to_vec(&MffcIrIndexFile {
@@ -8183,8 +8390,9 @@ mod tests {
 
         let first_structural_hash = "1".repeat(64);
         let first_fn_name = format!("__mffc_{}", &first_structural_hash[..16]);
-        let structural_hash = "c".repeat(64);
-        let fn_name = format!("__mffc_{}", &structural_hash[..16]);
+        let canonical_structural_hash = "a".repeat(64);
+        let g8r_package_sha256 = "c".repeat(64);
+        let fn_name = format!("__mffc_{}", &g8r_package_sha256[..16]);
         let action_id = materialize_test_provenance(
             &store,
             "a",
@@ -8239,7 +8447,7 @@ mod tests {
                     ir_op_count: Some(1),
                 },
                 MffcCorpusEntry {
-                    structural_hash: structural_hash.clone(),
+                    structural_hash: g8r_package_sha256.clone(),
                     fn_name: fn_name.clone(),
                     source_index: 1,
                     rank: 3,
@@ -8263,6 +8471,32 @@ mod tests {
             "payload/mffcs_manifest.json",
             &serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
         );
+
+        let yosys_fn_name = "__source_equivalent".to_string();
+        let yosys_action_id = materialize_test_provenance(
+            &store,
+            "yosys-opt",
+            ActionSpec::DriverIrToOpt {
+                ir_action_id: source_ir_action_id.clone(),
+                top_fn_name: Some(yosys_fn_name.clone()),
+                version: "0.35.0".to_string(),
+                runtime: test_runtime(),
+            },
+            ArtifactType::IrPackageFile,
+            "payload/package.opt.ir",
+        );
+        overwrite_test_artifact(
+            &store,
+            &yosys_action_id,
+            ArtifactType::IrPackageFile,
+            "payload/package.opt.ir",
+            &format!(
+                "package optimized\n\nfn {yosys_fn_name}(x: bits[1]) -> bits[1] {{\n  ret not.9: bits[1] = not(x, id=9)\n}}"
+            ),
+        );
+
+        let g8r_stats_action_id = "e".repeat(64);
+        let yosys_stats_action_id = "f".repeat(64);
         let sample = StdlibG8rVsYosysSample {
             fn_key: "source".to_string(),
             crate_version: "0.31.0".to_string(),
@@ -8270,7 +8504,7 @@ mod tests {
             stdlib_root_action_id: None,
             ir_action_id: action_id.clone(),
             ir_top: Some(fn_name.clone()),
-            structural_hash: Some(structural_hash.clone()),
+            structural_hash: Some(canonical_structural_hash.clone()),
             ir_node_count: 1,
             g8r_nodes: 2.0,
             g8r_levels: 3.0,
@@ -8279,8 +8513,8 @@ mod tests {
             g8r_product: 6.0,
             yosys_abc_product: 2.0,
             g8r_product_loss: 4.0,
-            g8r_stats_action_id: "e".repeat(64),
-            yosys_abc_stats_action_id: "f".repeat(64),
+            g8r_stats_action_id: g8r_stats_action_id.clone(),
+            yosys_abc_stats_action_id: yosys_stats_action_id.clone(),
         };
         let comparison = IrFnCorpusG8rVsYosysIndexFile {
             schema_version:
@@ -8295,8 +8529,36 @@ mod tests {
                 yosys_only_count: 0,
                 available_crate_versions: vec!["0.31.0".to_string()],
             },
-            g8r_points: Vec::new(),
-            yosys_points: Vec::new(),
+            g8r_points: vec![IrFnCorpusEntityPoint {
+                structural_hash: canonical_structural_hash.clone(),
+                crate_version: "0.31.0".to_string(),
+                point: StdlibAigStatsPoint {
+                    fn_key: "g8r-source".to_string(),
+                    ir_action_id: action_id.clone(),
+                    ir_top: Some(fn_name.clone()),
+                    crate_version: "0.31.0".to_string(),
+                    dso_version: "0.35.0".to_string(),
+                    and_nodes: 2.0,
+                    depth: 3.0,
+                    created_utc: Utc::now(),
+                    stats_action_id: g8r_stats_action_id,
+                },
+            }],
+            yosys_points: vec![IrFnCorpusEntityPoint {
+                structural_hash: canonical_structural_hash.clone(),
+                crate_version: "0.31.0".to_string(),
+                point: StdlibAigStatsPoint {
+                    fn_key: "yosys-source".to_string(),
+                    ir_action_id: yosys_action_id.clone(),
+                    ir_top: Some(yosys_fn_name.clone()),
+                    crate_version: "0.31.0".to_string(),
+                    dso_version: "0.35.0".to_string(),
+                    and_nodes: 1.0,
+                    depth: 2.0,
+                    created_utc: Utc::now(),
+                    stats_action_id: yosys_stats_action_id,
+                },
+            }],
         };
         let (count, bytes) = build_mffc_ir_index_bytes_for_paired_index(
             &store,
@@ -8305,20 +8567,37 @@ mod tests {
         .expect("build MFFC IR index");
         assert_eq!(count, 1);
         let index: MffcIrIndexFile = serde_json::from_slice(&bytes).expect("parse MFFC IR index");
-        assert_eq!(index.entries[0].ir_action_id, action_id);
-        assert_eq!(index.entries[0].ir_top, fn_name);
-        assert_eq!(index.entries[0].structural_hash, structural_hash);
-        assert_eq!(index.entries[0].source_ir_action_id, source_ir_action_id);
-        assert_eq!(index.entries[0].source_ir_top, "__source");
+        let entry = &index.entries[0];
+        assert_eq!(entry.crate_version, "0.31.0");
+        assert_eq!(entry.mffc_structural_hash, canonical_structural_hash);
+        assert_eq!(entry.g8r.ir_action_id, action_id);
+        assert_eq!(entry.g8r.ir_top, fn_name);
+        assert_eq!(entry.g8r.extracted_package_sha256, g8r_package_sha256);
+        assert_eq!(entry.g8r.source_ir_action_id, source_ir_action_id);
+        assert_eq!(entry.g8r.source_ir_top, "__source");
+        assert_eq!(entry.g8r.source_structural_hash, source_structural_hash);
+        let g8r_structure = entry
+            .g8r
+            .mffc_structure
+            .as_ref()
+            .expect("G8r evidence has MFFC structure metadata");
+        assert_eq!(g8r_structure.source_root_node_index, 7);
+        assert_eq!(g8r_structure.source_root_text_id, 70);
+        assert_eq!(entry.g8r.root_ir_text_id, 3);
+        assert_eq!(g8r_structure.source_frontier_node_indices, vec![1, 2]);
+        assert!(entry.g8r.ir_text.contains("identity(x, id=3)"));
+        assert_eq!(entry.yosys_abc.ir_action_id, yosys_action_id);
+        assert_eq!(entry.yosys_abc.ir_top, yosys_fn_name);
+        assert_eq!(entry.yosys_abc.extracted_package_sha256.len(), 64);
+        assert_eq!(entry.yosys_abc.source_ir_action_id, yosys_action_id);
+        assert_eq!(entry.yosys_abc.source_ir_top, yosys_fn_name);
         assert_eq!(
-            index.entries[0].source_structural_hash,
-            source_structural_hash
+            entry.yosys_abc.source_structural_hash,
+            canonical_structural_hash
         );
-        assert_eq!(index.entries[0].source_root_node_index, 7);
-        assert_eq!(index.entries[0].source_root_text_id, 70);
-        assert_eq!(index.entries[0].root_ir_text_id, 3);
-        assert_eq!(index.entries[0].source_frontier_node_indices, vec![1, 2]);
-        assert!(index.entries[0].ir_text.contains("identity(x, id=3)"));
+        assert_eq!(entry.yosys_abc.root_ir_text_id, 9);
+        assert!(entry.yosys_abc.mffc_structure.is_none());
+        assert!(entry.yosys_abc.ir_text.contains("not(x, id=9)"));
         crate::query::canonicalize_public_web_index_json(
             crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME,
             &bytes,

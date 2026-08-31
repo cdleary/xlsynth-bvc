@@ -3748,14 +3748,6 @@ fn max_ir_text_id(ir_text: &str) -> u64 {
     ids.into_iter().max().unwrap_or(0)
 }
 
-pub(crate) fn contains_ir_text_id(ir_text: &str, wanted: u64) -> bool {
-    let mut ids = Vec::new();
-    for line in ir_text.lines() {
-        append_ir_text_ids_from_line(line, &mut ids);
-    }
-    ids.contains(&wanted)
-}
-
 pub(crate) fn extract_ir_ret_text_id(ir_fn_text: &str) -> Result<u64> {
     let mut ret_text_id = None;
     for line in ir_fn_text.lines() {
