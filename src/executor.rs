@@ -2054,7 +2054,15 @@ pub(crate) fn run_driver_ir_to_delay_info_action(
         driver_script(
             r#"
 /tmp/xlsynth-release/delay_info_main --delay_model "${DELAY_MODEL}" --top "${IR_TOP}" --proto_out /tmp/delay_info.pb /inputs/input.ir > /tmp/delay_info_stdout.txt
-protoc -I /tmp/xlsynth-release/protos --decode=xls.DelayInfoProto /tmp/xlsynth-release/protos/xls/estimators/delay_model/delay_info.proto < /tmp/delay_info.pb > /outputs/delay_info.textproto
+decode_proto_root=/tmp/xlsynth-release/protos
+if grep -Eq '^edition = "[0-9]+";' "${decode_proto_root}/xls/ir/op.proto"; then
+  decode_proto_root=/tmp/xls-protos-decode
+  rm -rf "${decode_proto_root}"
+  mkdir -p "${decode_proto_root}/xls/ir" "${decode_proto_root}/xls/estimators/delay_model"
+  sed -E 's/^edition = "[0-9]+";/syntax = "proto3";/' /tmp/xlsynth-release/protos/xls/ir/op.proto > "${decode_proto_root}/xls/ir/op.proto"
+  cp /tmp/xlsynth-release/protos/xls/estimators/delay_model/delay_info.proto "${decode_proto_root}/xls/estimators/delay_model/delay_info.proto"
+fi
+protoc -I "${decode_proto_root}" --decode=xls.DelayInfoProto "${decode_proto_root}/xls/estimators/delay_model/delay_info.proto" < /tmp/delay_info.pb > /outputs/delay_info.textproto
 test -s /outputs/delay_info.textproto
 "#,
         )
@@ -2062,7 +2070,15 @@ test -s /outputs/delay_info.textproto
         driver_script(
             r#"
 /tmp/xlsynth-release/delay_info_main --delay_model "${DELAY_MODEL}" --proto_out /tmp/delay_info.pb /inputs/input.ir > /tmp/delay_info_stdout.txt
-protoc -I /tmp/xlsynth-release/protos --decode=xls.DelayInfoProto /tmp/xlsynth-release/protos/xls/estimators/delay_model/delay_info.proto < /tmp/delay_info.pb > /outputs/delay_info.textproto
+decode_proto_root=/tmp/xlsynth-release/protos
+if grep -Eq '^edition = "[0-9]+";' "${decode_proto_root}/xls/ir/op.proto"; then
+  decode_proto_root=/tmp/xls-protos-decode
+  rm -rf "${decode_proto_root}"
+  mkdir -p "${decode_proto_root}/xls/ir" "${decode_proto_root}/xls/estimators/delay_model"
+  sed -E 's/^edition = "[0-9]+";/syntax = "proto3";/' /tmp/xlsynth-release/protos/xls/ir/op.proto > "${decode_proto_root}/xls/ir/op.proto"
+  cp /tmp/xlsynth-release/protos/xls/estimators/delay_model/delay_info.proto "${decode_proto_root}/xls/estimators/delay_model/delay_info.proto"
+fi
+protoc -I "${decode_proto_root}" --decode=xls.DelayInfoProto "${decode_proto_root}/xls/estimators/delay_model/delay_info.proto" < /tmp/delay_info.pb > /outputs/delay_info.textproto
 test -s /outputs/delay_info.textproto
 "#,
         )
@@ -2143,7 +2159,7 @@ cat > /tmp/xlsynth-toolchain.toml <<'TOML'
 [toolchain]
 tool_path = "/tmp/xlsynth-release"
 TOML
-xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir-equiv /inputs/lhs.ir /inputs/rhs.ir --top "${IR_TOP}" --solver auto --output_json /outputs/ir_equiv.json
+xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir-equiv /inputs/lhs.ir /inputs/rhs.ir --top "${IR_TOP}" --solver toolchain --output_json /outputs/ir_equiv.json
 test -s /outputs/ir_equiv.json
 "#,
         )
@@ -2154,7 +2170,7 @@ cat > /tmp/xlsynth-toolchain.toml <<'TOML'
 [toolchain]
 tool_path = "/tmp/xlsynth-release"
 TOML
-xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir-equiv /inputs/lhs.ir /inputs/rhs.ir --solver auto --output_json /outputs/ir_equiv.json
+xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir-equiv /inputs/lhs.ir /inputs/rhs.ir --solver toolchain --output_json /outputs/ir_equiv.json
 test -s /outputs/ir_equiv.json
 "#,
         )
@@ -2345,7 +2361,7 @@ tool_path = "/tmp/xlsynth-release"
 TOML
 xlsynth-driver aig2ir /inputs/input.aig > /outputs/input_from_aig.ir
 test -s /outputs/input_from_aig.ir
-xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir-equiv /inputs/input.ir /outputs/input_from_aig.ir --top "${IR_TOP}" --solver auto --output_json /outputs/ir_aig_equiv.json
+xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir-equiv /inputs/input.ir /outputs/input_from_aig.ir --top "${IR_TOP}" --solver toolchain --output_json /outputs/ir_aig_equiv.json
 test -s /outputs/ir_aig_equiv.json
 "#,
         )
@@ -2358,7 +2374,7 @@ tool_path = "/tmp/xlsynth-release"
 TOML
 xlsynth-driver aig2ir /inputs/input.aig > /outputs/input_from_aig.ir
 test -s /outputs/input_from_aig.ir
-xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir-equiv /inputs/input.ir /outputs/input_from_aig.ir --solver auto --output_json /outputs/ir_aig_equiv.json
+xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir-equiv /inputs/input.ir /outputs/input_from_aig.ir --solver toolchain --output_json /outputs/ir_aig_equiv.json
 test -s /outputs/ir_aig_equiv.json
 "#,
         )

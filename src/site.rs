@@ -24,8 +24,15 @@ use crate::snapshot::{
 
 pub(crate) const STATIC_SITE_RECORD_VERSION: u32 = 1;
 pub(crate) const STATIC_SITE_MANIFEST_FILENAME: &str = "site_manifest.v1.pb";
+const PLOTLY_ASSET_NAME: &str = "plotly-2.35.2.min.js";
+const PLOTLY_JS: &[u8] = include_bytes!("../third_party/plotly/plotly-2.35.2.min.js");
+const PLOTLY_LICENSE_ASSET_NAME: &str = "plotly-2.35.2.LICENSE.txt";
+const PLOTLY_LICENSE: &[u8] = include_bytes!("../third_party/plotly/LICENSE");
+const PLOTLY_NOTICE_ASSET_NAME: &str = "plotly-2.35.2.min.js.LICENSE.txt";
+const PLOTLY_NOTICE: &[u8] =
+    include_bytes!("../third_party/plotly/plotly-2.35.2.min.js.LICENSE.txt");
 
-const STYLE_CSS: &str = r#":root{color-scheme:light dark;--bg:#0d1117;--panel:#161b22;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--line:#30363d;--good:#3fb950;--bad:#f85149}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}header,main{max-width:1180px;margin:auto;padding:24px}header{border-bottom:1px solid var(--line)}a{color:var(--accent)}h1,h2{font-family:ui-sans-serif,system-ui,sans-serif}.meta,.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}#mffc-summary{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.card.warning-card{border-color:var(--bad)}.card code{overflow-wrap:anywhere}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:16px 0}select,input{font:inherit;padding:7px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px}pre{max-height:62vh;overflow:auto;background:#010409;padding:14px;border:1px solid var(--line);border-radius:8px}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border:1px solid var(--line);padding:6px;text-align:left;vertical-align:top}th{position:sticky;top:0;background:var(--panel)}.table-wrap{max-height:60vh;overflow:auto}svg{width:100%;height:300px;background:var(--panel);border:1px solid var(--line)}.progression-chart svg{height:auto;min-height:320px}.chart-grid{stroke:var(--line);stroke-width:1}.chart-axis{fill:var(--muted);font-size:12px}.chart-title{fill:var(--text);font-size:13px}.chart-line{fill:none;stroke-width:2.5}.chart-line-median{stroke:var(--accent)}.chart-line-p90{stroke:var(--muted)}.chart-dot-median{fill:var(--accent)}.chart-dot-p90{fill:var(--muted)}.delta-regressed{color:var(--bad)}.delta-improved{color:var(--good)}.delta-same{color:var(--muted)}.stat-value{font:500 24px/1.2 ui-sans-serif,system-ui,sans-serif;margin:.2rem 0}.chart-legend{display:flex;gap:18px;flex-wrap:wrap;margin:.5rem 0 1rem}.legend-swatch{display:inline-block;width:18px;height:3px;vertical-align:middle;margin-right:6px}.legend-median{background:var(--accent)}.legend-p90{background:var(--muted)}.loss-list{display:grid;gap:8px;margin:12px 0 24px}.loss-row{display:grid;grid-template-columns:minmax(220px,2fr) minmax(220px,5fr) minmax(90px,auto);gap:10px;align-items:center}.loss-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.loss-progress{width:100%;height:16px;accent-color:var(--bad)}.loss-value{color:var(--bad);text-align:right}.sample-link{font:inherit;color:var(--accent);background:none;border:0;padding:0;text-decoration:underline;cursor:pointer;text-align:left}.sample-detail{margin:20px 0;padding:16px;background:var(--panel);border:1px solid var(--line);border-radius:10px}.sample-detail h2{margin-top:0}.sample-detail code{overflow-wrap:anywhere}.nowrap{white-space:nowrap}@media(max-width:720px){.loss-row{grid-template-columns:1fr}.loss-value{text-align:left}}"#;
+const STYLE_CSS: &str = r#":root{color-scheme:light dark;--bg:#0d1117;--panel:#161b22;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--line:#30363d;--good:#3fb950;--bad:#f85149}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}header,main{max-width:1180px;margin:auto;padding:24px}header{border-bottom:1px solid var(--line)}a{color:var(--accent)}h1,h2{font-family:ui-sans-serif,system-ui,sans-serif}.meta,.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}#mffc-summary{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.card.warning-card{border-color:var(--bad)}.card code{overflow-wrap:anywhere}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:16px 0}select,input{font:inherit;padding:7px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px}pre{max-height:62vh;overflow:auto;background:#010409;padding:14px;border:1px solid var(--line);border-radius:8px}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border:1px solid var(--line);padding:6px;text-align:left;vertical-align:top}th{position:sticky;top:0;background:var(--panel)}.table-wrap{max-height:60vh;overflow:auto}#plot>svg,.progression-chart>svg{width:100%;height:300px;background:var(--panel);border:1px solid var(--line)}.progression-chart>svg{height:auto;min-height:320px}.chart-grid{stroke:var(--line);stroke-width:1}.chart-axis{fill:var(--muted);font-size:12px}.chart-title{fill:var(--text);font-size:13px}.chart-line{fill:none;stroke-width:2.5}.chart-line-median{stroke:var(--accent)}.chart-line-p90{stroke:var(--muted)}.chart-dot-median{fill:var(--accent)}.chart-dot-p90{fill:var(--muted)}.delta-regressed{color:var(--bad)}.delta-improved{color:var(--good)}.delta-same{color:var(--muted)}.stat-value{font:500 24px/1.2 ui-sans-serif,system-ui,sans-serif;margin:.2rem 0}.chart-legend{display:flex;gap:18px;flex-wrap:wrap;margin:.5rem 0 1rem}.legend-swatch{display:inline-block;width:18px;height:3px;vertical-align:middle;margin-right:6px}.legend-median{background:var(--accent)}.legend-p90{background:var(--muted)}.loss-list{display:grid;gap:8px;margin:12px 0 24px}.loss-row{display:grid;grid-template-columns:minmax(220px,2fr) minmax(220px,5fr) minmax(90px,auto);gap:10px;align-items:center}.loss-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.loss-progress{width:100%;height:16px;accent-color:var(--bad)}.loss-value{color:var(--bad);text-align:right}.sample-link{font:inherit;color:var(--accent);background:none;border:0;padding:0;text-decoration:underline;cursor:pointer;text-align:left}.sample-detail{margin:20px 0;padding:16px;background:var(--panel);border:1px solid var(--line);border-radius:10px}.sample-detail h2{margin-top:0}.sample-detail code{overflow-wrap:anywhere}.nowrap{white-space:nowrap}.comparison-header,.comparison-page{max-width:1600px}.comparison-controls{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}.comparison-range{width:min(520px,88vw);accent-color:var(--accent)}.comparison-status{display:flex;gap:18px;flex-wrap:wrap;margin:.7rem 0 0}.plot-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:16px}.plot-panel{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px}.plot-title{margin:2px 4px 0;font-size:.92rem;color:#a6ddff}.plotly-host{width:100%;min-height:400px}.comparison-detail{margin-top:16px}.comparison-detail pre{max-height:40vh}.comparison-nav{display:flex;gap:12px;flex-wrap:wrap}@media(max-width:980px){.plot-grid{grid-template-columns:1fr}}@media(max-width:720px){.loss-row{grid-template-columns:1fr}.loss-value{text-align:left}.plotly-host{min-height:340px}}"#;
 
 const APP_JS: &str = r#"const base=document.querySelector('meta[name=bvc-site-root]').content;
 const byId=id=>document.getElementById(id);
@@ -80,10 +87,26 @@ async function showMffcDetail(sample,catalog){
 }
 function mffcUnavailable(root,message){root.querySelector('.toolbar').hidden=true;byId('mffc-summary').innerHTML='';byId('mffc-detail').innerHTML='';byId('mffc-chart').innerHTML=`<p class=muted>${esc(message)}</p>`;byId('mffc-table').innerHTML=''}
 async function mffcDiscrepancies(catalog){const root=byId('mffc-discrepancies');if(!root)return;const key=root.dataset.datasetKey,dataset=catalog.datasets.find(d=>d.logical_key===key);if(!dataset){mffcUnavailable(root,'Paired MFFC comparison data is not available in this snapshot.');return}const data=await fetch(base+dataset.url).then(r=>{if(!r.ok)throw Error(`${dataset.url} ${r.status}`);return r.json()}),all=mffcSamples(data.dataset?.samples||[]),versions=[...new Set(all.map(row=>row.crate_version))].sort(versionCompare);if(!versions.length){mffcUnavailable(root,'No paired MFFC samples are available in this snapshot.');return}const versionEl=byId('mffc-crate-version'),nodesEl=byId('mffc-max-ir-nodes'),modeEl=byId('mffc-sample-mode'),query=new URLSearchParams(location.search);let visibleByTop=new Map;versionEl.innerHTML=versions.map(version=>`<option value='${esc(version)}'>crate v${esc(version)}</option>`).join('');const requestedVersion=query.get('crate_version');versionEl.value=versions.includes(requestedVersion)?requestedVersion:versions.at(-1);const requestedNodes=query.get('max_ir_nodes');nodesEl.value=requestedNodes&&/^\d+$/.test(requestedNodes)?requestedNodes:'';modeEl.value=query.get('losses_only')==='false'?'all':'losses_only';root.addEventListener('click',event=>{const button=event.target.closest?.('[data-mffc-top]'),sample=button?visibleByTop.get(button.dataset.mffcTop):null;if(sample)showMffcDetail(sample,catalog)});const render=()=>{mffcDetailGeneration++;byId('mffc-detail').innerHTML='<h2>Selected MFFC</h2><p class=muted>Click an MFFC name in the chart or table to inspect its exact source identities, XLS IR, and synthesis evidence.</p>';const versionRows=all.filter(row=>row.crate_version===versionEl.value),maxAvailable=Math.max(...versionRows.map(row=>row.ir_node_count)),requested=nodesEl.value===''?Infinity:Number(nodesEl.value),limit=Number.isFinite(requested)?Math.max(1,Math.min(requested,maxAvailable)):Infinity;nodesEl.max=String(maxAvailable);const nodeScoped=versionRows.filter(row=>row.ir_node_count<=limit),worse=nodeScoped.filter(row=>row.g8r_product_loss>0),better=nodeScoped.filter(row=>row.g8r_product_loss<0),same=nodeScoped.length-worse.length-better.length,visible=modeEl.value==='losses_only'?worse:nodeScoped,ranked=rankMffcSamples(visible),largest=worse.length?Math.max(...worse.map(row=>row.g8r_product_loss)):0;visibleByTop=new Map(ranked.map(row=>[row.ir_top,row]));byId('mffc-summary').innerHTML=`<article class=card><div class=muted>Paired MFFCs</div><div class=stat-value>${nodeScoped.length.toLocaleString()}</div><div class=meta>crate v${esc(versionEl.value)} · ${limit===Infinity?'all IR sizes':'≤ '+limit.toLocaleString()+' IR nodes'}</div></article><article class=card><div class=muted>G8r worse</div><div class='stat-value delta-regressed'>${worse.length.toLocaleString()}</div><div class=meta>${nodeScoped.length?product(100*worse.length/nodeScoped.length):'0'}% of paired MFFCs</div></article><article class=card><div class=muted>G8r better / tied</div><div class=stat-value><span class=delta-improved>${better.length.toLocaleString()}</span> / <span class=delta-same>${same.toLocaleString()}</span></div><div class=meta>Signed product loss below / equal to zero</div></article><article class=card><div class=muted>Largest G8r loss</div><div class='stat-value delta-regressed'>${largest?'+':''}${product(largest)}</div><div class=meta>nodes × levels product units</div></article>`;byId('mffc-chart').innerHTML=mffcChart(ranked);byId('mffc-table').innerHTML=mffcTable(ranked);const url=new URL(location.href);url.searchParams.set('crate_version',versionEl.value);if(nodesEl.value==='')url.searchParams.delete('max_ir_nodes');else url.searchParams.set('max_ir_nodes',String(limit));url.searchParams.set('losses_only',String(modeEl.value==='losses_only'));history.replaceState(null,'',url)};versionEl.addEventListener('change',render);nodesEl.addEventListener('change',render);modeEl.addEventListener('change',render);render()}
+let comparisonState=null;
+function comparisonLayout(title,xTitle,yTitle,xLog=false,yLog=false){const layout={title:{text:title,font:{color:'#cde7f7',size:14}},paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'#0b172a',margin:{l:68,r:18,t:42,b:62},hovermode:'closest',xaxis:{title:xTitle,showgrid:true,gridcolor:'#243c5d',linecolor:'#5e7da2',tickfont:{color:'#8fa9be',size:11},titlefont:{color:'#8fa9be',size:12},zeroline:false},yaxis:{title:yTitle,showgrid:true,gridcolor:'#243c5d',linecolor:'#5e7da2',tickfont:{color:'#8fa9be',size:11},titlefont:{color:'#8fa9be',size:12},zeroline:false},legend:{orientation:'h',font:{color:'#cde7f7',size:11},bgcolor:'rgba(17,35,58,.78)',bordercolor:'#213754',borderwidth:1}};if(xLog)layout.xaxis.type='log';if(yLog)layout.yaxis.type='log';return layout}
+function comparisonConfig(){return {displaylogo:false,responsive:true,scrollZoom:true,modeBarButtonsToRemove:['select2d','lasso2d','autoScale2d']}}
+function comparisonSelectionKey(sample){return `${sample.g8r_stats_action_id||''}:${sample.yosys_abc_stats_action_id||''}`}
+function comparisonHover(sample,state){return `${esc(sample.fn_key)}<br>crate:v${esc(sample.crate_version)}<br>dso:v${esc(sample.dso_version)}<br>ir_nodes=${sample.ir_node_count}<br>${esc(state.lhs)}(nodes,levels)=(${sample.g8r_nodes},${sample.g8r_levels})<br>${esc(state.rhs)}(nodes,levels)=(${sample.yosys_abc_nodes},${sample.yosys_abc_levels})<br>ir_action=${esc(sample.ir_action_id)}`}
+function comparisonQuadrant(sample,state){const dx=Number(sample.yosys_abc_nodes)-Number(sample.g8r_nodes),dy=Number(sample.yosys_abc_levels)-Number(sample.g8r_levels),eps=1e-9;let label;if(!Number.isFinite(dx)||!Number.isFinite(dy)||Math.abs(dx)<=eps&&Math.abs(dy)<=eps)label='Tie exact (nodes+levels equal)';else if(dx>eps&&dy>eps)label=`Q1 pure win (${state.lhs} fewer nodes+levels)`;else if(dx>=-eps&&dy>=-eps)label='Q1 partial win (one better, one equal)';else if(dx<-eps&&dy>eps)label='Q2 mixed (levels win, nodes loss)';else if(dx<-eps&&dy<-eps)label=`Q3 strict loss (${state.lhs} more nodes+levels)`;else if(dx<=eps&&dy<=eps)label='Q3 partial loss (one worse, one equal)';else label='Q4 mixed (nodes win, levels loss)';const color=label.startsWith('Q1')?'#7dff9f':label.startsWith('Q3')?'#ff8ea9':label.startsWith('Q2')?'#ffd36f':label.startsWith('Q4')?'#5ec9ff':'#8a8f98';return {dx:Number.isFinite(dx)?dx:0,dy:Number.isFinite(dy)?dy:0,label,color}}
+function comparisonLogValue(value){const number=Number(value);if(!Number.isFinite(number)||number<0)return null;return {value:number===0?1:number,clamped:number===0}}
+function bindComparisonClick(plotId,state){const plot=byId(plotId);if(!plot||typeof plot.on!=='function')return;if(typeof plot.removeAllListeners==='function')plot.removeAllListeners('plotly_click');plot.on('plotly_click',event=>{const sample=event?.points?.[0]?.customdata;if(sample)showComparisonDetail(sample,plotId,state)})}
+function renderComparisonPair(plotId,title,xTitle,yTitle,samples,xSelect,ySelect,state){const valid=[];for(const sample of samples){const x=comparisonLogValue(xSelect(sample)),y=comparisonLogValue(ySelect(sample));if(x&&y)valid.push({sample,x:x.value,y:y.value,clamped:x.clamped||y.clamped,quadrant:comparisonQuadrant(sample,state)})}const x=valid.map(row=>row.x),y=valid.map(row=>row.y),traces=[];if(valid.length){traces.push({type:'scatter',mode:'markers',name:'samples',x,y,customdata:valid.map(row=>row.sample),text:valid.map(row=>comparisonHover(row.sample,state)+'<br>'+row.quadrant.label),hovertemplate:'%{text}<br>x=%{x}<br>y=%{y}<extra></extra>',marker:{size:6,color:valid.map(row=>row.quadrant.color),opacity:.88}});const both=x.concat(y),min=Math.min(...both),max=Math.max(...both);traces.push({type:'scatter',mode:'lines',name:'y=x',x:[min,max],y:[min,max],line:{color:'#32f1b2',width:1.2,dash:'dot'},hoverinfo:'skip'})}const dropped=samples.length-valid.length,clamped=valid.filter(row=>row.clamped).length,layout=comparisonLayout(`${title} [n=${valid.length}, zero_as_one=${clamped}, dropped_negative_or_nonfinite=${dropped}]`,xTitle,yTitle,true,true);if(!valid.length)layout.annotations=[{text:'No positive-domain samples for current filter',showarrow:false,x:.5,y:.5,xref:'paper',yref:'paper',font:{color:'#8fa9be',size:13}}];Plotly.react(plotId,traces,layout,comparisonConfig()).then(()=>bindComparisonClick(plotId,state))}
+function renderComparisonQuadrants(samples,state){const valid=samples.map(sample=>({sample,...comparisonQuadrant(sample,state)})),counts={Q1:0,Q2:0,Q3:0,Q4:0,tie:0};for(const row of valid){const key=['Q1','Q2','Q3','Q4'].find(value=>row.label.startsWith(value));counts[key||'tie']++}const traces=valid.length?[{type:'scatter',mode:'markers',name:'delta samples',x:valid.map(row=>row.dx),y:valid.map(row=>row.dy),customdata:valid.map(row=>row.sample),text:valid.map(row=>`${comparisonHover(row.sample,state)}<br>delta_nodes(${esc(state.rhs)}-${esc(state.lhs)})=${row.dx}<br>delta_levels(${esc(state.rhs)}-${esc(state.lhs)})=${row.dy}<br>${row.label}`),hovertemplate:'%{text}<extra></extra>',marker:{size:6,color:valid.map(row=>row.color),opacity:.88}}]:[],layout=comparisonLayout(`delta quadrants [Q1=${counts.Q1} Q2=${counts.Q2} Q3=${counts.Q3} Q4=${counts.Q4} tie=${counts.tie}]`,`nodes delta = ${state.rhs}_nodes - ${state.lhs}_nodes (positive => ${state.lhs} better)`,`levels delta = ${state.rhs}_levels - ${state.lhs}_levels (positive => ${state.lhs} better)`);layout.shapes=[{type:'line',x0:0,x1:0,xref:'x',y0:0,y1:1,yref:'paper',line:{color:'#5ec9ff',width:1.2,dash:'dot'}},{type:'line',x0:0,x1:1,xref:'paper',y0:0,y1:0,yref:'y',line:{color:'#5ec9ff',width:1.2,dash:'dot'}}];layout.annotations=[['Q2 mixed',.13,.93,'#ffd36f'],['Q1 pure win',.87,.93,'#7dff9f'],['Q3 strict loss',.13,.08,'#ff8ea9'],['Q4 mixed',.87,.08,'#5ec9ff']].map(([text,x,y,color])=>({text,showarrow:false,x,y,xref:'paper',yref:'paper',font:{color,size:11}}));if(!valid.length)layout.annotations.push({text:'No samples for current filter',showarrow:false,x:.5,y:.5,xref:'paper',yref:'paper',font:{color:'#8fa9be',size:13}});Plotly.react('plot-delta-quadrant',traces,layout,comparisonConfig()).then(()=>bindComparisonClick('plot-delta-quadrant',state))}
+function renderComparisonLoss(samples,state){const valid=[];for(const sample of samples){if(!comparisonQuadrant(sample,state).label.startsWith('Q3 strict loss'))continue;const x=Number(sample.ir_node_count),y=Number(sample.g8r_product_loss);if(Number.isFinite(x)&&x>0&&Number.isFinite(y)&&y>0)valid.push({sample,x,y})}byId('loss-positive-count').textContent=String(valid.length);const traces=valid.length?[{type:'scatter',mode:'markers',name:'positive loss',x:valid.map(row=>row.x),y:valid.map(row=>row.y),customdata:valid.map(row=>row.sample),text:valid.map(row=>comparisonHover(row.sample,state)),hovertemplate:'%{text}<br>loss=%{y}<extra></extra>',marker:{size:6,color:'#ff8ea9',opacity:.9}}]:[],dropped=samples.length-valid.length,layout=comparisonLayout(`${state.lhs} product strict-loss amount vs ir nodes [n=${valid.length}, dropped_non_q3_strict_or_nonpositive_or_nonloss=${dropped}]`,'IR node count',`${state.lhs}_product - ${state.rhs}_product (positive = ${state.lhs} worse)`,true,true);if(!valid.length)layout.annotations=[{text:'No strict-loss samples for current filter',showarrow:false,x:.5,y:.5,xref:'paper',yref:'paper',font:{color:'#8fa9be',size:13}}];Plotly.react('plot-loss-vs-ir',traces,layout,comparisonConfig()).then(()=>bindComparisonClick('plot-loss-vs-ir',state))}
+async function showComparisonDetail(sample,sourcePlot,state){state.selectedSampleKey=comparisonSelectionKey(sample);syncComparisonQuery(state);const empty=byId('comparison-detail-empty'),json=byId('comparison-detail-json'),evidence=byId('comparison-detail-evidence');empty.hidden=true;json.hidden=false;json.textContent=JSON.stringify({selection_key:state.selectedSampleKey,selected_from_plot:sourcePlot,selected_at_utc:new Date().toISOString(),...sample},null,2);evidence.textContent='Loading exported structural evidence…';const hash=sample.structural_hash||'';if(!/^[0-9a-f]{64}$/.test(hash)){evidence.textContent='No structural hash is exported for this sample.';return}const key=`ir-fn-corpus-structural.v2/by-hash/${hash.slice(0,2)}/${hash.slice(2,4)}/${hash}.json`,dataset=state.catalog.datasets.find(value=>value.logical_key===key);if(!dataset){evidence.textContent='This snapshot does not contain structural evidence for the selected sample.';return}try{const data=await fetch(base+dataset.url).then(response=>{if(!response.ok)throw Error(`${dataset.url} ${response.status}`);return response.json()}),members=(data.members||[]).filter(member=>member.crate_version===sample.crate_version),member=members.find(value=>value.opt_ir_action_id===sample.ir_action_id&&value.ir_top===sample.ir_top)||members[0];if(!member){evidence.textContent='No matching structural member is present for this crate release.';return}const origin=member.dslx_origin?`${member.dslx_origin.dslx_file} :: ${member.dslx_origin.dslx_fn_name}`:'not exported',mffc=String(sample.ir_top||'').startsWith('__mffc_')?` · <a href='${base}mffc-discrepancies.html?crate_version=${encodeURIComponent(sample.crate_version)}&losses_only=true'>open MFFC IR evidence</a>`:'';evidence.innerHTML=`Structural hash <code>${esc(hash)}</code> · source IR action <code>${esc(member.source_ir_action_id)}</code> · origin ${esc(origin)}${mffc}`}catch(error){evidence.textContent=`Failed loading structural evidence: ${error}`}}
+function syncComparisonQuery(state){const url=new URL(location.href),maxNodes=Number(byId('comparison-max-ir-nodes').value),version=byId('comparison-crate-version').value,lossesOnly=byId('comparison-sample-mode').value==='losses_only';url.searchParams.set('max_ir_nodes',String(maxNodes));if(version)url.searchParams.set('crate_version',version);else url.searchParams.delete('crate_version');if(lossesOnly)url.searchParams.set('losses_only','true');else url.searchParams.delete('losses_only');if(state.selectedSampleKey)url.searchParams.set('sample',state.selectedSampleKey);else url.searchParams.delete('sample');history.replaceState(null,'',url)}
+function comparisonIsLoss(sample,state){const quadrant=comparisonQuadrant(sample,state);return quadrant.dx < -1e-9 || quadrant.dy < -1e-9}
+function updateComparisonPlots(state){const maxNodes=Number(byId('comparison-max-ir-nodes').value),version=byId('comparison-crate-version').value,lossesOnly=byId('comparison-sample-mode').value==='losses_only',filtered=state.samples.filter(sample=>(!version||sample.crate_version===version)&&Number(sample.ir_node_count)<=maxNodes&&(!lossesOnly||comparisonIsLoss(sample,state)));byId('comparison-max-ir-nodes-value').textContent=maxNodes.toLocaleString();byId('comparison-scope-label').textContent=version?`crate:v${version}`:'all crate versions';byId('comparison-filtered-count').textContent=filtered.length.toLocaleString();byId('comparison-no-data').hidden=filtered.length!==0;renderComparisonPair('plot-levels',`${state.lhs} levels vs ${state.rhs} levels`,`${state.lhs} levels`,`${state.rhs} levels`,filtered,sample=>sample.g8r_levels,sample=>sample.yosys_abc_levels,state);renderComparisonPair('plot-nodes',`${state.lhs} nodes vs ${state.rhs} nodes`,`${state.lhs} nodes`,`${state.rhs} nodes`,filtered,sample=>sample.g8r_nodes,sample=>sample.yosys_abc_nodes,state);renderComparisonQuadrants(filtered,state);renderComparisonLoss(filtered,state);syncComparisonQuery(state)}
+async function comparisonPlots(catalog){const root=byId('comparison-plots');if(!root)return;if(typeof Plotly==='undefined')throw Error('The pinned Plotly library could not be loaded.');const dataset=catalog.datasets.find(value=>value.logical_key===root.dataset.datasetKey);if(!dataset)throw Error('Comparison data is not available in this snapshot.');const data=await fetch(base+dataset.url).then(response=>{if(!response.ok)throw Error(`${dataset.url} ${response.status}`);return response.json()}),samples=(data.dataset?.samples||[]).filter(sample=>Number.isFinite(sample.ir_node_count)&&Number.isFinite(sample.g8r_nodes)&&Number.isFinite(sample.g8r_levels)&&Number.isFinite(sample.yosys_abc_nodes)&&Number.isFinite(sample.yosys_abc_levels)),versions=[...new Set(samples.map(sample=>sample.crate_version))].sort(versionCompare),query=new URLSearchParams(location.search),min=Math.max(0,Number(data.dataset?.min_ir_nodes)||0),max=Math.max(min,Number(data.dataset?.max_ir_nodes)||min),requestedMax=Number(query.get('max_ir_nodes')),slider=byId('comparison-max-ir-nodes'),version=byId('comparison-crate-version'),mode=byId('comparison-sample-mode');comparisonState={catalog,samples,lhs:root.dataset.lhsLabel,rhs:root.dataset.rhsLabel,selectedSampleKey:query.get('sample')};slider.min=String(min);slider.max=String(max);slider.value=String(Number.isFinite(requestedMax)&&requestedMax>=min?Math.min(requestedMax,max):max);version.innerHTML=`<option value=''>all crate versions</option>`+versions.map(value=>`<option value='${esc(value)}'>crate:v${esc(value)}</option>`).join('');version.value=versions.includes(query.get('crate_version'))?query.get('crate_version'):'';mode.value=query.get('losses_only')==='true'?'losses_only':'all';byId('comparison-total-count').textContent=samples.length.toLocaleString();slider.addEventListener('input',()=>updateComparisonPlots(comparisonState));version.addEventListener('change',()=>updateComparisonPlots(comparisonState));mode.addEventListener('change',()=>updateComparisonPlots(comparisonState));updateComparisonPlots(comparisonState);if(comparisonState.selectedSampleKey){const sample=samples.find(value=>comparisonSelectionKey(value)===comparisonState.selectedSampleKey);if(sample)showComparisonDetail(sample,'query',comparisonState);else{comparisonState.selectedSampleKey=null;syncComparisonQuery(comparisonState)}}}
 async function datasetExplorer(catalog){const select=byId('dataset');if(!select)return;for(const d of catalog.datasets){const o=document.createElement('option');o.value=d.logical_key;o.textContent=`${d.logical_key} (${d.bytes.toLocaleString()} B)`;select.appendChild(o)}const q=new URLSearchParams(location.search).get('key');if(q&&catalog.datasets.some(d=>d.logical_key===q))select.value=q;async function load(){const d=catalog.datasets.find(x=>x.logical_key===select.value);history.replaceState(null,'','?key='+encodeURIComponent(d.logical_key));byId('dataset-meta').textContent=`sha256 ${d.sha256} · ${d.bytes.toLocaleString()} bytes`;const data=await fetch(base+d.url).then(r=>{if(!r.ok)throw Error(`${d.url} ${r.status}`);return r.json()});const found=arrays(data),rows=found[0]?.[1]||[];byId('plot').innerHTML=renderPlot(rows);byId('table').innerHTML=found.length?`<h2>Rows: ${esc(found[0][0])}</h2>${renderTable(rows)}`:'<p class=muted>No tabular row arrays found.</p>';byId('raw').textContent=JSON.stringify(data,null,2)}select.addEventListener('change',load);if(catalog.datasets.length)await load()}
 function progressionUnavailable(root,message){root.querySelector('.toolbar').hidden=true;byId('progression-summary').innerHTML='';byId('progression-chart').innerHTML=`<p class=muted>${esc(message)}</p>`;byId('progression-table').innerHTML=''}
 async function progression(catalog){const root=byId('progression');if(!root)return;const key=root.dataset.datasetKey,dataset=catalog.datasets.find(d=>d.logical_key===key);if(!dataset){progressionUnavailable(root,'Release progression data is not available in this snapshot.');return}const data=await fetch(base+dataset.url).then(r=>{if(!r.ok)throw Error(`${dataset.url} ${r.status}`);return r.json()}),samples=data.dataset?.samples||[];let generations;try{generations=releaseGenerations(catalog,samples)}catch(error){progressionUnavailable(root,`Release progression data is ambiguous: ${error.message}`);return}const completeGenerations=generations.filter(g=>g.status==='complete'),completeVersions=[...new Set(completeGenerations.map(g=>g.version))].sort(versionCompare);if(completeVersions.length<2){const missingLineage=samples.length&&!samples.some(s=>s.stdlib_root_action_id),degradedCount=generations.length-completeGenerations.length,detail=missingLineage?'This snapshot predates exact run-lineage metadata and must be rebuilt.':completeVersions.length===1?`Only v${completeVersions[0]} has populated complete-run samples.`:'No populated complete-run samples are available.',degraded=degradedCount?` ${degradedCount.toLocaleString()} degraded run generation(s) were excluded because partial populations can bias the result.`:'';progressionUnavailable(root,`At least two populated complete crate releases are needed for a progression comparison. ${detail}${degraded}`);return}const stats=releaseStats(completeGenerations);byId('progression-chart').innerHTML=progressionChart(stats);const baseline=byId('baseline-version'),current=byId('current-version'),options=generations.map(g=>`<option value='${g.run_id}'>v${esc(g.version)} · run ${esc(g.run_id.slice(0,12))} · ${esc(g.status)} · ${g.samples.length.toLocaleString()} samples</option>`).join('');baseline.innerHTML=options;current.innerHTML=options;const preferredByVersion=new Map;for(const generation of completeGenerations)preferredByVersion.set(generation.version,generation);baseline.value=preferredByVersion.get(completeVersions.at(-2)).run_id;current.value=preferredByVersion.get(completeVersions.at(-1)).run_id;const render=()=>renderPair(generations,baseline.value,current.value);baseline.addEventListener('change',render);current.addEventListener('change',render);render()}
-async function main(){const catalog=await fetch(base+'catalog.json').then(r=>{if(!r.ok)throw Error(`catalog ${r.status}`);return r.json()});await datasetExplorer(catalog);await progression(catalog);await mffcDiscrepancies(catalog)}main().catch(e=>{const out=byId('error');if(out)out.textContent=e.stack||e});"#;
+async function main(){const catalog=await fetch(base+'catalog.json').then(r=>{if(!r.ok)throw Error(`catalog ${r.status}`);return r.json()});await datasetExplorer(catalog);await progression(catalog);await mffcDiscrepancies(catalog);await comparisonPlots(catalog)}main().catch(e=>{const out=byId('error');if(out)out.textContent=e.stack||e});"#;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BuildStaticSiteOptions {
@@ -351,6 +374,22 @@ fn html_shell(
     )
 }
 
+fn html_shell_with_plotly(
+    title: &str,
+    site_root_url: &str,
+    body: &str,
+    css_name: &str,
+    js_name: &str,
+) -> String {
+    let plotly =
+        format!(r#"<script defer src="{site_root_url}assets/{PLOTLY_ASSET_NAME}"></script>"#);
+    let script = format!(r#"<script defer src="{site_root_url}assets/{js_name}"></script>"#);
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\"><meta name=\"bvc-site-root\" content=\"{site_root_url}\"><title>{}</title><link rel=\"stylesheet\" href=\"{site_root_url}assets/{css_name}\">{plotly}{script}</head><body>{body}</body></html>",
+        escape_html(title)
+    )
+}
+
 fn site_root_url(page_relpath: &str) -> Result<String> {
     let page_relpath = normalized_relpath(page_relpath)?;
     if !page_relpath.ends_with(".html") {
@@ -468,9 +507,14 @@ fn expected_catalog_site_relpaths(
         "runs.html".to_string(),
         "progression.html".to_string(),
         "mffc-discrepancies.html".to_string(),
+        "ir-fn-corpus-g8r-vs-yosys-abc/index.html".to_string(),
+        "ir-fn-g8r-abc-vs-codegen-yosys-abc/index.html".to_string(),
         "dataset.html".to_string(),
         format!("assets/{css_name}"),
         format!("assets/{js_name}"),
+        format!("assets/{PLOTLY_ASSET_NAME}"),
+        format!("assets/{PLOTLY_LICENSE_ASSET_NAME}"),
+        format!("assets/{PLOTLY_NOTICE_ASSET_NAME}"),
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -576,6 +620,28 @@ fn progression_body(root_site_url: &str) -> String {
     )
 }
 
+fn comparison_plots_body(
+    root_site_url: &str,
+    title: &str,
+    dataset_key: &str,
+    lhs_label: &str,
+    rhs_label: &str,
+) -> String {
+    format!(
+        "<header class=\"comparison-header\"><p><a href=\"{root_site_url}\">← Results</a></p><h1>{}</h1><p class=\"meta\">The same interactive paired-synthesis view as the dynamic site: log/log levels and nodes, four-quadrant deltas, and strict product loss versus IR size</p><nav class=\"comparison-nav\"><a href=\"{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/\">G8r vs Yosys/ABC</a><a href=\"{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/\">G8r+ABC vs codegen+Yosys/ABC</a><a href=\"{root_site_url}mffc-discrepancies.html\">MFFC discrepancies</a></nav><p id=\"error\" role=\"alert\"></p></header><main id=\"comparison-plots\" class=\"comparison-page\" data-dataset-key=\"{}\" data-lhs-label=\"{}\" data-rhs-label=\"{}\"><section class=\"comparison-controls\"><div class=\"toolbar\"><label>Crate version scope <select id=\"comparison-crate-version\" aria-label=\"Comparison crate version\"></select></label><label>Sample mode <select id=\"comparison-sample-mode\" aria-label=\"Comparison sample mode\"><option value=\"all\">all samples</option><option value=\"losses_only\">show losses only</option></select></label><label>Maximum IR nodes <input id=\"comparison-max-ir-nodes\" class=\"comparison-range\" type=\"range\" step=\"1\" aria-label=\"Maximum IR nodes\"></label><output id=\"comparison-max-ir-nodes-value\"></output></div><div class=\"comparison-status meta\"><span>scope: <strong id=\"comparison-scope-label\">loading…</strong></span><span>filtered: <strong id=\"comparison-filtered-count\">0</strong> / <strong id=\"comparison-total-count\">0</strong></span><span>strict positive-loss plot: <strong id=\"loss-positive-count\">0</strong></span></div><p id=\"comparison-no-data\" class=\"muted\" hidden>No paired samples match the current filters.</p></section><section class=\"plot-grid\"><article class=\"plot-panel\"><h2 class=\"plot-title\">{} levels vs {} levels</h2><div id=\"plot-levels\" class=\"plotly-host\"></div></article><article class=\"plot-panel\"><h2 class=\"plot-title\">{} nodes vs {} nodes</h2><div id=\"plot-nodes\" class=\"plotly-host\"></div></article><article class=\"plot-panel\"><h2 class=\"plot-title\">Quadrant deltas: levels vs nodes</h2><div id=\"plot-delta-quadrant\" class=\"plotly-host\"></div></article><article class=\"plot-panel\"><h2 class=\"plot-title\">{} product loss amount vs IR node count</h2><div id=\"plot-loss-vs-ir\" class=\"plotly-host\"></div></article></section><p class=\"meta\">Scroll to zoom, drag to pan, and click any point for its sample identity and exported structural evidence. Zeroes on the log/log pair plots are displayed at 1 so they remain visible.</p><section class=\"card comparison-detail\" aria-live=\"polite\"><h2>Selected sample</h2><p id=\"comparison-detail-empty\" class=\"muted\">Click any point in any plot to inspect it.</p><p id=\"comparison-detail-evidence\" class=\"meta\"></p><pre id=\"comparison-detail-json\" hidden></pre></section><p class=\"meta\">Raw exported data: <a href=\"{root_site_url}dataset.html?key={}\">dataset explorer</a>.</p></main>",
+        escape_html(title),
+        escape_html(dataset_key),
+        escape_html(lhs_label),
+        escape_html(rhs_label),
+        escape_html(lhs_label),
+        escape_html(rhs_label),
+        escape_html(lhs_label),
+        escape_html(rhs_label),
+        escape_html(lhs_label),
+        url_encode(dataset_key),
+    )
+}
+
 fn mffc_discrepancies_body(root_site_url: &str) -> String {
     format!(
         "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>MFFC discrepancies</h1><p class=\"meta\">Paired MFFCs lowered through G8r+ABC and codegen+Yosys/ABC, ranked by signed nodes × levels product loss; positive means G8r is worse</p><p id=\"error\" role=\"alert\"></p></header><main id=\"mffc-discrepancies\" data-dataset-key=\"{}\" data-ir-dataset-key=\"{}\"><div class=\"toolbar\"><label>Crate release <select id=\"mffc-crate-version\" aria-label=\"MFFC crate release\"></select></label><label>Maximum IR nodes <input id=\"mffc-max-ir-nodes\" type=\"number\" min=\"1\" inputmode=\"numeric\" placeholder=\"all\" aria-label=\"Maximum MFFC IR nodes\"></label><label>Samples <select id=\"mffc-sample-mode\" aria-label=\"MFFC sample mode\"><option value=\"losses_only\">G8r losses only</option><option value=\"all\">all paired MFFCs</option></select></label></div><section id=\"mffc-summary\" class=\"grid\" aria-live=\"polite\"></section><section id=\"mffc-detail\" class=\"sample-detail\" aria-live=\"polite\"><h2>Selected MFFC</h2><p class=\"muted\">Click an MFFC name in the chart or table to inspect its origin, exact XLS IR, and synthesis evidence.</p></section><section id=\"mffc-chart\" aria-live=\"polite\"><p class=\"muted\">Loading paired MFFC data…</p></section><section id=\"mffc-table\" aria-live=\"polite\"></section><p class=\"meta\">Raw exported data: <a href=\"{root_site_url}dataset.html?key={}\">dataset explorer</a>.</p></main>",
@@ -594,6 +660,15 @@ fn expected_fixed_site_files(
     let mut files = BTreeMap::new();
     files.insert(format!("assets/{css_name}"), STYLE_CSS.as_bytes().to_vec());
     files.insert(format!("assets/{js_name}"), APP_JS.as_bytes().to_vec());
+    files.insert(format!("assets/{PLOTLY_ASSET_NAME}"), PLOTLY_JS.to_vec());
+    files.insert(
+        format!("assets/{PLOTLY_LICENSE_ASSET_NAME}"),
+        PLOTLY_LICENSE.to_vec(),
+    );
+    files.insert(
+        format!("assets/{PLOTLY_NOTICE_ASSET_NAME}"),
+        PLOTLY_NOTICE.to_vec(),
+    );
     files.insert("catalog.json".to_string(), encode_browser_catalog(catalog)?);
     files.insert(
         "snapshot_manifest.v1.pb".to_string(),
@@ -611,6 +686,42 @@ fn expected_fixed_site_files(
         )
         .into_bytes(),
     );
+    for (page_relpath, page_title, dataset_key, lhs_label, rhs_label) in [
+        (
+            "ir-fn-corpus-g8r-vs-yosys-abc/index.html",
+            "IR corpus: G8r vs Yosys/ABC",
+            crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+            "G8r",
+            "Yosys/ABC",
+        ),
+        (
+            "ir-fn-g8r-abc-vs-codegen-yosys-abc/index.html",
+            "IR corpus: G8r+ABC vs codegen+Yosys/ABC",
+            crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
+            "G8r+ABC",
+            "codegen+Yosys/ABC",
+        ),
+    ] {
+        let page_site_root_url = site_root_url(page_relpath)?;
+        files.insert(
+            page_relpath.to_string(),
+            html_shell_with_plotly(
+                &format!("xlsynth-bvc {page_title}"),
+                &page_site_root_url,
+                &comparison_plots_body(
+                    &page_site_root_url,
+                    page_title,
+                    dataset_key,
+                    lhs_label,
+                    rhs_label,
+                ),
+                &css_name,
+                &js_name,
+            )
+            .into_bytes(),
+        );
+    }
+
     files.insert(
         "mffc-discrepancies.html".to_string(),
         html_shell(
@@ -686,7 +797,7 @@ fn expected_fixed_site_files(
             "intentional skips"
         };
         let body = format!(
-            "<header><p><a href=\"{run_site_root_url}runs.html\">← Runs</a></p><h1>{} crate v{}</h1><p class=\"meta\">Campaign {} v{} · DSO v{} · status <strong>{}</strong></p></header><main><div class=\"grid\"><article class=\"card\"><h2>Completion</h2><p>{} roots complete · {} failed · {} canceled</p><p>{} missing outputs · {} failed samples · {} {intentional_skip_label}</p></article><article class=\"card\"><h2>Identity</h2><p>Run <code>{}</code></p><p>Campaign <code>{}</code></p><p><a href=\"{run_site_root_url}{}\">Download public run protobuf</a></p>{findings_download}</article></div><h2>Intentional skips</h2><ul>{intentional_skip_items}</ul><h2>Findings</h2><div class=\"table-wrap\"><table><thead><tr><th>Kind</th><th>Subject</th><th>Baseline loss</th><th>Current loss</th><th>Structural hash</th><th>Evidence actions</th></tr></thead><tbody>{finding_rows}</tbody></table></div><h2>Root actions</h2><ul>{root_actions}</ul><h2>Results</h2><p><a href=\"{run_site_root_url}progression.html\">View release progression</a> · <a href=\"{run_site_root_url}dataset.html?key={}\">Open g8r versus Yosys/ABC dataset</a></p></main>",
+            "<header><p><a href=\"{run_site_root_url}runs.html\">← Runs</a></p><h1>{} crate v{}</h1><p class=\"meta\">Campaign {} v{} · DSO v{} · status <strong>{}</strong></p></header><main><div class=\"grid\"><article class=\"card\"><h2>Completion</h2><p>{} roots complete · {} failed · {} canceled</p><p>{} missing outputs · {} failed samples · {} {intentional_skip_label}</p></article><article class=\"card\"><h2>Identity</h2><p>Run <code>{}</code></p><p>Campaign <code>{}</code></p><p><a href=\"{run_site_root_url}{}\">Download public run protobuf</a></p>{findings_download}</article></div><h2>Intentional skips</h2><ul>{intentional_skip_items}</ul><h2>Findings</h2><div class=\"table-wrap\"><table><thead><tr><th>Kind</th><th>Subject</th><th>Baseline loss</th><th>Current loss</th><th>Structural hash</th><th>Evidence actions</th></tr></thead><tbody>{finding_rows}</tbody></table></div><h2>Root actions</h2><ul>{root_actions}</ul><h2>Results</h2><p><a href=\"{run_site_root_url}ir-fn-corpus-g8r-vs-yosys-abc/\">Open interactive QoR plots</a> · <a href=\"{run_site_root_url}progression.html\">View release progression</a> · <a href=\"{run_site_root_url}dataset.html?key={}\">Open g8r versus Yosys/ABC dataset</a></p></main>",
             escape_html(&run.campaign_name),
             escape_html(&run.crate_version),
             escape_html(&run.campaign_name),
@@ -762,7 +873,7 @@ fn expected_fixed_site_files(
         })
         .collect::<String>();
     let index_body = format!(
-        "<header><h1>xlsynth-bvc results</h1><p class=\"meta\">Snapshot <code>{}</code> · {} runs · {} datasets · generated {}</p></header><main><p>This is a self-contained static publication. The build machine and sled database are not involved at request time.</p><p><a href=\"{root_site_url}progression.html\">View release progression →</a> · <a href=\"{root_site_url}mffc-discrepancies.html\">Inspect MFFC discrepancies →</a> · <a href=\"{root_site_url}runs.html\">Browse campaign runs and versions</a></p><h2>Datasets</h2><div class=\"grid\">{cards}</div></main>",
+        "<header><h1>xlsynth-bvc results</h1><p class=\"meta\">Snapshot <code>{}</code> · {} runs · {} datasets · generated {}</p></header><main><p>This is a self-contained static publication. The build machine and sled database are not involved at request time.</p><p><a href=\"{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/\">Interactive QoR plots →</a> · <a href=\"{root_site_url}progression.html\">View release progression →</a> · <a href=\"{root_site_url}mffc-discrepancies.html\">Inspect MFFC discrepancies →</a> · <a href=\"{root_site_url}runs.html\">Browse campaign runs and versions</a></p><h2>Datasets</h2><div class=\"grid\">{cards}</div></main>",
         snapshot.snapshot_id,
         catalog.runs.len(),
         catalog.datasets.len(),
@@ -839,6 +950,21 @@ pub(crate) fn build_static_site_with_protected_roots(
         &options.out_dir,
         &format!("assets/{js_name}"),
         APP_JS.as_bytes(),
+    )?;
+    write_file(
+        &options.out_dir,
+        &format!("assets/{PLOTLY_ASSET_NAME}"),
+        PLOTLY_JS,
+    )?;
+    write_file(
+        &options.out_dir,
+        &format!("assets/{PLOTLY_LICENSE_ASSET_NAME}"),
+        PLOTLY_LICENSE,
+    )?;
+    write_file(
+        &options.out_dir,
+        &format!("assets/{PLOTLY_NOTICE_ASSET_NAME}"),
+        PLOTLY_NOTICE,
     )?;
 
     let mut datasets = Vec::new();
@@ -947,6 +1073,43 @@ pub(crate) fn build_static_site_with_protected_roots(
         )
         .as_bytes(),
     )?;
+    for (page_relpath, page_title, dataset_key, lhs_label, rhs_label) in [
+        (
+            "ir-fn-corpus-g8r-vs-yosys-abc/index.html",
+            "IR corpus: G8r vs Yosys/ABC",
+            crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+            "G8r",
+            "Yosys/ABC",
+        ),
+        (
+            "ir-fn-g8r-abc-vs-codegen-yosys-abc/index.html",
+            "IR corpus: G8r+ABC vs codegen+Yosys/ABC",
+            crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
+            "G8r+ABC",
+            "codegen+Yosys/ABC",
+        ),
+    ] {
+        let page_site_root_url = site_root_url(page_relpath)?;
+        write_file(
+            &options.out_dir,
+            page_relpath,
+            html_shell_with_plotly(
+                &format!("xlsynth-bvc {page_title}"),
+                &page_site_root_url,
+                &comparison_plots_body(
+                    &page_site_root_url,
+                    page_title,
+                    dataset_key,
+                    lhs_label,
+                    rhs_label,
+                ),
+                &css_name,
+                &js_name,
+            )
+            .as_bytes(),
+        )?;
+    }
+
     write_file(
         &options.out_dir,
         "mffc-discrepancies.html",
@@ -1023,7 +1186,7 @@ pub(crate) fn build_static_site_with_protected_roots(
             "intentional skips"
         };
         let body = format!(
-            "<header><p><a href=\"{run_site_root_url}runs.html\">← Runs</a></p><h1>{} crate v{}</h1><p class=\"meta\">Campaign {} v{} · DSO v{} · status <strong>{}</strong></p></header><main><div class=\"grid\"><article class=\"card\"><h2>Completion</h2><p>{} roots complete · {} failed · {} canceled</p><p>{} missing outputs · {} failed samples · {} {intentional_skip_label}</p></article><article class=\"card\"><h2>Identity</h2><p>Run <code>{}</code></p><p>Campaign <code>{}</code></p><p><a href=\"{run_site_root_url}{}\">Download public run protobuf</a></p>{findings_download}</article></div><h2>Intentional skips</h2><ul>{intentional_skip_items}</ul><h2>Findings</h2><div class=\"table-wrap\"><table><thead><tr><th>Kind</th><th>Subject</th><th>Baseline loss</th><th>Current loss</th><th>Structural hash</th><th>Evidence actions</th></tr></thead><tbody>{finding_rows}</tbody></table></div><h2>Root actions</h2><ul>{root_actions}</ul><h2>Results</h2><p><a href=\"{run_site_root_url}progression.html\">View release progression</a> · <a href=\"{run_site_root_url}dataset.html?key={}\">Open g8r versus Yosys/ABC dataset</a></p></main>",
+            "<header><p><a href=\"{run_site_root_url}runs.html\">← Runs</a></p><h1>{} crate v{}</h1><p class=\"meta\">Campaign {} v{} · DSO v{} · status <strong>{}</strong></p></header><main><div class=\"grid\"><article class=\"card\"><h2>Completion</h2><p>{} roots complete · {} failed · {} canceled</p><p>{} missing outputs · {} failed samples · {} {intentional_skip_label}</p></article><article class=\"card\"><h2>Identity</h2><p>Run <code>{}</code></p><p>Campaign <code>{}</code></p><p><a href=\"{run_site_root_url}{}\">Download public run protobuf</a></p>{findings_download}</article></div><h2>Intentional skips</h2><ul>{intentional_skip_items}</ul><h2>Findings</h2><div class=\"table-wrap\"><table><thead><tr><th>Kind</th><th>Subject</th><th>Baseline loss</th><th>Current loss</th><th>Structural hash</th><th>Evidence actions</th></tr></thead><tbody>{finding_rows}</tbody></table></div><h2>Root actions</h2><ul>{root_actions}</ul><h2>Results</h2><p><a href=\"{run_site_root_url}ir-fn-corpus-g8r-vs-yosys-abc/\">Open interactive QoR plots</a> · <a href=\"{run_site_root_url}progression.html\">View release progression</a> · <a href=\"{run_site_root_url}dataset.html?key={}\">Open g8r versus Yosys/ABC dataset</a></p></main>",
             escape_html(&run.campaign_name),
             escape_html(&run.crate_version),
             escape_html(&run.campaign_name),
@@ -1101,7 +1264,7 @@ pub(crate) fn build_static_site_with_protected_roots(
         })
         .collect::<String>();
     let index_body = format!(
-        "<header><h1>xlsynth-bvc results</h1><p class=\"meta\">Snapshot <code>{}</code> · {} runs · {} datasets · generated {}</p></header><main><p>This is a self-contained static publication. The build machine and sled database are not involved at request time.</p><p><a href=\"{root_site_url}progression.html\">View release progression →</a> · <a href=\"{root_site_url}mffc-discrepancies.html\">Inspect MFFC discrepancies →</a> · <a href=\"{root_site_url}runs.html\">Browse campaign runs and versions</a></p><h2>Datasets</h2><div class=\"grid\">{cards}</div></main>",
+        "<header><h1>xlsynth-bvc results</h1><p class=\"meta\">Snapshot <code>{}</code> · {} runs · {} datasets · generated {}</p></header><main><p>This is a self-contained static publication. The build machine and sled database are not involved at request time.</p><p><a href=\"{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/\">Interactive QoR plots →</a> · <a href=\"{root_site_url}progression.html\">View release progression →</a> · <a href=\"{root_site_url}mffc-discrepancies.html\">Inspect MFFC discrepancies →</a> · <a href=\"{root_site_url}runs.html\">Browse campaign runs and versions</a></p><h2>Datasets</h2><div class=\"grid\">{cards}</div></main>",
         snapshot.snapshot_id,
         catalog.runs.len(),
         catalog.datasets.len(),
@@ -1369,6 +1532,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         bail!("site manifest base_url is not normalized");
     }
     let snapshot_id = digest_hex(&manifest.source_snapshot_id, "source_snapshot_id")?;
+    let trusted_plotly_relpath = format!("assets/{PLOTLY_ASSET_NAME}");
     let mut declared = BTreeMap::new();
     let mut total_bytes = 0_u64;
     for file in &manifest.files {
@@ -1402,7 +1566,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         ) {
             let text = std::str::from_utf8(&bytes)
                 .with_context(|| format!("site text file is not UTF-8: {relpath}"))?;
-            if text.contains("/api/") {
+            if relpath != trusted_plotly_relpath && text.contains("/api/") {
                 bail!("static site file contains forbidden /api/ request path: {relpath}");
             }
         }
@@ -1492,6 +1656,12 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     for (relpath, expected_bytes) in [
         (format!("assets/{css_name}"), STYLE_CSS.as_bytes()),
         (format!("assets/{js_name}"), APP_JS.as_bytes()),
+        (format!("assets/{PLOTLY_ASSET_NAME}"), PLOTLY_JS),
+        (
+            format!("assets/{PLOTLY_LICENSE_ASSET_NAME}"),
+            PLOTLY_LICENSE,
+        ),
+        (format!("assets/{PLOTLY_NOTICE_ASSET_NAME}"), PLOTLY_NOTICE),
     ] {
         let actual = fs::read(site_dir.join(&relpath))
             .with_context(|| format!("reading trusted static asset: {relpath}"))?;
@@ -1674,6 +1844,7 @@ fn run_browser_page(
     profile_dir: &Path,
     url: &str,
     expected_text: &str,
+    rendered_marker: Option<(&str, usize)>,
     timeout: Duration,
 ) -> Result<()> {
     let response = reqwest::blocking::get(url)
@@ -1687,19 +1858,25 @@ fn run_browser_page(
     }
     let screenshot_name = format!("{}.png", &sha256_hex(url.as_bytes())[..16]);
     let screenshot_path = profile_dir.join(screenshot_name);
-    let mut child = Command::new(browser)
+    let mut command = Command::new(browser);
+    command.args([
+        "--headless=new",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "--no-first-run",
+        "--disable-features=NetworkServiceSandbox",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--window-size=1280,900",
+    ]);
+    if rendered_marker.is_some() {
+        command.args(["--dump-dom", "--virtual-time-budget=12000"]);
+    }
+    let mut child = command
         .args([
-            "--headless=new",
-            "--disable-gpu",
-            "--disable-dev-shm-usage",
-            "--no-sandbox",
-            "--no-first-run",
-            "--disable-features=NetworkServiceSandbox",
-            "--disable-background-networking",
-            "--disable-component-update",
-            "--disable-default-apps",
-            "--disable-sync",
-            "--window-size=1280,900",
             &format!("--screenshot={}", screenshot_path.display()),
             &format!("--user-data-dir={}", profile_dir.display()),
             url,
@@ -1729,9 +1906,10 @@ fn run_browser_page(
     });
     let started = Instant::now();
     let status = loop {
-        if screenshot_path
-            .metadata()
-            .is_ok_and(|metadata| metadata.len() > 0)
+        if rendered_marker.is_none()
+            && screenshot_path
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() > 0)
         {
             let _ = child.kill();
             break child
@@ -1768,7 +1946,22 @@ fn run_browser_page(
             String::from_utf8_lossy(&stderr)
         );
     }
-    let _ = stdout;
+    if let Some((marker, expected_count)) = rendered_marker {
+        if !status.success() {
+            bail!(
+                "headless browser failed for {url} with {status}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        let rendered = String::from_utf8_lossy(&stdout);
+        let actual_count = rendered.matches(marker).count();
+        if actual_count < expected_count {
+            bail!(
+                "headless browser rendered {actual_count} instances of {marker:?}; expected at least {expected_count} for {url}: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1814,21 +2007,34 @@ pub(crate) fn smoke_static_site(
     let origin = format!("http://{address}");
     let timeout = Duration::from_secs(timeout_seconds);
     let pages = [
-        ("", "xlsynth-bvc results"),
-        ("runs.html", "Campaign runs"),
-        ("progression.html", "Release progression"),
-        ("mffc-discrepancies.html", "MFFC discrepancies"),
-        ("dataset.html", "Dataset explorer"),
+        ("", "xlsynth-bvc results", None),
+        ("runs.html", "Campaign runs", None),
+        ("progression.html", "Release progression", None),
+        ("mffc-discrepancies.html", "MFFC discrepancies", None),
+        (
+            "ir-fn-corpus-g8r-vs-yosys-abc/",
+            "IR corpus: G8r vs Yosys/ABC",
+            Some(("class=\"plotly-host js-plotly-plot\"", 4)),
+        ),
+        (
+            "ir-fn-g8r-abc-vs-codegen-yosys-abc/",
+            "IR corpus: G8r+ABC vs codegen+Yosys/ABC",
+            Some(("class=\"plotly-host js-plotly-plot\"", 4)),
+        ),
+        ("dataset.html", "Dataset explorer", None),
     ];
-    let result = pages.iter().try_for_each(|(path, expected)| {
-        run_browser_page(
-            &browser,
-            &profile_dir,
-            &format!("{origin}{}{path}", verified.base_url),
-            expected,
-            timeout,
-        )
-    });
+    let result = pages
+        .iter()
+        .try_for_each(|(path, expected, rendered_marker)| {
+            run_browser_page(
+                &browser,
+                &profile_dir,
+                &format!("{origin}{}{path}", verified.base_url),
+                expected,
+                *rendered_marker,
+                timeout,
+            )
+        });
     let _ = server.kill();
     let _ = server.wait();
     fs::remove_dir_all(&profile_dir).ok();
@@ -1840,7 +2046,10 @@ pub(crate) fn smoke_static_site(
         site_dir: site_dir.display().to_string(),
         base_url: verified.base_url,
         browser: browser.display().to_string(),
-        pages_checked: pages.iter().map(|(path, _)| (*path).to_string()).collect(),
+        pages_checked: pages
+            .iter()
+            .map(|(path, _, _)| (*path).to_string())
+            .collect(),
     })
 }
 
@@ -1976,6 +2185,46 @@ mod tests {
         assert!(APP_JS.contains("completeGenerations=generations.filter"));
         assert!(APP_JS.contains("Degraded runs are never selected by default or plotted"));
         assert!(APP_JS.contains("Partial-data warning"));
+        let comparison_html =
+            fs::read_to_string(site_dir.join("ir-fn-corpus-g8r-vs-yosys-abc/index.html"))
+                .expect("read comparison HTML");
+        assert!(comparison_html.contains(crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME));
+        assert!(comparison_html.contains("../assets/plotly-2.35.2.min.js"));
+        assert!(!comparison_html.contains("cdn.plot.ly"));
+        assert!(comparison_html.contains("script-src 'self';"));
+        assert!(comparison_html.contains("style-src 'self' 'unsafe-inline';"));
+        assert!(comparison_html.contains("../assets/"));
+        assert_eq!(
+            fs::read(site_dir.join(format!("assets/{PLOTLY_ASSET_NAME}")))
+                .expect("read local Plotly asset"),
+            PLOTLY_JS
+        );
+        assert!(
+            site_dir
+                .join(format!("assets/{PLOTLY_LICENSE_ASSET_NAME}"))
+                .is_file()
+        );
+        assert!(
+            site_dir
+                .join(format!("assets/{PLOTLY_NOTICE_ASSET_NAME}"))
+                .is_file()
+        );
+
+        let frontend_comparison_html =
+            fs::read_to_string(site_dir.join("ir-fn-g8r-abc-vs-codegen-yosys-abc/index.html"))
+                .expect("read frontend comparison HTML");
+        assert!(
+            frontend_comparison_html
+                .contains(crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME)
+        );
+        assert!(frontend_comparison_html.contains("G8r+ABC vs codegen+Yosys/ABC"));
+        assert!(APP_JS.contains("renderComparisonQuadrants"));
+        assert!(APP_JS.contains("renderComparisonLoss"));
+        assert!(!APP_JS.contains("scattergl"));
+        assert!(!STYLE_CSS.contains(".table-wrap{max-height:60vh;overflow:auto}svg{"));
+        assert!(STYLE_CSS.contains("#plot>svg,.progression-chart>svg{"));
+        assert!(APP_JS.contains("losses_only"));
+        assert!(APP_JS.contains("comparisonSelectionKey"));
         let mffc_html = fs::read_to_string(site_dir.join("mffc-discrepancies.html"))
             .expect("read MFFC discrepancies HTML");
         assert!(mffc_html.contains("MFFC discrepancies"));
@@ -2044,6 +2293,75 @@ const {pairs} = api.compareSamples(before, after);
 const actual = api.medianPairedProductLossChange(pairs);
 if (actual !== 1) {
   throw new Error(`expected median paired delta 1, got ${actual}`);
+}
+"#;
+        let mut child = match Command::new("node")
+            .arg("-e")
+            .arg(SCRIPT)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping embedded JavaScript behavior test: node is unavailable");
+                return;
+            }
+            Err(error) => panic!("starting node: {error}"),
+        };
+        child
+            .stdin
+            .take()
+            .expect("node stdin")
+            .write_all(APP_JS.as_bytes())
+            .expect("write embedded JavaScript");
+        let output = child.wait_with_output().expect("wait for node");
+        assert!(
+            output.status.success(),
+            "embedded JavaScript test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn comparison_javascript_matches_dynamic_quadrants_and_loss_filter() {
+        const SCRIPT: &str = r#"
+const fs = require('fs');
+global.document = {
+  querySelector: () => ({content: ''}),
+  getElementById: () => null,
+};
+const app = fs.readFileSync(0, 'utf8');
+const prefix = app.slice(0, app.indexOf('async function main()'));
+const api = new Function(prefix + '\nreturn {comparisonIsLoss,comparisonQuadrant,comparisonSelectionKey};')();
+const state = {lhs: 'G8r', rhs: 'Yosys/ABC'};
+const sample = (g8r_nodes, g8r_levels, yosys_abc_nodes, yosys_abc_levels) => ({
+  g8r_nodes,
+  g8r_levels,
+  yosys_abc_nodes,
+  yosys_abc_levels,
+});
+const cases = [
+  [sample(10, 10, 12, 12), 'Q1 pure win', false],
+  [sample(12, 8, 10, 10), 'Q2 mixed', true],
+  [sample(12, 12, 10, 10), 'Q3 strict loss', true],
+  [sample(8, 12, 10, 10), 'Q4 mixed', true],
+  [sample(10, 10, 10, 10), 'Tie exact', false],
+];
+for (const [value, prefix, loss] of cases) {
+  const actual = api.comparisonQuadrant(value, state).label;
+  if (!actual.startsWith(prefix)) {
+    throw new Error(`expected ${prefix}, got ${actual}`);
+  }
+  if (api.comparisonIsLoss(value, state) !== loss) {
+    throw new Error(`unexpected loss classification for ${actual}`);
+  }
+}
+const key = api.comparisonSelectionKey({g8r_stats_action_id: 'g', yosys_abc_stats_action_id: 'y'});
+if (key !== 'g:y') {
+  throw new Error(`unexpected selection key: ${key}`);
 }
 "#;
         let mut child = match Command::new("node")

@@ -26,7 +26,7 @@ pub(crate) const PUBLICATION_LOCK_FILENAME: &str = ".publication.lock";
 const PUBLISHED_ROOT_INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>xlsynth-bvc results</title></head>
 <body><p id="status">Loading current xlsynth-bvc results…</p><script>
-fetch('current.json',{cache:'no-store'}).then(response=>{if(!response.ok)throw new Error(`current.json ${response.status}`);return response.json()}).then(current=>{if(current.schema_version!==1||!/^sites\/[0-9a-f]{64}\/$/.test(current.site_url))throw new Error('invalid current site pointer');window.location.replace(current.site_url)}).catch(error=>{document.getElementById('status').textContent=`Unable to load current results: ${error.message}`});
+fetch('/current.json',{cache:'no-store'}).then(response=>{if(!response.ok)throw new Error(`current.json ${response.status}`);return response.json()}).then(current=>{if(current.schema_version!==1||!/^sites\/[0-9a-f]{64}\/$/.test(current.site_url))throw new Error('invalid current site pointer');window.location.replace(`/${current.site_url}`)}).catch(error=>{document.getElementById('status').textContent=`Unable to load current results: ${error.message}`});
 </script></body></html>
 "#;
 static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -899,7 +899,8 @@ mod tests {
         .expect("decode browser pointer");
         assert_eq!(browser.site_url, format!("{}/", first.site_relpath));
         let landing = fs::read_to_string(publish_root.join("index.html")).expect("landing");
-        assert!(landing.contains("current.json"));
+        assert!(landing.contains("fetch('/current.json'"));
+        assert!(landing.contains("window.location.replace(`/${current.site_url}`)"));
         let immutable_index =
             fs::read_to_string(publish_root.join(&first.site_relpath).join("index.html"))
                 .expect("immutable index");
