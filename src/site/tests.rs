@@ -239,12 +239,14 @@ fn homepage_javascript_summarizes_all_published_corpus_samples() {
     const SCRIPT: &str = r#"
 const fs = require('fs');
 let capturedLayout = null;
+let capturedTraces = null;
 global.document = {
   querySelector: () => ({content: ''}),
   getElementById: () => null,
 };
 global.Plotly = {
-  react: (_id, _traces, layout) => {
+  react: (_id, traces, layout) => {
+capturedTraces = traces;
 capturedLayout = layout;
 return Promise.resolve();
   },
@@ -285,6 +287,13 @@ api.homepagePairPlot('test-plot', [sample('0.66.0', 'zero', 0, 0, 0, 0, 0)], 'lh
 if (!capturedLayout?.annotations?.[0]?.text.includes('1 zero-valued pair plotted at 1 for log scale')) {
   throw new Error(`missing zero-clamp disclosure: ${JSON.stringify(capturedLayout)}`);
 }
+const largeSamples = Array.from({length: 70000}, (_, i) => sample('0.68.0', 'large-' + i, i + 1, i + 1, i + 2, i + 2, 0));
+api.homepagePairPlot('large-test-plot', largeSamples, 'lhs', 'rhs', value => value.g8r_nodes, value => value.yosys_abc_nodes, {lhs: 'lhs', rhs: 'rhs'});
+const referenceLine = capturedTraces.at(-1);
+if (JSON.stringify(referenceLine.x) !== JSON.stringify([1, 70001]) || JSON.stringify(referenceLine.y) !== JSON.stringify([1, 70001])) {
+  throw new Error('unexpected large-corpus bounds: ' + JSON.stringify(referenceLine));
+}
+
 const href = api.homepageExplorerHref({
   crate_version: '0.68.0',
   g8r_stats_action_id: 'g8r-action',
