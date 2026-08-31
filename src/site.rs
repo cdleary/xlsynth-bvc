@@ -91,6 +91,8 @@ let comparisonState=null;
 function comparisonLayout(title,xTitle,yTitle,xLog=false,yLog=false){const layout={title:{text:title,font:{color:'#cde7f7',size:14}},paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'#0b172a',margin:{l:68,r:18,t:42,b:62},hovermode:'closest',xaxis:{title:xTitle,showgrid:true,gridcolor:'#243c5d',linecolor:'#5e7da2',tickfont:{color:'#8fa9be',size:11},titlefont:{color:'#8fa9be',size:12},zeroline:false},yaxis:{title:yTitle,showgrid:true,gridcolor:'#243c5d',linecolor:'#5e7da2',tickfont:{color:'#8fa9be',size:11},titlefont:{color:'#8fa9be',size:12},zeroline:false},legend:{orientation:'h',font:{color:'#cde7f7',size:11},bgcolor:'rgba(17,35,58,.78)',bordercolor:'#213754',borderwidth:1}};if(xLog)layout.xaxis.type='log';if(yLog)layout.yaxis.type='log';return layout}
 function comparisonConfig(){return {displaylogo:false,responsive:true,scrollZoom:true,modeBarButtonsToRemove:['select2d','lasso2d','autoScale2d']}}
 function comparisonSelectionKey(sample){return `${sample.g8r_stats_action_id||''}:${sample.yosys_abc_stats_action_id||''}`}
+function comparisonDefaultVersion(versions,requested){return versions.includes(requested)?requested:(versions.at(-1)||'')}
+function comparisonDetailIsCurrent(state,selectionKey,generation){return state.selectedSampleKey===selectionKey&&state.detailGeneration===generation}
 function comparisonHover(sample,state){return `${esc(sample.fn_key)}<br>crate:v${esc(sample.crate_version)}<br>dso:v${esc(sample.dso_version)}<br>ir_nodes=${sample.ir_node_count}<br>${esc(state.lhs)}(nodes,levels)=(${sample.g8r_nodes},${sample.g8r_levels})<br>${esc(state.rhs)}(nodes,levels)=(${sample.yosys_abc_nodes},${sample.yosys_abc_levels})<br>ir_action=${esc(sample.ir_action_id)}`}
 function comparisonQuadrant(sample,state){const dx=Number(sample.yosys_abc_nodes)-Number(sample.g8r_nodes),dy=Number(sample.yosys_abc_levels)-Number(sample.g8r_levels),eps=1e-9;let label;if(!Number.isFinite(dx)||!Number.isFinite(dy)||Math.abs(dx)<=eps&&Math.abs(dy)<=eps)label='Tie exact (nodes+levels equal)';else if(dx>eps&&dy>eps)label=`Q1 pure win (${state.lhs} fewer nodes+levels)`;else if(dx>=-eps&&dy>=-eps)label='Q1 partial win (one better, one equal)';else if(dx<-eps&&dy>eps)label='Q2 mixed (levels win, nodes loss)';else if(dx<-eps&&dy<-eps)label=`Q3 strict loss (${state.lhs} more nodes+levels)`;else if(dx<=eps&&dy<=eps)label='Q3 partial loss (one worse, one equal)';else label='Q4 mixed (nodes win, levels loss)';const color=label.startsWith('Q1')?'#7dff9f':label.startsWith('Q3')?'#ff8ea9':label.startsWith('Q2')?'#ffd36f':label.startsWith('Q4')?'#5ec9ff':'#8a8f98';return {dx:Number.isFinite(dx)?dx:0,dy:Number.isFinite(dy)?dy:0,label,color}}
 function comparisonLogValue(value){const number=Number(value);if(!Number.isFinite(number)||number<0)return null;return {value:number===0?1:number,clamped:number===0}}
@@ -98,11 +100,36 @@ function bindComparisonClick(plotId,state){const plot=byId(plotId);if(!plot||typ
 function renderComparisonPair(plotId,title,xTitle,yTitle,samples,xSelect,ySelect,state){const valid=[];for(const sample of samples){const x=comparisonLogValue(xSelect(sample)),y=comparisonLogValue(ySelect(sample));if(x&&y)valid.push({sample,x:x.value,y:y.value,clamped:x.clamped||y.clamped,quadrant:comparisonQuadrant(sample,state)})}const x=valid.map(row=>row.x),y=valid.map(row=>row.y),traces=[];if(valid.length){traces.push({type:'scatter',mode:'markers',name:'samples',x,y,customdata:valid.map(row=>row.sample),text:valid.map(row=>comparisonHover(row.sample,state)+'<br>'+row.quadrant.label),hovertemplate:'%{text}<br>x=%{x}<br>y=%{y}<extra></extra>',marker:{size:6,color:valid.map(row=>row.quadrant.color),opacity:.88}});const both=x.concat(y),min=Math.min(...both),max=Math.max(...both);traces.push({type:'scatter',mode:'lines',name:'y=x',x:[min,max],y:[min,max],line:{color:'#32f1b2',width:1.2,dash:'dot'},hoverinfo:'skip'})}const dropped=samples.length-valid.length,clamped=valid.filter(row=>row.clamped).length,layout=comparisonLayout(`${title} [n=${valid.length}, zero_as_one=${clamped}, dropped_negative_or_nonfinite=${dropped}]`,xTitle,yTitle,true,true);if(!valid.length)layout.annotations=[{text:'No positive-domain samples for current filter',showarrow:false,x:.5,y:.5,xref:'paper',yref:'paper',font:{color:'#8fa9be',size:13}}];Plotly.react(plotId,traces,layout,comparisonConfig()).then(()=>bindComparisonClick(plotId,state))}
 function renderComparisonQuadrants(samples,state){const valid=samples.map(sample=>({sample,...comparisonQuadrant(sample,state)})),counts={Q1:0,Q2:0,Q3:0,Q4:0,tie:0};for(const row of valid){const key=['Q1','Q2','Q3','Q4'].find(value=>row.label.startsWith(value));counts[key||'tie']++}const traces=valid.length?[{type:'scatter',mode:'markers',name:'delta samples',x:valid.map(row=>row.dx),y:valid.map(row=>row.dy),customdata:valid.map(row=>row.sample),text:valid.map(row=>`${comparisonHover(row.sample,state)}<br>delta_nodes(${esc(state.rhs)}-${esc(state.lhs)})=${row.dx}<br>delta_levels(${esc(state.rhs)}-${esc(state.lhs)})=${row.dy}<br>${row.label}`),hovertemplate:'%{text}<extra></extra>',marker:{size:6,color:valid.map(row=>row.color),opacity:.88}}]:[],layout=comparisonLayout(`delta quadrants [Q1=${counts.Q1} Q2=${counts.Q2} Q3=${counts.Q3} Q4=${counts.Q4} tie=${counts.tie}]`,`nodes delta = ${state.rhs}_nodes - ${state.lhs}_nodes (positive => ${state.lhs} better)`,`levels delta = ${state.rhs}_levels - ${state.lhs}_levels (positive => ${state.lhs} better)`);layout.shapes=[{type:'line',x0:0,x1:0,xref:'x',y0:0,y1:1,yref:'paper',line:{color:'#5ec9ff',width:1.2,dash:'dot'}},{type:'line',x0:0,x1:1,xref:'paper',y0:0,y1:0,yref:'y',line:{color:'#5ec9ff',width:1.2,dash:'dot'}}];layout.annotations=[['Q2 mixed',.13,.93,'#ffd36f'],['Q1 pure win',.87,.93,'#7dff9f'],['Q3 strict loss',.13,.08,'#ff8ea9'],['Q4 mixed',.87,.08,'#5ec9ff']].map(([text,x,y,color])=>({text,showarrow:false,x,y,xref:'paper',yref:'paper',font:{color,size:11}}));if(!valid.length)layout.annotations.push({text:'No samples for current filter',showarrow:false,x:.5,y:.5,xref:'paper',yref:'paper',font:{color:'#8fa9be',size:13}});Plotly.react('plot-delta-quadrant',traces,layout,comparisonConfig()).then(()=>bindComparisonClick('plot-delta-quadrant',state))}
 function renderComparisonLoss(samples,state){const valid=[];for(const sample of samples){if(!comparisonQuadrant(sample,state).label.startsWith('Q3 strict loss'))continue;const x=Number(sample.ir_node_count),y=Number(sample.g8r_product_loss);if(Number.isFinite(x)&&x>0&&Number.isFinite(y)&&y>0)valid.push({sample,x,y})}byId('loss-positive-count').textContent=String(valid.length);const traces=valid.length?[{type:'scatter',mode:'markers',name:'positive loss',x:valid.map(row=>row.x),y:valid.map(row=>row.y),customdata:valid.map(row=>row.sample),text:valid.map(row=>comparisonHover(row.sample,state)),hovertemplate:'%{text}<br>loss=%{y}<extra></extra>',marker:{size:6,color:'#ff8ea9',opacity:.9}}]:[],dropped=samples.length-valid.length,layout=comparisonLayout(`${state.lhs} product strict-loss amount vs ir nodes [n=${valid.length}, dropped_non_q3_strict_or_nonpositive_or_nonloss=${dropped}]`,'IR node count',`${state.lhs}_product - ${state.rhs}_product (positive = ${state.lhs} worse)`,true,true);if(!valid.length)layout.annotations=[{text:'No strict-loss samples for current filter',showarrow:false,x:.5,y:.5,xref:'paper',yref:'paper',font:{color:'#8fa9be',size:13}}];Plotly.react('plot-loss-vs-ir',traces,layout,comparisonConfig()).then(()=>bindComparisonClick('plot-loss-vs-ir',state))}
-async function showComparisonDetail(sample,sourcePlot,state){state.selectedSampleKey=comparisonSelectionKey(sample);syncComparisonQuery(state);const empty=byId('comparison-detail-empty'),json=byId('comparison-detail-json'),evidence=byId('comparison-detail-evidence');empty.hidden=true;json.hidden=false;json.textContent=JSON.stringify({selection_key:state.selectedSampleKey,selected_from_plot:sourcePlot,selected_at_utc:new Date().toISOString(),...sample},null,2);evidence.textContent='Loading exported structural evidence…';const hash=sample.structural_hash||'';if(!/^[0-9a-f]{64}$/.test(hash)){evidence.textContent='No structural hash is exported for this sample.';return}const key=`ir-fn-corpus-structural.v2/by-hash/${hash.slice(0,2)}/${hash.slice(2,4)}/${hash}.json`,dataset=state.catalog.datasets.find(value=>value.logical_key===key);if(!dataset){evidence.textContent='This snapshot does not contain structural evidence for the selected sample.';return}try{const data=await fetch(base+dataset.url).then(response=>{if(!response.ok)throw Error(`${dataset.url} ${response.status}`);return response.json()}),members=(data.members||[]).filter(member=>member.crate_version===sample.crate_version),member=members.find(value=>value.opt_ir_action_id===sample.ir_action_id&&value.ir_top===sample.ir_top)||members[0];if(!member){evidence.textContent='No matching structural member is present for this crate release.';return}const origin=member.dslx_origin?`${member.dslx_origin.dslx_file} :: ${member.dslx_origin.dslx_fn_name}`:'not exported',mffc=String(sample.ir_top||'').startsWith('__mffc_')?` · <a href='${base}mffc-discrepancies.html?crate_version=${encodeURIComponent(sample.crate_version)}&losses_only=true'>open MFFC IR evidence</a>`:'';evidence.innerHTML=`Structural hash <code>${esc(hash)}</code> · source IR action <code>${esc(member.source_ir_action_id)}</code> · origin ${esc(origin)}${mffc}`}catch(error){evidence.textContent=`Failed loading structural evidence: ${error}`}}
+async function showComparisonDetail(sample,sourcePlot,state){
+  const selectionKey=comparisonSelectionKey(sample),generation=(state.detailGeneration||0)+1;
+  state.selectedSampleKey=selectionKey;
+  state.detailGeneration=generation;
+  syncComparisonQuery(state);
+  const empty=byId('comparison-detail-empty'),json=byId('comparison-detail-json'),evidence=byId('comparison-detail-evidence');
+  empty.hidden=true;
+  json.hidden=false;
+  json.textContent=JSON.stringify({selection_key:selectionKey,selected_from_plot:sourcePlot,selected_at_utc:new Date().toISOString(),...sample},null,2);
+  evidence.textContent='Loading exported structural evidence…';
+  const hash=sample.structural_hash||'';
+  if(!/^[0-9a-f]{64}$/.test(hash)){evidence.textContent='No structural hash is exported for this sample.';return}
+  const key=`ir-fn-corpus-structural.v2/by-hash/${hash.slice(0,2)}/${hash.slice(2,4)}/${hash}.json`,dataset=state.catalog.datasets.find(value=>value.logical_key===key);
+  if(!dataset){evidence.textContent='This snapshot does not contain structural evidence for the selected sample.';return}
+  try{
+    const data=await fetch(base+dataset.url).then(response=>{if(!response.ok)throw Error(`${dataset.url} ${response.status}`);return response.json()});
+    if(!comparisonDetailIsCurrent(state,selectionKey,generation))return;
+    const members=(data.members||[]).filter(member=>member.crate_version===sample.crate_version),member=members.find(value=>value.opt_ir_action_id===sample.ir_action_id&&value.ir_top===sample.ir_top)||members[0];
+    if(!member){evidence.textContent='No matching structural member is present for this crate release.';return}
+    const origin=member.dslx_origin?`${member.dslx_origin.dslx_file} :: ${member.dslx_origin.dslx_fn_name}`:'not exported',mffc=String(sample.ir_top||'').startsWith('__mffc_')?` · <a href='${base}mffc-discrepancies.html?crate_version=${encodeURIComponent(sample.crate_version)}&losses_only=true'>open MFFC IR evidence</a>`:'';
+    evidence.innerHTML=`Structural hash <code>${esc(hash)}</code> · source IR action <code>${esc(member.source_ir_action_id)}</code> · origin ${esc(origin)}${mffc}`;
+  }catch(error){
+    if(!comparisonDetailIsCurrent(state,selectionKey,generation))return;
+    evidence.textContent=`Failed loading structural evidence: ${error}`;
+  }
+}
 function syncComparisonQuery(state){const url=new URL(location.href),maxNodes=Number(byId('comparison-max-ir-nodes').value),version=byId('comparison-crate-version').value,lossesOnly=byId('comparison-sample-mode').value==='losses_only';url.searchParams.set('max_ir_nodes',String(maxNodes));if(version)url.searchParams.set('crate_version',version);else url.searchParams.delete('crate_version');if(lossesOnly)url.searchParams.set('losses_only','true');else url.searchParams.delete('losses_only');if(state.selectedSampleKey)url.searchParams.set('sample',state.selectedSampleKey);else url.searchParams.delete('sample');history.replaceState(null,'',url)}
 function comparisonIsLoss(sample,state){const quadrant=comparisonQuadrant(sample,state);return quadrant.dx < -1e-9 || quadrant.dy < -1e-9}
 function updateComparisonPlots(state){const maxNodes=Number(byId('comparison-max-ir-nodes').value),version=byId('comparison-crate-version').value,lossesOnly=byId('comparison-sample-mode').value==='losses_only',filtered=state.samples.filter(sample=>(!version||sample.crate_version===version)&&Number(sample.ir_node_count)<=maxNodes&&(!lossesOnly||comparisonIsLoss(sample,state)));byId('comparison-max-ir-nodes-value').textContent=maxNodes.toLocaleString();byId('comparison-scope-label').textContent=version?`crate:v${version}`:'all crate versions';byId('comparison-filtered-count').textContent=filtered.length.toLocaleString();byId('comparison-no-data').hidden=filtered.length!==0;renderComparisonPair('plot-levels',`${state.lhs} levels vs ${state.rhs} levels`,`${state.lhs} levels`,`${state.rhs} levels`,filtered,sample=>sample.g8r_levels,sample=>sample.yosys_abc_levels,state);renderComparisonPair('plot-nodes',`${state.lhs} nodes vs ${state.rhs} nodes`,`${state.lhs} nodes`,`${state.rhs} nodes`,filtered,sample=>sample.g8r_nodes,sample=>sample.yosys_abc_nodes,state);renderComparisonQuadrants(filtered,state);renderComparisonLoss(filtered,state);syncComparisonQuery(state)}
-async function comparisonPlots(catalog){const root=byId('comparison-plots');if(!root)return;if(typeof Plotly==='undefined')throw Error('The pinned Plotly library could not be loaded.');const dataset=catalog.datasets.find(value=>value.logical_key===root.dataset.datasetKey);if(!dataset)throw Error('Comparison data is not available in this snapshot.');const data=await fetch(base+dataset.url).then(response=>{if(!response.ok)throw Error(`${dataset.url} ${response.status}`);return response.json()}),samples=(data.dataset?.samples||[]).filter(sample=>Number.isFinite(sample.ir_node_count)&&Number.isFinite(sample.g8r_nodes)&&Number.isFinite(sample.g8r_levels)&&Number.isFinite(sample.yosys_abc_nodes)&&Number.isFinite(sample.yosys_abc_levels)),versions=[...new Set(samples.map(sample=>sample.crate_version))].sort(versionCompare),query=new URLSearchParams(location.search),min=Math.max(0,Number(data.dataset?.min_ir_nodes)||0),max=Math.max(min,Number(data.dataset?.max_ir_nodes)||min),requestedMax=Number(query.get('max_ir_nodes')),slider=byId('comparison-max-ir-nodes'),version=byId('comparison-crate-version'),mode=byId('comparison-sample-mode');comparisonState={catalog,samples,lhs:root.dataset.lhsLabel,rhs:root.dataset.rhsLabel,selectedSampleKey:query.get('sample')};slider.min=String(min);slider.max=String(max);slider.value=String(Number.isFinite(requestedMax)&&requestedMax>=min?Math.min(requestedMax,max):max);version.innerHTML=`<option value=''>all crate versions</option>`+versions.map(value=>`<option value='${esc(value)}'>crate:v${esc(value)}</option>`).join('');version.value=versions.includes(query.get('crate_version'))?query.get('crate_version'):'';mode.value=query.get('losses_only')==='true'?'losses_only':'all';byId('comparison-total-count').textContent=samples.length.toLocaleString();slider.addEventListener('input',()=>updateComparisonPlots(comparisonState));version.addEventListener('change',()=>updateComparisonPlots(comparisonState));mode.addEventListener('change',()=>updateComparisonPlots(comparisonState));updateComparisonPlots(comparisonState);if(comparisonState.selectedSampleKey){const sample=samples.find(value=>comparisonSelectionKey(value)===comparisonState.selectedSampleKey);if(sample)showComparisonDetail(sample,'query',comparisonState);else{comparisonState.selectedSampleKey=null;syncComparisonQuery(comparisonState)}}}
+async function comparisonPlots(catalog){const root=byId('comparison-plots');if(!root)return;if(typeof Plotly==='undefined')throw Error('The pinned Plotly library could not be loaded.');const dataset=catalog.datasets.find(value=>value.logical_key===root.dataset.datasetKey);if(!dataset)throw Error('Comparison data is not available in this snapshot.');const data=await fetch(base+dataset.url).then(response=>{if(!response.ok)throw Error(`${dataset.url} ${response.status}`);return response.json()}),samples=(data.dataset?.samples||[]).filter(sample=>Number.isFinite(sample.ir_node_count)&&Number.isFinite(sample.g8r_nodes)&&Number.isFinite(sample.g8r_levels)&&Number.isFinite(sample.yosys_abc_nodes)&&Number.isFinite(sample.yosys_abc_levels)),versions=[...new Set(samples.map(sample=>sample.crate_version))].sort(versionCompare),query=new URLSearchParams(location.search),min=Math.max(0,Number(data.dataset?.min_ir_nodes)||0),max=Math.max(min,Number(data.dataset?.max_ir_nodes)||min),requestedMax=Number(query.get('max_ir_nodes')),slider=byId('comparison-max-ir-nodes'),version=byId('comparison-crate-version'),mode=byId('comparison-sample-mode');comparisonState={catalog,samples,lhs:root.dataset.lhsLabel,rhs:root.dataset.rhsLabel,selectedSampleKey:query.get('sample')};slider.min=String(min);slider.max=String(max);slider.value=String(Number.isFinite(requestedMax)&&requestedMax>=min?Math.min(requestedMax,max):max);version.innerHTML=`<option value=''>all crate versions</option>`+versions.map(value=>`<option value='${esc(value)}'>crate:v${esc(value)}</option>`).join('');version.value=comparisonDefaultVersion(versions,query.get('crate_version'));mode.value=query.get('losses_only')==='true'?'losses_only':'all';byId('comparison-total-count').textContent=samples.length.toLocaleString();slider.addEventListener('input',()=>updateComparisonPlots(comparisonState));version.addEventListener('change',()=>updateComparisonPlots(comparisonState));mode.addEventListener('change',()=>updateComparisonPlots(comparisonState));updateComparisonPlots(comparisonState);if(comparisonState.selectedSampleKey){const sample=samples.find(value=>comparisonSelectionKey(value)===comparisonState.selectedSampleKey);if(sample)showComparisonDetail(sample,'query',comparisonState);else{comparisonState.selectedSampleKey=null;syncComparisonQuery(comparisonState)}}}
 async function datasetExplorer(catalog){const select=byId('dataset');if(!select)return;for(const d of catalog.datasets){const o=document.createElement('option');o.value=d.logical_key;o.textContent=`${d.logical_key} (${d.bytes.toLocaleString()} B)`;select.appendChild(o)}const q=new URLSearchParams(location.search).get('key');if(q&&catalog.datasets.some(d=>d.logical_key===q))select.value=q;async function load(){const d=catalog.datasets.find(x=>x.logical_key===select.value);history.replaceState(null,'','?key='+encodeURIComponent(d.logical_key));byId('dataset-meta').textContent=`sha256 ${d.sha256} · ${d.bytes.toLocaleString()} bytes`;const data=await fetch(base+d.url).then(r=>{if(!r.ok)throw Error(`${d.url} ${r.status}`);return r.json()});const found=arrays(data),rows=found[0]?.[1]||[];byId('plot').innerHTML=renderPlot(rows);byId('table').innerHTML=found.length?`<h2>Rows: ${esc(found[0][0])}</h2>${renderTable(rows)}`:'<p class=muted>No tabular row arrays found.</p>';byId('raw').textContent=JSON.stringify(data,null,2)}select.addEventListener('change',load);if(catalog.datasets.length)await load()}
 function progressionUnavailable(root,message){root.querySelector('.toolbar').hidden=true;byId('progression-summary').innerHTML='';byId('progression-chart').innerHTML=`<p class=muted>${esc(message)}</p>`;byId('progression-table').innerHTML=''}
 async function progression(catalog){const root=byId('progression');if(!root)return;const key=root.dataset.datasetKey,dataset=catalog.datasets.find(d=>d.logical_key===key);if(!dataset){progressionUnavailable(root,'Release progression data is not available in this snapshot.');return}const data=await fetch(base+dataset.url).then(r=>{if(!r.ok)throw Error(`${dataset.url} ${r.status}`);return r.json()}),samples=data.dataset?.samples||[];let generations;try{generations=releaseGenerations(catalog,samples)}catch(error){progressionUnavailable(root,`Release progression data is ambiguous: ${error.message}`);return}const completeGenerations=generations.filter(g=>g.status==='complete'),completeVersions=[...new Set(completeGenerations.map(g=>g.version))].sort(versionCompare);if(completeVersions.length<2){const missingLineage=samples.length&&!samples.some(s=>s.stdlib_root_action_id),degradedCount=generations.length-completeGenerations.length,detail=missingLineage?'This snapshot predates exact run-lineage metadata and must be rebuilt.':completeVersions.length===1?`Only v${completeVersions[0]} has populated complete-run samples.`:'No populated complete-run samples are available.',degraded=degradedCount?` ${degradedCount.toLocaleString()} degraded run generation(s) were excluded because partial populations can bias the result.`:'';progressionUnavailable(root,`At least two populated complete crate releases are needed for a progression comparison. ${detail}${degraded}`);return}const stats=releaseStats(completeGenerations);byId('progression-chart').innerHTML=progressionChart(stats);const baseline=byId('baseline-version'),current=byId('current-version'),options=generations.map(g=>`<option value='${g.run_id}'>v${esc(g.version)} · run ${esc(g.run_id.slice(0,12))} · ${esc(g.status)} · ${g.samples.length.toLocaleString()} samples</option>`).join('');baseline.innerHTML=options;current.innerHTML=options;const preferredByVersion=new Map;for(const generation of completeGenerations)preferredByVersion.set(generation.version,generation);baseline.value=preferredByVersion.get(completeVersions.at(-2)).run_id;current.value=preferredByVersion.get(completeVersions.at(-1)).run_id;const render=()=>renderPair(generations,baseline.value,current.value);baseline.addEventListener('change',render);current.addEventListener('change',render);render()}
@@ -2335,7 +2362,7 @@ global.document = {
 };
 const app = fs.readFileSync(0, 'utf8');
 const prefix = app.slice(0, app.indexOf('async function main()'));
-const api = new Function(prefix + '\nreturn {comparisonIsLoss,comparisonQuadrant,comparisonSelectionKey};')();
+const api = new Function(prefix + '\nreturn {comparisonDefaultVersion,comparisonIsLoss,comparisonQuadrant,comparisonSelectionKey};')();
 const state = {lhs: 'G8r', rhs: 'Yosys/ABC'};
 const sample = (g8r_nodes, g8r_levels, yosys_abc_nodes, yosys_abc_levels) => ({
   g8r_nodes,
@@ -2363,6 +2390,20 @@ const key = api.comparisonSelectionKey({g8r_stats_action_id: 'g', yosys_abc_stat
 if (key !== 'g:y') {
   throw new Error(`unexpected selection key: ${key}`);
 }
+const versions = ['0.9.0', '0.10.0'];
+if (api.comparisonDefaultVersion(versions, null) !== '0.10.0') {
+  throw new Error('missing version did not default to latest');
+}
+if (api.comparisonDefaultVersion(versions, '0.9.0') !== '0.9.0') {
+  throw new Error('valid requested version was not preserved');
+}
+if (api.comparisonDefaultVersion(versions, 'invalid') !== '0.10.0') {
+  throw new Error('invalid requested version did not default to latest');
+}
+if (api.comparisonDefaultVersion([], null) !== '') {
+  throw new Error('empty version list did not stay empty');
+}
+
 "#;
         let mut child = match Command::new("node")
             .arg("-e")
@@ -2389,6 +2430,112 @@ if (key !== 'g:y') {
         assert!(
             output.status.success(),
             "embedded JavaScript test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn comparison_javascript_ignores_stale_evidence_fetches() {
+        const SCRIPT: &str = r#"
+const fs = require('fs');
+const elements = {
+  'comparison-detail-empty': {hidden: false},
+  'comparison-detail-json': {hidden: true, textContent: ''},
+  'comparison-detail-evidence': {textContent: '', innerHTML: ''},
+  'comparison-max-ir-nodes': {value: '100'},
+  'comparison-crate-version': {value: '0.31.0'},
+  'comparison-sample-mode': {value: 'all'},
+};
+global.document = {
+  querySelector: () => ({content: ''}),
+  getElementById: id => elements[id] || null,
+};
+global.location = {href: 'https://example.test/plots'};
+global.history = {replaceState: () => {}};
+const pending = new Map();
+global.fetch = url => new Promise(resolve => pending.set(url, resolve));
+const app = fs.readFileSync(0, 'utf8');
+const prefix = app.slice(0, app.indexOf('async function main()'));
+const api = new Function(prefix + '\nreturn {showComparisonDetail};')();
+const firstHash = '1'.repeat(64);
+const secondHash = '2'.repeat(64);
+const datasetKey = hash => `ir-fn-corpus-structural.v2/by-hash/${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}.json`;
+const state = {
+  catalog: {datasets: [
+    {logical_key: datasetKey(firstHash), url: 'first.json'},
+    {logical_key: datasetKey(secondHash), url: 'second.json'},
+  ]},
+  lhs: 'G8r',
+  rhs: 'Yosys/ABC',
+  selectedSampleKey: null,
+};
+const sample = (name, hash) => ({
+  fn_key: name,
+  crate_version: '0.31.0',
+  dso_version: '0.54.7',
+  ir_node_count: 10,
+  ir_action_id: `action-${name}`,
+  ir_top: `top-${name}`,
+  structural_hash: hash,
+  g8r_stats_action_id: `g8r-${name}`,
+  yosys_abc_stats_action_id: `yabc-${name}`,
+});
+const response = name => ({
+  ok: true,
+  json: async () => ({members: [{
+    crate_version: '0.31.0',
+    opt_ir_action_id: `action-${name}`,
+    ir_top: `top-${name}`,
+    source_ir_action_id: `source-${name}`,
+    dslx_origin: {dslx_file: `${name}.x`, dslx_fn_name: name},
+  }]}),
+});
+(async () => {
+  const first = api.showComparisonDetail(sample('first', firstHash), 'plot-levels', state);
+  const second = api.showComparisonDetail(sample('second', secondHash), 'plot-nodes', state);
+  pending.get('second.json')(response('second'));
+  await second;
+  const secondHtml = elements['comparison-detail-evidence'].innerHTML;
+  if (!secondHtml.includes(secondHash) || !secondHtml.includes('source-second')) {
+    throw new Error(`second selection did not render: ${secondHtml}`);
+  }
+  pending.get('first.json')(response('first'));
+  await first;
+  const finalHtml = elements['comparison-detail-evidence'].innerHTML;
+  if (finalHtml !== secondHtml || finalHtml.includes(firstHash) || finalHtml.includes('source-first')) {
+    throw new Error(`stale first selection replaced second: ${finalHtml}`);
+  }
+})().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"#;
+        let mut child = match Command::new("node")
+            .arg("-e")
+            .arg(SCRIPT)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping embedded JavaScript race test: node is unavailable");
+                return;
+            }
+            Err(error) => panic!("starting node: {error}"),
+        };
+        child
+            .stdin
+            .take()
+            .expect("node stdin")
+            .write_all(APP_JS.as_bytes())
+            .expect("write embedded JavaScript");
+        let output = child.wait_with_output().expect("wait for node");
+        assert!(
+            output.status.success(),
+            "embedded JavaScript race test failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
