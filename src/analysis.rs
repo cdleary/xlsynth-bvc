@@ -979,6 +979,7 @@ mod tests {
             fn_key: "stdlib::subject".to_string(),
             crate_version: "0.31.0".to_string(),
             dso_version: "0.30.0".to_string(),
+            stdlib_root_action_id: None,
             ir_action_id: ir_id,
             ir_top: None,
             structural_hash: None,
@@ -1172,6 +1173,7 @@ mod tests {
                 .expect("dso version")
                 .value
                 .clone(),
+            stdlib_root_action_id: None,
             ir_action_id,
             ir_top: None,
             structural_hash: Some("a".repeat(64)),

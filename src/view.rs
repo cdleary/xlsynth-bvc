@@ -523,6 +523,8 @@ pub(crate) struct StdlibG8rVsYosysSample {
     pub(crate) fn_key: String,
     pub(crate) crate_version: String,
     pub(crate) dso_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stdlib_root_action_id: Option<String>,
     pub(crate) ir_action_id: String,
     pub(crate) ir_top: Option<String>,
     #[serde(default)]

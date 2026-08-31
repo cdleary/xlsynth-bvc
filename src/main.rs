@@ -23,6 +23,7 @@ mod proto;
 mod publish;
 mod query;
 mod queue;
+mod queue_progress;
 mod runtime;
 mod service;
 mod site;

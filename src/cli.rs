@@ -126,6 +126,22 @@ pub enum TopCommand {
     ShowQueueRecord {
         action_id: String,
     },
+    /// Watch filesystem queue records without opening the artifact database.
+    WatchQueue {
+        #[arg(long, default_value_t = 2.5)]
+        interval_seconds: f64,
+        #[arg(long, default_value_t = 8)]
+        running_limit: usize,
+        /// Print one snapshot and exit.
+        #[arg(long)]
+        once: bool,
+        /// Exit after both pending and running counts reach zero.
+        #[arg(long)]
+        exit_when_idle: bool,
+        /// Emit JSON snapshots instead of the terminal dashboard.
+        #[arg(long)]
+        json: bool,
+    },
     DrainQueue {
         #[arg(long)]
         limit: Option<usize>,

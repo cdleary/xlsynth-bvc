@@ -1880,6 +1880,7 @@ mod tests {
                 fn_key: "foo".to_string(),
                 crate_version: "0.40.0".to_string(),
                 dso_version: "0.39.0".to_string(),
+                stdlib_root_action_id: None,
                 ir_action_id: "ir".to_string(),
                 ir_top: None,
                 structural_hash: None,

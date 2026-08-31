@@ -306,6 +306,9 @@ fn validate_comparison_sample(field: &str, sample: &StdlibG8rVsYosysSample) -> R
     )?;
     validate_version(&format!("{field}.crate_version"), &sample.crate_version)?;
     validate_version(&format!("{field}.dso_version"), &sample.dso_version)?;
+    if let Some(action_id) = &sample.stdlib_root_action_id {
+        validate_hex_digest(&format!("{field}.stdlib_root_action_id"), action_id)?;
+    }
     for (name, action_id) in [
         ("ir_action_id", &sample.ir_action_id),
         ("g8r_stats_action_id", &sample.g8r_stats_action_id),
@@ -1042,6 +1045,46 @@ mod tests {
         .unwrap_err();
         assert!(
             format!("{error:#}").contains("inconsistent derived comparison metrics"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn public_projection_rejects_invalid_stdlib_root_lineage_digest() {
+        let mut value = empty_comparison_value(
+            crate::WEB_STDLIB_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+            false,
+            false,
+        );
+        value["dataset"]["available_crate_versions"] = json!(["0.35.0"]);
+        value["dataset"]["samples"] = json!([{
+            "fn_key": "xls/dslx/stdlib/sample.x::sample",
+            "crate_version": "0.35.0",
+            "dso_version": "0.35.0",
+            "stdlib_root_action_id": "not-a-digest",
+            "ir_action_id": "1".repeat(64),
+            "ir_top": "__sample",
+            "structural_hash": null,
+            "ir_node_count": 8,
+            "g8r_nodes": 10.0,
+            "g8r_levels": 2.0,
+            "yosys_abc_nodes": 5.0,
+            "yosys_abc_levels": 3.0,
+            "g8r_product": 20.0,
+            "yosys_abc_product": 15.0,
+            "g8r_product_loss": 5.0,
+            "g8r_stats_action_id": "2".repeat(64),
+            "yosys_abc_stats_action_id": "3".repeat(64)
+        }]);
+
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
+            &serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("stdlib_root_action_id must be a lowercase 64-character hex digest"),
             "unexpected error: {error:#}"
         );
     }
