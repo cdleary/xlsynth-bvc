@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crate::app;
 use crate::executor::{
     compute_action_id, contains_ir_text_id, discover_dslx_fn_to_ir_suggestions,
-    extract_ir_fn_block_by_name, max_ir_text_id,
+    extract_ir_fn_block_by_name, extract_ir_ret_text_id,
 };
 use crate::model::*;
 use crate::proto::{decode_queue_canceled, decode_queue_running};
@@ -1243,9 +1243,10 @@ pub(crate) struct MffcIrIndexEntry {
     pub(crate) crate_version: String,
     pub(crate) dso_version: String,
     pub(crate) rank: u64,
-    pub(crate) root_node_index: u64,
+    pub(crate) source_root_node_index: u64,
+    pub(crate) source_root_text_id: u64,
     pub(crate) root_ir_text_id: u64,
-    pub(crate) frontier_node_indices: Vec<u64>,
+    pub(crate) source_frontier_node_indices: Vec<u64>,
     pub(crate) frontier_non_literal_count: u64,
     pub(crate) internal_non_literal_count: u64,
     pub(crate) included_node_count: u64,
@@ -2367,11 +2368,6 @@ pub(crate) fn build_mffc_ir_index_bytes_for_paired_index(
         let source_ir_action_id = manifest.source_ir_action_id.clone();
         let source_ir_top = manifest.source_ir_top.clone();
         let output_ir_relpath = manifest.output_ir_relpath.clone();
-        let manifest_entry_order = manifest
-            .entries
-            .iter()
-            .map(|entry| entry.fn_name.clone())
-            .collect::<Vec<_>>();
         let manifest_entries = manifest
             .entries
             .into_iter()
@@ -2385,24 +2381,6 @@ pub(crate) fn build_mffc_ir_index_bytes_for_paired_index(
         let package_path = store.resolve_artifact_ref_path(&package_ref);
         let package_text = fs::read_to_string(&package_path)
             .with_context(|| format!("reading MFFC IR package: {}", package_path.display()))?;
-        let mut next_text_id_offset = 0u64;
-        let mut text_id_offsets = BTreeMap::new();
-        for fn_name in manifest_entry_order {
-            let ir_text =
-                extract_ir_fn_block_by_name(&package_text, &fn_name).with_context(|| {
-                    format!("extracting MFFC IR top {fn_name} from action {ir_action_id}")
-                })?;
-            if text_id_offsets
-                .insert(fn_name.clone(), next_text_id_offset)
-                .is_some()
-            {
-                bail!("MFFC manifest action {ir_action_id} has duplicate top {fn_name}");
-            }
-            next_text_id_offset = max_ir_text_id(&ir_text).checked_add(1).with_context(|| {
-                format!("MFFC IR text-id offset overflow in action {ir_action_id}")
-            })?;
-        }
-
         for (ir_top, (crate_version, dso_version)) in requested_tops {
             if crate_version != expected_crate_version || dso_version != expected_dso_version {
                 bail!(
@@ -2418,14 +2396,9 @@ pub(crate) fn build_mffc_ir_index_bytes_for_paired_index(
                 extract_ir_fn_block_by_name(&package_text, &ir_top).with_context(|| {
                     format!("extracting MFFC IR top {ir_top} from action {ir_action_id}")
                 })?;
-            let root_ir_text_id = manifest_entry
-                .root_text_id
-                .checked_add(*text_id_offsets.get(&ir_top).with_context(|| {
-                    format!("MFFC action {ir_action_id} has no text-id offset for top {ir_top}")
-                })?)
-                .with_context(|| {
-                    format!("MFFC root text-id overflow in action {ir_action_id} top {ir_top}")
-                })?;
+            let root_ir_text_id = extract_ir_ret_text_id(&ir_text).with_context(|| {
+                format!("extracting root text id from MFFC action {ir_action_id} top {ir_top}")
+            })?;
             entries.push(MffcIrIndexEntry {
                 ir_action_id: ir_action_id.clone(),
                 ir_top,
@@ -2436,9 +2409,10 @@ pub(crate) fn build_mffc_ir_index_bytes_for_paired_index(
                 crate_version,
                 dso_version,
                 rank: manifest_entry.rank,
-                root_node_index: manifest_entry.root_node_index,
+                source_root_node_index: manifest_entry.root_node_index,
+                source_root_text_id: manifest_entry.root_text_id,
                 root_ir_text_id,
-                frontier_node_indices: manifest_entry.frontier_leaf_indices.clone(),
+                source_frontier_node_indices: manifest_entry.frontier_leaf_indices.clone(),
                 frontier_non_literal_count: manifest_entry.frontier_non_literal_count,
                 internal_non_literal_count: manifest_entry.internal_non_literal_count,
                 included_node_count: manifest_entry.included_node_count,
@@ -8254,7 +8228,7 @@ mod tests {
                     source_index: 0,
                     rank: 0,
                     root_node_index: 3,
-                    root_text_id: 1,
+                    root_text_id: 34,
                     frontier_leaf_indices: vec![0],
                     frontier_non_literal_count: 1,
                     internal_non_literal_count: 1,
@@ -8270,7 +8244,7 @@ mod tests {
                     source_index: 1,
                     rank: 3,
                     root_node_index: 7,
-                    root_text_id: 1,
+                    root_text_id: 70,
                     frontier_leaf_indices: vec![1, 2],
                     frontier_non_literal_count: 2,
                     internal_non_literal_count: 12,
@@ -8340,9 +8314,10 @@ mod tests {
             index.entries[0].source_structural_hash,
             source_structural_hash
         );
-        assert_eq!(index.entries[0].root_node_index, 7);
+        assert_eq!(index.entries[0].source_root_node_index, 7);
+        assert_eq!(index.entries[0].source_root_text_id, 70);
         assert_eq!(index.entries[0].root_ir_text_id, 3);
-        assert_eq!(index.entries[0].frontier_node_indices, vec![1, 2]);
+        assert_eq!(index.entries[0].source_frontier_node_indices, vec![1, 2]);
         assert!(index.entries[0].ir_text.contains("identity(x, id=3)"));
         crate::query::canonicalize_public_web_index_json(
             crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME,

@@ -631,7 +631,7 @@ fn validate_mffc_ir_index(index: &MffcIrIndexFile) -> Result<()> {
         if entry.included_node_count == 0
             || entry.score_denominator == 0
             || entry
-                .frontier_node_indices
+                .source_frontier_node_indices
                 .windows(2)
                 .any(|pair| pair[0] >= pair[1])
         {
