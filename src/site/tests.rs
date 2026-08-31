@@ -253,7 +253,7 @@ return Promise.resolve();
 };
 const app = fs.readFileSync(0, 'utf8');
 const prefix = app.slice(0, app.indexOf('async function main()'));
-const api = new Function(prefix + '\nreturn {homepageSummary,homepageExplorerHref,homepagePairPlot};')();
+const api = new Function(prefix + '\nreturn {homepageSummary,homepageExplorerHref,homepagePairPlot,renderComparisonPair};')();
 const sample = (crate_version, fn_key, g8r_nodes, g8r_levels, yosys_abc_nodes, yosys_abc_levels, g8r_product_loss, ir_top = fn_key) => ({
   crate_version,
   fn_key,
@@ -292,6 +292,12 @@ api.homepagePairPlot('large-test-plot', largeSamples, 'lhs', 'rhs', value => val
 const referenceLine = capturedTraces.at(-1);
 if (JSON.stringify(referenceLine.x) !== JSON.stringify([1, 70001]) || JSON.stringify(referenceLine.y) !== JSON.stringify([1, 70001])) {
   throw new Error('unexpected large-corpus bounds: ' + JSON.stringify(referenceLine));
+}
+
+api.renderComparisonPair('large-explorer-plot', 'large explorer', 'lhs', 'rhs', largeSamples, value => value.g8r_nodes, value => value.yosys_abc_nodes, {lhs: 'lhs', rhs: 'rhs'});
+const explorerReferenceLine = capturedTraces.at(-1);
+if (JSON.stringify(explorerReferenceLine.x) !== JSON.stringify([1, 70001]) || JSON.stringify(explorerReferenceLine.y) !== JSON.stringify([1, 70001])) {
+  throw new Error('unexpected large-explorer bounds: ' + JSON.stringify(explorerReferenceLine));
 }
 
 const href = api.homepageExplorerHref({
