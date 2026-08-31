@@ -13,3 +13,4 @@
 /.sled/
 /*.sled/
 /snapshot/
+/.wrangler/
