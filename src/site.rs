@@ -32,7 +32,7 @@ const PLOTLY_NOTICE_ASSET_NAME: &str = "plotly-2.35.2.min.js.LICENSE.txt";
 const PLOTLY_NOTICE: &[u8] =
     include_bytes!("../third_party/plotly/plotly-2.35.2.min.js.LICENSE.txt");
 
-const STYLE_CSS: &str = r#":root{color-scheme:light dark;--bg:#0d1117;--panel:#161b22;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--line:#30363d;--good:#3fb950;--bad:#f85149}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}header,main{max-width:1180px;margin:auto;padding:24px}header{border-bottom:1px solid var(--line)}a{color:var(--accent)}h1,h2{font-family:ui-sans-serif,system-ui,sans-serif}.meta,.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}#mffc-summary{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.card.warning-card{border-color:var(--bad)}.card code{overflow-wrap:anywhere}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:16px 0}select,input{font:inherit;padding:7px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px}pre{max-height:62vh;overflow:auto;background:#010409;padding:14px;border:1px solid var(--line);border-radius:8px}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border:1px solid var(--line);padding:6px;text-align:left;vertical-align:top}th{position:sticky;top:0;background:var(--panel)}.table-wrap{max-height:60vh;overflow:auto}#plot>svg,.progression-chart>svg{width:100%;height:300px;background:var(--panel);border:1px solid var(--line)}.progression-chart>svg{height:auto;min-height:320px}.chart-grid{stroke:var(--line);stroke-width:1}.chart-axis{fill:var(--muted);font-size:12px}.chart-title{fill:var(--text);font-size:13px}.chart-line{fill:none;stroke-width:2.5}.chart-line-median{stroke:var(--accent)}.chart-line-p90{stroke:var(--muted)}.chart-dot-median{fill:var(--accent)}.chart-dot-p90{fill:var(--muted)}.delta-regressed{color:var(--bad)}.delta-improved{color:var(--good)}.delta-same{color:var(--muted)}.stat-value{font:500 24px/1.2 ui-sans-serif,system-ui,sans-serif;margin:.2rem 0}.chart-legend{display:flex;gap:18px;flex-wrap:wrap;margin:.5rem 0 1rem}.legend-swatch{display:inline-block;width:18px;height:3px;vertical-align:middle;margin-right:6px}.legend-median{background:var(--accent)}.legend-p90{background:var(--muted)}.loss-list{display:grid;gap:8px;margin:12px 0 24px}.loss-row{display:grid;grid-template-columns:minmax(220px,2fr) minmax(220px,5fr) minmax(90px,auto);gap:10px;align-items:center}.loss-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.loss-progress{width:100%;height:16px;accent-color:var(--bad)}.loss-value{color:var(--bad);text-align:right}.sample-link{font:inherit;color:var(--accent);background:none;border:0;padding:0;text-decoration:underline;cursor:pointer;text-align:left}.sample-detail{margin:20px 0;padding:16px;background:var(--panel);border:1px solid var(--line);border-radius:10px}.sample-detail h2{margin-top:0}.sample-detail code{overflow-wrap:anywhere}.nowrap{white-space:nowrap}.comparison-header,.comparison-page{max-width:1600px}.comparison-controls{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}.comparison-range{width:min(520px,88vw);accent-color:var(--accent)}.comparison-status{display:flex;gap:18px;flex-wrap:wrap;margin:.7rem 0 0}.plot-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:16px}.plot-panel{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px}.plot-title{margin:2px 4px 0;font-size:.92rem;color:#a6ddff}.plotly-host{width:100%;min-height:400px}.comparison-detail{margin-top:16px}.comparison-detail pre{max-height:40vh}.comparison-nav{display:flex;gap:12px;flex-wrap:wrap}@media(max-width:980px){.plot-grid{grid-template-columns:1fr}}@media(max-width:720px){.loss-row{grid-template-columns:1fr}.loss-value{text-align:left}.plotly-host{min-height:340px}}"#;
+const STYLE_CSS: &str = r#":root{color-scheme:light dark;--bg:#0d1117;--panel:#161b22;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--line:#30363d;--good:#3fb950;--bad:#f85149}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}header,main{max-width:1180px;margin:auto;padding:24px}header{border-bottom:1px solid var(--line)}a{color:var(--accent)}h1,h2{font-family:ui-sans-serif,system-ui,sans-serif}.meta,.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}#mffc-summary{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}.card.warning-card{border-color:var(--bad)}.card code{overflow-wrap:anywhere}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:16px 0}select,input{font:inherit;padding:7px;background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:6px}pre{max-height:62vh;overflow:auto;background:#010409;padding:14px;border:1px solid var(--line);border-radius:8px}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border:1px solid var(--line);padding:6px;text-align:left;vertical-align:top}th{position:sticky;top:0;background:var(--panel)}.table-wrap{max-height:60vh;overflow:auto}#plot>svg,.progression-chart>svg{width:100%;height:300px;background:var(--panel);border:1px solid var(--line)}.progression-chart>svg{height:auto;min-height:320px}.chart-grid{stroke:var(--line);stroke-width:1}.chart-axis{fill:var(--muted);font-size:12px}.chart-title{fill:var(--text);font-size:13px}.chart-line{fill:none;stroke-width:2.5}.chart-line-median{stroke:var(--accent)}.chart-line-p90{stroke:var(--muted)}.chart-dot-median{fill:var(--accent)}.chart-dot-p90{fill:var(--muted)}.delta-regressed{color:var(--bad)}.delta-improved{color:var(--good)}.delta-same{color:var(--muted)}.stat-value{font:500 24px/1.2 ui-sans-serif,system-ui,sans-serif;margin:.2rem 0}.chart-legend{display:flex;gap:18px;flex-wrap:wrap;margin:.5rem 0 1rem}.legend-swatch{display:inline-block;width:18px;height:3px;vertical-align:middle;margin-right:6px}.legend-median{background:var(--accent)}.legend-p90{background:var(--muted)}.loss-list{display:grid;gap:8px;margin:12px 0 24px}.loss-row{display:grid;grid-template-columns:minmax(220px,2fr) minmax(220px,5fr) minmax(90px,auto);gap:10px;align-items:center}.loss-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.loss-progress{width:100%;height:16px;accent-color:var(--bad)}.loss-value{color:var(--bad);text-align:right}.sample-link{font:inherit;color:var(--accent);background:none;border:0;padding:0;text-decoration:underline;cursor:pointer;text-align:left}.sample-detail{margin:20px 0;padding:16px;background:var(--panel);border:1px solid var(--line);border-radius:10px}.sample-detail h2{margin-top:0}.sample-detail code{overflow-wrap:anywhere}.nowrap{white-space:nowrap}.comparison-header,.comparison-page{max-width:1600px}.comparison-controls{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}.comparison-range{width:min(520px,88vw);accent-color:var(--accent)}.comparison-status{display:flex;gap:18px;flex-wrap:wrap;margin:.7rem 0 0}.plot-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:16px}.plot-panel{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px}.plot-title{margin:2px 4px 0;font-size:.92rem;color:#a6ddff}.plotly-host{width:100%;min-height:400px}.comparison-detail{margin-top:16px}.comparison-detail pre{max-height:40vh}.comparison-nav{display:flex;gap:12px;flex-wrap:wrap}.science-header,.science-main{max-width:1480px}.science-header{padding-top:20px;padding-bottom:18px}.science-topline{display:flex;align-items:flex-start;justify-content:space-between;gap:32px}.science-label{margin:0 0 5px;color:#7fb9e8;font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}.science-header h1{margin:0;font-size:clamp(1.65rem,3vw,2.35rem);line-height:1.08;letter-spacing:-.025em}.science-nav{display:flex;gap:18px;flex-wrap:wrap;padding-top:7px;font-size:13px}.science-nav a,.analysis-link,.publication-bar a{color:var(--text);text-decoration:none}.science-nav a:hover,.analysis-link:hover strong,.publication-bar a:hover{color:var(--accent)}.science-abstract{max-width:900px;margin:12px 0 0;color:#a8b2bf}.science-meta{display:flex;gap:24px;flex-wrap:wrap;margin:14px 0 0;font-size:12px;font-variant-numeric:tabular-nums}.science-meta div{display:flex;gap:7px}.science-meta dt{color:var(--muted)}.science-meta dd{margin:0}.science-main{padding-top:22px;padding-bottom:52px}.overview-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-bottom:14px}.overview-heading h2{margin:0;font-size:1.32rem}.overview-heading p{margin:4px 0 0}.text-link{white-space:nowrap;font-size:13px}.metric-row{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));margin:0 0 14px;border:1px solid var(--line);background:#11161d;font-variant-numeric:tabular-nums}.metric-row div{min-width:0;padding:12px 14px;border-right:1px solid var(--line)}.metric-row div:last-child{border-right:0}.metric-row dt{color:var(--muted);font-size:11px;letter-spacing:.05em;text-transform:uppercase}.metric-row dd{margin:4px 0 0;font:650 1.18rem/1.25 ui-sans-serif,system-ui,sans-serif;overflow-wrap:anywhere}.home-plot-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.home-chart-panel{min-width:0;border:1px solid var(--line);background:#11161d}.home-chart-header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:10px 12px;border-bottom:1px solid var(--line)}.home-chart-header h3{margin:0;font:650 .88rem/1.3 ui-sans-serif,system-ui,sans-serif}.home-chart-header span{color:var(--muted);font-size:11px}.home-plot{width:100%;min-height:330px}.home-plot .point{cursor:pointer}.analysis-index{margin-top:22px;border-top:1px solid var(--line)}.analysis-index-header{display:flex;align-items:baseline;justify-content:space-between;gap:24px;padding:17px 0 10px}.analysis-index h2{margin:0;font-size:1.12rem}.analysis-index-header p{margin:0;color:var(--muted);font-size:12px}.analysis-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border-top:1px solid var(--line);border-left:1px solid var(--line)}.analysis-link{display:grid;grid-template-columns:34px minmax(0,1fr) auto;gap:11px;align-items:start;padding:14px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.analysis-link>span:first-child{color:var(--muted);font-size:11px}.analysis-link strong{display:block;font-family:ui-sans-serif,system-ui,sans-serif}.analysis-link small{display:block;margin-top:3px;color:var(--muted);line-height:1.4}.analysis-link>span:last-child{color:var(--accent)}.publication-bar{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-top:18px;padding-top:14px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}.publication-bar nav{display:flex;gap:18px;flex-wrap:wrap}.science-nav a:focus-visible,.analysis-link:focus-visible,.publication-bar a:focus-visible,.text-link:focus-visible{outline:2px solid #88c7ff;outline-offset:3px}@media(max-width:980px){.metric-row{grid-template-columns:repeat(3,minmax(0,1fr))}.metric-row div{border-bottom:1px solid var(--line)}.home-plot-grid{grid-template-columns:1fr}}@media(max-width:700px){.science-topline,.overview-heading,.analysis-index-header{align-items:flex-start;flex-direction:column;gap:10px}.metric-row{grid-template-columns:repeat(2,minmax(0,1fr))}.analysis-list{grid-template-columns:1fr}.science-meta{gap:10px 18px}.home-plot{min-height:300px}}@media(max-width:980px){.plot-grid{grid-template-columns:1fr}}@media(max-width:720px){.loss-row{grid-template-columns:1fr}.loss-value{text-align:left}.plotly-host{min-height:340px}}"#;
 
 const APP_JS: &str = r#"const base=document.querySelector('meta[name=bvc-site-root]').content;
 const byId=id=>document.getElementById(id);
@@ -130,10 +130,19 @@ function syncComparisonQuery(state){const url=new URL(location.href),maxNodes=Nu
 function comparisonIsLoss(sample,state){const quadrant=comparisonQuadrant(sample,state);return quadrant.dx < -1e-9 || quadrant.dy < -1e-9}
 function updateComparisonPlots(state){const maxNodes=Number(byId('comparison-max-ir-nodes').value),version=byId('comparison-crate-version').value,lossesOnly=byId('comparison-sample-mode').value==='losses_only',filtered=state.samples.filter(sample=>(!version||sample.crate_version===version)&&Number(sample.ir_node_count)<=maxNodes&&(!lossesOnly||comparisonIsLoss(sample,state)));byId('comparison-max-ir-nodes-value').textContent=maxNodes.toLocaleString();byId('comparison-scope-label').textContent=version?`crate:v${version}`:'all crate versions';byId('comparison-filtered-count').textContent=filtered.length.toLocaleString();byId('comparison-no-data').hidden=filtered.length!==0;renderComparisonPair('plot-levels',`${state.lhs} levels vs ${state.rhs} levels`,`${state.lhs} levels`,`${state.rhs} levels`,filtered,sample=>sample.g8r_levels,sample=>sample.yosys_abc_levels,state);renderComparisonPair('plot-nodes',`${state.lhs} nodes vs ${state.rhs} nodes`,`${state.lhs} nodes`,`${state.rhs} nodes`,filtered,sample=>sample.g8r_nodes,sample=>sample.yosys_abc_nodes,state);renderComparisonQuadrants(filtered,state);renderComparisonLoss(filtered,state);syncComparisonQuery(state)}
 async function comparisonPlots(catalog){const root=byId('comparison-plots');if(!root)return;if(typeof Plotly==='undefined')throw Error('The pinned Plotly library could not be loaded.');const dataset=catalog.datasets.find(value=>value.logical_key===root.dataset.datasetKey);if(!dataset)throw Error('Comparison data is not available in this snapshot.');const data=await fetch(base+dataset.url).then(response=>{if(!response.ok)throw Error(`${dataset.url} ${response.status}`);return response.json()}),samples=(data.dataset?.samples||[]).filter(sample=>Number.isFinite(sample.ir_node_count)&&Number.isFinite(sample.g8r_nodes)&&Number.isFinite(sample.g8r_levels)&&Number.isFinite(sample.yosys_abc_nodes)&&Number.isFinite(sample.yosys_abc_levels)),versions=[...new Set(samples.map(sample=>sample.crate_version))].sort(versionCompare),query=new URLSearchParams(location.search),min=Math.max(0,Number(data.dataset?.min_ir_nodes)||0),max=Math.max(min,Number(data.dataset?.max_ir_nodes)||min),requestedMax=Number(query.get('max_ir_nodes')),slider=byId('comparison-max-ir-nodes'),version=byId('comparison-crate-version'),mode=byId('comparison-sample-mode');comparisonState={catalog,samples,lhs:root.dataset.lhsLabel,rhs:root.dataset.rhsLabel,selectedSampleKey:query.get('sample')};slider.min=String(min);slider.max=String(max);slider.value=String(Number.isFinite(requestedMax)&&requestedMax>=min?Math.min(requestedMax,max):max);version.innerHTML=`<option value=''>all crate versions</option>`+versions.map(value=>`<option value='${esc(value)}'>crate:v${esc(value)}</option>`).join('');version.value=comparisonDefaultVersion(versions,query.get('crate_version'));mode.value=query.get('losses_only')==='true'?'losses_only':'all';byId('comparison-total-count').textContent=samples.length.toLocaleString();slider.addEventListener('input',()=>updateComparisonPlots(comparisonState));version.addEventListener('change',()=>updateComparisonPlots(comparisonState));mode.addEventListener('change',()=>updateComparisonPlots(comparisonState));updateComparisonPlots(comparisonState);if(comparisonState.selectedSampleKey){const sample=samples.find(value=>comparisonSelectionKey(value)===comparisonState.selectedSampleKey);if(sample)showComparisonDetail(sample,'query',comparisonState);else{comparisonState.selectedSampleKey=null;syncComparisonQuery(comparisonState)}}}
+function homepageSummary(samples,state={lhs:'G8r+ABC',rhs:'codegen+Yosys/ABC'}){const valid=(samples||[]).filter(sample=>sample.crate_version&&Number.isFinite(sample.ir_node_count)&&Number.isFinite(sample.g8r_nodes)&&Number.isFinite(sample.g8r_levels)&&Number.isFinite(sample.yosys_abc_nodes)&&Number.isFinite(sample.yosys_abc_levels)),versions=[...new Set(valid.map(sample=>sample.crate_version))].sort(versionCompare),latest=versions.at(-1)||'',latestSamples=valid.filter(sample=>sample.crate_version===latest),quadrants=latestSamples.map(sample=>({sample,...comparisonQuadrant(sample,state)})),lossValues=latestSamples.map(sample=>Number(sample.g8r_product_loss)).filter(Number.isFinite);return {latest,samples:latestSamples,quadrants,pureWins:quadrants.filter(row=>row.label.startsWith('Q1 pure win')).length,strictLosses:quadrants.filter(row=>row.label.startsWith('Q3 strict loss')).length,medianLoss:lossValues.length?quantile(lossValues,.5):null}}
+function homepagePlotLayout(xTitle,yTitle,xLog=false,yLog=false){const layout=comparisonLayout('',xTitle,yTitle,xLog,yLog);layout.height=330;layout.margin={l:64,r:18,t:20,b:58};layout.showlegend=false;return layout}
+function homepageExplorerHref(sample,lossesOnly=false){const query=new URLSearchParams;query.set('crate_version',sample.crate_version);if(lossesOnly)query.set('losses_only','true');query.set('sample',comparisonSelectionKey(sample));return `${base}ir-fn-g8r-abc-vs-codegen-yosys-abc/?${query}`}
+function bindHomepageExplorerClick(plotId,lossesOnly=false){const plot=byId(plotId);if(!plot||typeof plot.on!=='function')return;if(typeof plot.removeAllListeners==='function')plot.removeAllListeners('plotly_click');plot.on('plotly_click',event=>{const sample=event?.points?.[0]?.customdata;if(sample)location.href=homepageExplorerHref(sample,lossesOnly)})}
+function homepagePairPlot(plotId,samples,xTitle,yTitle,xSelect,ySelect,state){const valid=[];for(const sample of samples){const x=comparisonLogValue(xSelect(sample)),y=comparisonLogValue(ySelect(sample));if(x&&y)valid.push({sample,x:x.value,y:y.value,quadrant:comparisonQuadrant(sample,state)})}const traces=[];if(valid.length){const x=valid.map(row=>row.x),y=valid.map(row=>row.y),both=x.concat(y),min=Math.min(...both),max=Math.max(...both);traces.push({type:'scatter',mode:'markers',x,y,customdata:valid.map(row=>row.sample),text:valid.map(row=>comparisonHover(row.sample,state)+'<br>'+row.quadrant.label),hovertemplate:'%{text}<br>x=%{x}<br>y=%{y}<extra></extra>',marker:{size:6,color:valid.map(row=>row.quadrant.color),opacity:.86}});traces.push({type:'scatter',mode:'lines',x:[min,max],y:[min,max],hoverinfo:'skip',line:{color:'#32f1b2',width:1.1,dash:'dot'}})}const layout=homepagePlotLayout(xTitle,yTitle,true,true);if(!valid.length)layout.annotations=[{text:'No samples in the latest release',showarrow:false,x:.5,y:.5,xref:'paper',yref:'paper',font:{color:'#8fa9be',size:12}}];return Plotly.react(plotId,traces,layout,comparisonConfig()).then(()=>bindHomepageExplorerClick(plotId))}
+function homepageQuadrantPlot(summary,state){const traces=summary.quadrants.length?[{type:'scatter',mode:'markers',x:summary.quadrants.map(row=>row.dx),y:summary.quadrants.map(row=>row.dy),customdata:summary.quadrants.map(row=>row.sample),text:summary.quadrants.map(row=>`${comparisonHover(row.sample,state)}<br>${row.label}`),hovertemplate:'%{text}<br>node delta=%{x}<br>level delta=%{y}<extra></extra>',marker:{size:6,color:summary.quadrants.map(row=>row.color),opacity:.86}}]:[],layout=homepagePlotLayout(`${state.rhs} nodes − ${state.lhs} nodes`,`${state.rhs} levels − ${state.lhs} levels`);layout.shapes=[{type:'line',x0:0,x1:0,xref:'x',y0:0,y1:1,yref:'paper',line:{color:'#5ec9ff',width:1,dash:'dot'}},{type:'line',x0:0,x1:1,xref:'paper',y0:0,y1:0,yref:'y',line:{color:'#5ec9ff',width:1,dash:'dot'}}];layout.annotations=[['Q2 mixed',.13,.93,'#ffd36f'],['Q1 pure win',.87,.93,'#7dff9f'],['Q3 strict loss',.13,.08,'#ff8ea9'],['Q4 mixed',.87,.08,'#5ec9ff']].map(([text,x,y,color])=>({text,showarrow:false,x,y,xref:'paper',yref:'paper',font:{color,size:10}}));return Plotly.react('home-plot-deltas',traces,layout,comparisonConfig()).then(()=>bindHomepageExplorerClick('home-plot-deltas'))}
+function homepageLossPlot(summary,state){const valid=summary.quadrants.filter(row=>row.label.startsWith('Q3 strict loss')).map(row=>({sample:row.sample,x:Number(row.sample.ir_node_count),y:Number(row.sample.g8r_product_loss)})).filter(row=>Number.isFinite(row.x)&&row.x>0&&Number.isFinite(row.y)&&row.y>0),traces=valid.length?[{type:'scatter',mode:'markers',x:valid.map(row=>row.x),y:valid.map(row=>row.y),customdata:valid.map(row=>row.sample),text:valid.map(row=>comparisonHover(row.sample,state)),hovertemplate:'%{text}<br>strict product loss=%{y}<extra></extra>',marker:{size:7,color:'#ff8ea9',opacity:.9}}]:[],layout=homepagePlotLayout('IR node count',`${state.lhs} product − ${state.rhs} product`,true,true);if(!valid.length)layout.annotations=[{text:'No positive strict-loss samples',showarrow:false,x:.5,y:.5,xref:'paper',yref:'paper',font:{color:'#8fa9be',size:12}}];return Plotly.react('home-plot-loss',traces,layout,comparisonConfig()).then(()=>bindHomepageExplorerClick('home-plot-loss',true))}
+async function homepageOverview(catalog){const root=byId('home-overview');if(!root)return;const status=byId('home-overview-status'),dataset=catalog.datasets.find(value=>value.logical_key===root.dataset.datasetKey);if(!dataset){status.textContent='Latest-release comparison data is not available in this snapshot.';root.dataset.rendered='unavailable';return}if(typeof Plotly==='undefined'){status.textContent='The local plotting library could not be loaded.';root.dataset.rendered='unavailable';return}try{const data=await fetch(base+dataset.url).then(response=>{if(!response.ok)throw Error(`${dataset.url} ${response.status}`);return response.json()}),state={lhs:root.dataset.lhsLabel,rhs:root.dataset.rhsLabel},summary=homepageSummary(data.dataset?.samples||[],state);if(!summary.latest||!summary.samples.length){status.textContent='No complete paired samples are present in the comparison dataset.';root.dataset.rendered='unavailable';return}byId('home-overview-release').textContent=`v${summary.latest}`;byId('home-sample-count').textContent=summary.samples.length.toLocaleString();byId('home-pure-win-count').textContent=summary.pureWins.toLocaleString();byId('home-strict-loss-count').textContent=summary.strictLosses.toLocaleString();byId('home-median-loss').textContent=summary.medianLoss===null?'—':`${summary.medianLoss>0?'+':''}${product(summary.medianLoss)}`;status.textContent=`crate v${summary.latest} · ${summary.samples.length.toLocaleString()} paired functions · click a point to inspect evidence`;await Promise.all([homepagePairPlot('home-plot-levels',summary.samples,`${state.lhs} levels`,`${state.rhs} levels`,sample=>sample.g8r_levels,sample=>sample.yosys_abc_levels,state),homepagePairPlot('home-plot-nodes',summary.samples,`${state.lhs} nodes`,`${state.rhs} nodes`,sample=>sample.g8r_nodes,sample=>sample.yosys_abc_nodes,state),homepageQuadrantPlot(summary,state),homepageLossPlot(summary,state)]);root.dataset.rendered='true'}catch(error){status.textContent=`Overview unavailable: ${error}`;root.dataset.rendered='unavailable'}}
+
 async function datasetExplorer(catalog){const select=byId('dataset');if(!select)return;for(const d of catalog.datasets){const o=document.createElement('option');o.value=d.logical_key;o.textContent=`${d.logical_key} (${d.bytes.toLocaleString()} B)`;select.appendChild(o)}const q=new URLSearchParams(location.search).get('key');if(q&&catalog.datasets.some(d=>d.logical_key===q))select.value=q;async function load(){const d=catalog.datasets.find(x=>x.logical_key===select.value);history.replaceState(null,'','?key='+encodeURIComponent(d.logical_key));byId('dataset-meta').textContent=`sha256 ${d.sha256} · ${d.bytes.toLocaleString()} bytes`;const data=await fetch(base+d.url).then(r=>{if(!r.ok)throw Error(`${d.url} ${r.status}`);return r.json()});const found=arrays(data),rows=found[0]?.[1]||[];byId('plot').innerHTML=renderPlot(rows);byId('table').innerHTML=found.length?`<h2>Rows: ${esc(found[0][0])}</h2>${renderTable(rows)}`:'<p class=muted>No tabular row arrays found.</p>';byId('raw').textContent=JSON.stringify(data,null,2)}select.addEventListener('change',load);if(catalog.datasets.length)await load()}
 function progressionUnavailable(root,message){root.querySelector('.toolbar').hidden=true;byId('progression-summary').innerHTML='';byId('progression-chart').innerHTML=`<p class=muted>${esc(message)}</p>`;byId('progression-table').innerHTML=''}
 async function progression(catalog){const root=byId('progression');if(!root)return;const key=root.dataset.datasetKey,dataset=catalog.datasets.find(d=>d.logical_key===key);if(!dataset){progressionUnavailable(root,'Release progression data is not available in this snapshot.');return}const data=await fetch(base+dataset.url).then(r=>{if(!r.ok)throw Error(`${dataset.url} ${r.status}`);return r.json()}),samples=data.dataset?.samples||[];let generations;try{generations=releaseGenerations(catalog,samples)}catch(error){progressionUnavailable(root,`Release progression data is ambiguous: ${error.message}`);return}const completeGenerations=generations.filter(g=>g.status==='complete'),completeVersions=[...new Set(completeGenerations.map(g=>g.version))].sort(versionCompare);if(completeVersions.length<2){const missingLineage=samples.length&&!samples.some(s=>s.stdlib_root_action_id),degradedCount=generations.length-completeGenerations.length,detail=missingLineage?'This snapshot predates exact run-lineage metadata and must be rebuilt.':completeVersions.length===1?`Only v${completeVersions[0]} has populated complete-run samples.`:'No populated complete-run samples are available.',degraded=degradedCount?` ${degradedCount.toLocaleString()} degraded run generation(s) were excluded because partial populations can bias the result.`:'';progressionUnavailable(root,`At least two populated complete crate releases are needed for a progression comparison. ${detail}${degraded}`);return}const stats=releaseStats(completeGenerations);byId('progression-chart').innerHTML=progressionChart(stats);const baseline=byId('baseline-version'),current=byId('current-version'),options=generations.map(g=>`<option value='${g.run_id}'>v${esc(g.version)} · run ${esc(g.run_id.slice(0,12))} · ${esc(g.status)} · ${g.samples.length.toLocaleString()} samples</option>`).join('');baseline.innerHTML=options;current.innerHTML=options;const preferredByVersion=new Map;for(const generation of completeGenerations)preferredByVersion.set(generation.version,generation);baseline.value=preferredByVersion.get(completeVersions.at(-2)).run_id;current.value=preferredByVersion.get(completeVersions.at(-1)).run_id;const render=()=>renderPair(generations,baseline.value,current.value);baseline.addEventListener('change',render);current.addEventListener('change',render);render()}
-async function main(){const catalog=await fetch(base+'catalog.json').then(r=>{if(!r.ok)throw Error(`catalog ${r.status}`);return r.json()});await datasetExplorer(catalog);await progression(catalog);await mffcDiscrepancies(catalog);await comparisonPlots(catalog)}main().catch(e=>{const out=byId('error');if(out)out.textContent=e.stack||e});"#;
+async function main(){const catalog=await fetch(base+'catalog.json').then(r=>{if(!r.ok)throw Error(`catalog ${r.status}`);return r.json()});await homepageOverview(catalog);await datasetExplorer(catalog);await progression(catalog);await mffcDiscrepancies(catalog);await comparisonPlots(catalog)}main().catch(e=>{const out=byId('error');if(out)out.textContent=e.stack||e});"#;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BuildStaticSiteOptions {
@@ -678,6 +687,28 @@ fn mffc_discrepancies_body(root_site_url: &str) -> String {
     )
 }
 
+fn homepage_body(
+    root_site_url: &str,
+    catalog: &BrowserCatalog,
+    snapshot: &crate::snapshot::StaticSnapshotManifest,
+) -> String {
+    let generated_utc = snapshot.generated_utc.to_rfc3339();
+    let generated_date = generated_utc.split('T').next().unwrap_or(&generated_utc);
+    let snapshot_short = snapshot
+        .snapshot_id
+        .get(..12)
+        .unwrap_or(&snapshot.snapshot_id);
+    format!(
+        r#"<header class="science-header"><div class="science-topline"><div><p class="science-label">xlsynth-bvc / static result corpus</p><h1>Boolean synthesis comparison</h1></div><nav class="science-nav" aria-label="Primary navigation"><a href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">QoR explorer</a><a href="{root_site_url}progression.html">Release history</a><a href="{root_site_url}runs.html">Runs</a><a href="{root_site_url}dataset.html">Data</a></nav></div><p class="science-abstract">Paired measurements of XLS IR through G8r+ABC and codegen+Yosys/ABC. Both paths share ABC downstream, so the overview isolates frontend structure; the full explorers provide sample-level links to immutable exported evidence.</p><dl class="science-meta"><div><dt>snapshot</dt><dd><code title="{}">{}</code></dd></div><div><dt>verified runs</dt><dd>{}</dd></div><div><dt>datasets</dt><dd>{}</dd></div><div><dt>generated</dt><dd>{}</dd></div></dl><p id="error" role="alert"></p></header><main class="science-main"><section id="home-overview" data-dataset-key="{}" data-lhs-label="G8r+ABC" data-rhs-label="codegen+Yosys/ABC" aria-labelledby="overview-title"><div class="overview-heading"><div><p class="science-label">latest release / G8r+ABC vs codegen+Yosys/ABC</p><h2 id="overview-title">Corpus overview</h2><p id="home-overview-status" class="meta" aria-live="polite">Loading paired synthesis measurements…</p></div><a class="text-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">Open the full interactive view →</a></div><dl class="metric-row"><div><dt>crate release</dt><dd id="home-overview-release">—</dd></div><div><dt>paired functions</dt><dd id="home-sample-count">—</dd></div><div><dt>Q1 pure wins</dt><dd id="home-pure-win-count">—</dd></div><div><dt>Q3 strict losses</dt><dd id="home-strict-loss-count">—</dd></div><div><dt>median signed product Δ</dt><dd id="home-median-loss">—</dd></div></dl><div class="home-plot-grid"><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic levels</h3><span>log / log · y=x reference</span></div><div id="home-plot-levels" class="home-plot" aria-label="G8r plus ABC versus codegen plus Yosys ABC logic levels"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic nodes</h3><span>log / log · y=x reference</span></div><div id="home-plot-nodes" class="home-plot" aria-label="G8r plus ABC versus codegen plus Yosys ABC logic nodes"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Node / level delta quadrants</h3><span>positive = G8r+ABC better</span></div><div id="home-plot-deltas" class="home-plot" aria-label="Four quadrant node and level delta plot"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Strict product losses vs IR size</h3><span>Q3 positive only · click to inspect</span></div><div id="home-plot-loss" class="home-plot" aria-label="G8r plus ABC strict product loss versus IR size"></div></article></div></section><section class="analysis-index" aria-labelledby="analysis-title"><div class="analysis-index-header"><h2 id="analysis-title">Analysis views</h2><p>Focused views of the same exported corpus</p></div><nav class="analysis-list" aria-label="Analysis views"><a class="analysis-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/"><span>01</span><span><strong>G8r+ABC vs codegen+Yosys/ABC</strong><small>Frontend structure comparison with a shared downstream optimizer.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/"><span>02</span><span><strong>G8r vs Yosys/ABC</strong><small>Direct backend comparison across releases, filters, quadrants, and sample evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}mffc-discrepancies.html"><span>03</span><span><strong>MFFC discrepancies</strong><small>Local cone ranking with paired IR and synthesis evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}progression.html"><span>04</span><span><strong>Release progression</strong><small>Median and tail product-loss changes across verified runs.</small></span><span>→</span></a></nav></section><footer class="publication-bar"><span>Self-contained static publication · no live database at request time</span><nav aria-label="Publication details"><a href="{root_site_url}runs.html">Campaign runs</a><a href="{root_site_url}dataset.html">Raw datasets</a></nav></footer></main>"#,
+        escape_html(&snapshot.snapshot_id),
+        escape_html(snapshot_short),
+        catalog.runs.len(),
+        catalog.datasets.len(),
+        escape_html(generated_date),
+        crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
+    )
+}
+
 fn expected_fixed_site_files(
     catalog: &BrowserCatalog,
     snapshot: &crate::snapshot::StaticSnapshotManifest,
@@ -886,34 +917,15 @@ fn expected_fixed_site_files(
         .into_bytes(),
     );
 
-    let cards = catalog
-        .datasets
-        .iter()
-        .map(|dataset| {
-            format!(
-                "<article class=\"card\"><h2><a href=\"{root_site_url}dataset.html?key={}\">{}</a></h2><p>{} bytes</p><code>{}</code></article>",
-                url_encode(&dataset.logical_key),
-                escape_html(&dataset.logical_key),
-                dataset.bytes,
-                dataset.sha256
-            )
-        })
-        .collect::<String>();
-    let index_body = format!(
-        "<header><h1>xlsynth-bvc results</h1><p class=\"meta\">Snapshot <code>{}</code> · {} runs · {} datasets · generated {}</p></header><main><p>This is a self-contained static publication. The build machine and sled database are not involved at request time.</p><p><a href=\"{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/\">Interactive QoR plots →</a> · <a href=\"{root_site_url}progression.html\">View release progression →</a> · <a href=\"{root_site_url}mffc-discrepancies.html\">Inspect MFFC discrepancies →</a> · <a href=\"{root_site_url}runs.html\">Browse campaign runs and versions</a></p><h2>Datasets</h2><div class=\"grid\">{cards}</div></main>",
-        snapshot.snapshot_id,
-        catalog.runs.len(),
-        catalog.datasets.len(),
-        snapshot.generated_utc.to_rfc3339()
-    );
+    let index_body = homepage_body(&root_site_url, catalog, snapshot);
     files.insert(
         "index.html".to_string(),
-        html_shell(
+        html_shell_with_plotly(
             "xlsynth-bvc results",
             &root_site_url,
             &index_body,
             &css_name,
-            None,
+            &js_name,
         )
         .into_bytes(),
     );
@@ -1277,35 +1289,16 @@ pub(crate) fn build_static_site_with_protected_roots(
         .as_bytes(),
     )?;
 
-    let cards = catalog
-        .datasets
-        .iter()
-        .map(|dataset| {
-            format!(
-                "<article class=\"card\"><h2><a href=\"{root_site_url}dataset.html?key={}\">{}</a></h2><p>{} bytes</p><code>{}</code></article>",
-                url_encode(&dataset.logical_key),
-                escape_html(&dataset.logical_key),
-                dataset.bytes,
-                dataset.sha256
-            )
-        })
-        .collect::<String>();
-    let index_body = format!(
-        "<header><h1>xlsynth-bvc results</h1><p class=\"meta\">Snapshot <code>{}</code> · {} runs · {} datasets · generated {}</p></header><main><p>This is a self-contained static publication. The build machine and sled database are not involved at request time.</p><p><a href=\"{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/\">Interactive QoR plots →</a> · <a href=\"{root_site_url}progression.html\">View release progression →</a> · <a href=\"{root_site_url}mffc-discrepancies.html\">Inspect MFFC discrepancies →</a> · <a href=\"{root_site_url}runs.html\">Browse campaign runs and versions</a></p><h2>Datasets</h2><div class=\"grid\">{cards}</div></main>",
-        snapshot.snapshot_id,
-        catalog.runs.len(),
-        catalog.datasets.len(),
-        snapshot.generated_utc.to_rfc3339()
-    );
+    let index_body = homepage_body(&root_site_url, &catalog, &snapshot);
     write_file(
         &options.out_dir,
         "index.html",
-        html_shell(
+        html_shell_with_plotly(
             "xlsynth-bvc results",
             &root_site_url,
             &index_body,
             &css_name,
-            None,
+            &js_name,
         )
         .as_bytes(),
     )?;
@@ -2191,6 +2184,23 @@ mod tests {
         assert_eq!(summary.dataset_count, 1);
         let verified = verify_static_site(&site_dir).expect("verify site");
         assert_eq!(verified.base_url, "/xlsynth-bvc/");
+        let index_html =
+            fs::read_to_string(site_dir.join("index.html")).expect("read homepage HTML");
+        assert!(index_html.contains("Boolean synthesis comparison"));
+        assert!(index_html.contains("id=\"home-overview\""));
+        assert!(
+            index_html
+                .contains(crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME)
+        );
+        assert_eq!(index_html.matches("class=\"analysis-link\"").count(), 4);
+        assert!(index_html.contains("Raw datasets"));
+        assert!(index_html.contains("Campaign runs"));
+        assert!(index_html.contains(PLOTLY_ASSET_NAME));
+        let (_, js_name) = static_site_asset_names();
+        assert!(index_html.contains(&js_name));
+        assert!(!index_html.contains("<h2>Datasets</h2>"));
+        assert!(!index_html.contains("class=\"feature-card\""));
+        assert!(!index_html.contains(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME));
         assert!(
             !fs::read_to_string(site_dir.join("dataset.html"))
                 .expect("read HTML")
@@ -2300,6 +2310,73 @@ mod tests {
                 .contains("progression.html")
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn homepage_javascript_summarizes_latest_release() {
+        const SCRIPT: &str = r#"
+const fs = require('fs');
+global.document = {
+  querySelector: () => ({content: ''}),
+  getElementById: () => null,
+};
+const app = fs.readFileSync(0, 'utf8');
+const prefix = app.slice(0, app.indexOf('async function main()'));
+const api = new Function(prefix + '\nreturn {homepageSummary,homepageExplorerHref};')();
+const sample = (crate_version, fn_key, g8r_nodes, g8r_levels, yosys_abc_nodes, yosys_abc_levels, g8r_product_loss) => ({
+  crate_version,
+  fn_key,
+  ir_node_count: 20,
+  g8r_nodes,
+  g8r_levels,
+  yosys_abc_nodes,
+  yosys_abc_levels,
+  g8r_product_loss,
+});
+const summary = api.homepageSummary([
+  sample('0.67.0', 'old', 1, 1, 1, 1, 0),
+  sample('0.68.0', 'win', 10, 5, 12, 7, -34),
+  sample('0.68.0', 'loss', 12, 8, 10, 6, 36),
+]);
+if (summary.latest !== '0.68.0' || summary.samples.length !== 2) {
+  throw new Error(`unexpected latest summary: ${JSON.stringify(summary)}`);
+}
+if (summary.pureWins !== 1 || summary.strictLosses !== 1 || summary.medianLoss !== 1) {
+  throw new Error(`unexpected quadrant summary: ${JSON.stringify(summary)}`);
+}
+const href = api.homepageExplorerHref({
+  crate_version: '0.68.0',
+  g8r_stats_action_id: 'g8r-action',
+  yosys_abc_stats_action_id: 'yosys-action',
+}, true);
+if (href !== 'ir-fn-g8r-abc-vs-codegen-yosys-abc/?crate_version=0.68.0&losses_only=true&sample=g8r-action%3Ayosys-action') {
+  throw new Error(`unexpected homepage explorer link: ${href}`);
+}
+"#;
+        let mut child = match Command::new("node")
+            .arg("-e")
+            .arg(SCRIPT)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("spawn node: {error}"),
+        };
+        child
+            .stdin
+            .as_mut()
+            .expect("node stdin")
+            .write_all(APP_JS.as_bytes())
+            .expect("write app js");
+        let output = child.wait_with_output().expect("wait for node");
+        assert!(
+            output.status.success(),
+            "node failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
