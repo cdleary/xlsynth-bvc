@@ -235,7 +235,7 @@ fn site_build_and_verify_supports_subdirectory_base() {
 }
 
 #[test]
-fn homepage_javascript_summarizes_all_published_corpus_samples() {
+fn homepage_javascript_selects_latest_published_crate_release() {
     const SCRIPT: &str = r#"
 const fs = require('fs');
 let capturedLayout = null;
@@ -274,14 +274,21 @@ const samples = [
   ...Array.from({length: 4}, (_, i) => sample('0.68.0', `k3-${i}`, 1, 1, 1, 1, 0, `__k3_cone_${i}`)),
 ];
 const summary = api.homepageSummary(samples);
-if (JSON.stringify(summary.versions) !== JSON.stringify(['0.66.0', '0.68.0']) || summary.samples.length !== 12) {
-  throw new Error(`unexpected all-corpus summary: ${JSON.stringify(summary)}`);
+if (JSON.stringify(summary.versions) !== JSON.stringify(['0.66.0', '0.68.0']) || summary.latestVersion !== '0.68.0' || summary.samples.length !== 9) {
+  throw new Error(`unexpected latest-release summary: ${JSON.stringify(summary)}`);
 }
-if (summary.selection !== 'all published paired IR samples' || summary.wholeFunctionCount !== 4 || summary.mffcCount !== 4 || summary.k3Count !== 4) {
-  throw new Error(`unexpected all-corpus policy: ${JSON.stringify(summary)}`);
+if (summary.selection !== 'latest crate release v0.68.0' || summary.wholeFunctionCount !== 1 || summary.mffcCount !== 4 || summary.k3Count !== 4) {
+  throw new Error(`unexpected latest-release policy: ${JSON.stringify(summary)}`);
 }
-if (summary.pureWins !== 2 || summary.strictLosses !== 1 || summary.medianLoss !== 0) {
+if (summary.pureWins !== 1 || summary.strictLosses !== 0 || summary.medianLoss !== 0) {
   throw new Error(`unexpected quadrant summary: ${JSON.stringify(summary)}`);
+}
+const semanticSummary = api.homepageSummary([
+  sample('0.9.0', 'older', 1, 1, 1, 1, 0),
+  sample('0.10.0', 'newer', 1, 1, 1, 1, 0),
+]);
+if (semanticSummary.latestVersion !== '0.10.0' || semanticSummary.samples.length !== 1 || semanticSummary.samples[0].fn_key !== 'newer') {
+  throw new Error(`latest release was not selected semantically: ${JSON.stringify(semanticSummary)}`);
 }
 api.homepagePairPlot('test-plot', [sample('0.66.0', 'zero', 0, 0, 0, 0, 0)], 'lhs', 'rhs', value => value.g8r_nodes, value => value.yosys_abc_nodes, {lhs: 'lhs', rhs: 'rhs'});
 if (!capturedLayout?.annotations?.[0]?.text.includes('1 zero-valued pair plotted at 1 for log scale')) {
