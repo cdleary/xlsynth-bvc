@@ -1742,6 +1742,17 @@ fn load_stats_nodes_and_levels(
     parsed
 }
 
+fn is_canonical_builtin_yosys_aig_action(action: &ActionSpec) -> bool {
+    matches!(
+        action,
+        ActionSpec::ComboVerilogToYosysAbcAig {
+            frontend,
+            yosys_script_ref,
+            ..
+        } if is_canonical_builtin_yosys_source(frontend, yosys_script_ref)
+    )
+}
+
 fn collect_previously_lossy_k_bool_source_structural_hashes(
     store: &ArtifactStore,
     provenances: &[Provenance],
@@ -1792,6 +1803,20 @@ fn collect_previously_lossy_k_bool_source_structural_hashes(
         else {
             continue;
         };
+        let ActionSpec::DriverAigToStats {
+            aig_action_id: yosys_aig_action_id,
+            ..
+        } = &yosys_stats_provenance.action
+        else {
+            continue;
+        };
+        let Some(yosys_aig_provenance) = by_action_id.get(yosys_aig_action_id.as_str()).copied()
+        else {
+            continue;
+        };
+        if !is_canonical_builtin_yosys_aig_action(&yosys_aig_provenance.action) {
+            continue;
+        }
         let Some((g8r_nodes, g8r_levels)) =
             load_stats_nodes_and_levels(store, g8r_stats_provenance, &mut stats_cache)
         else {
@@ -1855,6 +1880,17 @@ pub(crate) fn lossy_k_bool_source_structural_hash_for_aig_stat_diff(
 
     let g8r_stats_provenance = store.load_provenance(g8r_aig_stats_action_id).ok()?;
     let yosys_stats_provenance = store.load_provenance(yosys_abc_aig_stats_action_id).ok()?;
+    let ActionSpec::DriverAigToStats {
+        aig_action_id: yosys_aig_action_id,
+        ..
+    } = &yosys_stats_provenance.action
+    else {
+        return None;
+    };
+    let yosys_aig_provenance = store.load_provenance(yosys_aig_action_id).ok()?;
+    if !is_canonical_builtin_yosys_aig_action(&yosys_aig_provenance.action) {
+        return None;
+    }
 
     let mut stats_cache: BTreeMap<String, Option<(f64, f64)>> = BTreeMap::new();
     let (g8r_nodes, g8r_levels) =

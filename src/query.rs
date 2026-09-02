@@ -5571,14 +5571,6 @@ pub(crate) struct StdlibTrendSourceContext {
     pub(crate) dso_version: String,
 }
 
-fn is_canonical_builtin_yosys_source(
-    frontend: &YosysVerilogFrontend,
-    yosys_script_ref: &ScriptRef,
-) -> bool {
-    matches!(frontend, YosysVerilogFrontend::Builtin)
-        && is_canonical_yosys_script_ref(yosys_script_ref)
-}
-
 pub(crate) fn extract_stdlib_trend_source_context(
     provenance_by_action_id: &ProvenanceLookup<'_>,
     kind: StdlibTrendKind,
