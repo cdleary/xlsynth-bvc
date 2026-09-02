@@ -475,6 +475,7 @@ struct DriverIrToG8rBatchRunnable {
     suggested_next_actions: Vec<SuggestedAction>,
     ir_input_path: PathBuf,
     explicit_ir_top: Option<String>,
+    standalone_ir_top: Option<String>,
     use_legacy_ir2g8r_cli: bool,
     capture_prepared_ir: bool,
 }
@@ -2448,21 +2449,18 @@ fn g8r_lowering_mode_extra_flags(mode: &G8rLoweringMode) -> &'static str {
     }
 }
 
-fn is_generated_k_bool_cone_ir_top(ir_top: &str) -> bool {
-    let Some(rest) = ir_top.strip_prefix("__k") else {
-        return false;
-    };
-    let Some((k, suffix)) = rest.split_once("_cone_") else {
-        return false;
-    };
-    !k.is_empty() && k.bytes().all(|byte| byte.is_ascii_digit()) && !suffix.is_empty()
+fn input_ir_is_generated_k_bool_cone(details: &serde_json::Map<String, serde_json::Value>) -> bool {
+    details
+        .get("input_ir_fn_structural_hash_source")
+        .and_then(|value| value.as_str())
+        == Some(K_BOOL_CONE_MANIFEST_STRUCTURAL_HASH_SOURCE)
 }
 
-fn should_attempt_ir_semantic_reuse(ir_top: Option<&str>) -> bool {
+fn should_attempt_ir_semantic_reuse(input_ir_is_generated_k_bool_cone: bool) -> bool {
     // Generated k-cone functions are intentionally tiny. Walking every provenance row to
     // find a structurally identical prior result costs substantially more than recomputing
     // one, especially for large corpus stores.
-    !ir_top.is_some_and(is_generated_k_bool_cone_ir_top)
+    !input_ir_is_generated_k_bool_cone
 }
 
 fn record_input_ir_structural_hash(
@@ -2719,13 +2717,14 @@ fn prepare_driver_ir_to_g8r_batch_action(
     ) else {
         return Ok(PreparedDriverIrToG8rBatchAction::Fallback(action));
     };
+    let input_ir_is_generated_k_bool_cone = input_ir_is_generated_k_bool_cone(&details);
 
     let staging_dir = make_staging_dir(store, &action_id)?;
     let payload_dir = staging_dir.join("payload");
     fs::create_dir_all(&payload_dir)
         .with_context(|| format!("creating payload dir: {}", payload_dir.display()))?;
 
-    if should_attempt_ir_semantic_reuse(inferred_ir_top.as_deref())
+    if should_attempt_ir_semantic_reuse(input_ir_is_generated_k_bool_cone)
         && let Some(source) =
             find_semantic_reuse_candidate(store, &input_ir_structural_hash, |provenance| {
                 if provenance.action_id == action_id {
@@ -2824,6 +2823,9 @@ fn prepare_driver_ir_to_g8r_batch_action(
             suggested_next_actions,
             ir_input_path,
             explicit_ir_top,
+            standalone_ir_top: input_ir_is_generated_k_bool_cone
+                .then(|| inferred_ir_top.clone())
+                .flatten(),
             use_legacy_ir2g8r_cli,
             capture_prepared_ir,
         },
@@ -2861,7 +2863,7 @@ fn run_driver_ir_to_g8r_batch_runnable(
             write_driver_ir_input_for_top(
                 &member.ir_input_path,
                 &input_path,
-                member.explicit_ir_top.as_deref(),
+                member.standalone_ir_top.as_deref(),
             )?;
             let output_dir = outputs_dir.join(index.to_string());
             fs::create_dir_all(&output_dir)
@@ -3158,8 +3160,9 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
         &mut details,
         true,
     );
+    let input_ir_is_generated_k_bool_cone = input_ir_is_generated_k_bool_cone(&details);
 
-    if should_attempt_ir_semantic_reuse(inferred_ir_top.as_deref())
+    if should_attempt_ir_semantic_reuse(input_ir_is_generated_k_bool_cone)
         && let Some(hash) = input_ir_structural_hash.as_deref()
     {
         let reusable = find_semantic_reuse_candidate(store, hash, |provenance| {
@@ -3296,13 +3299,10 @@ xlsynth-driver ir2g8r ${G8R_EXTRA_FLAGS} /inputs/input.ir --fraig="${FRAIG}" --a
 
     let mut docker_ir_input_path = ir_input_path.clone();
     let mut isolated_work_dir = None;
-    if explicit_ir_top
-        .as_deref()
-        .is_some_and(is_generated_k_bool_cone_ir_top)
-    {
+    if input_ir_is_generated_k_bool_cone && let Some(top) = inferred_ir_top.as_deref() {
         let work_dir = make_temp_work_dir("ir2g8r-cone")?;
         let isolated_path = work_dir.join("input.ir");
-        write_driver_ir_input_for_top(&ir_input_path, &isolated_path, explicit_ir_top.as_deref())?;
+        write_driver_ir_input_for_top(&ir_input_path, &isolated_path, Some(top))?;
         docker_ir_input_path = isolated_path;
         isolated_work_dir = Some(work_dir);
     }
@@ -3411,8 +3411,9 @@ pub(crate) fn run_ir_fn_to_combinational_verilog_action(
         &mut details,
         true,
     );
+    let input_ir_is_generated_k_bool_cone = input_ir_is_generated_k_bool_cone(&details);
 
-    if should_attempt_ir_semantic_reuse(ir_top.as_deref())
+    if should_attempt_ir_semantic_reuse(input_ir_is_generated_k_bool_cone)
         && let Some(hash) = input_ir_structural_hash.as_deref()
     {
         let reusable = find_semantic_reuse_candidate(store, hash, |provenance| {
@@ -3459,7 +3460,7 @@ pub(crate) fn run_ir_fn_to_combinational_verilog_action(
     if let Some(top) = ir_top.as_deref() {
         let original_ir_text = fs::read_to_string(&ir_input_path)
             .with_context(|| format!("reading IR input text: {}", ir_input_path.display()))?;
-        let rewritten_ir_text = if is_generated_k_bool_cone_ir_top(top) {
+        let rewritten_ir_text = if input_ir_is_generated_k_bool_cone {
             extract_standalone_ir_fn_package(&original_ir_text, top)?
         } else {
             rewrite_ir_package_top_function(&original_ir_text, top)?
@@ -3789,7 +3790,7 @@ fn write_driver_ir_input_for_top(
     destination_path: &Path,
     explicit_ir_top: Option<&str>,
 ) -> Result<bool> {
-    let Some(ir_top) = explicit_ir_top.filter(|top| is_generated_k_bool_cone_ir_top(top)) else {
+    let Some(ir_top) = explicit_ir_top else {
         fs::copy(source_path, destination_path).with_context(|| {
             format!(
                 "copying driver IR input {} -> {}",
@@ -5691,19 +5692,24 @@ fn __k3_cone_bbbb(y: bits[1] id=3) -> bits[1] {
     }
 
     #[test]
-    fn generated_k_bool_cones_skip_global_semantic_reuse_scan() {
-        assert!(!should_attempt_ir_semantic_reuse(Some(
-            "__k3_cone_deadbeef"
-        )));
-        assert!(!should_attempt_ir_semantic_reuse(Some(
-            "__k17_cone_deadbeef"
-        )));
-        assert!(should_attempt_ir_semantic_reuse(Some("__mffc_deadbeef")));
-        assert!(should_attempt_ir_semantic_reuse(Some(
-            "__kfoo_cone_deadbeef"
-        )));
-        assert!(should_attempt_ir_semantic_reuse(Some("__k3_cone_")));
-        assert!(should_attempt_ir_semantic_reuse(None));
+    fn generated_k_bool_cone_fast_path_requires_manifest_provenance() {
+        let mut details = serde_json::Map::new();
+        assert!(!input_ir_is_generated_k_bool_cone(&details));
+        assert!(should_attempt_ir_semantic_reuse(false));
+
+        details.insert(
+            "input_ir_fn_structural_hash_source".to_string(),
+            json!(K_BOOL_CONE_MANIFEST_STRUCTURAL_HASH_SOURCE),
+        );
+        assert!(input_ir_is_generated_k_bool_cone(&details));
+        assert!(!should_attempt_ir_semantic_reuse(true));
+
+        details.insert(
+            "input_ir_fn_structural_hash_source".to_string(),
+            json!("computed_ir_fn_structural_hash"),
+        );
+        assert!(!input_ir_is_generated_k_bool_cone(&details));
+        assert!(should_attempt_ir_semantic_reuse(false));
     }
 
     #[test]

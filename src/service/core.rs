@@ -122,6 +122,8 @@ pub(crate) struct KnownInputIrStructuralHash {
     pub(crate) source: &'static str,
 }
 
+pub(crate) const K_BOOL_CONE_MANIFEST_STRUCTURAL_HASH_SOURCE: &str = "k_bool_cone_manifest_entry";
+
 pub(crate) fn resolve_known_input_ir_structural_hash(
     store: &ArtifactStore,
     ir_action_id: &str,
@@ -185,7 +187,7 @@ pub(crate) fn resolve_known_input_ir_structural_hash(
     };
     Ok(Some(KnownInputIrStructuralHash {
         hash,
-        source: "k_bool_cone_manifest_entry",
+        source: K_BOOL_CONE_MANIFEST_STRUCTURAL_HASH_SOURCE,
     }))
 }
 
@@ -1183,7 +1185,7 @@ mod tests {
                 .expect("resolve manifest hash")
                 .expect("manifest hash exists");
         assert_eq!(resolved.hash, hash);
-        assert_eq!(resolved.source, "k_bool_cone_manifest_entry");
+        assert_eq!(resolved.source, K_BOOL_CONE_MANIFEST_STRUCTURAL_HASH_SOURCE);
 
         fs::remove_dir_all(root).expect("cleanup");
     }
