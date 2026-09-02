@@ -495,6 +495,24 @@ fn progression_catalog_uses_repeated_subject_population_not_campaign_status() {
     assert_eq!(incompatible.missing_cohort_subject_count, 1);
     assert_eq!(incompatible.extra_subject_count, 1);
 
+    let mut mixed_dso = dataset.clone();
+    mixed_dso.samples[0].dso_version = "0.2.0".to_string();
+    let mixed_catalog = build_browser_progression_catalog(&mixed_dso, Some(&versions), &[])
+        .expect("rolling DSO updates keep the static site publishable");
+    assert_eq!(mixed_catalog.cohort_subject_count, 2);
+    assert_eq!(mixed_catalog.cohort_complete_generation_count, 1);
+    assert_eq!(mixed_catalog.generations.len(), 5);
+    let rolling_generations = mixed_catalog
+        .generations
+        .iter()
+        .filter(|generation| generation.crate_version == "0.1.0")
+        .collect::<Vec<_>>();
+    assert_eq!(rolling_generations.len(), 2);
+    assert!(rolling_generations.iter().all(|generation| {
+        generation.coverage == BrowserProgressionCoverage::Partial
+            && generation.observed_subject_count == 1
+    }));
+
     let mut lineage_free = dataset.clone();
     lineage_free.samples[0].stdlib_root_action_id = None;
     let unavailable = build_browser_progression_catalog(&lineage_free, Some(&versions), &[])
@@ -514,7 +532,7 @@ global.document = {
 };
 const app = fs.readFileSync(0, 'utf8');
 const prefix = app.slice(0, app.indexOf('async function main()'));
-const api = new Function(prefix + '\nreturn {compareSamples,medianPairedProductLossChange,progressionSelection};')();
+const api = new Function(prefix + '\nreturn {compareSamples,medianPairedProductLossChange,progressionSelection,releaseGenerations};')();
 const sample = (fn_key, g8r_product_loss) => ({fn_key, ir_top: null, g8r_product_loss});
 const before = [sample('a', 0), sample('b', 100), sample('c', 101)];
 const after = [sample('a', 99), sample('b', 98), sample('c', 102)];
@@ -538,6 +556,32 @@ const duplicate = api.progressionSelection(
 );
 if (duplicate.baseline !== 'before' || duplicate.current !== 'after') {
   throw new Error(`duplicate selections must be separated: ${JSON.stringify(duplicate)}`);
+}
+const root = '1'.repeat(64);
+const generation = (generation_id, dso_version) => ({
+  generation_id,
+  crate_version: '1.0.0',
+  dso_version,
+  stdlib_root_action_id: root,
+  observed_subject_count: 1,
+  coverage: 'partial',
+  cohort_subject_count: 2,
+  missing_cohort_subject_count: 1,
+  extra_subject_count: 0,
+  enumeration_status: null,
+  enumerated_subject_count: null,
+  unmeasured_enumerated_subject_count: null,
+  campaign_runs: [],
+});
+const rolling = api.releaseGenerations(
+  {progression: {generations: [generation('old', '0.1.0'), generation('new', '0.2.0')]}},
+  [
+    {fn_key: 'a', ir_top: null, crate_version: '1.0.0', dso_version: '0.1.0', stdlib_root_action_id: root},
+    {fn_key: 'b', ir_top: null, crate_version: '1.0.0', dso_version: '0.2.0', stdlib_root_action_id: root},
+  ],
+);
+if (rolling.length !== 2 || rolling.some(value => value.samples.length !== 1)) {
+  throw new Error(`mixed DSO populations must remain separate: ${JSON.stringify(rolling)}`);
 }
 "#;
     let mut child = match Command::new("node")

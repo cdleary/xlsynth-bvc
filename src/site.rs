@@ -293,32 +293,46 @@ fn build_browser_progression_catalog(
     {
         return Ok(empty_browser_progression_catalog());
     }
-    let mut grouped = BTreeMap::<(String, String), Vec<_>>::new();
+    let mut grouped = BTreeMap::<(String, String, String), Vec<_>>::new();
+    let mut cohort_populations = BTreeMap::<(String, String), BTreeSet<_>>::new();
     for sample in &dataset.samples {
         let root = sample
             .stdlib_root_action_id
             .as_ref()
             .expect("lineage presence was checked above");
-        grouped
+        let subject = ProgressionSubject {
+            fn_key: sample.fn_key.clone(),
+            ir_top: sample.ir_top.clone(),
+        };
+        if !cohort_populations
             .entry((sample.crate_version.clone(), root.clone()))
+            .or_default()
+            .insert(subject)
+        {
+            bail!(
+                "release progression population contains a duplicate subject: crate={} root={}",
+                sample.crate_version,
+                root
+            );
+        }
+        grouped
+            .entry((
+                sample.crate_version.clone(),
+                sample.dso_version.clone(),
+                root.clone(),
+            ))
             .or_default()
             .push(sample);
     }
 
     let mut sources = Vec::with_capacity(grouped.len());
     let mut population_frequency = BTreeMap::<Vec<ProgressionSubject>, u64>::new();
-    for ((crate_version, stdlib_root_action_id), samples) in grouped {
-        let dso_versions = samples
-            .iter()
-            .map(|sample| sample.dso_version.as_str())
-            .collect::<BTreeSet<_>>();
-        if dso_versions.len() != 1 {
-            bail!(
-                "release progression generation has multiple DSO versions: crate={} root={} dso_versions={dso_versions:?}",
-                crate_version,
-                stdlib_root_action_id
-            );
-        }
+    for subjects in cohort_populations.into_values() {
+        *population_frequency
+            .entry(subjects.into_iter().collect())
+            .or_default() += 1;
+    }
+    for ((crate_version, dso_version, stdlib_root_action_id), samples) in grouped {
         let mut subjects = BTreeSet::new();
         for sample in samples {
             let subject = ProgressionSubject {
@@ -334,10 +348,9 @@ fn build_browser_progression_catalog(
             }
         }
         let subjects = subjects.into_iter().collect::<Vec<_>>();
-        *population_frequency.entry(subjects.clone()).or_default() += 1;
         sources.push(ProgressionGenerationSource {
             crate_version,
-            dso_version: (*dso_versions.iter().next().expect("one DSO version")).to_string(),
+            dso_version,
             stdlib_root_action_id,
             subjects,
         });
@@ -450,6 +463,7 @@ fn build_browser_progression_catalog(
     }
     generations.sort_by(|left, right| {
         cmp_dotted_numeric_version(&left.crate_version, &right.crate_version)
+            .then(left.dso_version.cmp(&right.dso_version))
             .then(left.stdlib_root_action_id.cmp(&right.stdlib_root_action_id))
     });
     let cohort_complete_generation_count = u64::try_from(
