@@ -2129,7 +2129,7 @@ pub(crate) fn load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_in
     )
 }
 
-pub(crate) fn rebuild_ir_fn_corpus_g8r_vs_yosys_dataset_index(
+fn rebuild_ir_fn_corpus_g8r_vs_yosys_dataset_index_only(
     store: &ArtifactStore,
     repo_root: &Path,
 ) -> Result<IrFnCorpusG8rVsYosysIndexSummary> {
@@ -2150,6 +2150,15 @@ pub(crate) fn rebuild_ir_fn_corpus_g8r_vs_yosys_dataset_index(
         index_bytes,
         elapsed_ms,
     })
+}
+
+pub(crate) fn rebuild_ir_fn_corpus_g8r_vs_yosys_dataset_index(
+    store: &ArtifactStore,
+    repo_root: &Path,
+) -> Result<IrFnCorpusG8rVsYosysIndexSummary> {
+    let summary = rebuild_ir_fn_corpus_g8r_vs_yosys_dataset_index_only(store, repo_root)?;
+    rebuild_ir_fn_corpus_ir_index_if_paired_indices_available(store)?;
+    Ok(summary)
 }
 
 pub(crate) fn build_ir_fn_corpus_g8r_vs_yosys_dataset_index_bytes(
@@ -2250,7 +2259,7 @@ fn maybe_log_web_index_rebuild_progress(
     *last_progress_log_at = Instant::now();
 }
 
-pub(crate) fn rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(
+fn rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_only(
     store: &ArtifactStore,
     repo_root: &Path,
 ) -> Result<IrFnCorpusG8rVsYosysIndexSummary> {
@@ -2274,6 +2283,16 @@ pub(crate) fn rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(
         index_bytes,
         elapsed_ms,
     })
+}
+
+pub(crate) fn rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(
+    store: &ArtifactStore,
+    repo_root: &Path,
+) -> Result<IrFnCorpusG8rVsYosysIndexSummary> {
+    let summary =
+        rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_only(store, repo_root)?;
+    rebuild_ir_fn_corpus_ir_index_if_paired_indices_available(store)?;
+    Ok(summary)
 }
 
 pub(crate) fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_bytes(
@@ -2309,7 +2328,7 @@ pub(crate) fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_byte
 
 pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
     store: &ArtifactStore,
-    comparison_indices: &[(&[u8], u32)],
+    comparison_indices: &[(&str, &[u8], u32)],
 ) -> Result<IrFnCorpusIrIndexBuild> {
     type SideIdentity = (String, String, String);
     #[derive(Debug, PartialEq, Eq)]
@@ -2324,7 +2343,7 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
 
     let mut wanted: BTreeMap<String, BTreeMap<String, (String, String, String)>> = BTreeMap::new();
     let mut pair_requests_by_identity = BTreeMap::new();
-    for (comparison_index_bytes, expected_schema_version) in comparison_indices {
+    for (_, comparison_index_bytes, expected_schema_version) in comparison_indices {
         let comparison: IrFnCorpusG8rVsYosysIndexFile =
             serde_json::from_slice(comparison_index_bytes)
                 .context("parsing paired corpus index while exporting XLS IR")?;
@@ -2915,7 +2934,7 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
 
 fn rebuild_ir_fn_corpus_ir_index_for_paired_indices(
     store: &ArtifactStore,
-    comparison_indices: &[(&[u8], u32)],
+    comparison_indices: &[(&str, &[u8], u32)],
 ) -> Result<IrFnCorpusIrIndexSummary> {
     let started = Instant::now();
     let build = build_ir_fn_corpus_ir_index_bytes_for_paired_indices(store, comparison_indices)?;
@@ -2924,6 +2943,11 @@ fn rebuild_ir_fn_corpus_ir_index_for_paired_indices(
             WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
             build.manifest_bytes.as_slice(),
         ))
+        .chain(
+            comparison_indices
+                .iter()
+                .map(|(index_key, bytes, _)| (*index_key, *bytes)),
+        )
         .chain(
             build
                 .shard_files
@@ -2947,6 +2971,34 @@ fn rebuild_ir_fn_corpus_ir_index_for_paired_indices(
         index_bytes: index_bytes as u64,
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     })
+}
+
+fn rebuild_ir_fn_corpus_ir_index_if_paired_indices_available(
+    store: &ArtifactStore,
+) -> Result<Option<IrFnCorpusIrIndexSummary>> {
+    let Some(direct_comparison_bytes) =
+        store.load_web_index_bytes(WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME)?
+    else {
+        return Ok(None);
+    };
+    let Some(frontend_comparison_bytes) =
+        store.load_web_index_bytes(WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME)?
+    else {
+        return Ok(None);
+    };
+    let comparison_indices = [
+        (
+            WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+            direct_comparison_bytes.as_slice(),
+            WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+        ),
+        (
+            WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
+            frontend_comparison_bytes.as_slice(),
+            WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
+        ),
+    ];
+    rebuild_ir_fn_corpus_ir_index_for_paired_indices(store, &comparison_indices).map(Some)
 }
 
 pub(crate) fn rebuild_web_indices(
@@ -3028,7 +3080,7 @@ pub(crate) fn rebuild_web_indices(
     let phase_g8r_started = Instant::now();
     warn!("rebuild-web-indices phase=ir-fn-corpus-g8r-vs-yosys-abc begin");
     let ir_fn_corpus_g8r_vs_yosys =
-        rebuild_ir_fn_corpus_g8r_vs_yosys_dataset_index(store, repo_root)?;
+        rebuild_ir_fn_corpus_g8r_vs_yosys_dataset_index_only(store, repo_root)?;
     warn!(
         "rebuild-web-indices phase=ir-fn-corpus-g8r-vs-yosys-abc done samples={} versions={} elapsed={}",
         ir_fn_corpus_g8r_vs_yosys.sample_count,
@@ -3038,7 +3090,7 @@ pub(crate) fn rebuild_web_indices(
     let phase_frontend_started = Instant::now();
     warn!("rebuild-web-indices phase=ir-fn-g8r-abc-vs-codegen-yosys-abc begin");
     let ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc =
-        rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(store, repo_root)?;
+        rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_only(store, repo_root)?;
     warn!(
         "rebuild-web-indices phase=ir-fn-g8r-abc-vs-codegen-yosys-abc done samples={} versions={} elapsed={}",
         ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc.sample_count,
@@ -3047,24 +3099,8 @@ pub(crate) fn rebuild_web_indices(
     );
     let phase_ir_started = Instant::now();
     warn!("rebuild-web-indices phase=ir-fn-corpus-ir begin");
-    let direct_comparison_bytes = store
-        .load_web_index_bytes(WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME)?
-        .context("rebuilt direct paired corpus index is unavailable for XLS IR export")?;
-    let frontend_comparison_bytes = store
-        .load_web_index_bytes(WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME)?
-        .context("rebuilt frontend paired corpus index is unavailable for XLS IR export")?;
-    let comparison_indices = [
-        (
-            direct_comparison_bytes.as_slice(),
-            WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
-        ),
-        (
-            frontend_comparison_bytes.as_slice(),
-            WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
-        ),
-    ];
-    let ir_fn_corpus_ir =
-        rebuild_ir_fn_corpus_ir_index_for_paired_indices(store, &comparison_indices)?;
+    let ir_fn_corpus_ir = rebuild_ir_fn_corpus_ir_index_if_paired_indices_available(store)?
+        .context("rebuilt paired corpus indexes are unavailable for XLS IR export")?;
     warn!(
         "rebuild-web-indices phase=ir-fn-corpus-ir done entries={} bytes={} elapsed={}",
         ir_fn_corpus_ir.entry_count,
@@ -8964,10 +9000,12 @@ mod tests {
             serde_json::to_vec(&comparison).expect("serialize frontend comparison");
         let comparison_indices = [
             (
+                WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
                 direct_comparison_bytes.as_slice(),
                 crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
             ),
             (
+                WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
                 frontend_comparison_bytes.as_slice(),
                 crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
             ),
@@ -8975,6 +9013,56 @@ mod tests {
         let build =
             build_ir_fn_corpus_ir_index_bytes_for_paired_indices(&store, &comparison_indices)
                 .expect("build IR function corpus index");
+        validate_ir_fn_corpus_ir_index_closure(
+            comparison_indices
+                .iter()
+                .map(|(index_key, bytes, _)| (*index_key, *bytes))
+                .chain(std::iter::once((
+                    WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
+                    build.manifest_bytes.as_slice(),
+                )))
+                .chain(
+                    build
+                        .shard_files
+                        .iter()
+                        .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+                ),
+        )
+        .expect("generated IR index exactly covers both comparison indexes");
+
+        let mut changed_frontend_comparison = comparison.clone();
+        changed_frontend_comparison.dataset.samples[0].g8r_stats_action_id = "a".repeat(64);
+        changed_frontend_comparison.dataset.samples[0].yosys_abc_stats_action_id = "b".repeat(64);
+        changed_frontend_comparison.g8r_points[0]
+            .point
+            .stats_action_id = "a".repeat(64);
+        changed_frontend_comparison.yosys_points[0]
+            .point
+            .stats_action_id = "b".repeat(64);
+        let changed_frontend_bytes = serde_json::to_vec(&changed_frontend_comparison).unwrap();
+        let error = validate_ir_fn_corpus_ir_index_closure(
+            std::iter::once((
+                WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+                direct_comparison_bytes.as_slice(),
+            ))
+            .chain(std::iter::once((
+                WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
+                changed_frontend_bytes.as_slice(),
+            )))
+            .chain(std::iter::once((
+                WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
+                build.manifest_bytes.as_slice(),
+            )))
+            .chain(
+                build
+                    .shard_files
+                    .iter()
+                    .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+            ),
+        )
+        .expect_err("stale IR index must not validate against a changed comparison index");
+        assert!(format!("{error:#}").contains("do not exactly match comparison datasets"));
+
         assert_eq!(build.entry_count, 2);
         let manifest: IrFnCorpusIrIndexManifest = serde_json::from_slice(&build.manifest_bytes)
             .expect("parse IR function corpus manifest");

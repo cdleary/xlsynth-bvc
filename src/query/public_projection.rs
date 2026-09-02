@@ -740,32 +740,139 @@ fn validate_ir_fn_corpus_ir_shard(index: &IrFnCorpusIrShardFile) -> Result<()> {
     Ok(())
 }
 
+type IrFnCorpusIrPairKey = (String, String, String, String);
+type IrFnCorpusIrPairSides = ((String, String), (String, String));
+
+fn collect_expected_ir_fn_corpus_ir_pairs(
+    comparison: &IrFnCorpusG8rVsYosysIndexFile,
+    expected_schema_version: u32,
+    expected: &mut BTreeMap<IrFnCorpusIrPairKey, IrFnCorpusIrPairSides>,
+) -> Result<()> {
+    validate_corpus_index(comparison, expected_schema_version)?;
+
+    let mut g8r_by_entity = BTreeMap::new();
+    for row in &comparison.g8r_points {
+        let key = (row.structural_hash.as_str(), row.crate_version.as_str());
+        if g8r_by_entity.insert(key, &row.point).is_some() {
+            bail!("IR corpus comparison has duplicate G8r entity points");
+        }
+    }
+    let mut yosys_by_entity = BTreeMap::new();
+    for row in &comparison.yosys_points {
+        let key = (row.structural_hash.as_str(), row.crate_version.as_str());
+        if yosys_by_entity.insert(key, &row.point).is_some() {
+            bail!("IR corpus comparison has duplicate Yosys/ABC entity points");
+        }
+    }
+
+    for sample in &comparison.dataset.samples {
+        let structural_hash = sample
+            .structural_hash
+            .as_deref()
+            .context("IR corpus comparison sample has no structural hash")?;
+        let sample_top = sample
+            .ir_top
+            .as_deref()
+            .context("IR corpus comparison sample has no IR top")?;
+        let entity_key = (structural_hash, sample.crate_version.as_str());
+        let g8r = g8r_by_entity
+            .get(&entity_key)
+            .context("IR corpus comparison sample is missing its G8r entity point")?;
+        let yosys_abc = yosys_by_entity
+            .get(&entity_key)
+            .context("IR corpus comparison sample is missing its Yosys/ABC entity point")?;
+        let yosys_top = yosys_abc
+            .ir_top
+            .as_deref()
+            .context("IR corpus comparison Yosys/ABC point has no IR top")?;
+        if sample.ir_action_id != g8r.ir_action_id
+            || Some(sample_top) != g8r.ir_top.as_deref()
+            || sample.g8r_stats_action_id != g8r.stats_action_id
+            || sample.yosys_abc_stats_action_id != yosys_abc.stats_action_id
+        {
+            bail!("IR corpus comparison sample disagrees with its concrete entity points");
+        }
+        let key = (
+            sample.crate_version.clone(),
+            structural_hash.to_string(),
+            sample.g8r_stats_action_id.clone(),
+            sample.yosys_abc_stats_action_id.clone(),
+        );
+        let sides = (
+            (g8r.ir_action_id.clone(), sample_top.to_string()),
+            (yosys_abc.ir_action_id.clone(), yosys_top.to_string()),
+        );
+        match expected.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(sides);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &sides => {
+                bail!("IR corpus comparison indices disagree for one concrete sample");
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_ir_fn_corpus_ir_index_closure<'a>(
     entries: impl IntoIterator<Item = (&'a str, &'a [u8])>,
 ) -> Result<()> {
     let namespace_prefix = format!("{}/", crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE);
     let mut ir_entries = BTreeMap::new();
-    for (key, bytes) in entries.into_iter().filter(|(key, _)| {
-        *key == crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME || key.starts_with(&namespace_prefix)
-    }) {
-        if ir_entries.insert(key, bytes).is_some() {
-            bail!("duplicate IR function corpus index key: {key}");
+    let mut comparison_entries = BTreeMap::new();
+    for (key, bytes) in entries {
+        if key == crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME || key.starts_with(&namespace_prefix) {
+            if ir_entries.insert(key, bytes).is_some() {
+                bail!("duplicate IR function corpus index key: {key}");
+            }
+        } else if matches!(
+            key,
+            crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
+                | crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
+        ) && comparison_entries.insert(key, bytes).is_some()
+        {
+            bail!("duplicate IR function corpus comparison index key: {key}");
         }
     }
-    if ir_entries.is_empty() {
+    if ir_entries.is_empty() && comparison_entries.is_empty() {
         return Ok(());
     }
 
     let manifest_bytes = ir_entries
         .get(crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME)
         .copied()
-        .context("IR function corpus shards exist without their manifest")?;
+        .context("IR function corpus comparison indexes or shards exist without their manifest")?;
     let manifest: IrFnCorpusIrIndexManifest = serde_json::from_slice(manifest_bytes)
         .context("parsing IR function corpus manifest during closure validation")?;
     validate_ir_fn_corpus_ir_manifest(&manifest)?;
 
+    let mut expected_pairs = BTreeMap::new();
+    for (index_key, schema_version) in [
+        (
+            crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+            crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+        ),
+        (
+            crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
+            crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
+        ),
+    ] {
+        let bytes = comparison_entries
+            .get(index_key)
+            .copied()
+            .with_context(|| {
+                format!("IR function corpus IR index is missing comparison dataset {index_key}")
+            })?;
+        let comparison: IrFnCorpusG8rVsYosysIndexFile = serde_json::from_slice(bytes)
+            .with_context(|| format!("parsing IR function corpus comparison {index_key}"))?;
+        collect_expected_ir_fn_corpus_ir_pairs(&comparison, schema_version, &mut expected_pairs)
+            .with_context(|| format!("validating IR function corpus comparison {index_key}"))?;
+    }
+
     let mut expected_keys = BTreeSet::from([crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME.to_string()]);
     let mut actual_entry_count = 0usize;
+    let mut actual_pairs = BTreeMap::new();
     for summary in &manifest.shards {
         expected_keys.insert(summary.index_key.clone());
         let shard_bytes = ir_entries
@@ -800,6 +907,24 @@ pub(crate) fn validate_ir_fn_corpus_ir_index_closure<'a>(
                 summary.index_key
             );
         }
+        for entry in &shard.entries {
+            let key = (
+                entry.crate_version.clone(),
+                entry.structural_hash.clone(),
+                entry.g8r_stats_action_id.clone(),
+                entry.yosys_abc_stats_action_id.clone(),
+            );
+            let sides = (
+                (entry.g8r.ir_action_id.clone(), entry.g8r.ir_top.clone()),
+                (
+                    entry.yosys_abc.ir_action_id.clone(),
+                    entry.yosys_abc.ir_top.clone(),
+                ),
+            );
+            if actual_pairs.insert(key, sides).is_some() {
+                bail!("IR function corpus shards contain a duplicate concrete comparison identity");
+            }
+        }
         actual_entry_count = actual_entry_count
             .checked_add(shard.entries.len())
             .context("IR function corpus shard entry count overflow")?;
@@ -817,6 +942,27 @@ pub(crate) fn validate_ir_fn_corpus_ir_index_closure<'a>(
             "IR function corpus shard entry count mismatch: manifest={} actual={}",
             manifest.entry_count,
             actual_entry_count
+        );
+    }
+    if actual_pairs != expected_pairs {
+        let missing = expected_pairs
+            .keys()
+            .filter(|key| !actual_pairs.contains_key(*key))
+            .count();
+        let unexpected = actual_pairs
+            .keys()
+            .filter(|key| !expected_pairs.contains_key(*key))
+            .count();
+        let mismatched = actual_pairs
+            .iter()
+            .filter(|(key, sides)| {
+                expected_pairs
+                    .get(*key)
+                    .is_some_and(|value| value != *sides)
+            })
+            .count();
+        bail!(
+            "IR function corpus shards do not exactly match comparison datasets: missing={missing} unexpected={unexpected} mismatched={mismatched}"
         );
     }
     Ok(())
@@ -1060,10 +1206,30 @@ mod tests {
     }
 
     fn empty_ir_fn_corpus_ir_entries() -> Vec<(String, Vec<u8>)> {
-        let mut entries = vec![(
-            crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME.to_string(),
-            serde_json::to_vec(&empty_ir_fn_corpus_ir_value()).unwrap(),
-        )];
+        let mut entries = vec![
+            (
+                crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME.to_string(),
+                serde_json::to_vec(&empty_ir_fn_corpus_ir_value()).unwrap(),
+            ),
+            (
+                crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME.to_string(),
+                serde_json::to_vec(&empty_comparison_value(
+                    crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+                    false,
+                    true,
+                ))
+                .unwrap(),
+            ),
+            (
+                crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME.to_string(),
+                serde_json::to_vec(&empty_comparison_value(
+                    crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
+                    false,
+                    true,
+                ))
+                .unwrap(),
+            ),
+        ];
         entries.extend((u8::MIN..=u8::MAX).map(|byte| {
             let prefix = format!("{byte:02x}");
             (

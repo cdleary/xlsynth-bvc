@@ -631,10 +631,12 @@ fn rebuild_snapshot_web_indices(
     warn!("rebuild-snapshot-web-indices phase=ir-fn-corpus-ir begin");
     let comparison_indices = [
         (
+            WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
             ir_fn_corpus_g8r_vs_yosys_bytes.as_slice(),
             crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
         ),
         (
+            WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
             ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_bytes.as_slice(),
             crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
         ),
@@ -646,6 +648,11 @@ fn rebuild_snapshot_web_indices(
             WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
             ir_build.manifest_bytes.as_slice(),
         ))
+        .chain(
+            comparison_indices
+                .iter()
+                .map(|(index_key, bytes, _)| (*index_key, *bytes)),
+        )
         .chain(
             ir_build
                 .shard_files
@@ -1460,25 +1467,6 @@ mod tests {
         .expect("serialize empty versions index")
     }
 
-    fn empty_ir_corpus_index_bytes() -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
-            "generated_utc": Utc::now(),
-            "dataset": {
-                "fraig": false,
-                "samples": [],
-                "min_ir_nodes": 0,
-                "max_ir_nodes": 0,
-                "g8r_only_count": 0,
-                "yosys_only_count": 0,
-                "available_crate_versions": []
-            },
-            "g8r_points": [],
-            "yosys_points": []
-        }))
-        .expect("serialize empty IR corpus index")
-    }
-
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2026,22 +2014,22 @@ mod tests {
     }
 
     #[test]
-    fn static_snapshot_build_skips_incremental_delta_rows() {
+    fn static_snapshot_build_skips_non_allowlisted_nested_rows() {
         let root = make_temp_dir("skip-incremental");
         let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
         store
             .write_web_index_bytes(
-                "ir-fn-corpus-g8r-vs-yosys-abc.v3.json",
-                &empty_ir_corpus_index_bytes(),
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
             )
             .expect("write base index");
         store
             .write_web_index_bytes(
-                "ir-fn-corpus-g8r-vs-yosys-abc.v3.json/incremental-delta/row-1.json",
+                &format!("{WEB_VERSIONS_SUMMARY_INDEX_FILENAME}/nested/row-1.json"),
                 br#"{"row":1}"#,
             )
-            .expect("write incremental delta row");
+            .expect("write nested row");
 
         let out_dir = root.join("snapshot-out");
         let summary = build_static_snapshot(
@@ -2060,15 +2048,15 @@ mod tests {
         assert_eq!(manifest.dataset_files.len(), 1);
         assert_eq!(
             manifest.dataset_files[0].index_key,
-            "ir-fn-corpus-g8r-vs-yosys-abc.v3.json"
+            WEB_VERSIONS_SUMMARY_INDEX_FILENAME
         );
         let delta_path = out_dir
             .join("web_index")
-            .join("ir-fn-corpus-g8r-vs-yosys-abc.v3.json")
-            .join("incremental-delta");
+            .join(WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .join("nested");
         assert!(
             !delta_path.exists(),
-            "incremental delta path should be skipped"
+            "non-allowlisted nested path should be skipped"
         );
     }
 
