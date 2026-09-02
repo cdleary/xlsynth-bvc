@@ -205,7 +205,7 @@ The vendored third-party metadata is documented in `third_party/xlsynth-crate/VE
 
 - `enqueue`: writes queue item in `pending/` by action ID (dedup by action ID), with optional explicit `priority` (default `0`).
 - `drain-queue`: first preflights runtime dependencies (image builds + release/proto cache fill), then workers claim only dependency-ready items (all dependency action IDs already completed) with an atomic hard-link-based claim from `pending` into `running`, attach a unique lease token plus owner/expiry data, execute, then commit terminal state under a per-action advisory fence that verifies the same lease token.
-- claim order is: higher explicit queue priority first, then action-kind scheduler priority, then enqueue time.
+- claim selection rotates through bounded windows of the pending queue; within each inspected window the order is higher explicit queue priority first, then action-kind scheduler priority, then enqueue time. Priority is therefore best-effort across a large queue rather than globally strict.
 - suggested descendants do not inherit root priority verbatim anymore: enqueue uses the parent item's explicit priority as a base and adds a small stage bonus derived from action-kind scheduler priority, so lineages closer to `DriverAigToStats` / `AigStatDiff` naturally outrank older upstream work from the same root priority.
 - compatible `DriverIrToG8rAig` micro-batching is intentionally conservative: extra claims stay within the same explicit queue priority band and are capped at four total actions per worker so newly-ready stats/diff work is less likely to wait behind already-leased G8r batches.
 - expired running leases are reclaimed back to pending before draining (unless disabled).
