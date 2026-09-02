@@ -44,6 +44,7 @@ pub(crate) fn default_yosys_runtime(repo_root: &Path) -> Result<YosysRuntimeSpec
             dockerfile_sha256: sha256_bytes(include_bytes!("../docker/yosys-abc.Dockerfile")),
             docker_image_id: String::new(),
             upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
+            slang_commit: None,
         },
     )
 }
@@ -56,6 +57,7 @@ pub(crate) fn test_yosys_runtime() -> YosysRuntimeSpec {
         dockerfile_sha256: sha256_bytes(include_bytes!("../docker/yosys-abc.Dockerfile")),
         docker_image_id: "e".repeat(64),
         upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
+        slang_commit: None,
     }
 }
 

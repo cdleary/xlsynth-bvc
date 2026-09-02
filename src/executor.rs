@@ -256,6 +256,7 @@ pub(crate) fn execute_action(
         ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id,
             verilog_top_module_name,
+            frontend,
             yosys_script_ref,
             runtime,
         } => run_combo_verilog_to_yosys_abc_aig_action(
@@ -264,6 +265,7 @@ pub(crate) fn execute_action(
             &action_id,
             verilog_action_id,
             verilog_top_module_name.as_deref(),
+            frontend,
             yosys_script_ref,
             runtime,
             &payload_dir,
@@ -3382,6 +3384,7 @@ pub(crate) fn run_ir_fn_to_combinational_verilog_action(
             ActionSpec::ComboVerilogToYosysAbcAig {
                 verilog_action_id: action_id.to_string(),
                 verilog_top_module_name: ir_top.clone(),
+                frontend: YosysVerilogFrontend::Builtin,
                 yosys_script_ref,
                 runtime: default_yosys_runtime(repo_root)?,
             },
@@ -4986,10 +4989,25 @@ pub(crate) fn run_combo_verilog_to_yosys_abc_aig_action(
     action_id: &str,
     verilog_action_id: &str,
     verilog_top_module_name: Option<&str>,
+    frontend: &YosysVerilogFrontend,
     yosys_script_ref: &ScriptRef,
     runtime: &YosysRuntimeSpec,
     payload_dir: &Path,
 ) -> Result<ActionOutcome> {
+    match (frontend, runtime.slang_commit.as_deref()) {
+        (YosysVerilogFrontend::Builtin, None) => {}
+        (YosysVerilogFrontend::Slang { revision }, Some(runtime_revision))
+            if revision == runtime_revision => {}
+        (YosysVerilogFrontend::Builtin, Some(_)) => {
+            bail!("builtin Yosys frontend requires a runtime without slang_commit")
+        }
+        (YosysVerilogFrontend::Slang { .. }, None) => {
+            bail!("slang Yosys frontend requires runtime.slang_commit")
+        }
+        (YosysVerilogFrontend::Slang { revision }, Some(runtime_revision)) => bail!(
+            "slang frontend revision `{revision}` does not match runtime revision `{runtime_revision}`"
+        ),
+    }
     let dep = load_dependency_of_type(store, verilog_action_id, ArtifactType::VerilogFile)?;
     let verilog_input_path = store.resolve_artifact_ref_path(&dep);
     if !verilog_input_path.exists() {
@@ -5010,18 +5028,38 @@ pub(crate) fn run_combo_verilog_to_yosys_abc_aig_action(
     let script = r#"
 set -euo pipefail
 {
-  echo "read_verilog ${READ_VERILOG_FLAGS} /inputs/input.v"
+  if [ "${YOSYS_VERILOG_FRONTEND}" = "slang" ]; then
+    if [ -n "${VERILOG_TOP_MODULE_NAME:-}" ]; then
+      echo "read_slang --top ${VERILOG_TOP_MODULE_NAME} /inputs/input.v"
+    else
+      echo "read_slang /inputs/input.v"
+    fi
+  else
+    echo "read_verilog ${READ_VERILOG_FLAGS} /inputs/input.v"
+  fi
   if [ -n "${VERILOG_TOP_MODULE_NAME:-}" ]; then
     echo "hierarchy -check -top ${VERILOG_TOP_MODULE_NAME}"
   fi
   echo "script /inputs/flow.ys"
   echo "write_aiger /outputs/result.aig"
 } > /tmp/run.ys
-yosys -s /tmp/run.ys
+if [ "${YOSYS_VERILOG_FRONTEND}" = "slang" ]; then
+  yosys -m slang -s /tmp/run.ys
+else
+  yosys -s /tmp/run.ys
+fi
 test -s /outputs/result.aig
 "#;
 
     let mut env = BTreeMap::new();
+    env.insert(
+        "YOSYS_VERILOG_FRONTEND".to_string(),
+        match frontend {
+            YosysVerilogFrontend::Builtin => "builtin",
+            YosysVerilogFrontend::Slang { .. } => "slang",
+        }
+        .to_string(),
+    );
     env.insert(
         "READ_VERILOG_FLAGS".to_string(),
         if dep.relpath.ends_with(".sv") {
@@ -5081,6 +5119,7 @@ test -s /outputs/result.aig
             "yosys_runtime": runtime,
             "yosys_upstream_commit": runtime.upstream_commit.as_deref(),
             "verilog_top_module_name": verilog_top_module_name,
+            "frontend": frontend,
             "yosys_script_ref": yosys_script_ref,
             "flow": "yosys_script_to_aiger",
         }),

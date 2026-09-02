@@ -57,8 +57,9 @@ const DEFAULT_RELEASE_PLATFORM: &str = "ubuntu2004";
 const DEFAULT_DOCKERFILE: &str = "docker/xlsynth-driver.Dockerfile";
 const DEFAULT_DOCKER_IMAGE_PREFIX: &str = "xlsynth-bvc-driver";
 const DEFAULT_YOSYS_DOCKERFILE: &str = "docker/yosys-abc.Dockerfile";
-const DEFAULT_YOSYS_DOCKER_IMAGE: &str = "xlsynth-bvc-yosys-abc:yosys-1f023432-py";
+const DEFAULT_YOSYS_DOCKER_IMAGE: &str = "xlsynth-bvc-yosys-abc:yosys-1f023432-slang-b6e440d6-py";
 const DEFAULT_YOSYS_UPSTREAM_COMMIT: &str = "1f023432681c159885f0b834a2e0717e67c4c115";
+const DEFAULT_YOSYS_SLANG_COMMIT: &str = "b6e440d6a2586b93c2a43da676c207c8c2a15778";
 const DEFAULT_YOSYS_FLOW_SCRIPT: &str = "flows/yosys_to_aig.ys";
 const DEFAULT_QUEUE_LEASE_SECONDS: i64 = 900;
 const DEFAULT_QUEUE_PRIORITY: i32 = 0;
@@ -235,7 +236,11 @@ impl DriverCli {
 }
 
 impl YosysCli {
-    pub(crate) fn into_runtime(self, repo_root: &Path) -> Result<YosysRuntimeSpec> {
+    pub(crate) fn into_runtime(
+        self,
+        repo_root: &Path,
+        slang_commit: Option<String>,
+    ) -> Result<YosysRuntimeSpec> {
         let dockerfile = self.yosys_dockerfile.to_string_lossy().to_string();
         crate::service::bind_yosys_runtime_image(
             repo_root,
@@ -245,6 +250,7 @@ impl YosysCli {
                 docker_image_id: String::new(),
                 dockerfile,
                 upstream_commit: self.yosys_upstream_commit,
+                slang_commit,
             },
         )
     }

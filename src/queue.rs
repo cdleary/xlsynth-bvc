@@ -2333,6 +2333,7 @@ mod tests {
             docker_image_id: "e".repeat(64),
             dockerfile_sha256: "d".repeat(64),
             upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
+            slang_commit: None,
         };
         let diff = ActionSpec::AigStatDiff {
             opt_ir_action_id: "a".repeat(64),
@@ -2347,6 +2348,7 @@ mod tests {
         let yabc = ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id: "e".repeat(64),
             verilog_top_module_name: Some("__top".to_string()),
+            frontend: crate::model::YosysVerilogFrontend::Builtin,
             yosys_script_ref: crate::model::ScriptRef {
                 path: "flows/yosys_to_aig.ys".to_string(),
                 sha256: "f".repeat(64),

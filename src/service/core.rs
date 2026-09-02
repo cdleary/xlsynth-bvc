@@ -538,6 +538,7 @@ pub(crate) fn build_aig_stat_diff_suggestion_for_stats_action(
             let yosys_aig = ActionSpec::ComboVerilogToYosysAbcAig {
                 verilog_action_id: combo_action_id,
                 verilog_top_module_name: top_fn_name.clone(),
+                frontend: YosysVerilogFrontend::Builtin,
                 yosys_script_ref,
                 runtime: default_yosys_runtime(repo_root)?,
             };
@@ -565,10 +566,11 @@ pub(crate) fn build_aig_stat_diff_suggestion_for_stats_action(
         }
         ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id,
+            frontend,
             yosys_script_ref,
             ..
         } => {
-            if !is_canonical_yosys_script_ref(&yosys_script_ref) {
+            if !is_canonical_builtin_yosys_source(&frontend, &yosys_script_ref) {
                 return Ok(None);
             }
             let Some(ctx) = infer_verilog_driver_context(store, &verilog_action_id)? else {
@@ -750,6 +752,13 @@ pub(crate) fn is_canonical_yosys_script_ref(script_ref: &ScriptRef) -> bool {
             .to_string()
     }
     normalize_script_path(&script_ref.path) == normalize_script_path(DEFAULT_YOSYS_FLOW_SCRIPT)
+}
+
+pub(crate) fn is_canonical_builtin_yosys_source(
+    frontend: &YosysVerilogFrontend,
+    script_ref: &ScriptRef,
+) -> bool {
+    matches!(frontend, YosysVerilogFrontend::Builtin) && is_canonical_yosys_script_ref(script_ref)
 }
 
 pub(crate) fn resolve_script_ref(repo_root: &Path, script_ref: &ScriptRef) -> Result<PathBuf> {
@@ -1188,5 +1197,23 @@ mod tests {
         assert_eq!(resolved.source, K_BOOL_CONE_MANIFEST_STRUCTURAL_HASH_SOURCE);
 
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn canonical_yosys_source_requires_builtin_frontend() {
+        let canonical_script = ScriptRef {
+            path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
+            sha256: "0".repeat(64),
+        };
+        assert!(is_canonical_builtin_yosys_source(
+            &YosysVerilogFrontend::Builtin,
+            &canonical_script
+        ));
+        assert!(!is_canonical_builtin_yosys_source(
+            &YosysVerilogFrontend::Slang {
+                revision: "a".repeat(40),
+            },
+            &canonical_script
+        ));
     }
 }

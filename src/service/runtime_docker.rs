@@ -31,14 +31,15 @@ fn driver_runtime_fingerprint(runtime: &DriverRuntimeSpec) -> Result<String> {
 }
 
 fn yosys_runtime_fingerprint(runtime: &YosysRuntimeSpec) -> Result<String> {
-    Ok(runtime_fingerprint(
-        "yosys",
-        &[
-            &runtime.dockerfile,
-            &runtime.dockerfile_sha256,
-            runtime.upstream_commit.as_deref().unwrap_or(""),
-        ],
-    ))
+    let mut components = vec![
+        runtime.dockerfile.as_str(),
+        runtime.dockerfile_sha256.as_str(),
+        runtime.upstream_commit.as_deref().unwrap_or(""),
+    ];
+    if let Some(slang_commit) = runtime.slang_commit.as_deref() {
+        components.push(slang_commit);
+    }
+    Ok(runtime_fingerprint("yosys", &components))
 }
 
 pub(crate) fn driver_cache_mount(
@@ -1212,7 +1213,7 @@ fn yosys_image_build_args(
         .as_deref()
         .context("yosys runtime requires upstream_commit")?;
     let commit_prefix = &commit[..8];
-    Ok(vec![
+    let mut args = vec![
         OsString::from("build"),
         OsString::from("--file"),
         dockerfile.into_os_string(),
@@ -1222,10 +1223,17 @@ fn yosys_image_build_args(
         OsString::from(format!("YOSYS_COMMIT={commit}")),
         OsString::from("--build-arg"),
         OsString::from(format!("YOSYS_COMMIT_PREFIX={commit_prefix}")),
+    ];
+    if let Some(slang_commit) = runtime.slang_commit.as_deref() {
+        args.push(OsString::from("--build-arg"));
+        args.push(OsString::from(format!("YOSYS_SLANG_COMMIT={slang_commit}")));
+    }
+    args.extend([
         OsString::from("--build-arg"),
         OsString::from(format!("BVC_RUNTIME_FINGERPRINT={fingerprint}")),
         OsString::from("."),
-    ])
+    ]);
+    Ok(args)
 }
 
 pub(crate) fn ensure_driver_image(
@@ -3243,6 +3251,7 @@ mod tests {
             ))),
             docker_image_id: String::new(),
             upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
+            slang_commit: None,
         }
     }
 
@@ -3272,6 +3281,12 @@ mod tests {
             yosys_fingerprint,
             yosys_runtime_fingerprint(&changed_yosys).expect("changed yosys fingerprint")
         );
+        let mut slang_yosys = yosys.clone();
+        slang_yosys.slang_commit = Some(crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string());
+        assert_ne!(
+            yosys_fingerprint,
+            yosys_runtime_fingerprint(&slang_yosys).expect("slang yosys fingerprint")
+        );
     }
 
     #[test]
@@ -3296,6 +3311,26 @@ mod tests {
         assert!(args.contains(&format!("YOSYS_COMMIT_PREFIX={}", &commit[..8])));
         assert!(args.contains(&format!("BVC_RUNTIME_FINGERPRINT={fingerprint}")));
         assert!(args.contains(&build_ref));
+
+        let mut slang_runtime = runtime.clone();
+        slang_runtime.slang_commit = Some(crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string());
+        let slang_fingerprint =
+            yosys_runtime_fingerprint(&slang_runtime).expect("slang fingerprint");
+        let slang_args = yosys_image_build_args(
+            &slang_runtime,
+            PathBuf::from(&slang_runtime.dockerfile),
+            &slang_fingerprint,
+            "yosys:slang-test",
+        )
+        .expect("slang build args")
+        .into_iter()
+        .map(|value| value.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+        assert!(slang_args.contains(&format!(
+            "YOSYS_SLANG_COMMIT={}",
+            crate::DEFAULT_YOSYS_SLANG_COMMIT
+        )));
+        assert!(slang_args.contains(&format!("BVC_RUNTIME_FINGERPRINT={slang_fingerprint}")));
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         checked_runtime_dockerfile(root, &runtime.dockerfile, &runtime.dockerfile_sha256)
@@ -3803,6 +3838,7 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
         let yosys_from_combo_a = ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id: combo_a_id.clone(),
             verilog_top_module_name: Some("top_a".to_string()),
+            frontend: crate::model::YosysVerilogFrontend::Builtin,
             yosys_script_ref: yosys_script_ref.clone(),
             runtime: yosys_runtime.clone(),
         };

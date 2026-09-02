@@ -201,6 +201,7 @@ message ComboVerilogToYosysAbcAigDetails {
   ScriptRef yosys_script_ref = 2;
   optional string verilog_top_module_name = 3;
   string flow = 4;
+  YosysVerilogFrontend frontend = 5;
 }
 
 message AigToYosysAbcAigDetails {

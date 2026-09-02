@@ -587,6 +587,8 @@ pub enum RunAction {
         verilog_action_id: String,
         #[arg(long)]
         verilog_top_module_name: Option<String>,
+        #[arg(long, value_enum, default_value_t = YosysVerilogFrontendCli::Builtin)]
+        frontend: YosysVerilogFrontendCli,
         #[arg(long)]
         yosys_script: String,
         #[command(flatten)]
@@ -616,6 +618,12 @@ pub enum RunAction {
         #[arg(long)]
         yosys_abc_aig_stats_action_id: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum YosysVerilogFrontendCli {
+    Builtin,
+    Slang,
 }
 
 #[derive(Debug, Clone, Args)]

@@ -3218,10 +3218,11 @@ fn extract_ir_fn_corpus_g8r_abc_vs_codegen_source_context(
         }
         ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id,
+            frontend,
             yosys_script_ref,
             ..
         } => {
-            if !is_canonical_yosys_script_ref(yosys_script_ref) {
+            if !is_canonical_builtin_yosys_source(frontend, yosys_script_ref) {
                 return None;
             }
             let verilog_provenance = provenance_by_action_id.get(verilog_action_id.as_str())?;
@@ -3494,10 +3495,11 @@ fn compute_ir_fn_corpus_stats_upsert_point(
             }
             ActionSpec::ComboVerilogToYosysAbcAig {
                 verilog_action_id,
+                frontend,
                 yosys_script_ref,
                 ..
             } => {
-                if !is_canonical_yosys_script_ref(yosys_script_ref) {
+                if !is_canonical_builtin_yosys_source(frontend, yosys_script_ref) {
                     return Ok(None);
                 }
                 let verilog_provenance = store.load_provenance(verilog_action_id)?;
@@ -3707,10 +3709,11 @@ fn compute_ir_fn_corpus_g8r_abc_vs_codegen_stats_upsert_point(
             }
             ActionSpec::ComboVerilogToYosysAbcAig {
                 verilog_action_id,
+                frontend,
                 yosys_script_ref,
                 ..
             } => {
-                if !is_canonical_yosys_script_ref(yosys_script_ref) {
+                if !is_canonical_builtin_yosys_source(frontend, yosys_script_ref) {
                     return Ok(None);
                 }
                 let verilog_provenance = store.load_provenance(verilog_action_id)?;
@@ -3870,6 +3873,13 @@ pub(crate) fn script_ref_short_label(script_ref: &ScriptRef) -> String {
         .unwrap_or(normalized)
 }
 
+fn yosys_frontend_short_label(frontend: &YosysVerilogFrontend) -> Option<String> {
+    match frontend {
+        YosysVerilogFrontend::Builtin => None,
+        YosysVerilogFrontend::Slang { revision } => Some(format!("slang@{}", short_id(revision))),
+    }
+}
+
 pub(crate) fn action_graph_node_label(action: &ActionSpec) -> String {
     match action {
         ActionSpec::ImportIrPackageFile {
@@ -3983,25 +3993,24 @@ pub(crate) fn action_graph_node_label(action: &ActionSpec) -> String {
             format!("ir2mffc(min={})", min_internal_non_literal)
         }
         ActionSpec::ComboVerilogToYosysAbcAig {
-            verilog_top_module_name: Some(top),
+            verilog_top_module_name,
+            frontend,
             yosys_script_ref,
             ..
         } => {
-            format!(
-                "yosys-abc\n{}\n{}",
-                top,
-                script_ref_short_label(yosys_script_ref)
-            )
+            let mut label = action_kind_short_label(action).to_string();
+            if let Some(top) = verilog_top_module_name {
+                label.push('\n');
+                label.push_str(top);
+            }
+            label.push('\n');
+            label.push_str(&script_ref_short_label(yosys_script_ref));
+            if let Some(frontend_label) = yosys_frontend_short_label(frontend) {
+                label.push('\n');
+                label.push_str(&frontend_label);
+            }
+            label
         }
-        ActionSpec::ComboVerilogToYosysAbcAig {
-            verilog_top_module_name: None,
-            yosys_script_ref,
-            ..
-        } => format!(
-            "{}\n{}",
-            action_kind_short_label(action),
-            script_ref_short_label(yosys_script_ref)
-        ),
         ActionSpec::AigToYosysAbcAig {
             yosys_script_ref, ..
         } => format!(
@@ -5602,11 +5611,12 @@ pub(crate) fn extract_stdlib_trend_source_context(
             StdlibTrendKind::YosysAbc,
             ActionSpec::ComboVerilogToYosysAbcAig {
                 verilog_action_id,
+                frontend,
                 yosys_script_ref,
                 ..
             },
         ) => {
-            if !is_canonical_yosys_script_ref(yosys_script_ref) {
+            if !is_canonical_builtin_yosys_source(frontend, yosys_script_ref) {
                 return None;
             }
             let verilog_provenance = *provenance_by_action_id.get(verilog_action_id.as_str())?;
@@ -8270,14 +8280,22 @@ pub(crate) fn action_subject(action: &ActionSpec) -> String {
         ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id,
             verilog_top_module_name,
+            frontend,
             yosys_script_ref,
             ..
-        } => format!(
-            "verilog={} top={} script={}",
-            short_id(verilog_action_id),
-            verilog_top_module_name.as_deref().unwrap_or("<auto>"),
-            script_ref_short_label(yosys_script_ref)
-        ),
+        } => {
+            let mut subject = format!(
+                "verilog={} top={} script={}",
+                short_id(verilog_action_id),
+                verilog_top_module_name.as_deref().unwrap_or("<auto>"),
+                script_ref_short_label(yosys_script_ref)
+            );
+            if let Some(frontend_label) = yosys_frontend_short_label(frontend) {
+                subject.push_str(" frontend=");
+                subject.push_str(&frontend_label);
+            }
+            subject
+        }
         ActionSpec::AigToYosysAbcAig {
             aig_action_id,
             yosys_script_ref,
@@ -9258,9 +9276,10 @@ mod tests {
 
     #[test]
     fn action_subject_for_yosys_abc_includes_script_label() {
-        let action = ActionSpec::ComboVerilogToYosysAbcAig {
+        let mut action = ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id: "f".repeat(64),
             verilog_top_module_name: Some("__float32__add".to_string()),
+            frontend: crate::model::YosysVerilogFrontend::Builtin,
             yosys_script_ref: ScriptRef {
                 path: "flows/yosys_to_aig.ys".to_string(),
                 sha256: "0".repeat(64),
@@ -9271,13 +9290,30 @@ mod tests {
             action_subject(&action),
             "verilog=ffffffffffff top=__float32__add script=yosys_to_aig.ys"
         );
+
+        let slang_revision = "a".repeat(40);
+        let ActionSpec::ComboVerilogToYosysAbcAig {
+            frontend, runtime, ..
+        } = &mut action
+        else {
+            unreachable!()
+        };
+        *frontend = crate::model::YosysVerilogFrontend::Slang {
+            revision: slang_revision.clone(),
+        };
+        runtime.slang_commit = Some(slang_revision);
+        assert_eq!(
+            action_subject(&action),
+            "verilog=ffffffffffff top=__float32__add script=yosys_to_aig.ys frontend=slang@aaaaaaaaaaaa"
+        );
     }
 
     #[test]
     fn action_graph_node_label_for_yosys_abc_includes_script_label() {
-        let action = ActionSpec::ComboVerilogToYosysAbcAig {
+        let mut action = ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id: "f".repeat(64),
             verilog_top_module_name: Some("__float32__add".to_string()),
+            frontend: crate::model::YosysVerilogFrontend::Builtin,
             yosys_script_ref: ScriptRef {
                 path: "flows/ablate_abc_fast.ys".to_string(),
                 sha256: "0".repeat(64),
@@ -9287,6 +9323,22 @@ mod tests {
         assert_eq!(
             action_graph_node_label(&action),
             "yosys-abc\n__float32__add\nablate_abc_fast.ys"
+        );
+
+        let slang_revision = "a".repeat(40);
+        let ActionSpec::ComboVerilogToYosysAbcAig {
+            frontend, runtime, ..
+        } = &mut action
+        else {
+            unreachable!()
+        };
+        *frontend = crate::model::YosysVerilogFrontend::Slang {
+            revision: slang_revision.clone(),
+        };
+        runtime.slang_commit = Some(slang_revision);
+        assert_eq!(
+            action_graph_node_label(&action),
+            "yosys-abc\n__float32__add\nablate_abc_fast.ys\nslang@aaaaaaaaaaaa"
         );
     }
 
@@ -9318,6 +9370,7 @@ mod tests {
                 ActionSpec::ComboVerilogToYosysAbcAig {
                     verilog_action_id: verilog_action_id.clone(),
                     verilog_top_module_name: Some("__float32__add".to_string()),
+                    frontend: crate::model::YosysVerilogFrontend::Builtin,
                     yosys_script_ref: ScriptRef {
                         path: "flows/ablate_abc_fast.ys".to_string(),
                         sha256: "0".repeat(64),
@@ -9365,6 +9418,7 @@ mod tests {
                 ActionSpec::ComboVerilogToYosysAbcAig {
                     verilog_action_id: verilog_action_id.clone(),
                     verilog_top_module_name: Some("__float32__add".to_string()),
+                    frontend: crate::model::YosysVerilogFrontend::Builtin,
                     yosys_script_ref: ScriptRef {
                         path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
                         sha256: "0".repeat(64),
@@ -9386,6 +9440,63 @@ mod tests {
         assert_eq!(ctx.ir_top.as_deref(), Some("__float32__add"));
         assert_eq!(ctx.crate_version, "0.31.0");
         assert_eq!(ctx.dso_version, "0.35.0");
+    }
+
+    #[test]
+    fn extract_stdlib_trend_source_context_yosys_rejects_slang_frontend() {
+        let runtime = test_runtime();
+        let ir_action_id = "7".repeat(64);
+        let verilog_action_id = "8".repeat(64);
+        let yosys_action_id = "9".repeat(64);
+        let slang_revision = "a".repeat(40);
+        let mut provenance_by_action_id = BTreeMap::new();
+        provenance_by_action_id.insert(
+            verilog_action_id.clone(),
+            synthetic_provenance(
+                &verilog_action_id,
+                ActionSpec::IrFnToCombinationalVerilog {
+                    ir_action_id,
+                    top_fn_name: Some("__float32__add".to_string()),
+                    use_system_verilog: true,
+                    version: "0.35.0".to_string(),
+                    runtime,
+                },
+                ArtifactType::VerilogFile,
+            ),
+        );
+        provenance_by_action_id.insert(
+            yosys_action_id.clone(),
+            synthetic_provenance(
+                &yosys_action_id,
+                ActionSpec::ComboVerilogToYosysAbcAig {
+                    verilog_action_id,
+                    verilog_top_module_name: Some("__float32__add".to_string()),
+                    frontend: crate::model::YosysVerilogFrontend::Slang {
+                        revision: slang_revision.clone(),
+                    },
+                    yosys_script_ref: ScriptRef {
+                        path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
+                        sha256: "0".repeat(64),
+                    },
+                    runtime: YosysRuntimeSpec {
+                        slang_commit: Some(slang_revision),
+                        ..crate::runtime::test_yosys_runtime()
+                    },
+                },
+                ArtifactType::AigFile,
+            ),
+        );
+        let lookup = borrowed_lookup(&provenance_by_action_id);
+
+        assert!(
+            extract_stdlib_trend_source_context(
+                &lookup,
+                StdlibTrendKind::YosysAbc,
+                &yosys_action_id,
+                false,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -9714,6 +9825,7 @@ mod tests {
             ActionSpec::ComboVerilogToYosysAbcAig {
                 verilog_action_id: ir2combo_id.clone(),
                 verilog_top_module_name: Some(ir_top.to_string()),
+                frontend: crate::model::YosysVerilogFrontend::Builtin,
                 yosys_script_ref: ScriptRef {
                     path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
                     sha256: "0".repeat(64),

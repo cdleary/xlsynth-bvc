@@ -1167,14 +1167,32 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
         RunAction::ComboVerilogToYosysAbcAig {
             verilog_action_id,
             verilog_top_module_name,
+            frontend,
             yosys_script,
             yosys,
-        } => Ok(ActionSpec::ComboVerilogToYosysAbcAig {
-            verilog_action_id,
-            verilog_top_module_name,
-            yosys_script_ref: make_script_ref(repo_root, &yosys_script)?,
-            runtime: yosys.into_runtime(repo_root)?,
-        }),
+        } => {
+            let frontend = match frontend {
+                crate::cli::YosysVerilogFrontendCli::Builtin => {
+                    crate::model::YosysVerilogFrontend::Builtin
+                }
+                crate::cli::YosysVerilogFrontendCli::Slang => {
+                    crate::model::YosysVerilogFrontend::Slang {
+                        revision: crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string(),
+                    }
+                }
+            };
+            let slang_commit = match &frontend {
+                crate::model::YosysVerilogFrontend::Builtin => None,
+                crate::model::YosysVerilogFrontend::Slang { revision } => Some(revision.clone()),
+            };
+            Ok(ActionSpec::ComboVerilogToYosysAbcAig {
+                verilog_action_id,
+                verilog_top_module_name,
+                frontend,
+                yosys_script_ref: make_script_ref(repo_root, &yosys_script)?,
+                runtime: yosys.into_runtime(repo_root, slang_commit)?,
+            })
+        }
         RunAction::AigToYosysAbcAig {
             aig_action_id,
             yosys_script,
@@ -1182,7 +1200,7 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
         } => Ok(ActionSpec::AigToYosysAbcAig {
             aig_action_id,
             yosys_script_ref: make_script_ref(repo_root, &yosys_script)?,
-            runtime: yosys.into_runtime(repo_root)?,
+            runtime: yosys.into_runtime(repo_root, None)?,
         }),
         RunAction::AigToStats {
             aig_action_id,
@@ -3539,6 +3557,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn slang_cli_action_binds_the_same_revision_into_its_runtime() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let action = run_action_to_spec(
+            repo_root,
+            RunAction::ComboVerilogToYosysAbcAig {
+                verilog_action_id: "a".repeat(64),
+                verilog_top_module_name: Some("main".to_string()),
+                frontend: crate::cli::YosysVerilogFrontendCli::Slang,
+                yosys_script: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
+                yosys: crate::cli::YosysCli {
+                    yosys_dockerfile: PathBuf::from(crate::DEFAULT_YOSYS_DOCKERFILE),
+                    yosys_docker_image: crate::DEFAULT_YOSYS_DOCKER_IMAGE.to_string(),
+                    yosys_upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
+                },
+            },
+        )
+        .expect("construct slang action");
+        let ActionSpec::ComboVerilogToYosysAbcAig {
+            frontend, runtime, ..
+        } = action
+        else {
+            panic!("unexpected action kind");
+        };
+        assert_eq!(
+            frontend,
+            YosysVerilogFrontend::Slang {
+                revision: crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string()
+            }
+        );
+        assert_eq!(
+            runtime.slang_commit.as_deref(),
+            Some(crate::DEFAULT_YOSYS_SLANG_COMMIT)
+        );
+    }
+
     fn test_action_id(seed: &str) -> String {
         format!("{:x}", Sha256::digest(seed.as_bytes()))
     }
@@ -3641,6 +3695,22 @@ mod tests {
         structural_hash: &str,
         seed: &str,
     ) -> Provenance {
+        write_loss_history_for_hash_with_frontend(
+            store,
+            runtime,
+            structural_hash,
+            seed,
+            YosysVerilogFrontend::Builtin,
+        )
+    }
+
+    fn write_loss_history_for_hash_with_frontend(
+        store: &ArtifactStore,
+        runtime: &DriverRuntimeSpec,
+        structural_hash: &str,
+        seed: &str,
+        frontend: YosysVerilogFrontend,
+    ) -> Provenance {
         let source_opt = write_provenance_record(
             store,
             make_opt_action(&test_action_id(&format!("src-ir-{seed}")), runtime),
@@ -3700,8 +3770,40 @@ mod tests {
             )],
         );
 
+        let yosys_runtime = match &frontend {
+            YosysVerilogFrontend::Builtin => crate::runtime::test_yosys_runtime(),
+            YosysVerilogFrontend::Slang { revision } => YosysRuntimeSpec {
+                slang_commit: Some(revision.clone()),
+                ..crate::runtime::test_yosys_runtime()
+            },
+        };
+        let yosys_aig_action = ActionSpec::ComboVerilogToYosysAbcAig {
+            verilog_action_id: test_action_id(&format!("verilog-{seed}")),
+            verilog_top_module_name: Some("foo".to_string()),
+            frontend,
+            yosys_script_ref: ScriptRef {
+                path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
+                sha256: "0".repeat(64),
+            },
+            runtime: yosys_runtime,
+        };
+        let yosys_aig_action_id =
+            compute_action_id(&yosys_aig_action).expect("compute yosys AIG action id");
+        write_provenance_record(
+            store,
+            yosys_aig_action,
+            make_artifact(
+                &yosys_aig_action_id,
+                ArtifactType::AigFile,
+                "payload/yosys.aig",
+            ),
+            json!({}),
+            Vec::new(),
+            vec![("payload/yosys.aig".to_string(), b"aig".to_vec())],
+        );
+
         let yosys_stats_action = ActionSpec::DriverAigToStats {
-            aig_action_id: test_action_id(&format!("yosys-aig-{seed}")),
+            aig_action_id: yosys_aig_action_id,
             version: "v0.39.0".to_string(),
             runtime: runtime.clone(),
         };
@@ -3885,6 +3987,7 @@ mod tests {
         let excluded_action = ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id,
             verilog_top_module_name: Some("__float64__fma".to_string()),
+            frontend: crate::model::YosysVerilogFrontend::Builtin,
             yosys_script_ref: ScriptRef {
                 path: "flows/yosys_to_aig.ys".to_string(),
                 sha256: "a".repeat(64),
@@ -4209,6 +4312,47 @@ mod tests {
         assert_eq!(second.enqueued_count, 1);
         assert_eq!(second.skipped_not_previously_lossy_k_bool_count, 0);
         assert!(store.pending_queue_path(&suggestion.action_id).exists());
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn slang_aig_stat_diff_does_not_update_k_bool_previous_loss_cache() {
+        let (store, root) = make_test_store("reject-slang-kbool-loss-cache");
+        let runtime = test_runtime();
+        let structural_hash = "d".repeat(64);
+
+        assert!(
+            load_complete_previously_lossy_k_bool_source_hashes(&store, 3)
+                .expect("prime empty previous-loss cache")
+                .is_empty()
+        );
+        let diff = write_loss_history_for_hash_with_frontend(
+            &store,
+            &runtime,
+            &structural_hash,
+            "slang",
+            YosysVerilogFrontend::Slang {
+                revision: "a".repeat(40),
+            },
+        );
+
+        assert!(
+            !load_previously_lossy_k_bool_source_structural_hashes(&store, 3)
+                .expect("scan previous-loss history")
+                .contains(&structural_hash)
+        );
+        assert_eq!(
+            lossy_k_bool_source_structural_hash_for_aig_stat_diff(&store, &diff),
+            None
+        );
+        note_completed_action_for_previous_loss_k_cone_policy(&store, &diff.action_id)
+            .expect("ignore slang diff for previous-loss cache");
+        assert!(
+            !load_complete_previously_lossy_k_bool_source_hashes(&store, 3)
+                .expect("load cached previous-loss hashes")
+                .contains(&structural_hash)
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp store");
     }

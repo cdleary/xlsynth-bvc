@@ -197,7 +197,7 @@ queries explicit.
 `download-stdlib` uses that same compatibility map to resolve a runtime for `dslx-list-fns`-based suggestion generation; failures are recorded in provenance details without failing the stdlib extraction artifact.
 `ir-to-delay-info` uses `delay_info_main --proto_out` and decodes the emitted binary `xls.DelayInfoProto` with `protoc` into canonical textual output (`delay_info.textproto`) using schema files cached during setup from the release's locked `xlsynth/xlsynth` source commit.
 
-Yosys/ABC actions use a dedicated image (`docker/yosys-abc.Dockerfile`) and take a script reference that is captured as `(path, sha256)` in the action spec; rematerialization re-validates that hash.
+Yosys/ABC actions use a dedicated image (`docker/yosys-abc.Dockerfile`) and take a script reference that is captured as `(path, sha256)` in the action spec; rematerialization re-validates that hash. The image also contains a pinned sv-elab/yosys-slang plugin. `ComboVerilogToYosysAbcAig` records either the canonical builtin frontend or `slang` with its exact plugin revision in action identity and provenance. A slang action requires the same commit in its Yosys runtime identity; that commit participates in the runtime fingerprint and is passed to the Docker build.
 
 The vendored third-party metadata is documented in `third_party/xlsynth-crate/VENDORED.md`.
 
@@ -235,7 +235,7 @@ The built-in `discover-releases` command does this polling directly and supports
 - `run ir-equiv --lhs-ir-action-id ... --rhs-ir-action-id ... [--top-fn-name ...] --version vX.Y.Z` checks IR equivalence and emits an equivalence JSON report.
 - `run ir-to-combo-verilog --ir-action-id ... [--top-fn-name ...] [--use-system-verilog] --version vX.Y.Z` emits combinational Verilog text from IR via `ir2combo`.
 - `run ir-to-k-bool-cone-corpus --ir-action-id ... [--top-fn-name ...] [--k 3] --version vX.Y.Z` runs `ir-bool-cones`, merges emitted cones into one deterministic IR package, and writes a companion manifest.
-- `run combo-verilog-to-yosys-abc-aig --verilog-action-id ... [--verilog-top-module-name ...] --yosys-script path/to/flow.ys` runs a Yosys+ABC flow script and emits `result.aig`.
+- `run combo-verilog-to-yosys-abc-aig --verilog-action-id ... [--verilog-top-module-name ...] [--frontend builtin|slang] --yosys-script path/to/flow.ys` reads RTL with the selected Yosys frontend, runs a Yosys+ABC flow script, and emits `result.aig`.
 - `run aig-to-stats --aig-action-id ... --version vX.Y.Z` computes JSON metrics for an AIG artifact.
 - `run aig-stat-diff --opt-ir-action-id ... --g8r-aig-stats-action-id ... --yosys-abc-aig-stats-action-id ...` joins and diffs both metric snapshots.
 - `enqueue [--priority N] ...` puts one action in queue; larger `N` runs sooner.

@@ -60,6 +60,11 @@ assembling generated structs ad hoc.
 - Hash inputs use domain separation.
 - Wall-clock time, host paths, process IDs, and machine names do not enter
   content identities.
+- An absent `ComboVerilogToYosysAbcAigAction.frontend` is the canonical
+  builtin-Yosys encoding. Slang is explicit and carries its full source commit,
+  which must match `YosysRuntimeSpec.slang_commit`; the runtime fingerprint and
+  Docker build therefore bind the same revision that participates in the action
+  ID and provenance.
 
 Action identity has a separate, documented canonical encoding contract in
 `docs/action-id-v2.md`.

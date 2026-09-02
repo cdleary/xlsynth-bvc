@@ -11,6 +11,7 @@ use crate::proto::action::{
     action_id_to_hex, action_id_to_proto, action_spec_from_proto, action_spec_to_proto,
     digest_from_hex, digest_to_hex, driver_runtime_from_proto, driver_runtime_to_proto,
     script_ref_from_proto, script_ref_to_proto, yosys_runtime_from_proto, yosys_runtime_to_proto,
+    yosys_verilog_frontend_from_proto, yosys_verilog_frontend_to_proto,
 };
 use crate::proto::queue::{
     artifact_ref_from_proto, artifact_ref_to_proto, timestamp_from_proto, timestamp_to_proto,
@@ -492,6 +493,7 @@ fn details_to_proto(action: &model::ActionSpec, details: &Value) -> Result<pb::A
         }),
         M::ComboVerilogToYosysAbcAig {
             verilog_top_module_name,
+            frontend,
             yosys_script_ref,
             runtime,
             ..
@@ -515,6 +517,7 @@ fn details_to_proto(action: &model::ActionSpec, details: &Value) -> Result<pb::A
                 verilog_top_module_name: string(map, "verilog_top_module_name")
                     .or_else(|| verilog_top_module_name.clone()),
                 flow: string(map, "flow").unwrap_or_default(),
+                frontend: yosys_verilog_frontend_to_proto(frontend),
             })
         }
         M::AigToYosysAbcAig {
@@ -1006,6 +1009,13 @@ fn details_from_proto(action: &model::ActionSpec, value: &pb::ActionDetails) -> 
             if let Some(value) = &details.verilog_top_module_name {
                 map.insert("verilog_top_module_name".into(), json!(value));
             }
+            map.insert(
+                "frontend".into(),
+                json!(yosys_verilog_frontend_from_proto(
+                    &details.frontend,
+                    "details.frontend",
+                )?),
+            );
             map.insert("flow".into(), json!(details.flow));
         }
         (M::AigToYosysAbcAig { .. }, Kind::AigToYosysAbcAig(details)) => {
@@ -1460,6 +1470,71 @@ mod tests {
                 expected_badge
             );
         }
+    }
+
+    #[test]
+    fn yosys_slang_frontend_round_trips_in_action_and_details() {
+        let frontend = model::YosysVerilogFrontend::Slang {
+            revision: "a".repeat(40),
+        };
+        let runtime = model::YosysRuntimeSpec {
+            docker_image: "xlsynth-bvc-yosys-abc:test".into(),
+            dockerfile: "docker/yosys-abc.Dockerfile".into(),
+            dockerfile_sha256: "b".repeat(64),
+            docker_image_id: "c".repeat(64),
+            upstream_commit: Some("d".repeat(40)),
+            slang_commit: Some("a".repeat(40)),
+        };
+        let script_ref = model::ScriptRef {
+            path: "flows/yosys_to_aig.ys".into(),
+            sha256: "e".repeat(64),
+        };
+        let action = model::ActionSpec::ComboVerilogToYosysAbcAig {
+            verilog_action_id: "f".repeat(64),
+            verilog_top_module_name: Some("main".into()),
+            frontend: frontend.clone(),
+            yosys_script_ref: script_ref.clone(),
+            runtime: runtime.clone(),
+        };
+        let action_id = crate::proto::compute_model_action_id_v2(&action)
+            .expect("action id")
+            .to_hex();
+        let provenance = model::Provenance {
+            schema_version: PROVENANCE_RECORD_VERSION,
+            action_id: action_id.clone(),
+            created_utc: Utc.with_ymd_and_hms(2026, 9, 1, 1, 2, 3).unwrap(),
+            action,
+            dependencies: Vec::new(),
+            output_artifact: model::ArtifactRef {
+                action_id,
+                artifact_type: model::ArtifactType::AigFile,
+                relpath: "payload/result.aig".into(),
+            },
+            output_files: Vec::new(),
+            commands: Vec::new(),
+            details: json!({
+                "yosys_runtime": runtime,
+                "yosys_script_ref": script_ref,
+                "verilog_top_module_name": "main",
+                "frontend": frontend,
+                "flow": "yosys_script_to_aiger",
+            }),
+            suggested_next_actions: Vec::new(),
+        };
+
+        let decoded =
+            decode_provenance(&encode_provenance(&provenance).expect("encode")).expect("decode");
+        let model::ActionSpec::ComboVerilogToYosysAbcAig { frontend, .. } = decoded.action else {
+            panic!("unexpected action kind");
+        };
+        assert_eq!(
+            frontend,
+            model::YosysVerilogFrontend::Slang {
+                revision: "a".repeat(40)
+            }
+        );
+        assert_eq!(decoded.details["frontend"]["kind"], "slang");
+        assert_eq!(decoded.details["frontend"]["revision"], "a".repeat(40));
     }
 
     #[test]

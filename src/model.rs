@@ -24,6 +24,8 @@ pub(crate) struct YosysRuntimeSpec {
     pub(crate) docker_image_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) upstream_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) slang_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
@@ -62,6 +64,20 @@ pub(crate) struct ArtifactRef {
 pub(crate) struct ScriptRef {
     pub(crate) path: String,
     pub(crate) sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum YosysVerilogFrontend {
+    #[default]
+    Builtin,
+    Slang {
+        revision: String,
+    },
+}
+
+fn is_builtin_yosys_verilog_frontend(frontend: &YosysVerilogFrontend) -> bool {
+    matches!(frontend, YosysVerilogFrontend::Builtin)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +173,8 @@ pub(crate) enum ActionSpec {
     ComboVerilogToYosysAbcAig {
         verilog_action_id: String,
         verilog_top_module_name: Option<String>,
+        #[serde(default, skip_serializing_if = "is_builtin_yosys_verilog_frontend")]
+        frontend: YosysVerilogFrontend,
         yosys_script_ref: ScriptRef,
         runtime: YosysRuntimeSpec,
     },
