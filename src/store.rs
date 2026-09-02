@@ -15,7 +15,7 @@ use std::io::{Cursor, Write};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -357,7 +357,7 @@ fn promote_staging_action_dir_fs(staging_dir: &Path, final_dir: &Path) -> Result
 struct SledArtifactBackend {
     db_path: PathBuf,
     db: Mutex<Option<sled::Db>>,
-    materialization_lock: Mutex<()>,
+    materialization_lock: RwLock<()>,
 }
 
 impl SledArtifactBackend {
@@ -590,7 +590,7 @@ impl SledArtifactBackend {
     fn materialize_action_from_db(&self, store_root: &Path, action_id: &str) -> Result<PathBuf> {
         let _materialization_guard = self
             .materialization_lock
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("acquiring sled materialization lock"))?;
         let final_dir = self.materialized_action_dir_for(store_root, action_id);
         if final_dir.join("provenance.pb").exists() {
@@ -2018,13 +2018,14 @@ impl ArtifactBackend for SledArtifactBackend {
             encoded_staged_files.push((key, encoded));
         }
 
-        // A materializer must not observe the canonical transaction until the
-        // promotion has flushed and invalidated any cache directory left by a
-        // prior incarnation of this action. Provenance replacement takes this
-        // same lock for the same reason.
+        // Multiple immutable promotions may commit concurrently so their
+        // durable flushes can overlap/coalesce. Materialization and provenance
+        // replacement take the write side of this lock, so neither can observe
+        // a canonical transaction until its promotion has flushed and
+        // invalidated any cache directory left by a prior incarnation.
         let _materialization_guard = self
             .materialization_lock
-            .lock()
+            .read()
             .map_err(|_| anyhow::anyhow!("acquiring sled materialization lock for promotion"))?;
 
         let prefix = Self::action_files_prefix(action_id);
@@ -2229,7 +2230,7 @@ impl ArtifactBackend for SledArtifactBackend {
     fn write_provenance(&self, store_root: &Path, provenance: &Provenance) -> Result<()> {
         let _materialization_guard = self
             .materialization_lock
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("acquiring sled materialization lock"))?;
         let db = self.open_db()?;
         let provenance_tree = db
@@ -2714,7 +2715,7 @@ impl ArtifactStore {
         let artifact_backend: Box<dyn ArtifactBackend> = Box::new(SledArtifactBackend {
             db_path,
             db: Mutex::new(None),
-            materialization_lock: Mutex::new(()),
+            materialization_lock: RwLock::new(()),
         });
         Self {
             root,
@@ -3328,8 +3329,8 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use std::ops::ControlFlow;
-    use std::sync::{Arc, Barrier};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn make_test_root(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -3766,7 +3767,7 @@ mod tests {
         let backend = SledArtifactBackend {
             db_path,
             db: Mutex::new(None),
-            materialization_lock: Mutex::new(()),
+            materialization_lock: RwLock::new(()),
         };
         backend.ensure_layout(&root).expect("ensure sled layout");
 
@@ -3784,7 +3785,7 @@ mod tests {
         let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = backend
                 .materialization_lock
-                .lock()
+                .write()
                 .expect("acquire materialization lock for poisoning");
             panic!("poison materialization lock");
         }));
@@ -3800,6 +3801,53 @@ mod tests {
             "unexpected error: {error:#}"
         );
         assert!(!backend.action_exists(&root, &action_id));
+
+        drop(backend);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn independent_sled_promotions_share_the_materialization_lock() {
+        let root = make_test_root("xlsynth-bvc-store-sled-shared-promotion-lock");
+        let db_path = root.join("store.sled");
+        let backend = Arc::new(SledArtifactBackend {
+            db_path,
+            db: Mutex::new(None),
+            materialization_lock: RwLock::new(()),
+        });
+        backend.ensure_layout(&root).expect("ensure sled layout");
+
+        let provenance = make_test_provenance(&"e".repeat(64), "payload/result.txt", 5);
+        let action_id = provenance.action_id.clone();
+        let staging = root.join("staging-action");
+        std::fs::create_dir_all(staging.join("payload")).expect("create staged payload");
+        std::fs::write(staging.join("payload/result.txt"), b"first").expect("write staged payload");
+        std::fs::write(
+            staging.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode provenance"),
+        )
+        .expect("write staged provenance");
+
+        let existing_promotion = backend
+            .materialization_lock
+            .read()
+            .expect("acquire existing promotion lock");
+        let thread_backend = Arc::clone(&backend);
+        let thread_root = root.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let promotion_thread = std::thread::spawn(move || {
+            let result =
+                thread_backend.promote_staging_action_dir(&thread_root, &action_id, &staging);
+            result_tx.send(result).expect("send promotion result");
+        });
+
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a promotion should not block behind another promotion")
+            .expect("promotion result");
+        drop(existing_promotion);
+        promotion_thread.join().expect("promotion thread");
+        assert!(backend.action_exists(&root, &provenance.action_id));
 
         drop(backend);
         std::fs::remove_dir_all(root).expect("cleanup");
