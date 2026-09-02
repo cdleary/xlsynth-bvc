@@ -2448,6 +2448,23 @@ fn g8r_lowering_mode_extra_flags(mode: &G8rLoweringMode) -> &'static str {
     }
 }
 
+fn is_generated_k_bool_cone_ir_top(ir_top: &str) -> bool {
+    let Some(rest) = ir_top.strip_prefix("__k") else {
+        return false;
+    };
+    let Some((k, suffix)) = rest.split_once("_cone_") else {
+        return false;
+    };
+    !k.is_empty() && k.bytes().all(|byte| byte.is_ascii_digit()) && !suffix.is_empty()
+}
+
+fn should_attempt_ir_semantic_reuse(ir_top: Option<&str>) -> bool {
+    // Generated k-cone functions are intentionally tiny. Walking every provenance row to
+    // find a structurally identical prior result costs substantially more than recomputing
+    // one, especially for large corpus stores.
+    !ir_top.is_some_and(is_generated_k_bool_cone_ir_top)
+}
+
 fn record_input_ir_structural_hash(
     store: &ArtifactStore,
     repo_root: &Path,
@@ -2708,37 +2725,39 @@ fn prepare_driver_ir_to_g8r_batch_action(
     fs::create_dir_all(&payload_dir)
         .with_context(|| format!("creating payload dir: {}", payload_dir.display()))?;
 
-    if let Some(source) =
-        find_semantic_reuse_candidate(store, &input_ir_structural_hash, |provenance| {
-            if provenance.action_id == action_id {
-                return false;
-            }
-            let matches_action = matches!(
-                &provenance.action,
-                ActionSpec::DriverIrToG8rAig {
-                    fraig: candidate_fraig,
-                    lowering_mode: candidate_lowering_mode,
-                    version: candidate_version,
-                    runtime: candidate_runtime,
-                    ..
-                } if *candidate_fraig == fraig
-                    && candidate_lowering_mode == lowering_mode
-                    && candidate_version == version
-                    && same_driver_runtime(candidate_runtime, runtime)
-            );
-            if !matches_action {
-                return false;
-            }
-            if capture_prepared_ir
-                && !provenance
-                    .output_files
-                    .iter()
-                    .any(|file| file.path == prepared_ir_relpath)
-            {
-                return false;
-            }
-            provenance.details.get("ir_top").and_then(|v| v.as_str()) == inferred_ir_top.as_deref()
-        })?
+    if should_attempt_ir_semantic_reuse(inferred_ir_top.as_deref())
+        && let Some(source) =
+            find_semantic_reuse_candidate(store, &input_ir_structural_hash, |provenance| {
+                if provenance.action_id == action_id {
+                    return false;
+                }
+                let matches_action = matches!(
+                    &provenance.action,
+                    ActionSpec::DriverIrToG8rAig {
+                        fraig: candidate_fraig,
+                        lowering_mode: candidate_lowering_mode,
+                        version: candidate_version,
+                        runtime: candidate_runtime,
+                        ..
+                    } if *candidate_fraig == fraig
+                        && candidate_lowering_mode == lowering_mode
+                        && candidate_version == version
+                        && same_driver_runtime(candidate_runtime, runtime)
+                );
+                if !matches_action {
+                    return false;
+                }
+                if capture_prepared_ir
+                    && !provenance
+                        .output_files
+                        .iter()
+                        .any(|file| file.path == prepared_ir_relpath)
+                {
+                    return false;
+                }
+                provenance.details.get("ir_top").and_then(|v| v.as_str())
+                    == inferred_ir_top.as_deref()
+            })?
     {
         reuse_payload_from_provenance(store, &source, &payload_dir)?;
         details.insert(
@@ -2839,13 +2858,11 @@ fn run_driver_ir_to_g8r_batch_runnable(
         );
         for (index, member) in runnable.iter().enumerate() {
             let input_path = inputs_dir.join(format!("{index}.ir"));
-            fs::copy(&member.ir_input_path, &input_path).with_context(|| {
-                format!(
-                    "copying batch IR input {} -> {}",
-                    member.ir_input_path.display(),
-                    input_path.display()
-                )
-            })?;
+            write_driver_ir_input_for_top(
+                &member.ir_input_path,
+                &input_path,
+                member.explicit_ir_top.as_deref(),
+            )?;
             let output_dir = outputs_dir.join(index.to_string());
             fs::create_dir_all(&output_dir)
                 .with_context(|| format!("creating batch output dir: {}", output_dir.display()))?;
@@ -3142,7 +3159,9 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
         true,
     );
 
-    if let Some(hash) = input_ir_structural_hash.as_deref() {
+    if should_attempt_ir_semantic_reuse(inferred_ir_top.as_deref())
+        && let Some(hash) = input_ir_structural_hash.as_deref()
+    {
         let reusable = find_semantic_reuse_candidate(store, hash, |provenance| {
             if provenance.action_id == action_id {
                 return false;
@@ -3275,19 +3294,38 @@ xlsynth-driver ir2g8r ${G8R_EXTRA_FLAGS} /inputs/input.ir --fraig="${FRAIG}" --a
         env.insert("IR_TOP".to_string(), top.clone());
     }
 
+    let mut docker_ir_input_path = ir_input_path.clone();
+    let mut isolated_work_dir = None;
+    if explicit_ir_top
+        .as_deref()
+        .is_some_and(is_generated_k_bool_cone_ir_top)
+    {
+        let work_dir = make_temp_work_dir("ir2g8r-cone")?;
+        let isolated_path = work_dir.join("input.ir");
+        write_driver_ir_input_for_top(&ir_input_path, &isolated_path, explicit_ir_top.as_deref())?;
+        docker_ir_input_path = isolated_path;
+        isolated_work_dir = Some(work_dir);
+    }
+
     let mounts = vec![
-        DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
+        DockerMount::read_only(&docker_ir_input_path, "/inputs/input.ir")?,
         DockerMount::read_write(payload_dir, "/outputs")?,
         driver_cache_mount(store, runtime)?,
     ];
 
-    let run_trace = execute_persistent_runner_script(
-        &docker_image_content_ref(&runtime.docker_image_id)?,
-        &mounts,
-        &env,
-        &script,
-        action_id,
-    )?;
+    let run_trace = (|| {
+        execute_persistent_runner_script(
+            &docker_image_content_ref(&runtime.docker_image_id)?,
+            &mounts,
+            &env,
+            &script,
+            action_id,
+        )
+    })();
+    if let Some(dir) = isolated_work_dir {
+        fs::remove_dir_all(dir).ok();
+    }
+    let run_trace = run_trace?;
     commands.push(run_trace);
 
     Ok(ActionOutcome {
@@ -3361,32 +3399,22 @@ pub(crate) fn run_ir_fn_to_combinational_verilog_action(
     details.insert("delay_model".to_string(), json!("unit"));
     details.insert("driver_subcommand".to_string(), json!("ir2combo"));
 
-    let mut input_ir_structural_hash = None;
-    match compute_ir_fn_structural_hash(
+    let input_ir_structural_hash = record_input_ir_structural_hash(
         store,
         repo_root,
+        ir_action_id,
         &ir_input_path,
         ir_top.as_deref(),
         version,
         runtime,
-    ) {
-        Ok((hash, trace)) => {
-            commands.push(trace);
-            details.insert(
-                INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY.to_string(),
-                json!(hash.clone()),
-            );
-            input_ir_structural_hash = Some(hash);
-        }
-        Err(err) => {
-            details.insert(
-                "input_ir_fn_structural_hash_error".to_string(),
-                json!(format!("{:#}", err)),
-            );
-        }
-    }
+        &mut commands,
+        &mut details,
+        true,
+    );
 
-    if let Some(hash) = input_ir_structural_hash.as_deref() {
+    if should_attempt_ir_semantic_reuse(ir_top.as_deref())
+        && let Some(hash) = input_ir_structural_hash.as_deref()
+    {
         let reusable = find_semantic_reuse_candidate(store, hash, |provenance| {
             if provenance.action_id == action_id {
                 return false;
@@ -3431,7 +3459,11 @@ pub(crate) fn run_ir_fn_to_combinational_verilog_action(
     if let Some(top) = ir_top.as_deref() {
         let original_ir_text = fs::read_to_string(&ir_input_path)
             .with_context(|| format!("reading IR input text: {}", ir_input_path.display()))?;
-        let rewritten_ir_text = rewrite_ir_package_top_function(&original_ir_text, top)?;
+        let rewritten_ir_text = if is_generated_k_bool_cone_ir_top(top) {
+            extract_standalone_ir_fn_package(&original_ir_text, top)?
+        } else {
+            rewrite_ir_package_top_function(&original_ir_text, top)?
+        };
         let work_dir = make_temp_work_dir("ir2combo-top")?;
         let rewritten_path = work_dir.join("input.with_top.ir");
         fs::write(&rewritten_path, rewritten_ir_text).with_context(|| {
@@ -3718,6 +3750,67 @@ pub(crate) fn extract_ir_fn_block_by_name(ir_text: &str, ir_fn_name: &str) -> Re
     }
 
     bail!("unterminated function body for `{ir_fn_name}`")
+}
+
+fn extract_standalone_ir_fn_package(ir_text: &str, ir_fn_name: &str) -> Result<String> {
+    let package_decl = ir_text
+        .lines()
+        .find(|line| line.trim_start().starts_with("package "))
+        .ok_or_else(|| anyhow!("unable to locate IR package declaration"))?;
+    let fn_block = extract_ir_fn_block_by_name(ir_text, ir_fn_name)?;
+    let mut block_lines = fn_block.lines();
+    let decl_line = block_lines
+        .next()
+        .ok_or_else(|| anyhow!("empty IR function block for `{ir_fn_name}`"))?;
+    let trimmed_decl = decl_line.trim_start();
+    let indent = &decl_line[..decl_line.len().saturating_sub(trimmed_decl.len())];
+    let top_decl = if let Some(rest) = trimmed_decl.strip_prefix("fn ") {
+        format!("{indent}top fn {rest}")
+    } else if trimmed_decl.starts_with("top fn ") {
+        decl_line.to_string()
+    } else {
+        bail!("unsupported IR function declaration for `{ir_fn_name}`");
+    };
+
+    let mut result = String::with_capacity(package_decl.len() + fn_block.len() + 4);
+    result.push_str(package_decl.trim());
+    result.push_str("\n\n");
+    result.push_str(&top_decl);
+    result.push('\n');
+    for line in block_lines {
+        result.push_str(line);
+        result.push('\n');
+    }
+    Ok(result)
+}
+
+fn write_driver_ir_input_for_top(
+    source_path: &Path,
+    destination_path: &Path,
+    explicit_ir_top: Option<&str>,
+) -> Result<bool> {
+    let Some(ir_top) = explicit_ir_top.filter(|top| is_generated_k_bool_cone_ir_top(top)) else {
+        fs::copy(source_path, destination_path).with_context(|| {
+            format!(
+                "copying driver IR input {} -> {}",
+                source_path.display(),
+                destination_path.display()
+            )
+        })?;
+        return Ok(false);
+    };
+
+    let package_text = fs::read_to_string(source_path)
+        .with_context(|| format!("reading cone IR package: {}", source_path.display()))?;
+    let isolated = extract_standalone_ir_fn_package(&package_text, ir_top)
+        .with_context(|| format!("extracting standalone cone IR function `{ir_top}`"))?;
+    fs::write(destination_path, isolated).with_context(|| {
+        format!(
+            "writing standalone cone IR input: {}",
+            destination_path.display()
+        )
+    })?;
+    Ok(true)
 }
 
 fn append_ir_text_ids_from_line(line: &str, ids: &mut Vec<u64>) {
@@ -5576,6 +5669,41 @@ fn __k3_cone_bbbb(y: bits[1] id=1) -> bits[1] {
         assert!(block.starts_with("fn __k3_cone_bbbb("));
         assert!(block.contains("ret y.2"));
         assert!(!block.contains("__k3_cone_aaaa"));
+    }
+
+    #[test]
+    fn extract_standalone_ir_fn_package_keeps_only_requested_top() {
+        let input = r#"package k_bool_cones
+
+fn __k3_cone_aaaa(x: bits[1] id=1) -> bits[1] {
+  ret x.2: bits[1] = identity(x, id=2)
+}
+
+fn __k3_cone_bbbb(y: bits[1] id=3) -> bits[1] {
+  ret y.4: bits[1] = not(y, id=4)
+}"#;
+        let package = extract_standalone_ir_fn_package(input, "__k3_cone_bbbb")
+            .expect("extract standalone package");
+        assert!(package.starts_with("package k_bool_cones\n\ntop fn __k3_cone_bbbb("));
+        assert!(package.contains("ret y.4"));
+        assert!(!package.contains("__k3_cone_aaaa"));
+        assert_eq!(package.matches("top fn ").count(), 1);
+    }
+
+    #[test]
+    fn generated_k_bool_cones_skip_global_semantic_reuse_scan() {
+        assert!(!should_attempt_ir_semantic_reuse(Some(
+            "__k3_cone_deadbeef"
+        )));
+        assert!(!should_attempt_ir_semantic_reuse(Some(
+            "__k17_cone_deadbeef"
+        )));
+        assert!(should_attempt_ir_semantic_reuse(Some("__mffc_deadbeef")));
+        assert!(should_attempt_ir_semantic_reuse(Some(
+            "__kfoo_cone_deadbeef"
+        )));
+        assert!(should_attempt_ir_semantic_reuse(Some("__k3_cone_")));
+        assert!(should_attempt_ir_semantic_reuse(None));
     }
 
     #[test]

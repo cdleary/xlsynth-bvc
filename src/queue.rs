@@ -23,7 +23,14 @@ use crate::proto::{
 use crate::store::ArtifactStore;
 
 static CLAIM_SCAN_CURSOR: AtomicUsize = AtomicUsize::new(0);
+static COMPATIBLE_CLAIM_SCAN_CURSOR: AtomicUsize = AtomicUsize::new(0);
 static QUEUE_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+// Queue selection is deliberately approximate and rotates through the pending tree. Reading and
+// decoding thousands of queue records per claim costs more than executing a tiny generated cone.
+const MAX_READY_CANDIDATES_PER_CLAIM: usize = 32;
+const MAX_PENDING_SCAN_PER_CLAIM: usize = 128;
+const MAX_PENDING_SCAN_PER_COMPATIBLE_CLAIM: usize = 256;
 
 struct QueueTransitionLock {
     file: File,
@@ -382,8 +389,6 @@ pub(crate) fn claim_next_pending_item(
     if pending.is_empty() {
         return Ok(None);
     }
-    const MAX_READY_CANDIDATES: usize = 128;
-    const MAX_PENDING_SCAN_PER_CLAIM: usize = 1024;
     let total_pending = pending.len();
     let start_offset =
         CLAIM_SCAN_CURSOR.fetch_add(MAX_PENDING_SCAN_PER_CLAIM, Ordering::Relaxed) % total_pending;
@@ -423,7 +428,7 @@ pub(crate) fn claim_next_pending_item(
                         queue_priority: priority,
                         action_priority: action_scheduler_priority(&action),
                     },
-                    MAX_READY_CANDIDATES,
+                    MAX_READY_CANDIDATES_PER_CLAIM,
                 );
             }
             ActionReadiness::NotReady => continue,
@@ -501,8 +506,14 @@ pub(crate) fn claim_compatible_pending_items(
         return Ok(Vec::new());
     }
 
+    let total_pending = pending.len();
+    let start_offset = COMPATIBLE_CLAIM_SCAN_CURSOR
+        .fetch_add(MAX_PENDING_SCAN_PER_COMPATIBLE_CLAIM, Ordering::Relaxed)
+        % total_pending;
+    let scan_count = total_pending.min(MAX_PENDING_SCAN_PER_COMPATIBLE_CLAIM);
     let mut ready_candidates = Vec::new();
-    for pending_path in pending {
+    for i in 0..scan_count {
+        let pending_path = pending[(start_offset + i) % total_pending].clone();
         let bytes = match fs::read(&pending_path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
