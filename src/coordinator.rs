@@ -404,6 +404,13 @@ fn indexed_source_fingerprint(store: &ArtifactStore) -> Result<pb::Sha256Digest>
 }
 
 fn indexed_output_fingerprint(store: &ArtifactStore) -> Result<pb::Sha256Digest> {
+    indexed_output_fingerprint_for_policy(store, PUBLICATION_POLICY_VERSION)
+}
+
+fn indexed_output_fingerprint_for_policy(
+    store: &ArtifactStore,
+    publication_policy_version: u32,
+) -> Result<pb::Sha256Digest> {
     let mut entries = store.list_web_index_entries_with_prefix("")?;
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -411,7 +418,7 @@ fn indexed_output_fingerprint(store: &ArtifactStore) -> Result<pb::Sha256Digest>
     hasher.update(INDEXED_OUTPUT_FINGERPRINT_DOMAIN);
     // A disclosure-policy change must invalidate an older reusable index checkpoint even when
     // the store still contains exactly the previous policy's dataset set.
-    hasher.update(PUBLICATION_POLICY_VERSION.to_be_bytes());
+    hasher.update(publication_policy_version.to_be_bytes());
     for (index_key, bytes) in entries {
         hasher.update((index_key.len() as u64).to_be_bytes());
         hasher.update(index_key.as_bytes());
@@ -1076,6 +1083,10 @@ mod tests {
         store.ensure_layout().expect("layout");
         let source_before = indexed_source_fingerprint(&store).expect("empty source fingerprint");
         let output_before = indexed_output_fingerprint(&store).expect("empty output fingerprint");
+        let previous_policy_output =
+            indexed_output_fingerprint_for_policy(&store, PUBLICATION_POLICY_VERSION - 1)
+                .expect("previous-policy output fingerprint");
+        assert_ne!(previous_policy_output, output_before);
         let mut state = pb::CoordinatorState {
             stage_results: vec![pb::CoordinatorStageResult {
                 stage: pb::CoordinatorStage::Indexed as i32,
@@ -1091,6 +1102,12 @@ mod tests {
             &source_before,
             &output_before
         ));
+        state.indexed_output_fingerprint = Some(previous_policy_output);
+        assert!(
+            !indexed_checkpoint_matches(&state, &source_before, &output_before),
+            "a checkpoint from the prior publication policy must be rebuilt"
+        );
+        state.indexed_output_fingerprint = Some(output_before.clone());
 
         let action = crate::model::ActionSpec::ImportIrPackageFile {
             source_sha256: "a".repeat(64),
