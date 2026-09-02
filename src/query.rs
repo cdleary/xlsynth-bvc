@@ -3873,6 +3873,13 @@ pub(crate) fn script_ref_short_label(script_ref: &ScriptRef) -> String {
         .unwrap_or(normalized)
 }
 
+fn yosys_frontend_short_label(frontend: &YosysVerilogFrontend) -> Option<String> {
+    match frontend {
+        YosysVerilogFrontend::Builtin => None,
+        YosysVerilogFrontend::Slang { revision } => Some(format!("slang@{}", short_id(revision))),
+    }
+}
+
 pub(crate) fn action_graph_node_label(action: &ActionSpec) -> String {
     match action {
         ActionSpec::ImportIrPackageFile {
@@ -3986,25 +3993,24 @@ pub(crate) fn action_graph_node_label(action: &ActionSpec) -> String {
             format!("ir2mffc(min={})", min_internal_non_literal)
         }
         ActionSpec::ComboVerilogToYosysAbcAig {
-            verilog_top_module_name: Some(top),
+            verilog_top_module_name,
+            frontend,
             yosys_script_ref,
             ..
         } => {
-            format!(
-                "yosys-abc\n{}\n{}",
-                top,
-                script_ref_short_label(yosys_script_ref)
-            )
+            let mut label = action_kind_short_label(action).to_string();
+            if let Some(top) = verilog_top_module_name {
+                label.push('\n');
+                label.push_str(top);
+            }
+            label.push('\n');
+            label.push_str(&script_ref_short_label(yosys_script_ref));
+            if let Some(frontend_label) = yosys_frontend_short_label(frontend) {
+                label.push('\n');
+                label.push_str(&frontend_label);
+            }
+            label
         }
-        ActionSpec::ComboVerilogToYosysAbcAig {
-            verilog_top_module_name: None,
-            yosys_script_ref,
-            ..
-        } => format!(
-            "{}\n{}",
-            action_kind_short_label(action),
-            script_ref_short_label(yosys_script_ref)
-        ),
         ActionSpec::AigToYosysAbcAig {
             yosys_script_ref, ..
         } => format!(
@@ -8282,14 +8288,22 @@ pub(crate) fn action_subject(action: &ActionSpec) -> String {
         ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id,
             verilog_top_module_name,
+            frontend,
             yosys_script_ref,
             ..
-        } => format!(
-            "verilog={} top={} script={}",
-            short_id(verilog_action_id),
-            verilog_top_module_name.as_deref().unwrap_or("<auto>"),
-            script_ref_short_label(yosys_script_ref)
-        ),
+        } => {
+            let mut subject = format!(
+                "verilog={} top={} script={}",
+                short_id(verilog_action_id),
+                verilog_top_module_name.as_deref().unwrap_or("<auto>"),
+                script_ref_short_label(yosys_script_ref)
+            );
+            if let Some(frontend_label) = yosys_frontend_short_label(frontend) {
+                subject.push_str(" frontend=");
+                subject.push_str(&frontend_label);
+            }
+            subject
+        }
         ActionSpec::AigToYosysAbcAig {
             aig_action_id,
             yosys_script_ref,
@@ -9270,7 +9284,7 @@ mod tests {
 
     #[test]
     fn action_subject_for_yosys_abc_includes_script_label() {
-        let action = ActionSpec::ComboVerilogToYosysAbcAig {
+        let mut action = ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id: "f".repeat(64),
             verilog_top_module_name: Some("__float32__add".to_string()),
             frontend: crate::model::YosysVerilogFrontend::Builtin,
@@ -9284,11 +9298,27 @@ mod tests {
             action_subject(&action),
             "verilog=ffffffffffff top=__float32__add script=yosys_to_aig.ys"
         );
+
+        let slang_revision = "a".repeat(40);
+        let ActionSpec::ComboVerilogToYosysAbcAig {
+            frontend, runtime, ..
+        } = &mut action
+        else {
+            unreachable!()
+        };
+        *frontend = crate::model::YosysVerilogFrontend::Slang {
+            revision: slang_revision.clone(),
+        };
+        runtime.slang_commit = Some(slang_revision);
+        assert_eq!(
+            action_subject(&action),
+            "verilog=ffffffffffff top=__float32__add script=yosys_to_aig.ys frontend=slang@aaaaaaaaaaaa"
+        );
     }
 
     #[test]
     fn action_graph_node_label_for_yosys_abc_includes_script_label() {
-        let action = ActionSpec::ComboVerilogToYosysAbcAig {
+        let mut action = ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id: "f".repeat(64),
             verilog_top_module_name: Some("__float32__add".to_string()),
             frontend: crate::model::YosysVerilogFrontend::Builtin,
@@ -9301,6 +9331,22 @@ mod tests {
         assert_eq!(
             action_graph_node_label(&action),
             "yosys-abc\n__float32__add\nablate_abc_fast.ys"
+        );
+
+        let slang_revision = "a".repeat(40);
+        let ActionSpec::ComboVerilogToYosysAbcAig {
+            frontend, runtime, ..
+        } = &mut action
+        else {
+            unreachable!()
+        };
+        *frontend = crate::model::YosysVerilogFrontend::Slang {
+            revision: slang_revision.clone(),
+        };
+        runtime.slang_commit = Some(slang_revision);
+        assert_eq!(
+            action_graph_node_label(&action),
+            "yosys-abc\n__float32__add\nablate_abc_fast.ys\nslang@aaaaaaaaaaaa"
         );
     }
 
