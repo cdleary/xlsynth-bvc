@@ -2912,16 +2912,28 @@ fn rebuild_ir_fn_corpus_ir_index_for_paired_indices(
 ) -> Result<IrFnCorpusIrIndexSummary> {
     let started = Instant::now();
     let build = build_ir_fn_corpus_ir_index_bytes_for_paired_indices(store, comparison_indices)?;
+    validate_ir_fn_corpus_ir_index_closure(
+        std::iter::once((
+            WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
+            build.manifest_bytes.as_slice(),
+        ))
+        .chain(
+            build
+                .shard_files
+                .iter()
+                .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+        ),
+    )?;
     let mut index_bytes = build.manifest_bytes.len();
-    store
-        .write_web_index_bytes(WEB_IR_FN_CORPUS_IR_INDEX_FILENAME, &build.manifest_bytes)
-        .context("writing paired XLS IR manifest")?;
     for (index_key, bytes) in &build.shard_files {
         index_bytes += bytes.len();
         store
             .write_web_index_bytes(index_key, bytes)
             .with_context(|| format!("writing paired XLS IR shard {index_key}"))?;
     }
+    store
+        .write_web_index_bytes(WEB_IR_FN_CORPUS_IR_INDEX_FILENAME, &build.manifest_bytes)
+        .context("writing paired XLS IR manifest")?;
     Ok(IrFnCorpusIrIndexSummary {
         index_path: store.web_index_location(WEB_IR_FN_CORPUS_IR_INDEX_FILENAME),
         entry_count: build.entry_count,

@@ -738,6 +738,76 @@ fn validate_ir_fn_corpus_ir_shard(index: &IrFnCorpusIrShardFile) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_ir_fn_corpus_ir_index_closure<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<()> {
+    let namespace_prefix = format!("{}/", crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE);
+    let mut ir_entries = BTreeMap::new();
+    for (key, bytes) in entries.into_iter().filter(|(key, _)| {
+        *key == crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME || key.starts_with(&namespace_prefix)
+    }) {
+        if ir_entries.insert(key, bytes).is_some() {
+            bail!("duplicate IR function corpus index key: {key}");
+        }
+    }
+    if ir_entries.is_empty() {
+        return Ok(());
+    }
+
+    let manifest_bytes = ir_entries
+        .get(crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME)
+        .copied()
+        .context("IR function corpus shards exist without their manifest")?;
+    let manifest: IrFnCorpusIrIndexManifest = serde_json::from_slice(manifest_bytes)
+        .context("parsing IR function corpus manifest during closure validation")?;
+    validate_ir_fn_corpus_ir_manifest(&manifest)?;
+
+    let mut expected_keys = BTreeSet::from([crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME.to_string()]);
+    let mut actual_entry_count = 0usize;
+    for summary in &manifest.shards {
+        expected_keys.insert(summary.index_key.clone());
+        let shard_bytes = ir_entries
+            .get(summary.index_key.as_str())
+            .copied()
+            .with_context(|| {
+                format!(
+                    "IR function corpus manifest declares missing shard {}",
+                    summary.index_key
+                )
+            })?;
+        let shard: IrFnCorpusIrShardFile = serde_json::from_slice(shard_bytes)
+            .with_context(|| format!("parsing IR function corpus shard {}", summary.index_key))?;
+        validate_ir_fn_corpus_ir_shard(&shard).with_context(|| {
+            format!("validating IR function corpus shard {}", summary.index_key)
+        })?;
+        if shard.prefix != summary.prefix || shard.entries.len() != summary.entry_count {
+            bail!(
+                "IR function corpus shard {} disagrees with its manifest summary",
+                summary.index_key
+            );
+        }
+        actual_entry_count = actual_entry_count
+            .checked_add(shard.entries.len())
+            .context("IR function corpus shard entry count overflow")?;
+    }
+
+    let actual_keys = ir_entries
+        .keys()
+        .map(|key| (*key).to_string())
+        .collect::<BTreeSet<_>>();
+    if actual_keys != expected_keys {
+        bail!("IR function corpus index contains undeclared or missing shard keys");
+    }
+    if actual_entry_count != manifest.entry_count {
+        bail!(
+            "IR function corpus shard entry count mismatch: manifest={} actual={}",
+            manifest.entry_count,
+            actual_entry_count
+        );
+    }
+    Ok(())
+}
+
 fn ir_fn_corpus_ir_shard_prefix(index_key: &str) -> Option<&str> {
     let prefix = index_key
         .strip_prefix(crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE)?
@@ -963,6 +1033,29 @@ mod tests {
         })
     }
 
+    fn empty_ir_fn_corpus_ir_entries() -> Vec<(String, Vec<u8>)> {
+        let mut entries = vec![(
+            crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME.to_string(),
+            serde_json::to_vec(&empty_ir_fn_corpus_ir_value()).unwrap(),
+        )];
+        entries.extend((u8::MIN..=u8::MAX).map(|byte| {
+            let prefix = format!("{byte:02x}");
+            (
+                format!(
+                    "{}/{prefix}.json",
+                    crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE
+                ),
+                serde_json::to_vec(&json!({
+                    "schema_version": crate::WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION,
+                    "prefix": prefix,
+                    "entries": []
+                }))
+                .unwrap(),
+            )
+        }));
+        entries
+    }
+
     fn structural_group_fixture() -> (String, Vec<u8>) {
         let structural_hash = "7".repeat(64);
         let opt_ir_action_id = "1".repeat(64);
@@ -1172,6 +1265,46 @@ mod tests {
         let error = format!("{error:#}");
         assert!(error.contains("absolute host path"));
         assert!(!error.contains(marker));
+    }
+
+    #[test]
+    fn ir_fn_corpus_ir_closure_requires_every_declared_shard_and_exact_counts() {
+        let entries = empty_ir_fn_corpus_ir_entries();
+        validate_ir_fn_corpus_ir_index_closure(
+            entries
+                .iter()
+                .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+        )
+        .expect("complete empty IR corpus index closure");
+
+        let mut missing = entries.clone();
+        let (missing_key, _) = missing.pop().expect("remove final shard");
+        let error = validate_ir_fn_corpus_ir_index_closure(
+            missing
+                .iter()
+                .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+        )
+        .expect_err("missing declared shard must fail closure validation");
+        assert!(
+            format!("{error:#}").contains(&format!("declares missing shard {missing_key}")),
+            "unexpected error: {error:#}"
+        );
+
+        let mut count_mismatch = entries;
+        let mut manifest = empty_ir_fn_corpus_ir_value();
+        manifest["entry_count"] = json!(1);
+        manifest["shards"][0]["entry_count"] = json!(1);
+        count_mismatch[0].1 = serde_json::to_vec(&manifest).unwrap();
+        let error = validate_ir_fn_corpus_ir_index_closure(
+            count_mismatch
+                .iter()
+                .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+        )
+        .expect_err("manifest/shard count mismatch must fail closure validation");
+        assert!(
+            format!("{error:#}").contains("disagrees with its manifest summary"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

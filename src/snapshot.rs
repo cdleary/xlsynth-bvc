@@ -641,16 +641,28 @@ fn rebuild_snapshot_web_indices(
     ];
     let ir_build =
         build_ir_fn_corpus_ir_index_bytes_for_paired_indices(store, &comparison_indices)?;
+    crate::query::validate_ir_fn_corpus_ir_index_closure(
+        std::iter::once((
+            WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
+            ir_build.manifest_bytes.as_slice(),
+        ))
+        .chain(
+            ir_build
+                .shard_files
+                .iter()
+                .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+        ),
+    )?;
     let mut ir_bytes = ir_build.manifest_bytes.len();
+    for (index_key, bytes) in &ir_build.shard_files {
+        ir_bytes += bytes.len();
+        direct_files.push(write_snapshot_dataset_entry(out_dir, index_key, bytes)?);
+    }
     direct_files.push(write_snapshot_dataset_entry(
         out_dir,
         WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
         &ir_build.manifest_bytes,
     )?);
-    for (index_key, bytes) in &ir_build.shard_files {
-        ir_bytes += bytes.len();
-        direct_files.push(write_snapshot_dataset_entry(out_dir, index_key, bytes)?);
-    }
     warn!(
         "rebuild-snapshot-web-indices phase=ir-fn-corpus-ir done entries={} direct_bytes={}",
         ir_build.entry_count, ir_bytes
@@ -1074,6 +1086,12 @@ pub(crate) fn build_static_snapshot(
     entries.retain(|(index_key, _)| {
         should_copy_snapshot_store_index(index_key, direct_heavy_indices_written)
     });
+    crate::query::validate_ir_fn_corpus_ir_index_closure(
+        entries
+            .iter()
+            .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+    )
+    .context("validating IR function corpus index closure before static snapshot")?;
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (index_key, bytes) in entries {
@@ -1201,7 +1219,7 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
     let mut decoded_run_ids = std::collections::BTreeSet::new();
     let mut decoded_runs = std::collections::BTreeMap::new();
     let mut decoded_analysis_reports = Vec::new();
-    let mut structural_index_entries = Vec::new();
+    let mut public_index_entries = Vec::new();
     declared_relpaths.insert(STATIC_SNAPSHOT_MANIFEST_FILENAME.to_string());
     for entry in &manifest.dataset_files {
         let expected_relpath = if entry.index_key.starts_with("runs/") {
@@ -1328,17 +1346,20 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
         } else if entry.index_key.starts_with("runs/") {
             bail!("unknown run publication file: {}", entry.index_key);
         }
-        if entry
-            .index_key
-            .starts_with(WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE)
-        {
-            structural_index_entries.push((entry.index_key.clone(), bytes));
+        if !entry.index_key.starts_with("runs/") {
+            public_index_entries.push((entry.index_key.clone(), bytes));
         }
         recomputed_total_bytes += actual_bytes;
     }
 
-    crate::service::validate_ir_fn_corpus_structural_index_closure(&structural_index_entries)
+    crate::service::validate_ir_fn_corpus_structural_index_closure(&public_index_entries)
         .context("validating structural index closure in static snapshot")?;
+    crate::query::validate_ir_fn_corpus_ir_index_closure(
+        public_index_entries
+            .iter()
+            .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+    )
+    .context("validating IR function corpus index closure in static snapshot")?;
 
     validate_analysis_public_run_bindings(&decoded_runs, &decoded_analysis_reports)?;
 
