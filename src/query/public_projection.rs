@@ -618,6 +618,8 @@ fn validate_ir_fn_corpus_ir_manifest(index: &IrFnCorpusIrIndexManifest) -> Resul
         if shard.prefix != expected_prefix || shard.index_key != expected_key {
             bail!("IR function corpus manifest shard identity is invalid");
         }
+        validate_hex_digest("ir_fn_corpus_ir.shard.sha256", &shard.sha256)?;
+        usize::try_from(shard.bytes).context("IR function corpus shard byte count overflow")?;
         entry_count = entry_count
             .checked_add(shard.entry_count)
             .context("IR function corpus manifest entry count overflow")?;
@@ -775,6 +777,18 @@ pub(crate) fn validate_ir_fn_corpus_ir_index_closure<'a>(
                     summary.index_key
                 )
             })?;
+        if shard_bytes.len() as u64 != summary.bytes {
+            bail!(
+                "IR function corpus shard {} byte count disagrees with its manifest summary",
+                summary.index_key
+            );
+        }
+        if sha256_bytes_hex(shard_bytes) != summary.sha256 {
+            bail!(
+                "IR function corpus shard {} SHA-256 disagrees with its manifest summary",
+                summary.index_key
+            );
+        }
         let shard: IrFnCorpusIrShardFile = serde_json::from_slice(shard_bytes)
             .with_context(|| format!("parsing IR function corpus shard {}", summary.index_key))?;
         validate_ir_fn_corpus_ir_shard(&shard).with_context(|| {
@@ -1010,17 +1024,29 @@ mod tests {
         value
     }
 
+    fn empty_ir_fn_corpus_ir_shard_bytes(prefix: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema_version": crate::WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION,
+            "prefix": prefix,
+            "entries": []
+        }))
+        .unwrap()
+    }
+
     fn empty_ir_fn_corpus_ir_value() -> Value {
         let shards = (u8::MIN..=u8::MAX)
             .map(|byte| {
                 let prefix = format!("{byte:02x}");
+                let bytes = empty_ir_fn_corpus_ir_shard_bytes(&prefix);
                 json!({
                     "prefix": prefix,
                     "index_key": format!(
                         "{}/{prefix}.json",
                         crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE
                     ),
-                    "entry_count": 0
+                    "entry_count": 0,
+                    "bytes": bytes.len(),
+                    "sha256": sha256_bytes_hex(&bytes)
                 })
             })
             .collect::<Vec<_>>();
@@ -1045,12 +1071,7 @@ mod tests {
                     "{}/{prefix}.json",
                     crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE
                 ),
-                serde_json::to_vec(&json!({
-                    "schema_version": crate::WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION,
-                    "prefix": prefix,
-                    "entries": []
-                }))
-                .unwrap(),
+                empty_ir_fn_corpus_ir_shard_bytes(&prefix),
             )
         }));
         entries
@@ -1276,6 +1297,25 @@ mod tests {
                 .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
         )
         .expect("complete empty IR corpus index closure");
+
+        let mut tampered = entries.clone();
+        let (_, shard_bytes) = tampered
+            .iter_mut()
+            .find(|(index_key, _)| index_key.ends_with("/00.json"))
+            .expect("find shard to tamper with");
+        let mut shard: Value = serde_json::from_slice(shard_bytes).unwrap();
+        shard["prefix"] = json!("01");
+        *shard_bytes = serde_json::to_vec(&shard).unwrap();
+        let error = validate_ir_fn_corpus_ir_index_closure(
+            tampered
+                .iter()
+                .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+        )
+        .expect_err("same-size shard content change must fail closure validation");
+        assert!(
+            format!("{error:#}").contains("SHA-256 disagrees"),
+            "unexpected error: {error:#}"
+        );
 
         let mut missing = entries.clone();
         let (missing_key, _) = missing.pop().expect("remove final shard");

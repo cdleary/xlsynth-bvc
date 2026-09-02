@@ -5,7 +5,6 @@ use chrono::{DateTime, Utc};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
@@ -1239,6 +1238,8 @@ pub(crate) struct IrFnCorpusIrShardSummary {
     pub(crate) prefix: String,
     pub(crate) index_key: String,
     pub(crate) entry_count: usize,
+    pub(crate) bytes: u64,
+    pub(crate) sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1252,6 +1253,10 @@ pub(crate) struct IrFnCorpusIrIndexBuild {
     pub(crate) entry_count: usize,
     pub(crate) manifest_bytes: Vec<u8>,
     pub(crate) shard_files: Vec<(String, Vec<u8>)>,
+}
+
+fn sha256_bytes_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2888,6 +2893,8 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
             prefix,
             index_key: index_key.clone(),
             entry_count: shard_entry_count,
+            bytes: bytes.len() as u64,
+            sha256: sha256_bytes_hex(&bytes),
         });
         shard_files.push((index_key, bytes));
     }
