@@ -15,7 +15,7 @@ use crate::campaign::{campaign_analysis_path, list_finalized_campaign_runs};
 use crate::query::{
     build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_bytes,
     build_ir_fn_corpus_g8r_vs_yosys_dataset_index_bytes,
-    build_ir_fn_corpus_ir_index_bytes_for_paired_index,
+    build_ir_fn_corpus_ir_index_bytes_for_paired_indices,
     rebuild_stdlib_fn_version_timeline_dataset_index, rebuild_stdlib_fns_trend_dataset_index,
     rebuild_stdlib_g8r_vs_yosys_dataset_index, rebuild_versions_cards_index,
 };
@@ -629,10 +629,18 @@ fn rebuild_snapshot_web_indices(
     );
 
     warn!("rebuild-snapshot-web-indices phase=ir-fn-corpus-ir begin");
-    let ir_build = build_ir_fn_corpus_ir_index_bytes_for_paired_index(
-        store,
-        &ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_bytes,
-    )?;
+    let comparison_indices = [
+        (
+            ir_fn_corpus_g8r_vs_yosys_bytes.as_slice(),
+            crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+        ),
+        (
+            ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_bytes.as_slice(),
+            crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
+        ),
+    ];
+    let ir_build =
+        build_ir_fn_corpus_ir_index_bytes_for_paired_indices(store, &comparison_indices)?;
     let mut ir_bytes = ir_build.manifest_bytes.len();
     direct_files.push(write_snapshot_dataset_entry(
         out_dir,

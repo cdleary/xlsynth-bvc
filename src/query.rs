@@ -1257,6 +1257,8 @@ pub(crate) struct IrFnCorpusIrIndexBuild {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct IrFnCorpusIrComparisonEntry {
     pub(crate) crate_version: String,
+    pub(crate) g8r_stats_action_id: String,
+    pub(crate) yosys_abc_stats_action_id: String,
     pub(crate) structural_hash: String,
     pub(crate) g8r: IrFnCorpusIrSide,
     pub(crate) yosys_abc: IrFnCorpusIrSide,
@@ -2300,118 +2302,138 @@ pub(crate) fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_byte
     ))
 }
 
-pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_index(
+pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
     store: &ArtifactStore,
-    comparison_index_bytes: &[u8],
+    comparison_indices: &[(&[u8], u32)],
 ) -> Result<IrFnCorpusIrIndexBuild> {
-    let comparison: IrFnCorpusG8rVsYosysIndexFile = serde_json::from_slice(comparison_index_bytes)
-        .context("parsing paired corpus index while exporting XLS IR")?;
-    if comparison.schema_version
-        != WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION
-    {
-        bail!(
-            "paired corpus index schema mismatch while exporting XLS IR: expected={} got={}",
-            WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
-            comparison.schema_version
-        );
-    }
-
-    let mut g8r_by_entity = BTreeMap::new();
-    for row in comparison.g8r_points {
-        let structural_hash = normalize_structural_hash_hex(&row.structural_hash)
-            .context("paired corpus G8r point has an invalid structural hash")?;
-        if row.crate_version != row.point.crate_version {
-            bail!("paired corpus G8r point has conflicting crate-version identity");
-        }
-        let key = (structural_hash, row.crate_version);
-        if g8r_by_entity.insert(key, row.point).is_some() {
-            bail!("paired corpus index has duplicate G8r entity points");
-        }
-    }
-    let mut yosys_by_entity = BTreeMap::new();
-    for row in comparison.yosys_points {
-        let structural_hash = normalize_structural_hash_hex(&row.structural_hash)
-            .context("paired corpus Yosys/ABC point has an invalid structural hash")?;
-        if row.crate_version != row.point.crate_version {
-            bail!("paired corpus Yosys/ABC point has conflicting crate-version identity");
-        }
-        let key = (structural_hash, row.crate_version);
-        if yosys_by_entity.insert(key, row.point).is_some() {
-            bail!("paired corpus index has duplicate Yosys/ABC entity points");
-        }
-    }
-
     type SideIdentity = (String, String, String);
+    #[derive(Debug, PartialEq, Eq)]
     struct PairRequest {
         crate_version: String,
+        g8r_stats_action_id: String,
+        yosys_abc_stats_action_id: String,
         structural_hash: String,
         g8r: SideIdentity,
         yosys_abc: SideIdentity,
     }
 
     let mut wanted: BTreeMap<String, BTreeMap<String, (String, String, String)>> = BTreeMap::new();
-    let mut pair_requests = Vec::new();
-    for sample in comparison.dataset.samples {
-        let sample_top = sample
-            .ir_top
-            .as_deref()
-            .context("paired corpus sample has no IR top while exporting XLS IR")?;
-        let structural_hash = sample
-            .structural_hash
-            .as_deref()
-            .and_then(normalize_structural_hash_hex)
-            .context("paired corpus sample has no valid canonical structural hash")?;
-        let entity_key = (structural_hash.clone(), sample.crate_version.clone());
-        let g8r = g8r_by_entity
-            .get(&entity_key)
-            .context("paired corpus sample is missing its G8r entity point")?;
-        let yosys_abc = yosys_by_entity
-            .get(&entity_key)
-            .context("paired corpus sample is missing its Yosys/ABC entity point")?;
-        if sample.ir_action_id != g8r.ir_action_id
-            || sample_top != g8r.ir_top.as_deref().unwrap_or("")
-            || sample.g8r_stats_action_id != g8r.stats_action_id
-            || sample.yosys_abc_stats_action_id != yosys_abc.stats_action_id
-        {
-            bail!("paired corpus sample disagrees with its concrete entity points");
+    let mut pair_requests_by_identity = BTreeMap::new();
+    for (comparison_index_bytes, expected_schema_version) in comparison_indices {
+        let comparison: IrFnCorpusG8rVsYosysIndexFile =
+            serde_json::from_slice(comparison_index_bytes)
+                .context("parsing paired corpus index while exporting XLS IR")?;
+        if comparison.schema_version != *expected_schema_version {
+            bail!(
+                "paired corpus index schema mismatch while exporting XLS IR: expected={} got={}",
+                expected_schema_version,
+                comparison.schema_version
+            );
         }
 
-        let yosys_ir_top = yosys_abc
-            .ir_top
-            .as_deref()
-            .context("paired corpus Yosys/ABC point has no IR top")?;
-        let mut identities = Vec::new();
-        for (point, ir_top) in [(g8r, sample_top), (yosys_abc, yosys_ir_top)] {
-            let release_identity = (
-                sample.crate_version.clone(),
-                point.dso_version.clone(),
-                structural_hash.clone(),
-            );
-            if let Some(existing) = wanted
-                .entry(point.ir_action_id.clone())
-                .or_default()
-                .insert(ir_top.to_string(), release_identity.clone())
-                && existing != release_identity
-            {
-                bail!(
-                    "paired corpus index has conflicting release identity for action {} top {}",
-                    point.ir_action_id,
-                    ir_top
-                );
+        let mut g8r_by_entity = BTreeMap::new();
+        for row in comparison.g8r_points {
+            let structural_hash = normalize_structural_hash_hex(&row.structural_hash)
+                .context("paired corpus G8r point has an invalid structural hash")?;
+            if row.crate_version != row.point.crate_version {
+                bail!("paired corpus G8r point has conflicting crate-version identity");
             }
-            identities.push((
-                point.ir_action_id.clone(),
-                ir_top.to_string(),
-                sample.crate_version.clone(),
-            ));
+            let key = (structural_hash, row.crate_version);
+            if g8r_by_entity.insert(key, row.point).is_some() {
+                bail!("paired corpus index has duplicate G8r entity points");
+            }
         }
-        pair_requests.push(PairRequest {
-            crate_version: sample.crate_version,
-            structural_hash,
-            g8r: identities.remove(0),
-            yosys_abc: identities.remove(0),
-        });
+        let mut yosys_by_entity = BTreeMap::new();
+        for row in comparison.yosys_points {
+            let structural_hash = normalize_structural_hash_hex(&row.structural_hash)
+                .context("paired corpus Yosys/ABC point has an invalid structural hash")?;
+            if row.crate_version != row.point.crate_version {
+                bail!("paired corpus Yosys/ABC point has conflicting crate-version identity");
+            }
+            let key = (structural_hash, row.crate_version);
+            if yosys_by_entity.insert(key, row.point).is_some() {
+                bail!("paired corpus index has duplicate Yosys/ABC entity points");
+            }
+        }
+
+        for sample in comparison.dataset.samples {
+            let sample_top = sample
+                .ir_top
+                .as_deref()
+                .context("paired corpus sample has no IR top while exporting XLS IR")?;
+            let structural_hash = sample
+                .structural_hash
+                .as_deref()
+                .and_then(normalize_structural_hash_hex)
+                .context("paired corpus sample has no valid canonical structural hash")?;
+            let entity_key = (structural_hash.clone(), sample.crate_version.clone());
+            let g8r = g8r_by_entity
+                .get(&entity_key)
+                .context("paired corpus sample is missing its G8r entity point")?;
+            let yosys_abc = yosys_by_entity
+                .get(&entity_key)
+                .context("paired corpus sample is missing its Yosys/ABC entity point")?;
+            if sample.ir_action_id != g8r.ir_action_id
+                || sample_top != g8r.ir_top.as_deref().unwrap_or("")
+                || sample.g8r_stats_action_id != g8r.stats_action_id
+                || sample.yosys_abc_stats_action_id != yosys_abc.stats_action_id
+            {
+                bail!("paired corpus sample disagrees with its concrete entity points");
+            }
+
+            let yosys_ir_top = yosys_abc
+                .ir_top
+                .as_deref()
+                .context("paired corpus Yosys/ABC point has no IR top")?;
+            let mut identities = Vec::new();
+            for (point, ir_top) in [(g8r, sample_top), (yosys_abc, yosys_ir_top)] {
+                let release_identity = (
+                    sample.crate_version.clone(),
+                    point.dso_version.clone(),
+                    structural_hash.clone(),
+                );
+                if let Some(existing) = wanted
+                    .entry(point.ir_action_id.clone())
+                    .or_default()
+                    .insert(ir_top.to_string(), release_identity.clone())
+                    && existing != release_identity
+                {
+                    bail!(
+                        "paired corpus index has conflicting release identity for action {} top {}",
+                        point.ir_action_id,
+                        ir_top
+                    );
+                }
+                identities.push((
+                    point.ir_action_id.clone(),
+                    ir_top.to_string(),
+                    sample.crate_version.clone(),
+                ));
+            }
+            let pair_identity = (
+                sample.g8r_stats_action_id.clone(),
+                sample.yosys_abc_stats_action_id.clone(),
+            );
+            let request = PairRequest {
+                crate_version: sample.crate_version,
+                g8r_stats_action_id: sample.g8r_stats_action_id,
+                yosys_abc_stats_action_id: sample.yosys_abc_stats_action_id,
+                structural_hash,
+                g8r: identities.remove(0),
+                yosys_abc: identities.remove(0),
+            };
+            match pair_requests_by_identity.entry(pair_identity) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(request);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &request => {
+                    bail!("paired corpus indices disagree for one concrete stats-action pair");
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
     }
+    let pair_requests = pair_requests_by_identity.into_values().collect::<Vec<_>>();
 
     let mut generated_utc = DateTime::from_timestamp(0, 0).expect("Unix epoch is representable");
     let mut sides_by_identity: BTreeMap<SideIdentity, IrFnCorpusIrSide> = BTreeMap::new();
@@ -2826,6 +2848,8 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_index(
         })?;
         entries.push(IrFnCorpusIrComparisonEntry {
             crate_version: request.crate_version,
+            g8r_stats_action_id: request.g8r_stats_action_id,
+            yosys_abc_stats_action_id: request.yosys_abc_stats_action_id,
             structural_hash: request.structural_hash,
             g8r: g8r.clone(),
             yosys_abc: yosys_abc.clone(),
@@ -2835,6 +2859,11 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_index(
         a.crate_version
             .cmp(&b.crate_version)
             .then(a.structural_hash.cmp(&b.structural_hash))
+            .then(a.g8r_stats_action_id.cmp(&b.g8r_stats_action_id))
+            .then(
+                a.yosys_abc_stats_action_id
+                    .cmp(&b.yosys_abc_stats_action_id),
+            )
     });
     let entry_count = entries.len();
     let mut entries_by_prefix: BTreeMap<String, Vec<IrFnCorpusIrComparisonEntry>> = BTreeMap::new();
@@ -2877,12 +2906,12 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_index(
     })
 }
 
-fn rebuild_ir_fn_corpus_ir_index_for_paired_index(
+fn rebuild_ir_fn_corpus_ir_index_for_paired_indices(
     store: &ArtifactStore,
-    comparison_index_bytes: &[u8],
+    comparison_indices: &[(&[u8], u32)],
 ) -> Result<IrFnCorpusIrIndexSummary> {
     let started = Instant::now();
-    let build = build_ir_fn_corpus_ir_index_bytes_for_paired_index(store, comparison_index_bytes)?;
+    let build = build_ir_fn_corpus_ir_index_bytes_for_paired_indices(store, comparison_indices)?;
     let mut index_bytes = build.manifest_bytes.len();
     store
         .write_web_index_bytes(WEB_IR_FN_CORPUS_IR_INDEX_FILENAME, &build.manifest_bytes)
@@ -2999,11 +3028,24 @@ pub(crate) fn rebuild_web_indices(
     );
     let phase_ir_started = Instant::now();
     warn!("rebuild-web-indices phase=ir-fn-corpus-ir begin");
-    let comparison_index_bytes = store
+    let direct_comparison_bytes = store
+        .load_web_index_bytes(WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME)?
+        .context("rebuilt direct paired corpus index is unavailable for XLS IR export")?;
+    let frontend_comparison_bytes = store
         .load_web_index_bytes(WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME)?
-        .context("rebuilt paired corpus index is unavailable for XLS IR export")?;
+        .context("rebuilt frontend paired corpus index is unavailable for XLS IR export")?;
+    let comparison_indices = [
+        (
+            direct_comparison_bytes.as_slice(),
+            WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+        ),
+        (
+            frontend_comparison_bytes.as_slice(),
+            WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
+        ),
+    ];
     let ir_fn_corpus_ir =
-        rebuild_ir_fn_corpus_ir_index_for_paired_index(store, &comparison_index_bytes)?;
+        rebuild_ir_fn_corpus_ir_index_for_paired_indices(store, &comparison_indices)?;
     warn!(
         "rebuild-web-indices phase=ir-fn-corpus-ir done entries={} bytes={} elapsed={}",
         ir_fn_corpus_ir.entry_count,
@@ -8890,15 +8932,34 @@ mod tests {
                 },
             }],
         };
-        let build = build_ir_fn_corpus_ir_index_bytes_for_paired_index(
-            &store,
-            &serde_json::to_vec(&comparison).expect("serialize comparison"),
-        )
-        .expect("build IR function corpus index");
-        assert_eq!(build.entry_count, 1);
+        let mut direct_comparison = comparison.clone();
+        direct_comparison.schema_version =
+            crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION;
+        direct_comparison.dataset.samples[0].g8r_stats_action_id = "1".repeat(64);
+        direct_comparison.dataset.samples[0].yosys_abc_stats_action_id = "2".repeat(64);
+        direct_comparison.g8r_points[0].point.stats_action_id = "1".repeat(64);
+        direct_comparison.yosys_points[0].point.stats_action_id = "2".repeat(64);
+        let direct_comparison_bytes =
+            serde_json::to_vec(&direct_comparison).expect("serialize direct comparison");
+        let frontend_comparison_bytes =
+            serde_json::to_vec(&comparison).expect("serialize frontend comparison");
+        let comparison_indices = [
+            (
+                direct_comparison_bytes.as_slice(),
+                crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+            ),
+            (
+                frontend_comparison_bytes.as_slice(),
+                crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
+            ),
+        ];
+        let build =
+            build_ir_fn_corpus_ir_index_bytes_for_paired_indices(&store, &comparison_indices)
+                .expect("build IR function corpus index");
+        assert_eq!(build.entry_count, 2);
         let manifest: IrFnCorpusIrIndexManifest = serde_json::from_slice(&build.manifest_bytes)
             .expect("parse IR function corpus manifest");
-        assert_eq!(manifest.entry_count, 1);
+        assert_eq!(manifest.entry_count, 2);
         assert_eq!(manifest.shards.len(), 256);
         let shard_key = format!(
             "{}/{}.json",
@@ -8914,7 +8975,14 @@ mod tests {
         let index: IrFnCorpusIrShardFile =
             serde_json::from_slice(shard_bytes).expect("parse IR function corpus shard");
         assert_eq!(index.prefix, &canonical_structural_hash[..2]);
-        let entry = &index.entries[0];
+        assert_eq!(index.entries.len(), 2);
+        let entry = index
+            .entries
+            .iter()
+            .find(|entry| entry.g8r_stats_action_id == "e".repeat(64))
+            .expect("find frontend comparison IR entry by exact stats identity");
+        assert_eq!(entry.g8r_stats_action_id, "e".repeat(64));
+        assert_eq!(entry.yosys_abc_stats_action_id, "f".repeat(64));
         assert_eq!(entry.crate_version, "0.31.0");
         assert_eq!(entry.structural_hash, canonical_structural_hash);
         assert_eq!(entry.g8r.ir_action_id, yosys_action_id);

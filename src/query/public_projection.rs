@@ -707,16 +707,29 @@ fn validate_ir_fn_corpus_ir_shard(index: &IrFnCorpusIrShardFile) -> Result<()> {
         Ok(())
     }
 
-    let mut previous_key: Option<(&str, &str)> = None;
+    let mut previous_key: Option<(&str, &str, &str, &str)> = None;
     for entry in &index.entries {
         validate_hex_digest("ir_fn_corpus_ir.structural_hash", &entry.structural_hash)?;
+        validate_hex_digest(
+            "ir_fn_corpus_ir.g8r_stats_action_id",
+            &entry.g8r_stats_action_id,
+        )?;
+        validate_hex_digest(
+            "ir_fn_corpus_ir.yosys_abc_stats_action_id",
+            &entry.yosys_abc_stats_action_id,
+        )?;
         if !entry.structural_hash.starts_with(&index.prefix) {
             bail!("IR function corpus entry is stored in the wrong shard");
         }
         validate_version("ir_fn_corpus_ir.crate_version", &entry.crate_version)?;
         validate_side("g8r", &entry.g8r)?;
         validate_side("yosys_abc", &entry.yosys_abc)?;
-        let key = (entry.crate_version.as_str(), entry.structural_hash.as_str());
+        let key = (
+            entry.crate_version.as_str(),
+            entry.structural_hash.as_str(),
+            entry.g8r_stats_action_id.as_str(),
+            entry.yosys_abc_stats_action_id.as_str(),
+        );
         if previous_key.is_some_and(|previous| previous >= key) {
             bail!("IR function corpus entries are not strictly sorted and unique");
         }

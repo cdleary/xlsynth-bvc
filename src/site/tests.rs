@@ -810,6 +810,8 @@ const irResponse = (name, hash) => ({
   json: async () => ({entries: [{
 crate_version: '0.31.0',
 structural_hash: hash,
+g8r_stats_action_id: `g8r-${name}`,
+yosys_abc_stats_action_id: `yabc-${name}`,
 g8r: {ir_action_id: `ir-${name}`, ir_top: `top-${name}`, ir_text: `fn top-${name}() -> bits[1] { ret literal.1: bits[1] = literal(value=1, id=1) }`},
 yosys_abc: {ir_action_id: `ir-${name}`, ir_top: `top-${name}`, ir_text: `fn top-${name}() -> bits[1] { ret literal.1: bits[1] = literal(value=1, id=1) }`},
   }]}),
