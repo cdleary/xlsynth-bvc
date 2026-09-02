@@ -1483,6 +1483,7 @@ mod tests {
             dockerfile_sha256: "b".repeat(64),
             docker_image_id: "c".repeat(64),
             upstream_commit: Some("d".repeat(40)),
+            slang_commit: Some("a".repeat(40)),
         };
         let script_ref = model::ScriptRef {
             path: "flows/yosys_to_aig.ys".into(),

@@ -51,6 +51,8 @@ message YosysRuntimeSpec {
   Sha256Digest dockerfile_sha256 = 4;
   // Immutable local OCI image config digest resolved when the action is planned.
   Sha256Digest docker_image_id = 5;
+  // Exact yosys-slang source commit built into this runtime when that frontend is used.
+  optional string slang_commit = 6;
 }
 
 message DriverReleaseCacheFile {

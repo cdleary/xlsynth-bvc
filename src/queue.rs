@@ -2333,6 +2333,7 @@ mod tests {
             docker_image_id: "e".repeat(64),
             dockerfile_sha256: "d".repeat(64),
             upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
+            slang_commit: None,
         };
         let diff = ActionSpec::AigStatDiff {
             opt_ir_action_id: "a".repeat(64),

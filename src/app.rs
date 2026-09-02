@@ -1170,10 +1170,8 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
             frontend,
             yosys_script,
             yosys,
-        } => Ok(ActionSpec::ComboVerilogToYosysAbcAig {
-            verilog_action_id,
-            verilog_top_module_name,
-            frontend: match frontend {
+        } => {
+            let frontend = match frontend {
                 crate::cli::YosysVerilogFrontendCli::Builtin => {
                     crate::model::YosysVerilogFrontend::Builtin
                 }
@@ -1182,10 +1180,19 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
                         revision: crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string(),
                     }
                 }
-            },
-            yosys_script_ref: make_script_ref(repo_root, &yosys_script)?,
-            runtime: yosys.into_runtime(repo_root)?,
-        }),
+            };
+            let slang_commit = match &frontend {
+                crate::model::YosysVerilogFrontend::Builtin => None,
+                crate::model::YosysVerilogFrontend::Slang { revision } => Some(revision.clone()),
+            };
+            Ok(ActionSpec::ComboVerilogToYosysAbcAig {
+                verilog_action_id,
+                verilog_top_module_name,
+                frontend,
+                yosys_script_ref: make_script_ref(repo_root, &yosys_script)?,
+                runtime: yosys.into_runtime(repo_root, slang_commit)?,
+            })
+        }
         RunAction::AigToYosysAbcAig {
             aig_action_id,
             yosys_script,
@@ -1193,7 +1200,7 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
         } => Ok(ActionSpec::AigToYosysAbcAig {
             aig_action_id,
             yosys_script_ref: make_script_ref(repo_root, &yosys_script)?,
-            runtime: yosys.into_runtime(repo_root)?,
+            runtime: yosys.into_runtime(repo_root, None)?,
         }),
         RunAction::AigToStats {
             aig_action_id,
@@ -3548,6 +3555,42 @@ mod tests {
             docker_image_id: "e".repeat(64),
             release_cache_input_sha256: "f".repeat(64),
         }
+    }
+
+    #[test]
+    fn slang_cli_action_binds_the_same_revision_into_its_runtime() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let action = run_action_to_spec(
+            repo_root,
+            RunAction::ComboVerilogToYosysAbcAig {
+                verilog_action_id: "a".repeat(64),
+                verilog_top_module_name: Some("main".to_string()),
+                frontend: crate::cli::YosysVerilogFrontendCli::Slang,
+                yosys_script: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
+                yosys: crate::cli::YosysCli {
+                    yosys_dockerfile: PathBuf::from(crate::DEFAULT_YOSYS_DOCKERFILE),
+                    yosys_docker_image: crate::DEFAULT_YOSYS_DOCKER_IMAGE.to_string(),
+                    yosys_upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
+                },
+            },
+        )
+        .expect("construct slang action");
+        let ActionSpec::ComboVerilogToYosysAbcAig {
+            frontend, runtime, ..
+        } = action
+        else {
+            panic!("unexpected action kind");
+        };
+        assert_eq!(
+            frontend,
+            YosysVerilogFrontend::Slang {
+                revision: crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string()
+            }
+        );
+        assert_eq!(
+            runtime.slang_commit.as_deref(),
+            Some(crate::DEFAULT_YOSYS_SLANG_COMMIT)
+        );
     }
 
     fn test_action_id(seed: &str) -> String {

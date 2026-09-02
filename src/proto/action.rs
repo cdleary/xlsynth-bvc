@@ -249,6 +249,7 @@ pub(crate) fn yosys_runtime_to_proto(
         docker_image: value.docker_image.clone(),
         dockerfile: Some(relpath(&value.dockerfile, &format!("{field}.dockerfile"))?),
         upstream_commit: value.upstream_commit.clone(),
+        slang_commit: value.slang_commit.clone(),
         dockerfile_sha256: Some(digest_from_hex(
             &value.dockerfile_sha256,
             &format!("{field}.dockerfile_sha256"),
@@ -362,6 +363,37 @@ fn validate_yosys_runtime(value: &pb::YosysRuntimeSpec, field: &str) -> Result<(
     let commit = required(&value.upstream_commit, &format!("{field}.upstream_commit"))?;
     if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("{field}.upstream_commit must be a full 40-character hexadecimal commit");
+    }
+    if let Some(commit) = &value.slang_commit
+        && (commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        bail!("{field}.slang_commit must be a full 40-character hexadecimal commit");
+    }
+    Ok(())
+}
+
+fn validate_yosys_verilog_frontend_runtime(
+    frontend: &Option<pb::YosysVerilogFrontend>,
+    runtime: &pb::YosysRuntimeSpec,
+    field: &str,
+) -> Result<()> {
+    match frontend {
+        None => {
+            if runtime.slang_commit.is_some() {
+                bail!("{field}.runtime.slang_commit must be absent for the builtin frontend");
+            }
+        }
+        Some(frontend) => {
+            let frontend_revision =
+                required(&frontend.revision, &format!("{field}.frontend.revision"))?;
+            let runtime_revision = required(
+                &runtime.slang_commit,
+                &format!("{field}.runtime.slang_commit"),
+            )?;
+            if frontend_revision != runtime_revision {
+                bail!("{field} frontend revision must match runtime.slang_commit");
+            }
+        }
     }
     Ok(())
 }
@@ -574,9 +606,12 @@ pub(crate) fn validate_action_spec(action: &pb::ActionSpec) -> Result<()> {
                 &value.frontend,
                 "combo_verilog_to_yosys_abc_aig.frontend",
             )?;
-            validate_yosys_runtime(
-                required(&value.runtime, "combo_verilog_to_yosys_abc_aig.runtime")?,
-                "combo_verilog_to_yosys_abc_aig.runtime",
+            let runtime = required(&value.runtime, "combo_verilog_to_yosys_abc_aig.runtime")?;
+            validate_yosys_runtime(runtime, "combo_verilog_to_yosys_abc_aig.runtime")?;
+            validate_yosys_verilog_frontend_runtime(
+                &value.frontend,
+                runtime,
+                "combo_verilog_to_yosys_abc_aig",
             )
         }
         Kind::AigToYosysAbcAig(value) => {
@@ -591,10 +626,12 @@ pub(crate) fn validate_action_spec(action: &pb::ActionSpec) -> Result<()> {
                 )?,
                 "aig_to_yosys_abc_aig.yosys_script_ref",
             )?;
-            validate_yosys_runtime(
-                required(&value.runtime, "aig_to_yosys_abc_aig.runtime")?,
-                "aig_to_yosys_abc_aig.runtime",
-            )
+            let runtime = required(&value.runtime, "aig_to_yosys_abc_aig.runtime")?;
+            validate_yosys_runtime(runtime, "aig_to_yosys_abc_aig.runtime")?;
+            if runtime.slang_commit.is_some() {
+                bail!("aig_to_yosys_abc_aig.runtime.slang_commit must be absent");
+            }
+            Ok(())
         }
         Kind::DriverAigToStats(value) => {
             validate_action_id(
@@ -1053,6 +1090,7 @@ pub(crate) fn yosys_runtime_from_proto(
         docker_image: value.docker_image.clone(),
         dockerfile: relpath_value(&value.dockerfile, &format!("{field}.dockerfile"))?,
         upstream_commit: value.upstream_commit.clone(),
+        slang_commit: value.slang_commit.clone(),
         dockerfile_sha256: digest_to_hex(
             required(
                 &value.dockerfile_sha256,
@@ -1398,6 +1436,7 @@ mod tests {
             docker_image_id: "e".repeat(64),
             dockerfile_sha256: "d".repeat(64),
             upstream_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            slang_commit: None,
         }
     }
 
@@ -1653,12 +1692,16 @@ mod tests {
         let builtin_json = serde_json::to_value(&action).expect("builtin JSON");
         assert!(builtin_json.get("frontend").is_none());
 
-        let model::ActionSpec::ComboVerilogToYosysAbcAig { frontend, .. } = &mut action else {
+        let model::ActionSpec::ComboVerilogToYosysAbcAig {
+            frontend, runtime, ..
+        } = &mut action
+        else {
             panic!("expected ComboVerilogToYosysAbcAig");
         };
         *frontend = model::YosysVerilogFrontend::Slang {
             revision: "a".repeat(40),
         };
+        runtime.slang_commit = Some("a".repeat(40));
         let slang_id = compute_model_action_id_v2(&action).expect("slang action id");
         assert_ne!(builtin_id, slang_id);
 
@@ -1677,19 +1720,40 @@ mod tests {
                 .as_deref(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
+        assert_eq!(
+            slang_pb
+                .runtime
+                .as_ref()
+                .expect("runtime")
+                .slang_commit
+                .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
 
         let mut other_revision = action.clone();
-        let model::ActionSpec::ComboVerilogToYosysAbcAig { frontend, .. } = &mut other_revision
+        let model::ActionSpec::ComboVerilogToYosysAbcAig {
+            frontend, runtime, ..
+        } = &mut other_revision
         else {
             panic!("expected ComboVerilogToYosysAbcAig");
         };
         *frontend = model::YosysVerilogFrontend::Slang {
             revision: "b".repeat(40),
         };
+        runtime.slang_commit = Some("b".repeat(40));
         assert_ne!(
             slang_id,
             compute_model_action_id_v2(&other_revision).expect("other slang action id")
         );
+
+        let mut mismatched = slang.as_proto().clone();
+        let pb::action_spec::Kind::ComboVerilogToYosysAbcAig(value) =
+            mismatched.kind.as_mut().expect("kind")
+        else {
+            panic!("unexpected action kind");
+        };
+        value.runtime.as_mut().expect("runtime").slang_commit = Some("b".repeat(40));
+        assert!(ValidatedActionSpec::try_from(mismatched).is_err());
 
         let mut invalid = slang.as_proto().clone();
         let pb::action_spec::Kind::ComboVerilogToYosysAbcAig(value) =

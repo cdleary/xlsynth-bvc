@@ -236,7 +236,11 @@ impl DriverCli {
 }
 
 impl YosysCli {
-    pub(crate) fn into_runtime(self, repo_root: &Path) -> Result<YosysRuntimeSpec> {
+    pub(crate) fn into_runtime(
+        self,
+        repo_root: &Path,
+        slang_commit: Option<String>,
+    ) -> Result<YosysRuntimeSpec> {
         let dockerfile = self.yosys_dockerfile.to_string_lossy().to_string();
         crate::service::bind_yosys_runtime_image(
             repo_root,
@@ -246,6 +250,7 @@ impl YosysCli {
                 docker_image_id: String::new(),
                 dockerfile,
                 upstream_commit: self.yosys_upstream_commit,
+                slang_commit,
             },
         )
     }

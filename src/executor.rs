@@ -4994,6 +4994,20 @@ pub(crate) fn run_combo_verilog_to_yosys_abc_aig_action(
     runtime: &YosysRuntimeSpec,
     payload_dir: &Path,
 ) -> Result<ActionOutcome> {
+    match (frontend, runtime.slang_commit.as_deref()) {
+        (YosysVerilogFrontend::Builtin, None) => {}
+        (YosysVerilogFrontend::Slang { revision }, Some(runtime_revision))
+            if revision == runtime_revision => {}
+        (YosysVerilogFrontend::Builtin, Some(_)) => {
+            bail!("builtin Yosys frontend requires a runtime without slang_commit")
+        }
+        (YosysVerilogFrontend::Slang { .. }, None) => {
+            bail!("slang Yosys frontend requires runtime.slang_commit")
+        }
+        (YosysVerilogFrontend::Slang { revision }, Some(runtime_revision)) => bail!(
+            "slang frontend revision `{revision}` does not match runtime revision `{runtime_revision}`"
+        ),
+    }
     let dep = load_dependency_of_type(store, verilog_action_id, ArtifactType::VerilogFile)?;
     let verilog_input_path = store.resolve_artifact_ref_path(&dep);
     if !verilog_input_path.exists() {
