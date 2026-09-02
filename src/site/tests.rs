@@ -496,11 +496,22 @@ fn progression_catalog_uses_repeated_subject_population_not_campaign_status() {
     assert_eq!(incompatible.extra_subject_count, 1);
 
     let mut mixed_dso = dataset.clone();
-    mixed_dso.samples[0].dso_version = "0.2.0".to_string();
+    for sample in mixed_dso
+        .samples
+        .iter_mut()
+        .filter(|sample| sample.crate_version == "0.1.0")
+    {
+        sample.dso_version = "0.9.0".to_string();
+    }
+    let mut recomputed = mixed_dso.samples[0].clone();
+    recomputed.dso_version = "0.10.0".to_string();
+    recomputed.g8r_stats_action_id = "g8r-recomputed".to_string();
+    recomputed.yosys_abc_stats_action_id = "yosys-recomputed".to_string();
+    mixed_dso.samples.push(recomputed);
     let mixed_catalog = build_browser_progression_catalog(&mixed_dso, Some(&versions), &[])
         .expect("rolling DSO updates keep the static site publishable");
     assert_eq!(mixed_catalog.cohort_subject_count, 2);
-    assert_eq!(mixed_catalog.cohort_complete_generation_count, 1);
+    assert_eq!(mixed_catalog.cohort_complete_generation_count, 2);
     assert_eq!(mixed_catalog.generations.len(), 5);
     let rolling_generations = mixed_catalog
         .generations
@@ -508,10 +519,37 @@ fn progression_catalog_uses_repeated_subject_population_not_campaign_status() {
         .filter(|generation| generation.crate_version == "0.1.0")
         .collect::<Vec<_>>();
     assert_eq!(rolling_generations.len(), 2);
-    assert!(rolling_generations.iter().all(|generation| {
-        generation.coverage == BrowserProgressionCoverage::Partial
-            && generation.observed_subject_count == 1
-    }));
+    assert_eq!(rolling_generations[0].dso_version, "0.9.0");
+    assert_eq!(rolling_generations[0].observed_subject_count, 2);
+    assert_eq!(rolling_generations[1].dso_version, "0.10.0");
+    assert_eq!(rolling_generations[1].observed_subject_count, 1);
+    assert_eq!(
+        rolling_generations[1].coverage,
+        BrowserProgressionCoverage::Partial
+    );
+
+    let mut unavailable_enumeration = versions.clone();
+    let unknown_card = unavailable_enumeration
+        .cards
+        .iter_mut()
+        .find(|card| card.crate_version == "0.3.0")
+        .expect("version card");
+    unknown_card.stdlib_enumeration.state = crate::view::StdlibEnumerationState::Unknown;
+    unknown_card.stdlib_enumeration.concrete_functions = 0;
+    let unavailable_enumeration_catalog =
+        build_browser_progression_catalog(&dataset, Some(&unavailable_enumeration), &[])
+            .expect("unavailable enumeration metadata remains publishable");
+    let unknown_generation = unavailable_enumeration_catalog
+        .generations
+        .iter()
+        .find(|generation| generation.crate_version == "0.3.0")
+        .expect("unknown-enumeration generation");
+    assert_eq!(
+        unknown_generation.enumeration_status.as_deref(),
+        Some("unknown")
+    );
+    assert_eq!(unknown_generation.enumerated_subject_count, None);
+    assert_eq!(unknown_generation.unmeasured_enumerated_subject_count, None);
 
     let mut lineage_free = dataset.clone();
     lineage_free.samples[0].stdlib_root_action_id = None;
@@ -574,13 +612,14 @@ const generation = (generation_id, dso_version) => ({
   campaign_runs: [],
 });
 const rolling = api.releaseGenerations(
-  {progression: {generations: [generation('old', '0.1.0'), generation('new', '0.2.0')]}},
+  {progression: {generations: [generation('new', '0.10.0'), generation('old', '0.9.0')]}},
   [
-    {fn_key: 'a', ir_top: null, crate_version: '1.0.0', dso_version: '0.1.0', stdlib_root_action_id: root},
-    {fn_key: 'b', ir_top: null, crate_version: '1.0.0', dso_version: '0.2.0', stdlib_root_action_id: root},
+    {fn_key: 'a', ir_top: null, crate_version: '1.0.0', dso_version: '0.9.0', stdlib_root_action_id: root},
+    {fn_key: 'a', ir_top: null, crate_version: '1.0.0', dso_version: '0.10.0', stdlib_root_action_id: root},
   ],
 );
-if (rolling.length !== 2 || rolling.some(value => value.samples.length !== 1)) {
+if (rolling.length !== 2 || rolling.some(value => value.samples.length !== 1)
+    || rolling[0].generation_id !== 'old' || rolling[1].generation_id !== 'new') {
   throw new Error(`mixed DSO populations must remain separate: ${JSON.stringify(rolling)}`);
 }
 "#;

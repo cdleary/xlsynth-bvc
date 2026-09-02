@@ -304,17 +304,10 @@ fn build_browser_progression_catalog(
             fn_key: sample.fn_key.clone(),
             ir_top: sample.ir_top.clone(),
         };
-        if !cohort_populations
+        cohort_populations
             .entry((sample.crate_version.clone(), root.clone()))
             .or_default()
-            .insert(subject)
-        {
-            bail!(
-                "release progression population contains a duplicate subject: crate={} root={}",
-                sample.crate_version,
-                root
-            );
-        }
+            .insert(subject);
         grouped
             .entry((
                 sample.crate_version.clone(),
@@ -391,7 +384,11 @@ fn build_browser_progression_catalog(
                     card.crate_version.clone(),
                     (
                         enumeration_state_label(card.stdlib_enumeration.state).to_string(),
-                        card.stdlib_enumeration.concrete_functions,
+                        matches!(
+                            card.stdlib_enumeration.state,
+                            StdlibEnumerationState::Partial | StdlibEnumerationState::Ok
+                        )
+                        .then_some(card.stdlib_enumeration.concrete_functions),
                     ),
                 )
                 .is_some()
@@ -424,7 +421,7 @@ fn build_browser_progression_catalog(
             u64::try_from(source.subjects.len()).context("subject count exceeds u64")?;
         let (enumeration_status, enumerated_subject_count) = enumeration_by_version
             .get(&source.crate_version)
-            .map(|(status, count)| (Some(status.clone()), Some(*count)))
+            .map(|(status, count)| (Some(status.clone()), *count))
             .unwrap_or((None, None));
         let unmeasured_enumerated_subject_count =
             enumerated_subject_count.map(|count| count.saturating_sub(observed_subject_count));
@@ -463,7 +460,7 @@ fn build_browser_progression_catalog(
     }
     generations.sort_by(|left, right| {
         cmp_dotted_numeric_version(&left.crate_version, &right.crate_version)
-            .then(left.dso_version.cmp(&right.dso_version))
+            .then_with(|| cmp_dotted_numeric_version(&left.dso_version, &right.dso_version))
             .then(left.stdlib_root_action_id.cmp(&right.stdlib_root_action_id))
     });
     let cohort_complete_generation_count = u64::try_from(
