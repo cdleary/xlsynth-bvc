@@ -21,6 +21,8 @@ use crate::proto::v1 as pb;
 use crate::snapshot::{
     load_static_snapshot_manifest, should_include_snapshot_index_key, verify_static_snapshot,
 };
+use crate::versioning::cmp_dotted_numeric_version;
+use crate::view::{StdlibEnumerationState, StdlibG8rVsYosysDataset, VersionCardsReport};
 
 pub(crate) const STATIC_SITE_RECORD_VERSION: u32 = 1;
 pub(crate) const STATIC_SITE_MANIFEST_FILENAME: &str = "site_manifest.v1.pb";
@@ -34,6 +36,7 @@ const PLOTLY_NOTICE: &[u8] =
 
 const STYLE_CSS: &str = include_str!("site_assets/style.css");
 const APP_JS: &str = include_str!("site_assets/app.js");
+const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BuildStaticSiteOptions {
@@ -78,6 +81,7 @@ struct BrowserCatalog {
     base_url: String,
     datasets: Vec<BrowserDataset>,
     runs: Vec<BrowserRun>,
+    progression: BrowserProgressionCatalog,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +139,79 @@ struct BrowserFinding {
     evidence_action_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BrowserProgressionCatalog {
+    dataset_key: String,
+    cohort_subject_count: u64,
+    cohort_subject_sha256: Option<String>,
+    cohort_complete_generation_count: u64,
+    generations: Vec<BrowserProgressionGeneration>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BrowserProgressionCoverage {
+    CohortComplete,
+    Partial,
+    Incompatible,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BrowserProgressionRunRef {
+    run_id: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BrowserProgressionGeneration {
+    generation_id: String,
+    crate_version: String,
+    dso_version: String,
+    stdlib_root_action_id: String,
+    coverage: BrowserProgressionCoverage,
+    observed_subject_count: u64,
+    cohort_subject_count: u64,
+    missing_cohort_subject_count: u64,
+    extra_subject_count: u64,
+    enumeration_status: Option<String>,
+    enumerated_subject_count: Option<u64>,
+    unmeasured_enumerated_subject_count: Option<u64>,
+    campaign_runs: Vec<BrowserProgressionRunRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProgressionComparisonIndexFile {
+    schema_version: u32,
+    generated_utc: chrono::DateTime<chrono::Utc>,
+    dataset: StdlibG8rVsYosysDataset,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProgressionVersionsIndexFile {
+    schema_version: u32,
+    generated_utc: chrono::DateTime<chrono::Utc>,
+    report: VersionCardsReport,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct ProgressionSubject {
+    fn_key: String,
+    ir_top: Option<String>,
+}
+
+#[derive(Debug)]
+struct ProgressionGenerationSource {
+    crate_version: String,
+    dso_version: String,
+    stdlib_root_action_id: String,
+    subjects: Vec<ProgressionSubject>,
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -159,6 +236,275 @@ fn decode_canonical_browser_catalog(bytes: &[u8]) -> Result<BrowserCatalog> {
         bail!("browser catalog is not canonically encoded");
     }
     Ok(catalog)
+}
+
+fn progression_subjects_sha256(subjects: &[ProgressionSubject]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"xlsynth-bvc/release-progression-cohort/v1\0");
+    hasher.update(
+        serde_json::to_vec(subjects).context("encoding release progression cohort identity")?,
+    );
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn progression_generation_id(
+    crate_version: &str,
+    dso_version: &str,
+    stdlib_root_action_id: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"xlsynth-bvc/release-progression-generation/v1\0");
+    for value in [crate_version, dso_version, stdlib_root_action_id] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn enumeration_state_label(state: StdlibEnumerationState) -> &'static str {
+    match state {
+        StdlibEnumerationState::Unknown => "unknown",
+        StdlibEnumerationState::Missing => "missing",
+        StdlibEnumerationState::Failed => "failed",
+        StdlibEnumerationState::Partial => "partial",
+        StdlibEnumerationState::Ok => "ok",
+    }
+}
+
+fn build_browser_progression_catalog(
+    dataset: &StdlibG8rVsYosysDataset,
+    versions: Option<&VersionCardsReport>,
+    runs: &[BrowserRun],
+) -> Result<BrowserProgressionCatalog> {
+    let mut grouped = BTreeMap::<(String, String), Vec<_>>::new();
+    for sample in &dataset.samples {
+        let root = sample.stdlib_root_action_id.as_ref().with_context(|| {
+            format!(
+                "release progression sample lacks stdlib root lineage: {} {}",
+                sample.crate_version, sample.fn_key
+            )
+        })?;
+        grouped
+            .entry((sample.crate_version.clone(), root.clone()))
+            .or_default()
+            .push(sample);
+    }
+
+    let mut sources = Vec::with_capacity(grouped.len());
+    let mut population_frequency = BTreeMap::<Vec<ProgressionSubject>, u64>::new();
+    for ((crate_version, stdlib_root_action_id), samples) in grouped {
+        let dso_versions = samples
+            .iter()
+            .map(|sample| sample.dso_version.as_str())
+            .collect::<BTreeSet<_>>();
+        if dso_versions.len() != 1 {
+            bail!(
+                "release progression generation has multiple DSO versions: crate={} root={} dso_versions={dso_versions:?}",
+                crate_version,
+                stdlib_root_action_id
+            );
+        }
+        let mut subjects = BTreeSet::new();
+        for sample in samples {
+            let subject = ProgressionSubject {
+                fn_key: sample.fn_key.clone(),
+                ir_top: sample.ir_top.clone(),
+            };
+            if !subjects.insert(subject) {
+                bail!(
+                    "release progression generation contains a duplicate subject: crate={} root={}",
+                    crate_version,
+                    stdlib_root_action_id
+                );
+            }
+        }
+        let subjects = subjects.into_iter().collect::<Vec<_>>();
+        *population_frequency.entry(subjects.clone()).or_default() += 1;
+        sources.push(ProgressionGenerationSource {
+            crate_version,
+            dso_version: (*dso_versions.iter().next().expect("one DSO version")).to_string(),
+            stdlib_root_action_id,
+            subjects,
+        });
+    }
+
+    let mut populations = population_frequency.into_iter().collect::<Vec<_>>();
+    populations.sort_by(
+        |(left_subjects, left_count), (right_subjects, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then(right_subjects.len().cmp(&left_subjects.len()))
+                .then_with(|| {
+                    progression_subjects_sha256(left_subjects)
+                        .expect("cohort encoding is infallible")
+                        .cmp(
+                            &progression_subjects_sha256(right_subjects)
+                                .expect("cohort encoding is infallible"),
+                        )
+                })
+        },
+    );
+    let cohort = populations
+        .first()
+        .map(|(subjects, _)| subjects.clone())
+        .unwrap_or_default();
+    let cohort_set = cohort.iter().cloned().collect::<BTreeSet<_>>();
+    let cohort_subject_sha256 = if cohort.is_empty() {
+        None
+    } else {
+        Some(progression_subjects_sha256(&cohort)?)
+    };
+
+    let mut enumeration_by_version = BTreeMap::new();
+    if let Some(versions) = versions {
+        for card in &versions.cards {
+            if enumeration_by_version
+                .insert(
+                    card.crate_version.clone(),
+                    (
+                        enumeration_state_label(card.stdlib_enumeration.state).to_string(),
+                        card.stdlib_enumeration.concrete_functions,
+                    ),
+                )
+                .is_some()
+            {
+                bail!(
+                    "version summary contains duplicate cards for {}",
+                    card.crate_version
+                );
+            }
+        }
+    }
+
+    let cohort_subject_count = u64::try_from(cohort.len()).context("cohort size exceeds u64")?;
+    let mut generations = Vec::with_capacity(sources.len());
+    for source in sources {
+        let subject_set = source.subjects.iter().cloned().collect::<BTreeSet<_>>();
+        let missing_cohort_subject_count =
+            u64::try_from(cohort_set.difference(&subject_set).count())
+                .context("missing cohort subject count exceeds u64")?;
+        let extra_subject_count = u64::try_from(subject_set.difference(&cohort_set).count())
+            .context("extra subject count exceeds u64")?;
+        let coverage = if subject_set == cohort_set {
+            BrowserProgressionCoverage::CohortComplete
+        } else if extra_subject_count == 0 {
+            BrowserProgressionCoverage::Partial
+        } else {
+            BrowserProgressionCoverage::Incompatible
+        };
+        let observed_subject_count =
+            u64::try_from(source.subjects.len()).context("subject count exceeds u64")?;
+        let (enumeration_status, enumerated_subject_count) = enumeration_by_version
+            .get(&source.crate_version)
+            .map(|(status, count)| (Some(status.clone()), Some(*count)))
+            .unwrap_or((None, None));
+        let unmeasured_enumerated_subject_count =
+            enumerated_subject_count.map(|count| count.saturating_sub(observed_subject_count));
+        let mut campaign_runs = runs
+            .iter()
+            .filter(|run| {
+                run.crate_version == source.crate_version
+                    && run.dso_version == source.dso_version
+                    && run.root_action_ids.contains(&source.stdlib_root_action_id)
+            })
+            .map(|run| BrowserProgressionRunRef {
+                run_id: run.run_id.clone(),
+                status: run.status.clone(),
+            })
+            .collect::<Vec<_>>();
+        campaign_runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        generations.push(BrowserProgressionGeneration {
+            generation_id: progression_generation_id(
+                &source.crate_version,
+                &source.dso_version,
+                &source.stdlib_root_action_id,
+            ),
+            crate_version: source.crate_version,
+            dso_version: source.dso_version,
+            stdlib_root_action_id: source.stdlib_root_action_id,
+            coverage,
+            observed_subject_count,
+            cohort_subject_count,
+            missing_cohort_subject_count,
+            extra_subject_count,
+            enumeration_status,
+            enumerated_subject_count,
+            unmeasured_enumerated_subject_count,
+            campaign_runs,
+        });
+    }
+    generations.sort_by(|left, right| {
+        cmp_dotted_numeric_version(&left.crate_version, &right.crate_version)
+            .then(left.stdlib_root_action_id.cmp(&right.stdlib_root_action_id))
+    });
+    let cohort_complete_generation_count = u64::try_from(
+        generations
+            .iter()
+            .filter(|generation| generation.coverage == BrowserProgressionCoverage::CohortComplete)
+            .count(),
+    )
+    .context("complete generation count exceeds u64")?;
+    Ok(BrowserProgressionCatalog {
+        dataset_key: crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME.to_string(),
+        cohort_subject_count,
+        cohort_subject_sha256,
+        cohort_complete_generation_count,
+        generations,
+    })
+}
+
+fn build_browser_progression_catalog_from_site(
+    site_dir: &Path,
+    datasets: &[BrowserDataset],
+    runs: &[BrowserRun],
+) -> Result<BrowserProgressionCatalog> {
+    let Some(comparison_entry) = datasets.iter().find(|dataset| {
+        dataset.logical_key == crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME
+    }) else {
+        return Ok(BrowserProgressionCatalog {
+            dataset_key: crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME.to_string(),
+            cohort_subject_count: 0,
+            cohort_subject_sha256: None,
+            cohort_complete_generation_count: 0,
+            generations: Vec::new(),
+        });
+    };
+    let comparison_bytes = fs::read(site_dir.join(&comparison_entry.url)).with_context(|| {
+        format!(
+            "reading comparison dataset for release progression: {}",
+            comparison_entry.url
+        )
+    })?;
+    let comparison: ProgressionComparisonIndexFile = serde_json::from_slice(&comparison_bytes)
+        .context("decoding typed release progression comparison dataset")?;
+    if comparison.schema_version != crate::WEB_STDLIB_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION
+        || comparison.dataset.fraig
+    {
+        bail!("release progression comparison dataset has the wrong schema or fraig mode");
+    }
+    let versions = datasets
+        .iter()
+        .find(|dataset| dataset.logical_key == crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+        .map(|entry| {
+            let bytes = fs::read(site_dir.join(&entry.url)).with_context(|| {
+                format!(
+                    "reading versions dataset for release progression: {}",
+                    entry.url
+                )
+            })?;
+            let versions: ProgressionVersionsIndexFile = serde_json::from_slice(&bytes)
+                .context("decoding typed release progression versions dataset")?;
+            if versions.schema_version != crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION {
+                bail!("release progression versions dataset has the wrong schema");
+            }
+            Ok(versions)
+        })
+        .transpose()?;
+    build_browser_progression_catalog(
+        &comparison.dataset,
+        versions.as_ref().map(|versions| &versions.report),
+        runs,
+    )
 }
 
 fn normalize_base_url(value: &str) -> Result<String> {
@@ -542,7 +888,7 @@ fn actual_site_relpaths(site_dir: &Path) -> Result<BTreeSet<String>> {
 
 fn progression_body(root_site_url: &str) -> String {
     format!(
-        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Release progression</h1><p class=\"meta\">Signed G8r − Yosys/ABC nodes × levels product loss across published xlsynth-driver crate runs; negative means G8r is better</p><p id=\"error\" role=\"alert\"></p></header><main id=\"progression\" data-dataset-key=\"{}\"><div class=\"toolbar\"><label>Baseline <select id=\"baseline-version\" aria-label=\"Baseline crate release\"></select></label><label>Current <select id=\"current-version\" aria-label=\"Current crate release\"></select></label></div><section id=\"progression-summary\" class=\"grid\" aria-live=\"polite\"></section><h2>Distribution progression</h2><section id=\"progression-chart\" class=\"progression-chart\" aria-live=\"polite\"><p class=\"muted\">Loading release data…</p></section><section id=\"progression-table\" aria-live=\"polite\"></section></main>",
+        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Release progression</h1><p class=\"meta\">Signed G8r − Yosys/ABC nodes × levels product loss across the canonical measured stdlib cohort; negative means G8r is better</p><p id=\"error\" role=\"alert\"></p></header><main id=\"progression\" data-dataset-key=\"{}\"><div class=\"toolbar\"><label>Baseline <select id=\"baseline-version\" aria-label=\"Baseline crate release\"></select></label><label>Current <select id=\"current-version\" aria-label=\"Current crate release\"></select></label><label><input id=\"include-incomplete\" type=\"checkbox\"> Include incomplete generations</label></div><p id=\"progression-status\" class=\"meta\" aria-live=\"polite\">Loading release data…</p><section id=\"progression-summary\" class=\"grid\" aria-live=\"polite\"></section><h2>Distribution progression</h2><section id=\"progression-chart\" class=\"progression-chart\" aria-live=\"polite\"><p class=\"muted\">Loading release data…</p></section><h2>Generation coverage</h2><section id=\"progression-inventory\" aria-live=\"polite\"></section><section id=\"progression-table\" aria-live=\"polite\"></section></main>",
         crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
     )
 }
@@ -974,12 +1320,15 @@ pub(crate) fn build_static_site_with_protected_roots(
         run.findings_protobuf_url = Some(target_relpath);
         run.findings = findings;
     }
+    let progression =
+        build_browser_progression_catalog_from_site(&options.out_dir, &datasets, &runs)?;
     let catalog = BrowserCatalog {
-        schema_version: 1,
+        schema_version: BROWSER_CATALOG_SCHEMA_VERSION,
         snapshot_id: snapshot.snapshot_id.clone(),
         base_url: base_url.clone(),
         datasets,
         runs,
+        progression,
     };
     write_file(
         &options.out_dir,
@@ -1517,7 +1866,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     let catalog_bytes =
         fs::read(site_dir.join("catalog.json")).context("reading browser catalog")?;
     let catalog = decode_canonical_browser_catalog(&catalog_bytes)?;
-    if catalog.schema_version != 1
+    if catalog.schema_version != BROWSER_CATALOG_SCHEMA_VERSION
         || catalog.snapshot_id != snapshot_id
         || catalog.base_url != base_url
     {
@@ -1631,6 +1980,11 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     }
     if catalog_dataset_urls != declared_dataset_urls {
         bail!("browser catalog datasets do not exactly match declared public JSON files");
+    }
+    let expected_progression =
+        build_browser_progression_catalog_from_site(site_dir, &catalog.datasets, &catalog.runs)?;
+    if catalog.progression != expected_progression {
+        bail!("browser release progression projection disagrees with source datasets");
     }
     if !catalog.runs.windows(2).all(|pair| {
         (&pair[0].crate_version, &pair[0].run_id) < (&pair[1].crate_version, &pair[1].run_id)
@@ -1755,7 +2109,7 @@ fn run_browser_page(
     profile_dir: &Path,
     url: &str,
     expected_text: &str,
-    rendered_marker: Option<(&str, usize)>,
+    rendered_markers: &[(String, usize)],
     timeout: Duration,
 ) -> Result<()> {
     let response = reqwest::blocking::get(url)
@@ -1783,7 +2137,7 @@ fn run_browser_page(
         "--disable-sync",
         "--window-size=1280,900",
     ]);
-    if rendered_marker.is_some() {
+    if !rendered_markers.is_empty() {
         command.args(["--dump-dom", "--virtual-time-budget=12000"]);
     }
     let mut child = command
@@ -1817,7 +2171,7 @@ fn run_browser_page(
     });
     let started = Instant::now();
     let status = loop {
-        if rendered_marker.is_none()
+        if rendered_markers.is_empty()
             && screenshot_path
                 .metadata()
                 .is_ok_and(|metadata| metadata.len() > 0)
@@ -1857,7 +2211,7 @@ fn run_browser_page(
             String::from_utf8_lossy(&stderr)
         );
     }
-    if let Some((marker, expected_count)) = rendered_marker {
+    if !rendered_markers.is_empty() {
         if !status.success() {
             bail!(
                 "headless browser failed for {url} with {status}: {}",
@@ -1865,12 +2219,14 @@ fn run_browser_page(
             );
         }
         let rendered = String::from_utf8_lossy(&stdout);
-        let actual_count = rendered.matches(marker).count();
-        if actual_count < expected_count {
-            bail!(
-                "headless browser rendered {actual_count} instances of {marker:?}; expected at least {expected_count} for {url}: {}",
-                String::from_utf8_lossy(&stderr)
-            );
+        for (marker, expected_count) in rendered_markers {
+            let actual_count = rendered.matches(marker).count();
+            if actual_count < *expected_count {
+                bail!(
+                    "headless browser rendered {actual_count} instances of {marker:?}; expected at least {expected_count} for {url}: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
         }
     }
     Ok(())
@@ -1885,6 +2241,39 @@ pub(crate) fn smoke_static_site(
         bail!("browser smoke timeout must be nonzero");
     }
     let verified = verify_static_site(site_dir)?;
+    let catalog = decode_canonical_browser_catalog(
+        &fs::read(site_dir.join("catalog.json")).context("reading browser smoke catalog")?,
+    )?;
+    let mut complete_versions = catalog
+        .progression
+        .generations
+        .iter()
+        .filter(|generation| generation.coverage == BrowserProgressionCoverage::CohortComplete)
+        .map(|generation| generation.crate_version.clone())
+        .collect::<Vec<_>>();
+    complete_versions.sort_by(|left, right| cmp_dotted_numeric_version(left, right));
+    complete_versions.dedup();
+    let progression_markers = if complete_versions.len() >= 2 {
+        vec![
+            ("data-progression-rendered=\"true\"".to_string(), 1),
+            (
+                format!(
+                    "data-progression-baseline-version=\"{}\"",
+                    complete_versions[complete_versions.len() - 2]
+                ),
+                1,
+            ),
+            (
+                format!(
+                    "data-progression-current-version=\"{}\"",
+                    complete_versions[complete_versions.len() - 1]
+                ),
+                1,
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
     let browser = browser_path(explicit_browser)?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1917,32 +2306,36 @@ pub(crate) fn smoke_static_site(
     fs::create_dir_all(&profile_dir).context("creating temporary Chrome profile")?;
     let origin = format!("http://{address}");
     let timeout = Duration::from_secs(timeout_seconds);
-    let pages = [
-        ("", "xlsynth-bvc results", None),
-        ("runs.html", "Campaign runs", None),
-        ("progression.html", "Release progression", None),
-        ("mffc-discrepancies.html", "MFFC discrepancies", None),
+    let pages = vec![
+        ("", "xlsynth-bvc results", Vec::new()),
+        ("runs.html", "Campaign runs", Vec::new()),
+        (
+            "progression.html",
+            "Release progression",
+            progression_markers,
+        ),
+        ("mffc-discrepancies.html", "MFFC discrepancies", Vec::new()),
         (
             "ir-fn-corpus-g8r-vs-yosys-abc/",
             "IR corpus: G8r vs Yosys/ABC",
-            Some(("class=\"plotly-host js-plotly-plot\"", 4)),
+            vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
         ),
         (
             "ir-fn-g8r-abc-vs-codegen-yosys-abc/",
             "IR corpus: G8r+ABC vs codegen+Yosys/ABC",
-            Some(("class=\"plotly-host js-plotly-plot\"", 4)),
+            vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
         ),
-        ("dataset.html", "Dataset explorer", None),
+        ("dataset.html", "Dataset explorer", Vec::new()),
     ];
     let result = pages
         .iter()
-        .try_for_each(|(path, expected, rendered_marker)| {
+        .try_for_each(|(path, expected, rendered_markers)| {
             run_browser_page(
                 &browser,
                 &profile_dir,
                 &format!("{origin}{}{path}", verified.base_url),
                 expected,
-                *rendered_marker,
+                rendered_markers,
                 timeout,
             )
         });

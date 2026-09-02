@@ -133,8 +133,10 @@ fn site_build_and_verify_supports_subdirectory_base() {
         fs::read_to_string(site_dir.join("progression.html")).expect("read progression HTML");
     assert!(progression_html.contains(crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME));
     assert!(progression_html.contains("Signed G8r − Yosys/ABC"));
+    assert!(progression_html.contains("id=\"include-incomplete\""));
+    assert!(progression_html.contains("id=\"progression-inventory\""));
     assert!(APP_JS.contains("Release progression data is not available in this snapshot."));
-    assert!(APP_JS.contains("At least two populated complete crate releases are needed"));
+    assert!(APP_JS.contains("At least two cohort-complete releases are needed"));
     assert!(APP_JS.contains("negative means G8r is better"));
     assert!(APP_JS.contains("sample.stdlib_root_action_id"));
     assert!(APP_JS.contains("contains duplicate samples"));
@@ -142,8 +144,10 @@ fn site_build_and_verify_supports_subdirectory_base() {
     assert!(APP_JS.contains("Median paired per-function product-loss change"));
     assert!(APP_JS.contains("Current-only and baseline-only"));
     assert!(APP_JS.contains("completeGenerations=generations.filter"));
-    assert!(APP_JS.contains("Degraded runs are never selected by default or plotted"));
-    assert!(APP_JS.contains("Partial-data warning"));
+    assert!(APP_JS.contains("Incomplete cohorts are never selected by default or plotted"));
+    assert!(APP_JS.contains("Incomplete-cohort warning"));
+    assert!(!APP_JS.contains("Degraded runs are never selected by default or plotted"));
+    assert!(!APP_JS.contains("Selected campaign generation is unavailable"));
     let comparison_html =
         fs::read_to_string(site_dir.join("ir-fn-corpus-g8r-vs-yosys-abc/index.html"))
             .expect("read comparison HTML");
@@ -340,6 +344,156 @@ if (href !== 'ir-fn-g8r-abc-vs-codegen-yosys-abc/?crate_version=0.68.0&losses_on
         "node failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn progression_catalog_uses_repeated_subject_population_not_campaign_status() {
+    fn sample(
+        crate_version: &str,
+        stdlib_root_action_id: &str,
+        fn_key: &str,
+    ) -> crate::view::StdlibG8rVsYosysSample {
+        crate::view::StdlibG8rVsYosysSample {
+            fn_key: fn_key.to_string(),
+            crate_version: crate_version.to_string(),
+            dso_version: "0.1.0".to_string(),
+            stdlib_root_action_id: Some(stdlib_root_action_id.to_string()),
+            ir_action_id: format!("ir-{crate_version}-{fn_key}"),
+            ir_top: Some(format!("top_{fn_key}")),
+            structural_hash: None,
+            ir_node_count: 1,
+            g8r_nodes: 1.0,
+            g8r_levels: 1.0,
+            yosys_abc_nodes: 1.0,
+            yosys_abc_levels: 1.0,
+            g8r_product: 1.0,
+            yosys_abc_product: 1.0,
+            g8r_product_loss: 0.0,
+            g8r_stats_action_id: format!("g8r-{crate_version}-{fn_key}"),
+            yosys_abc_stats_action_id: format!("yosys-{crate_version}-{fn_key}"),
+        }
+    }
+
+    let roots = [
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "3333333333333333333333333333333333333333333333333333333333333333",
+        "4444444444444444444444444444444444444444444444444444444444444444",
+    ];
+    let dataset = StdlibG8rVsYosysDataset {
+        fraig: false,
+        samples: vec![
+            sample("0.1.0", roots[0], "a"),
+            sample("0.1.0", roots[0], "b"),
+            sample("0.2.0", roots[1], "a"),
+            sample("0.2.0", roots[1], "b"),
+            sample("0.3.0", roots[2], "a"),
+            sample("0.4.0", roots[3], "a"),
+            sample("0.4.0", roots[3], "c"),
+        ],
+        min_ir_nodes: 1,
+        max_ir_nodes: 1,
+        g8r_only_count: 0,
+        yosys_only_count: 0,
+        available_crate_versions: vec![
+            "0.1.0".to_string(),
+            "0.2.0".to_string(),
+            "0.3.0".to_string(),
+            "0.4.0".to_string(),
+        ],
+    };
+    let version_cards = ["0.1.0", "0.2.0", "0.3.0", "0.4.0"]
+        .into_iter()
+        .map(|crate_version| {
+            json!({
+                "crate_version": crate_version,
+                "crate_release_datetime": null,
+                "total_materialized": 0,
+                "failed_total": 0,
+                "dso_versions": ["0.1.0"],
+                "stdlib_enumeration": {
+                    "state": "ok",
+                    "reason": "discovery_counts",
+                    "scanned_files": 1,
+                    "failed_files": 0,
+                    "concrete_functions": 3,
+                    "suggested_actions": 3
+                },
+                "failed_by_kind": [],
+                "failures": []
+            })
+        })
+        .collect::<Vec<_>>();
+    let versions: VersionCardsReport = serde_json::from_value(json!({
+        "cards": version_cards,
+        "unattributed_actions": []
+    }))
+    .expect("version cards");
+    let degraded_run = BrowserRun {
+        campaign_id: "campaign".to_string(),
+        run_id: "degraded-run".to_string(),
+        campaign_name: "comparison".to_string(),
+        campaign_semantic_version: 1,
+        crate_version: "0.2.0".to_string(),
+        dso_version: "0.1.0".to_string(),
+        status: "degraded".to_string(),
+        updated_utc: "2026-09-01T00:00:00Z".to_string(),
+        root_action_ids: vec![roots[1].to_string()],
+        completed_root_count: 1,
+        failed_count: 1,
+        canceled_count: 0,
+        missing_output_count: 0,
+        failed_sample_count: 1,
+        intentionally_skipped_samples: Vec::new(),
+        protobuf_url: "data/runs/degraded-run.pb".to_string(),
+        page_url: "runs/degraded-run/".to_string(),
+        findings_protobuf_url: None,
+        findings: Vec::new(),
+    };
+
+    let catalog = build_browser_progression_catalog(&dataset, Some(&versions), &[degraded_run])
+        .expect("build progression catalog");
+    assert_eq!(catalog.cohort_subject_count, 2);
+    assert!(catalog.cohort_subject_sha256.is_some());
+    assert_eq!(catalog.cohort_complete_generation_count, 2);
+    assert_eq!(catalog.generations.len(), 4);
+
+    let generation = |version: &str| {
+        catalog
+            .generations
+            .iter()
+            .find(|generation| generation.crate_version == version)
+            .expect("generation")
+    };
+    assert_eq!(
+        generation("0.1.0").coverage,
+        BrowserProgressionCoverage::CohortComplete
+    );
+    let degraded_generation = generation("0.2.0");
+    assert_eq!(
+        degraded_generation.coverage,
+        BrowserProgressionCoverage::CohortComplete
+    );
+    assert_eq!(degraded_generation.campaign_runs.len(), 1);
+    assert_eq!(degraded_generation.campaign_runs[0].status, "degraded");
+    assert_eq!(degraded_generation.enumerated_subject_count, Some(3));
+    assert_eq!(
+        degraded_generation.unmeasured_enumerated_subject_count,
+        Some(1)
+    );
+
+    let partial = generation("0.3.0");
+    assert_eq!(partial.coverage, BrowserProgressionCoverage::Partial);
+    assert_eq!(partial.missing_cohort_subject_count, 1);
+    assert_eq!(partial.extra_subject_count, 0);
+
+    let incompatible = generation("0.4.0");
+    assert_eq!(
+        incompatible.coverage,
+        BrowserProgressionCoverage::Incompatible
+    );
+    assert_eq!(incompatible.missing_cohort_subject_count, 1);
+    assert_eq!(incompatible.extra_subject_count, 1);
 }
 
 #[test]
