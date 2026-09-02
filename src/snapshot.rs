@@ -15,17 +15,18 @@ use crate::campaign::{campaign_analysis_path, list_finalized_campaign_runs};
 use crate::query::{
     build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_bytes,
     build_ir_fn_corpus_g8r_vs_yosys_dataset_index_bytes,
-    build_mffc_ir_index_bytes_for_paired_index, rebuild_stdlib_fn_version_timeline_dataset_index,
-    rebuild_stdlib_fns_trend_dataset_index, rebuild_stdlib_g8r_vs_yosys_dataset_index,
-    rebuild_versions_cards_index,
+    build_ir_fn_corpus_ir_index_bytes_for_paired_index,
+    rebuild_stdlib_fn_version_timeline_dataset_index, rebuild_stdlib_fns_trend_dataset_index,
+    rebuild_stdlib_g8r_vs_yosys_dataset_index, rebuild_versions_cards_index,
 };
 use crate::store::ArtifactStore;
 use crate::view::StdlibTrendKind;
 use crate::{
     WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
-    WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME, WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME,
-    WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY, WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE,
-    WEB_STDLIB_FN_TIMELINE_INDEX_FILENAME, WEB_STDLIB_FNS_TREND_G8R_FRAIG_FALSE_INDEX_FILENAME,
+    WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME, WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
+    WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE, WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY,
+    WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE, WEB_STDLIB_FN_TIMELINE_INDEX_FILENAME,
+    WEB_STDLIB_FNS_TREND_G8R_FRAIG_FALSE_INDEX_FILENAME,
     WEB_STDLIB_FNS_TREND_YOSYS_ABC_INDEX_FILENAME,
     WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
     WEB_STDLIB_G8R_VS_YOSYS_FRAIG_TRUE_INDEX_FILENAME, WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
@@ -244,6 +245,20 @@ fn is_public_structural_group_index_key(index_key: &str) -> bool {
         && second_shard == &hash[2..4]
 }
 
+fn is_public_ir_fn_corpus_ir_shard_key(index_key: &str) -> bool {
+    let Some(prefix) = index_key
+        .strip_prefix(WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .and_then(|suffix| suffix.strip_suffix(".json"))
+    else {
+        return false;
+    };
+    prefix.len() == 2
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub(crate) fn should_include_snapshot_index_key(index_key: &str) -> bool {
     matches!(
         index_key,
@@ -255,9 +270,10 @@ pub(crate) fn should_include_snapshot_index_key(index_key: &str) -> bool {
             | WEB_STDLIB_G8R_VS_YOSYS_FRAIG_TRUE_INDEX_FILENAME
             | WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
             | WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
-            | WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME
+            | WEB_IR_FN_CORPUS_IR_INDEX_FILENAME
             | WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY
-    ) || is_public_structural_group_index_key(index_key)
+    ) || is_public_ir_fn_corpus_ir_shard_key(index_key)
+        || is_public_structural_group_index_key(index_key)
 }
 
 fn should_copy_snapshot_store_index(index_key: &str, direct_heavy_indices_written: bool) -> bool {
@@ -265,7 +281,8 @@ fn should_copy_snapshot_store_index(index_key: &str, direct_heavy_indices_writte
         && (!direct_heavy_indices_written
             || (index_key != WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
                 && index_key != WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
-                && index_key != WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME))
+                && index_key != WEB_IR_FN_CORPUS_IR_INDEX_FILENAME
+                && !is_public_ir_fn_corpus_ir_shard_key(index_key)))
 }
 
 fn write_snapshot_dataset_entry(
@@ -611,20 +628,24 @@ fn rebuild_snapshot_web_indices(
         ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc.index_bytes
     );
 
-    warn!("rebuild-snapshot-web-indices phase=ir-fn-corpus-mffc-ir begin");
-    let (mffc_ir_entry_count, mffc_ir_bytes) = build_mffc_ir_index_bytes_for_paired_index(
+    warn!("rebuild-snapshot-web-indices phase=ir-fn-corpus-ir begin");
+    let ir_build = build_ir_fn_corpus_ir_index_bytes_for_paired_index(
         store,
         &ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_bytes,
     )?;
+    let mut ir_bytes = ir_build.manifest_bytes.len();
     direct_files.push(write_snapshot_dataset_entry(
         out_dir,
-        WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME,
-        &mffc_ir_bytes,
+        WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
+        &ir_build.manifest_bytes,
     )?);
+    for (index_key, bytes) in &ir_build.shard_files {
+        ir_bytes += bytes.len();
+        direct_files.push(write_snapshot_dataset_entry(out_dir, index_key, bytes)?);
+    }
     warn!(
-        "rebuild-snapshot-web-indices phase=ir-fn-corpus-mffc-ir done entries={} direct_bytes={}",
-        mffc_ir_entry_count,
-        mffc_ir_bytes.len()
+        "rebuild-snapshot-web-indices phase=ir-fn-corpus-ir done entries={} direct_bytes={}",
+        ir_build.entry_count, ir_bytes
     );
 
     warn!("rebuild-snapshot-web-indices done");
@@ -1617,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_snapshot_includes_mffc_ir_from_canonical_rebuild() {
+    fn skipped_snapshot_includes_ir_fn_corpus_from_canonical_rebuild() {
         let root = make_temp_dir("skip-rebuild-mffc-ir");
         let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
@@ -1631,11 +1652,11 @@ mod tests {
         .expect("seed empty structural index");
         let rebuild = crate::query::rebuild_web_indices(&store, &test_repo_root())
             .expect("run canonical coordinator index rebuild");
-        assert_eq!(rebuild.ir_fn_corpus_mffc_ir.entry_count, 0);
+        assert_eq!(rebuild.ir_fn_corpus_ir.entry_count, 0);
         assert!(
             store
-                .load_web_index_bytes(WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME)
-                .expect("load MFFC IR web index")
+                .load_web_index_bytes(WEB_IR_FN_CORPUS_IR_INDEX_FILENAME)
+                .expect("load IR function corpus web index")
                 .is_some()
         );
 
@@ -1655,7 +1676,7 @@ mod tests {
             manifest
                 .dataset_files
                 .iter()
-                .any(|entry| { entry.index_key == WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME })
+                .any(|entry| { entry.index_key == WEB_IR_FN_CORPUS_IR_INDEX_FILENAME })
         );
         verify_static_snapshot(&out_dir).expect("verify coordinator-style snapshot");
         fs::remove_dir_all(root).expect("cleanup");
@@ -2136,7 +2157,7 @@ mod tests {
             WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
         ));
         assert!(should_include_snapshot_index_key(
-            WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME
+            WEB_IR_FN_CORPUS_IR_INDEX_FILENAME
         ));
         assert!(should_include_snapshot_index_key(
             WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY

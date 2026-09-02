@@ -8,7 +8,7 @@ use std::path::{Component, Path};
 
 const MAX_PUBLIC_LABEL_BYTES: usize = 512;
 const MAX_PUBLIC_SIGNATURE_BYTES: usize = 4096;
-const MAX_PUBLIC_MFFC_IR_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PUBLIC_IR_FUNCTION_BYTES: usize = 2 * 1024 * 1024;
 
 pub(crate) fn validate_safe_public_text(field: &str, value: &str, max_bytes: usize) -> Result<()> {
     if value.is_empty() || value.trim() != value || value.len() > max_bytes {
@@ -601,32 +601,73 @@ fn validate_structural_group(group: &IrFnCorpusStructuralGroupFile) -> Result<()
     Ok(())
 }
 
-fn validate_mffc_ir_index(index: &MffcIrIndexFile) -> Result<()> {
-    if index.schema_version != crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_SCHEMA_VERSION {
-        bail!("MFFC IR index schema version mismatch");
+fn validate_ir_fn_corpus_ir_manifest(index: &IrFnCorpusIrIndexManifest) -> Result<()> {
+    if index.schema_version != crate::WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION {
+        bail!("IR function corpus manifest schema version mismatch");
     }
-    fn validate_side(label: &str, side: &MffcIrSide) -> Result<()> {
-        validate_hex_digest(&format!("mffc_ir.{label}.ir_action_id"), &side.ir_action_id)?;
+    if index.shard_prefix_hex_chars != 2 || index.shards.len() != 256 {
+        bail!("IR function corpus manifest must declare all two-hex-digit shards");
+    }
+    let mut entry_count = 0usize;
+    for (byte, shard) in (u8::MIN..=u8::MAX).zip(&index.shards) {
+        let expected_prefix = format!("{byte:02x}");
+        let expected_key = format!(
+            "{}/{expected_prefix}.json",
+            crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE
+        );
+        if shard.prefix != expected_prefix || shard.index_key != expected_key {
+            bail!("IR function corpus manifest shard identity is invalid");
+        }
+        entry_count = entry_count
+            .checked_add(shard.entry_count)
+            .context("IR function corpus manifest entry count overflow")?;
+    }
+    if entry_count != index.entry_count {
+        bail!("IR function corpus manifest entry count is inconsistent");
+    }
+    Ok(())
+}
+
+fn validate_ir_fn_corpus_ir_shard(index: &IrFnCorpusIrShardFile) -> Result<()> {
+    if index.schema_version != crate::WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION {
+        bail!("IR function corpus shard schema version mismatch");
+    }
+    if index.prefix.len() != 2
+        || !index
+            .prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("IR function corpus shard prefix is invalid");
+    }
+    fn validate_side(label: &str, side: &IrFnCorpusIrSide) -> Result<()> {
         validate_hex_digest(
-            &format!("mffc_ir.{label}.extracted_package_sha256"),
+            &format!("ir_fn_corpus_ir.{label}.ir_action_id"),
+            &side.ir_action_id,
+        )?;
+        validate_hex_digest(
+            &format!("ir_fn_corpus_ir.{label}.extracted_package_sha256"),
             &side.extracted_package_sha256,
         )?;
         validate_hex_digest(
-            &format!("mffc_ir.{label}.source_ir_action_id"),
+            &format!("ir_fn_corpus_ir.{label}.source_ir_action_id"),
             &side.source_ir_action_id,
         )?;
         validate_hex_digest(
-            &format!("mffc_ir.{label}.source_structural_hash"),
+            &format!("ir_fn_corpus_ir.{label}.source_structural_hash"),
             &side.source_structural_hash,
         )?;
-        validate_version(&format!("mffc_ir.{label}.dso_version"), &side.dso_version)?;
+        validate_version(
+            &format!("ir_fn_corpus_ir.{label}.dso_version"),
+            &side.dso_version,
+        )?;
         validate_safe_public_text(
-            &format!("mffc_ir.{label}.ir_top"),
+            &format!("ir_fn_corpus_ir.{label}.ir_top"),
             &side.ir_top,
             MAX_PUBLIC_LABEL_BYTES,
         )?;
         validate_safe_public_text(
-            &format!("mffc_ir.{label}.source_ir_top"),
+            &format!("ir_fn_corpus_ir.{label}.source_ir_top"),
             &side.source_ir_top,
             MAX_PUBLIC_LABEL_BYTES,
         )?;
@@ -648,40 +689,52 @@ fn validate_mffc_ir_index(index: &MffcIrIndexFile) -> Result<()> {
             }
         }
         if side.ir_text.is_empty()
-            || side.ir_text.len() > MAX_PUBLIC_MFFC_IR_BYTES
+            || side.ir_text.len() > MAX_PUBLIC_IR_FUNCTION_BYTES
             || side.ir_text.contains(['\0', '\r'])
         {
-            bail!("MFFC IR text is empty, oversized, or contains forbidden control data");
+            bail!("IR function text is empty, oversized, or contains forbidden control data");
         }
         let extracted = extract_ir_fn_block_by_name(&side.ir_text, &side.ir_top)
-            .context("validating public MFFC IR function block")?;
+            .context("validating public IR function block")?;
         if extracted != side.ir_text {
-            bail!("MFFC IR text contains data outside its selected function block");
+            bail!("IR function text contains data outside its selected function block");
         }
         let actual_root_text_id = extract_ir_ret_text_id(&side.ir_text)
-            .context("validating public MFFC IR root text id")?;
+            .context("validating public IR function root text id")?;
         if actual_root_text_id != side.root_ir_text_id {
-            bail!("MFFC IR root text id does not identify the return node");
+            bail!("IR function root text id does not identify the return node");
         }
         Ok(())
     }
 
     let mut previous_key: Option<(&str, &str)> = None;
     for entry in &index.entries {
-        validate_hex_digest("mffc_ir.mffc_structural_hash", &entry.mffc_structural_hash)?;
-        validate_version("mffc_ir.crate_version", &entry.crate_version)?;
+        validate_hex_digest("ir_fn_corpus_ir.structural_hash", &entry.structural_hash)?;
+        if !entry.structural_hash.starts_with(&index.prefix) {
+            bail!("IR function corpus entry is stored in the wrong shard");
+        }
+        validate_version("ir_fn_corpus_ir.crate_version", &entry.crate_version)?;
         validate_side("g8r", &entry.g8r)?;
         validate_side("yosys_abc", &entry.yosys_abc)?;
-        let key = (
-            entry.crate_version.as_str(),
-            entry.mffc_structural_hash.as_str(),
-        );
+        let key = (entry.crate_version.as_str(), entry.structural_hash.as_str());
         if previous_key.is_some_and(|previous| previous >= key) {
-            bail!("MFFC IR entries are not strictly sorted and unique");
+            bail!("IR function corpus entries are not strictly sorted and unique");
         }
         previous_key = Some(key);
     }
     Ok(())
+}
+
+fn ir_fn_corpus_ir_shard_prefix(index_key: &str) -> Option<&str> {
+    let prefix = index_key
+        .strip_prefix(crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE)?
+        .strip_prefix('/')?
+        .strip_suffix(".json")?;
+    (prefix.len() == 2
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(prefix)
 }
 
 pub(crate) fn canonicalize_public_web_index_json(index_key: &str, bytes: &[u8]) -> Result<Vec<u8>> {
@@ -760,13 +813,26 @@ pub(crate) fn canonicalize_public_web_index_json(index_key: &str, bytes: &[u8]) 
                 },
             )
         }
-        crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME => canonicalize_typed::<MffcIrIndexFile>(
-            index_key,
-            bytes,
-            false,
-            false,
-            validate_mffc_ir_index,
-        ),
+        crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME => {
+            canonicalize_typed::<IrFnCorpusIrIndexManifest>(
+                index_key,
+                bytes,
+                false,
+                false,
+                validate_ir_fn_corpus_ir_manifest,
+            )
+        }
+        key if ir_fn_corpus_ir_shard_prefix(key).is_some() => {
+            let expected_prefix = ir_fn_corpus_ir_shard_prefix(key)
+                .context("validated IR function corpus shard key has no prefix")?;
+            canonicalize_typed::<IrFnCorpusIrShardFile>(index_key, bytes, false, false, |index| {
+                validate_ir_fn_corpus_ir_shard(index)?;
+                if index.prefix != expected_prefix {
+                    bail!("IR function corpus shard key does not match its payload prefix");
+                }
+                Ok(())
+            })
+        }
         crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY => {
             canonicalize_typed::<IrFnCorpusStructuralManifest>(
                 index_key,
@@ -861,11 +927,26 @@ mod tests {
         value
     }
 
-    fn empty_mffc_ir_value() -> Value {
+    fn empty_ir_fn_corpus_ir_value() -> Value {
+        let shards = (u8::MIN..=u8::MAX)
+            .map(|byte| {
+                let prefix = format!("{byte:02x}");
+                json!({
+                    "prefix": prefix,
+                    "index_key": format!(
+                        "{}/{prefix}.json",
+                        crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE
+                    ),
+                    "entry_count": 0
+                })
+            })
+            .collect::<Vec<_>>();
         json!({
-            "schema_version": crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_SCHEMA_VERSION,
+            "schema_version": crate::WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION,
             "generated_utc": "2026-08-29T12:00:00Z",
-            "entries": []
+            "shard_prefix_hex_chars": 2,
+            "entry_count": 0,
+            "shards": shards
         })
     }
 
@@ -991,8 +1072,8 @@ mod tests {
                 .unwrap(),
             ),
             (
-                crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME.to_string(),
-                serde_json::to_vec(&empty_mffc_ir_value()).unwrap(),
+                crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME.to_string(),
+                serde_json::to_vec(&empty_ir_fn_corpus_ir_value()).unwrap(),
             ),
             (
                 crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY.to_string(),
