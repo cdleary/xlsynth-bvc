@@ -26,7 +26,7 @@ pub(crate) const PUBLICATION_LOCK_FILENAME: &str = ".publication.lock";
 const PUBLISHED_ROOT_INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>xlsynth-bvc results</title></head>
 <body><p id="status">Loading current xlsynth-bvc results…</p><script>
-function currentSiteTarget(current,locationValue){const requested=locationValue.pathname.replace(/^\/+/, '');const reserved=requested===''||requested==='index.html'||requested==='current.json'||requested==='current.pb'||requested.startsWith('sites/')||requested.startsWith('catalogs/');const suffix=reserved?'':requested;return `/${current.site_url}${suffix}${locationValue.search}${locationValue.hash}`}
+function currentSiteTarget(current,locationValue){const requested=locationValue.pathname.replace(/^\/+/, '');const reserved=requested===''||requested==='index.html'||requested==='current.json'||requested==='current.pb'||requested.startsWith('sites/')||requested.startsWith('catalogs/');const aliases={'progression':'progression.html','progression/':'progression.html','runs':'runs.html','runs/':'runs.html','dataset':'dataset.html','dataset/':'dataset.html','mffc-discrepancies':'mffc-discrepancies.html','mffc-discrepancies/':'mffc-discrepancies.html'};const suffix=reserved?'':(aliases[requested]||requested);return `/${current.site_url}${suffix}${locationValue.search}${locationValue.hash}`}
 fetch('/current.json',{cache:'no-store'}).then(response=>{if(!response.ok)throw new Error(`current.json ${response.status}`);return response.json()}).then(current=>{if(current.schema_version!==1||!/^sites\/[0-9a-f]{64}\/$/.test(current.site_url))throw new Error('invalid current site pointer');window.location.replace(currentSiteTarget(current,window.location))}).catch(error=>{document.getElementById('status').textContent=`Unable to load current results: ${error.message}`});
 </script></body></html>
 "#;
@@ -739,8 +739,13 @@ const currentSiteTarget = new Function(helper + '; return currentSiteTarget;')()
 const current = {site_url: 'sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'};
 const cases = [
   [{pathname: '/', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
-  [{pathname: '/progression', search: '?all_versions=true', hash: '#chart'}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/progression?all_versions=true#chart'],
+  [{pathname: '/progression', search: '?all_versions=true', hash: '#chart'}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/progression.html?all_versions=true#chart'],
+  [{pathname: '/progression/', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/progression.html'],
+  [{pathname: '/runs', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/runs.html'],
+  [{pathname: '/dataset', search: '?key=versions', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/dataset.html?key=versions'],
+  [{pathname: '/mffc-discrepancies', search: '', hash: '#detail'}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/mffc-discrepancies.html#detail'],
   [{pathname: '/progression.html', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/progression.html'],
+  [{pathname: '/runs/abc', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/runs/abc'],
   [{pathname: '/index.html', search: '?source=root', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/?source=root'],
 ];
 for (const [locationValue, expected] of cases) {
