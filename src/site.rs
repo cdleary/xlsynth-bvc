@@ -271,19 +271,34 @@ fn enumeration_state_label(state: StdlibEnumerationState) -> &'static str {
     }
 }
 
+fn empty_browser_progression_catalog() -> BrowserProgressionCatalog {
+    BrowserProgressionCatalog {
+        dataset_key: crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME.to_string(),
+        cohort_subject_count: 0,
+        cohort_subject_sha256: None,
+        cohort_complete_generation_count: 0,
+        generations: Vec::new(),
+    }
+}
+
 fn build_browser_progression_catalog(
     dataset: &StdlibG8rVsYosysDataset,
     versions: Option<&VersionCardsReport>,
     runs: &[BrowserRun],
 ) -> Result<BrowserProgressionCatalog> {
+    if dataset
+        .samples
+        .iter()
+        .any(|sample| sample.stdlib_root_action_id.is_none())
+    {
+        return Ok(empty_browser_progression_catalog());
+    }
     let mut grouped = BTreeMap::<(String, String), Vec<_>>::new();
     for sample in &dataset.samples {
-        let root = sample.stdlib_root_action_id.as_ref().with_context(|| {
-            format!(
-                "release progression sample lacks stdlib root lineage: {} {}",
-                sample.crate_version, sample.fn_key
-            )
-        })?;
+        let root = sample
+            .stdlib_root_action_id
+            .as_ref()
+            .expect("lineage presence was checked above");
         grouped
             .entry((sample.crate_version.clone(), root.clone()))
             .or_default()
@@ -461,13 +476,7 @@ fn build_browser_progression_catalog_from_site(
     let Some(comparison_entry) = datasets.iter().find(|dataset| {
         dataset.logical_key == crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME
     }) else {
-        return Ok(BrowserProgressionCatalog {
-            dataset_key: crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME.to_string(),
-            cohort_subject_count: 0,
-            cohort_subject_sha256: None,
-            cohort_complete_generation_count: 0,
-            generations: Vec::new(),
-        });
+        return Ok(empty_browser_progression_catalog());
     };
     let comparison_bytes = fs::read(site_dir.join(&comparison_entry.url)).with_context(|| {
         format!(

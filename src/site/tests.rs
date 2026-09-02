@@ -494,6 +494,14 @@ fn progression_catalog_uses_repeated_subject_population_not_campaign_status() {
     );
     assert_eq!(incompatible.missing_cohort_subject_count, 1);
     assert_eq!(incompatible.extra_subject_count, 1);
+
+    let mut lineage_free = dataset.clone();
+    lineage_free.samples[0].stdlib_root_action_id = None;
+    let unavailable = build_browser_progression_catalog(&lineage_free, Some(&versions), &[])
+        .expect("lineage-free datasets keep the rest of the static site publishable");
+    assert_eq!(unavailable.cohort_subject_count, 0);
+    assert_eq!(unavailable.cohort_complete_generation_count, 0);
+    assert!(unavailable.generations.is_empty());
 }
 
 #[test]
@@ -506,7 +514,7 @@ global.document = {
 };
 const app = fs.readFileSync(0, 'utf8');
 const prefix = app.slice(0, app.indexOf('async function main()'));
-const api = new Function(prefix + '\nreturn {compareSamples,medianPairedProductLossChange};')();
+const api = new Function(prefix + '\nreturn {compareSamples,medianPairedProductLossChange,progressionSelection};')();
 const sample = (fn_key, g8r_product_loss) => ({fn_key, ir_top: null, g8r_product_loss});
 const before = [sample('a', 0), sample('b', 100), sample('c', 101)];
 const after = [sample('a', 99), sample('b', 98), sample('c', 102)];
@@ -514,6 +522,22 @@ const {pairs} = api.compareSamples(before, after);
 const actual = api.medianPairedProductLossChange(pairs);
 if (actual !== 1) {
   throw new Error(`expected median paired delta 1, got ${actual}`);
+}
+const one = api.progressionSelection([{generation_id: 'only'}]);
+if (one.baseline !== '' || one.current !== 'only') {
+  throw new Error(`one generation must not compare to itself: ${JSON.stringify(one)}`);
+}
+const two = api.progressionSelection([{generation_id: 'before'}, {generation_id: 'after'}]);
+if (two.baseline !== 'before' || two.current !== 'after') {
+  throw new Error(`two generations must default to a distinct pair: ${JSON.stringify(two)}`);
+}
+const duplicate = api.progressionSelection(
+  [{generation_id: 'before'}, {generation_id: 'after'}],
+  'after',
+  'after',
+);
+if (duplicate.baseline !== 'before' || duplicate.current !== 'after') {
+  throw new Error(`duplicate selections must be separated: ${JSON.stringify(duplicate)}`);
 }
 "#;
     let mut child = match Command::new("node")
