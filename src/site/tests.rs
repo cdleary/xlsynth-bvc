@@ -206,7 +206,8 @@ fn site_build_and_verify_supports_subdirectory_base() {
     assert!(APP_JS.contains("No paired MFFC samples are available in this snapshot."));
     assert!(APP_JS.contains("Largest G8r product losses"));
     assert!(APP_JS.contains("Both evidence paths reference this same action and top."));
-    assert!(APP_JS.contains("entry.structural_hash===sample.structural_hash"));
+    assert!(APP_JS.contains("entry.g8r_stats_action_id===sample.g8r_stats_action_id"));
+    assert!(APP_JS.contains("entry.yosys_abc_stats_action_id===sample.yosys_abc_stats_action_id"));
     assert!(APP_JS.contains("mffcIrPanel('G8r'"));
     assert!(APP_JS.contains("mffcIrPanel('Yosys/ABC'"));
     assert!(APP_JS.contains("Representative subject"));
