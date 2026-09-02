@@ -106,11 +106,25 @@ message IrFnToMffcCorpusAction {
   DriverRuntimeSpec runtime = 7;
 }
 
+enum YosysVerilogFrontendKind {
+  YOSYS_VERILOG_FRONTEND_KIND_UNSPECIFIED = 0;
+  YOSYS_VERILOG_FRONTEND_KIND_BUILTIN = 1;
+  YOSYS_VERILOG_FRONTEND_KIND_SLANG = 2;
+}
+
+message YosysVerilogFrontend {
+  YosysVerilogFrontendKind kind = 1;
+  // Exact sv-elab/yosys-slang source commit. Present only for the slang frontend.
+  optional string revision = 2;
+}
+
 message ComboVerilogToYosysAbcAigAction {
   ActionId verilog_action_id = 1;
   optional string verilog_top_module_name = 2;
   ScriptRef yosys_script_ref = 3;
   YosysRuntimeSpec runtime = 4;
+  // Absent is the canonical encoding for the historical builtin frontend.
+  YosysVerilogFrontend frontend = 5;
 }
 
 message AigToYosysAbcAigAction {

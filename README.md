@@ -68,7 +68,13 @@ cargo run --bin xlsynth_bvc -- run ir-to-combo-verilog \
 cargo run --bin xlsynth_bvc -- run combo-verilog-to-yosys-abc-aig \
   --verilog-action-id <verilog_action_id> \
   --verilog-top-module-name foo \
+  --frontend slang \
   --yosys-script flows/yosys_to_aig.ys
+
+The Verilog-to-AIG frontend defaults to Yosys's builtin `read_verilog`. Pass
+`--frontend slang` to load the pinned sv-elab/yosys-slang plugin and use
+`read_slang`; the exact plugin revision participates in the action ID and
+provenance.
 
 # Compute AIG stats from either g8r or yosys/abc AIG output
 cargo run --bin xlsynth_bvc -- run aig-to-stats \

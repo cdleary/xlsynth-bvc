@@ -2347,6 +2347,7 @@ mod tests {
         let yabc = ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id: "e".repeat(64),
             verilog_top_module_name: Some("__top".to_string()),
+            frontend: crate::model::YosysVerilogFrontend::Builtin,
             yosys_script_ref: crate::model::ScriptRef {
                 path: "flows/yosys_to_aig.ys".to_string(),
                 sha256: "f".repeat(64),

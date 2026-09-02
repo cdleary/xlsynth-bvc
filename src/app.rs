@@ -1167,11 +1167,22 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
         RunAction::ComboVerilogToYosysAbcAig {
             verilog_action_id,
             verilog_top_module_name,
+            frontend,
             yosys_script,
             yosys,
         } => Ok(ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id,
             verilog_top_module_name,
+            frontend: match frontend {
+                crate::cli::YosysVerilogFrontendCli::Builtin => {
+                    crate::model::YosysVerilogFrontend::Builtin
+                }
+                crate::cli::YosysVerilogFrontendCli::Slang => {
+                    crate::model::YosysVerilogFrontend::Slang {
+                        revision: crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string(),
+                    }
+                }
+            },
             yosys_script_ref: make_script_ref(repo_root, &yosys_script)?,
             runtime: yosys.into_runtime(repo_root)?,
         }),
@@ -3885,6 +3896,7 @@ mod tests {
         let excluded_action = ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id,
             verilog_top_module_name: Some("__float64__fma".to_string()),
+            frontend: crate::model::YosysVerilogFrontend::Builtin,
             yosys_script_ref: ScriptRef {
                 path: "flows/yosys_to_aig.ys".to_string(),
                 sha256: "a".repeat(64),

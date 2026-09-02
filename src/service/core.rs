@@ -538,6 +538,7 @@ pub(crate) fn build_aig_stat_diff_suggestion_for_stats_action(
             let yosys_aig = ActionSpec::ComboVerilogToYosysAbcAig {
                 verilog_action_id: combo_action_id,
                 verilog_top_module_name: top_fn_name.clone(),
+                frontend: YosysVerilogFrontend::Builtin,
                 yosys_script_ref,
                 runtime: default_yosys_runtime(repo_root)?,
             };

@@ -3803,6 +3803,7 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
         let yosys_from_combo_a = ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id: combo_a_id.clone(),
             verilog_top_module_name: Some("top_a".to_string()),
+            frontend: crate::model::YosysVerilogFrontend::Builtin,
             yosys_script_ref: yosys_script_ref.clone(),
             runtime: yosys_runtime.clone(),
         };

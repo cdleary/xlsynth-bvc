@@ -9261,6 +9261,7 @@ mod tests {
         let action = ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id: "f".repeat(64),
             verilog_top_module_name: Some("__float32__add".to_string()),
+            frontend: crate::model::YosysVerilogFrontend::Builtin,
             yosys_script_ref: ScriptRef {
                 path: "flows/yosys_to_aig.ys".to_string(),
                 sha256: "0".repeat(64),
@@ -9278,6 +9279,7 @@ mod tests {
         let action = ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id: "f".repeat(64),
             verilog_top_module_name: Some("__float32__add".to_string()),
+            frontend: crate::model::YosysVerilogFrontend::Builtin,
             yosys_script_ref: ScriptRef {
                 path: "flows/ablate_abc_fast.ys".to_string(),
                 sha256: "0".repeat(64),
@@ -9318,6 +9320,7 @@ mod tests {
                 ActionSpec::ComboVerilogToYosysAbcAig {
                     verilog_action_id: verilog_action_id.clone(),
                     verilog_top_module_name: Some("__float32__add".to_string()),
+                    frontend: crate::model::YosysVerilogFrontend::Builtin,
                     yosys_script_ref: ScriptRef {
                         path: "flows/ablate_abc_fast.ys".to_string(),
                         sha256: "0".repeat(64),
@@ -9365,6 +9368,7 @@ mod tests {
                 ActionSpec::ComboVerilogToYosysAbcAig {
                     verilog_action_id: verilog_action_id.clone(),
                     verilog_top_module_name: Some("__float32__add".to_string()),
+                    frontend: crate::model::YosysVerilogFrontend::Builtin,
                     yosys_script_ref: ScriptRef {
                         path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
                         sha256: "0".repeat(64),
@@ -9714,6 +9718,7 @@ mod tests {
             ActionSpec::ComboVerilogToYosysAbcAig {
                 verilog_action_id: ir2combo_id.clone(),
                 verilog_top_module_name: Some(ir_top.to_string()),
+                frontend: crate::model::YosysVerilogFrontend::Builtin,
                 yosys_script_ref: ScriptRef {
                     path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
                     sha256: "0".repeat(64),

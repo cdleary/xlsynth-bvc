@@ -14,6 +14,7 @@ use crate::cli::{CorpusExecutionMode, CorpusRecipePreset, CorpusTopFnPolicy, Dri
 use crate::executor::{compute_action_id, execute_action};
 use crate::model::{
     ActionSpec, ArtifactRef, ArtifactType, DriverRuntimeSpec, Provenance, YosysRuntimeSpec,
+    YosysVerilogFrontend,
 };
 use crate::queue::{
     enqueue_action_with_priority, load_queue_canceled_record, load_queue_done_record,
@@ -1192,6 +1193,7 @@ fn build_action_plan(
     let yosys_abc_aig_action = ActionSpec::ComboVerilogToYosysAbcAig {
         verilog_action_id: combo_verilog_action_id.clone(),
         verilog_top_module_name: Some(sample.top_fn_name.clone()),
+        frontend: YosysVerilogFrontend::Builtin,
         yosys_script_ref: yosys_script_ref.clone(),
         runtime: yosys_runtime.clone(),
     };

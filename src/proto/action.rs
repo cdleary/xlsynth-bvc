@@ -260,6 +260,18 @@ pub(crate) fn yosys_runtime_to_proto(
     })
 }
 
+pub(crate) fn yosys_verilog_frontend_to_proto(
+    value: &model::YosysVerilogFrontend,
+) -> Option<pb::YosysVerilogFrontend> {
+    match value {
+        model::YosysVerilogFrontend::Builtin => None,
+        model::YosysVerilogFrontend::Slang { revision } => Some(pb::YosysVerilogFrontend {
+            kind: pb::YosysVerilogFrontendKind::Slang as i32,
+            revision: Some(revision.clone()),
+        }),
+    }
+}
+
 pub(crate) fn script_ref_to_proto(value: &model::ScriptRef, field: &str) -> Result<pb::ScriptRef> {
     Ok(pb::ScriptRef {
         path: Some(relpath(&value.path, &format!("{field}.path"))?),
@@ -303,6 +315,31 @@ fn validate_driver_runtime(value: &pb::DriverRuntimeSpec, field: &str) -> Result
         )?,
         &format!("{field}.release_cache_input_sha256"),
     )
+}
+
+fn validate_yosys_verilog_frontend(
+    value: &Option<pb::YosysVerilogFrontend>,
+    field: &str,
+) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    match pb::YosysVerilogFrontendKind::try_from(value.kind) {
+        Ok(pb::YosysVerilogFrontendKind::Slang) => {
+            let revision = required(&value.revision, &format!("{field}.revision"))?;
+            if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("{field}.revision must be a full 40-character hexadecimal commit");
+            }
+            Ok(())
+        }
+        Ok(pb::YosysVerilogFrontendKind::Builtin) => {
+            bail!("{field} must be absent for the canonical builtin frontend")
+        }
+        Ok(pb::YosysVerilogFrontendKind::Unspecified) => {
+            bail!("{field}.kind must be specified")
+        }
+        Err(_) => bail!("{field}.kind is unknown: {}", value.kind),
+    }
 }
 
 fn validate_yosys_runtime(value: &pb::YosysRuntimeSpec, field: &str) -> Result<()> {
@@ -532,6 +569,10 @@ pub(crate) fn validate_action_spec(action: &pb::ActionSpec) -> Result<()> {
                     "combo_verilog_to_yosys_abc_aig.yosys_script_ref",
                 )?,
                 "combo_verilog_to_yosys_abc_aig.yosys_script_ref",
+            )?;
+            validate_yosys_verilog_frontend(
+                &value.frontend,
+                "combo_verilog_to_yosys_abc_aig.frontend",
             )?;
             validate_yosys_runtime(
                 required(&value.runtime, "combo_verilog_to_yosys_abc_aig.runtime")?,
@@ -862,6 +903,7 @@ fn action_spec_from_model(action: &model::ActionSpec) -> Result<pb::ActionSpec> 
         M::ComboVerilogToYosysAbcAig {
             verilog_action_id,
             verilog_top_module_name,
+            frontend,
             yosys_script_ref,
             runtime,
         } => Kind::ComboVerilogToYosysAbcAig(pb::ComboVerilogToYosysAbcAigAction {
@@ -878,6 +920,7 @@ fn action_spec_from_model(action: &model::ActionSpec) -> Result<pb::ActionSpec> 
                 runtime,
                 "combo_verilog_to_yosys_abc_aig.runtime",
             )?),
+            frontend: yosys_verilog_frontend_to_proto(frontend),
         }),
         M::AigToYosysAbcAig {
             aig_action_id,
@@ -1022,6 +1065,25 @@ pub(crate) fn yosys_runtime_from_proto(
             &format!("{field}.docker_image_id"),
         )?,
     })
+}
+
+pub(crate) fn yosys_verilog_frontend_from_proto(
+    value: &Option<pb::YosysVerilogFrontend>,
+    field: &str,
+) -> Result<model::YosysVerilogFrontend> {
+    validate_yosys_verilog_frontend(value, field)?;
+    let Some(value) = value else {
+        return Ok(model::YosysVerilogFrontend::Builtin);
+    };
+    match pb::YosysVerilogFrontendKind::try_from(value.kind) {
+        Ok(pb::YosysVerilogFrontendKind::Slang) => Ok(model::YosysVerilogFrontend::Slang {
+            revision: value
+                .revision
+                .clone()
+                .context("validated slang frontend must have a revision")?,
+        }),
+        _ => unreachable!("validated frontend is either absent builtin or slang"),
+    }
 }
 
 pub(crate) fn script_ref_from_proto(
@@ -1244,6 +1306,10 @@ pub(crate) fn action_spec_from_proto(action: &pb::ActionSpec) -> Result<model::A
                 "combo_verilog_to_yosys_abc_aig.verilog_action_id",
             )?,
             verilog_top_module_name: value.verilog_top_module_name.clone(),
+            frontend: yosys_verilog_frontend_from_proto(
+                &value.frontend,
+                "combo_verilog_to_yosys_abc_aig.frontend",
+            )?,
             yosys_script_ref: script_ref_from_proto(
                 required(
                     &value.yosys_script_ref,
@@ -1474,6 +1540,7 @@ mod tests {
                 model::ActionSpec::ComboVerilogToYosysAbcAig {
                     verilog_action_id: id(0x0d),
                     verilog_top_module_name: Some("main".to_string()),
+                    frontend: model::YosysVerilogFrontend::Builtin,
                     yosys_script_ref: script.clone(),
                     runtime: yosys.clone(),
                 },
@@ -1563,6 +1630,75 @@ mod tests {
             )),
         };
         assert!(ValidatedActionSpec::try_from(action).is_err());
+    }
+
+    #[test]
+    fn yosys_frontend_is_canonical_and_binds_action_identity() {
+        let (_, mut action) = sample_actions()
+            .into_iter()
+            .find(|(name, _)| *name == "combo_verilog_to_yosys_abc_aig")
+            .expect("combo Verilog action fixture");
+
+        let builtin_id = compute_model_action_id_v2(&action).expect("builtin action id");
+        let builtin = ValidatedActionSpec::try_from(&action).expect("builtin action");
+        let pb::action_spec::Kind::ComboVerilogToYosysAbcAig(builtin) =
+            builtin.as_proto().kind.as_ref().expect("kind")
+        else {
+            panic!("unexpected action kind");
+        };
+        assert!(
+            builtin.frontend.is_none(),
+            "builtin must retain the historical absent-field encoding"
+        );
+        let builtin_json = serde_json::to_value(&action).expect("builtin JSON");
+        assert!(builtin_json.get("frontend").is_none());
+
+        let model::ActionSpec::ComboVerilogToYosysAbcAig { frontend, .. } = &mut action else {
+            panic!("expected ComboVerilogToYosysAbcAig");
+        };
+        *frontend = model::YosysVerilogFrontend::Slang {
+            revision: "a".repeat(40),
+        };
+        let slang_id = compute_model_action_id_v2(&action).expect("slang action id");
+        assert_ne!(builtin_id, slang_id);
+
+        let slang = ValidatedActionSpec::try_from(&action).expect("slang action");
+        let pb::action_spec::Kind::ComboVerilogToYosysAbcAig(slang_pb) =
+            slang.as_proto().kind.as_ref().expect("kind")
+        else {
+            panic!("unexpected action kind");
+        };
+        assert_eq!(
+            slang_pb
+                .frontend
+                .as_ref()
+                .expect("frontend")
+                .revision
+                .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+
+        let mut other_revision = action.clone();
+        let model::ActionSpec::ComboVerilogToYosysAbcAig { frontend, .. } = &mut other_revision
+        else {
+            panic!("expected ComboVerilogToYosysAbcAig");
+        };
+        *frontend = model::YosysVerilogFrontend::Slang {
+            revision: "b".repeat(40),
+        };
+        assert_ne!(
+            slang_id,
+            compute_model_action_id_v2(&other_revision).expect("other slang action id")
+        );
+
+        let mut invalid = slang.as_proto().clone();
+        let pb::action_spec::Kind::ComboVerilogToYosysAbcAig(value) =
+            invalid.kind.as_mut().expect("kind")
+        else {
+            panic!("unexpected action kind");
+        };
+        value.frontend.as_mut().expect("frontend").revision = Some("short".to_string());
+        assert!(ValidatedActionSpec::try_from(invalid).is_err());
     }
 
     #[test]

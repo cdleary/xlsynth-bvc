@@ -38,7 +38,10 @@ Before encoding:
 5. Reject empty identifiers such as function names, platform names, image
    references, delay models, and output formats.
 6. Decode hexadecimal input digests/action IDs to exactly 32 bytes.
-7. Map every semantic enum to a concrete nonzero protobuf value.
+7. Map every semantic enum stored on the wire to a concrete nonzero protobuf
+   value. The absent `ComboVerilogToYosysAbcAig.frontend` submessage is the
+   one canonical exception: it preserves the historical builtin frontend
+   encoding; slang uses an explicit enum and full source revision.
 8. Reject an absent action `oneof` or absent required submessage.
 9. Require driver runtimes to carry both a 32-byte immutable OCI image ID and
    the 32-byte digest of their canonical release-cache input manifest.
