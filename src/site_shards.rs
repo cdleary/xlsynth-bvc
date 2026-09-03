@@ -76,6 +76,10 @@ fn structural_shard_key(prefix: &str) -> String {
     format!("{STATIC_STRUCTURAL_SHARD_NAMESPACE}/{prefix}.json")
 }
 
+fn is_structural_manifest_source(index_key: &str) -> bool {
+    index_key == crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY
+}
+
 fn structural_shard_prefix(index_key: &str) -> Option<&str> {
     let prefix = index_key
         .strip_prefix(STATIC_STRUCTURAL_SHARD_NAMESPACE)
@@ -328,6 +332,30 @@ fn build_structural_datasets(
     out_dir: &Path,
     entries: &[crate::snapshot::StaticSnapshotDatasetFile],
 ) -> Result<Vec<BrowserDataset>> {
+    let Some(source_manifest_entry) = entries
+        .iter()
+        .find(|entry| is_structural_manifest_source(&entry.index_key))
+    else {
+        if entries
+            .iter()
+            .any(|entry| structural_group_hash(&entry.index_key).is_some())
+        {
+            bail!("structural groups exist without their source manifest");
+        }
+        return Ok(Vec::new());
+    };
+    let source_manifest_bytes = read_snapshot_json(snapshot_dir, source_manifest_entry)?;
+    let source_manifest: crate::model::IrFnCorpusStructuralManifest =
+        serde_json::from_slice(&source_manifest_bytes)
+            .context("decoding structural source manifest")?;
+    let canonical_source = crate::query::canonicalize_public_web_index_json(
+        &source_manifest_entry.index_key,
+        &source_manifest_bytes,
+    )?;
+    if canonical_source != source_manifest_bytes {
+        bail!("structural source manifest is not canonical");
+    }
+
     let mut groups_by_prefix: BTreeMap<String, Vec<crate::model::IrFnCorpusStructuralGroupFile>> =
         BTreeMap::new();
     for entry in entries {
@@ -350,17 +378,47 @@ fn build_structural_datasets(
     }
 
     let mut datasets = Vec::new();
+    let mut shard_summaries = Vec::new();
     for (prefix, mut groups) in groups_by_prefix {
         groups.sort_by(|left, right| left.structural_hash.cmp(&right.structural_hash));
+        let group_count = groups.len();
+        let member_count = groups.iter().map(|group| group.members.len()).sum();
         let key = structural_shard_key(&prefix);
         let bytes = serde_json::to_vec(&StaticStructuralShard {
             schema_version: STATIC_STRUCTURAL_SHARD_SCHEMA_VERSION,
-            prefix,
+            prefix: prefix.clone(),
             groups,
         })
         .context("serializing static structural shard")?;
-        datasets.push(write_browser_dataset(out_dir, &key, &bytes)?);
+        let dataset = write_browser_dataset(out_dir, &key, &bytes)?;
+        shard_summaries.push(StaticStructuralShardSummary {
+            prefix,
+            index_key: key,
+            group_count,
+            member_count,
+            bytes: dataset.bytes,
+            sha256: dataset.sha256.clone(),
+        });
+        datasets.push(dataset);
     }
+    let static_manifest = StaticStructuralManifest {
+        schema_version: STATIC_STRUCTURAL_SHARD_SCHEMA_VERSION,
+        source: StaticStructuralSource {
+            logical_key: source_manifest_entry.index_key.clone(),
+            bytes: source_manifest_entry.bytes,
+            sha256: source_manifest_entry.sha256.clone(),
+            manifest: source_manifest,
+        },
+        shard_prefix_hex_chars: STATIC_STRUCTURAL_SHARD_PREFIX_HEX_CHARS,
+        shards: shard_summaries,
+    };
+    let manifest_bytes =
+        serde_json::to_vec(&static_manifest).context("serializing static structural manifest")?;
+    datasets.push(write_browser_dataset(
+        out_dir,
+        &source_manifest_entry.index_key,
+        &manifest_bytes,
+    )?);
     Ok(datasets)
 }
 
@@ -375,6 +433,7 @@ pub(super) fn build_static_site_datasets(
             continue;
         }
         if comparison_source_schema(&entry.index_key).is_some()
+            || is_structural_manifest_source(&entry.index_key)
             || structural_group_hash(&entry.index_key).is_some()
         {
             continue;
@@ -558,6 +617,64 @@ fn validate_structural_shard(prefix: &str, shard: &StaticStructuralShard) -> Res
     Ok(())
 }
 
+fn validate_structural_manifest(manifest: &StaticStructuralManifest) -> Result<()> {
+    if manifest.schema_version != STATIC_STRUCTURAL_SHARD_SCHEMA_VERSION
+        || manifest.shard_prefix_hex_chars != STATIC_STRUCTURAL_SHARD_PREFIX_HEX_CHARS
+        || !is_structural_manifest_source(&manifest.source.logical_key)
+    {
+        bail!("static structural manifest header is invalid");
+    }
+    validate_digest("structural source sha256", &manifest.source.sha256)?;
+    let source_bytes = serde_json::to_vec_pretty(&manifest.source.manifest)
+        .context("serializing structural source manifest")?;
+    let canonical_source = crate::query::canonicalize_public_web_index_json(
+        &manifest.source.logical_key,
+        &source_bytes,
+    )?;
+    if canonical_source != source_bytes
+        || source_bytes.len() as u64 != manifest.source.bytes
+        || sha256_hex(&source_bytes) != manifest.source.sha256
+    {
+        bail!("static structural source commitment is invalid");
+    }
+
+    let mut expected_counts = BTreeMap::<String, (usize, usize)>::new();
+    for group in &manifest.source.manifest.groups {
+        let prefix = hash_prefix(
+            &group.structural_hash,
+            STATIC_STRUCTURAL_SHARD_PREFIX_HEX_CHARS,
+            "structural manifest group hash",
+        )?;
+        let counts = expected_counts.entry(prefix.to_string()).or_default();
+        counts.0 += 1;
+        counts.1 += group.member_count;
+    }
+    if manifest.shards.len() != expected_counts.len() {
+        bail!("static structural manifest shard count is invalid");
+    }
+    let mut previous = None;
+    for summary in &manifest.shards {
+        let expected = expected_counts
+            .get(&summary.prefix)
+            .with_context(|| format!("unexpected structural shard prefix {}", summary.prefix))?;
+        if !is_lower_hex(
+            &summary.prefix,
+            STATIC_STRUCTURAL_SHARD_PREFIX_HEX_CHARS as usize,
+        ) || previous
+            .as_ref()
+            .is_some_and(|value| value >= &summary.prefix)
+            || summary.index_key != structural_shard_key(&summary.prefix)
+            || (summary.group_count, summary.member_count) != *expected
+            || summary.group_count == 0
+        {
+            bail!("static structural shard summary is invalid or unsorted");
+        }
+        validate_digest("structural shard summary sha256", &summary.sha256)?;
+        previous = Some(summary.prefix.clone());
+    }
+    Ok(())
+}
+
 pub(super) fn should_include_static_site_dataset_key(index_key: &str) -> bool {
     should_include_snapshot_index_key(index_key)
         || comparison_shard_key_parts(index_key).is_some()
@@ -590,6 +707,11 @@ pub(super) fn canonicalize_static_site_dataset_json(
     if let Some(prefix) = structural_shard_prefix(index_key) {
         return canonicalize_typed::<StaticStructuralShard>(bytes, |shard| {
             validate_structural_shard(prefix, shard)
+        });
+    }
+    if is_structural_manifest_source(index_key) {
+        return canonicalize_typed::<StaticStructuralManifest>(bytes, |manifest| {
+            validate_structural_manifest(manifest)
         });
     }
     crate::query::canonicalize_public_web_index_json(index_key, bytes)
@@ -739,20 +861,57 @@ fn verify_structural_projection(
     catalog_by_key: &BTreeMap<&str, &BrowserDataset>,
     expected_keys: &mut BTreeSet<String>,
 ) -> Result<()> {
+    let source_manifest_entry = source_by_key
+        .get(crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY)
+        .copied();
     let source_group_keys = source_by_key
         .keys()
         .filter(|key| structural_group_hash(key).is_some())
         .map(|key| (*key).to_string())
         .collect::<BTreeSet<_>>();
+    let Some(source_manifest_entry) = source_manifest_entry else {
+        if !source_group_keys.is_empty() {
+            bail!("snapshot structural groups exist without their manifest");
+        }
+        return Ok(());
+    };
+    let static_manifest_dataset = catalog_dataset(
+        catalog_by_key,
+        crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY,
+    )?;
+    expected_keys.insert(crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY.to_string());
+    let static_manifest_bytes = read_catalog_dataset(site_dir, static_manifest_dataset)?;
+    let static_manifest: StaticStructuralManifest = serde_json::from_slice(&static_manifest_bytes)
+        .context("decoding static structural manifest")?;
+    validate_structural_manifest(&static_manifest)?;
+    if static_manifest.source.logical_key != source_manifest_entry.index_key
+        || static_manifest.source.bytes != source_manifest_entry.bytes
+        || static_manifest.source.sha256 != source_manifest_entry.sha256
+    {
+        bail!("static structural manifest source does not match snapshot");
+    }
+
     let mut reconstructed_group_keys = BTreeSet::new();
-    for (key, dataset) in catalog_by_key {
-        let Some(prefix) = structural_shard_prefix(key) else {
-            continue;
-        };
-        expected_keys.insert((*key).to_string());
+    for summary in &static_manifest.shards {
+        let prefix = &summary.prefix;
+        let dataset = catalog_dataset(catalog_by_key, &summary.index_key)?;
+        expected_keys.insert(summary.index_key.clone());
+        if dataset.bytes != summary.bytes || dataset.sha256 != summary.sha256 {
+            bail!("structural shard metadata disagrees with manifest");
+        }
         let bytes = read_catalog_dataset(site_dir, dataset)?;
         let shard: StaticStructuralShard = serde_json::from_slice(&bytes)?;
         validate_structural_shard(prefix, &shard)?;
+        if shard.groups.len() != summary.group_count
+            || shard
+                .groups
+                .iter()
+                .map(|group| group.members.len())
+                .sum::<usize>()
+                != summary.member_count
+        {
+            bail!("structural shard counts disagree with manifest");
+        }
         for group in shard.groups {
             let source_key = structural_group_key(&group.structural_hash);
             if !reconstructed_group_keys.insert(source_key.clone()) {
@@ -800,7 +959,10 @@ pub(super) fn verify_static_site_dataset_projection(
 
     let mut expected_keys = BTreeSet::new();
     for (key, source_entry) in &source_by_key {
-        if comparison_source_schema(key).is_some() || structural_group_hash(key).is_some() {
+        if comparison_source_schema(key).is_some()
+            || is_structural_manifest_source(key)
+            || structural_group_hash(key).is_some()
+        {
             continue;
         }
         expected_keys.insert((*key).to_string());

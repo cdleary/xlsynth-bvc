@@ -195,6 +195,35 @@ struct StaticStructuralShard {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StaticStructuralSource {
+    logical_key: String,
+    bytes: u64,
+    sha256: String,
+    manifest: crate::model::IrFnCorpusStructuralManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticStructuralShardSummary {
+    prefix: String,
+    index_key: String,
+    group_count: usize,
+    member_count: usize,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticStructuralManifest {
+    schema_version: u32,
+    source: StaticStructuralSource,
+    shard_prefix_hex_chars: u8,
+    shards: Vec<StaticStructuralShardSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BrowserRun {
     campaign_id: String,
     run_id: String,

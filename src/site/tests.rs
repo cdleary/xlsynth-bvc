@@ -76,6 +76,136 @@ fn generated_site_links_are_relocatable() {
 }
 
 #[test]
+fn structural_static_manifest_advertises_resolvable_shards() {
+    let root = temp_root();
+    let store = ArtifactStore::new(root.join("store"));
+    store.ensure_layout().expect("store layout");
+    store
+        .write_web_index_bytes(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &empty_versions_index_bytes(),
+        )
+        .expect("write versions dataset");
+
+    let structural_hash = "7".repeat(64);
+    let group = crate::model::IrFnCorpusStructuralGroupFile {
+        schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
+        structural_hash: structural_hash.clone(),
+        members: vec![crate::model::IrFnCorpusStructuralMember {
+            opt_ir_action_id: "1".repeat(64),
+            source_ir_action_id: "2".repeat(64),
+            ir_top: "__sample".to_string(),
+            ir_fn_signature: Some("fn __sample(x: bits[1]) -> bits[1]".to_string()),
+            ir_op_count: Some(1),
+            crate_version: "0.68.0".to_string(),
+            dso_version: "0.68.0".to_string(),
+            created_utc: Utc::now(),
+            output_artifact: crate::model::ArtifactRef {
+                action_id: "1".repeat(64),
+                artifact_type: crate::model::ArtifactType::IrPackageFile,
+                relpath: "payload/result.ir".to_string(),
+            },
+            output_file_sha256: "3".repeat(64),
+            output_file_bytes: 42,
+            hash_source: "dependency_hint".to_string(),
+            hash_hint_source_action_ids: vec!["4".repeat(64)],
+            dslx_origin: None,
+            producer_action_kind: Some("driver_ir_to_opt".to_string()),
+        }],
+    };
+    let group_bytes = serde_json::to_vec_pretty(&group).expect("serialize structural group");
+    let group_key = format!(
+        "{}/{}",
+        crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE,
+        crate::service::hash_group_relpath(&structural_hash)
+    );
+    store
+        .write_web_index_bytes(&group_key, &group_bytes)
+        .expect("write structural group");
+    let source_manifest = crate::model::IrFnCorpusStructuralManifest {
+        schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
+        generated_utc: Utc::now(),
+        recompute_missing_hashes: false,
+        total_actions_scanned: 1,
+        total_driver_ir_to_opt_actions: 1,
+        total_ir_fn_to_k_bool_cone_corpus_actions: 0,
+        indexed_actions: 1,
+        indexed_k_bool_cone_members: 0,
+        distinct_structural_hashes: 1,
+        hash_from_dependency_hint_count: 1,
+        hash_recomputed_count: 0,
+        hash_hint_conflict_count: 0,
+        skipped_missing_output_count: 0,
+        skipped_missing_ir_top_count: 0,
+        skipped_missing_hash_hint_count: 0,
+        skipped_hash_error_count: 0,
+        skipped_k_bool_cone_manifest_errors: 0,
+        skipped_k_bool_cone_empty_count: 0,
+        source_action_set_sha256: Some("5".repeat(64)),
+        groups: vec![crate::model::IrFnCorpusStructuralManifestGroup {
+            structural_hash: structural_hash.clone(),
+            member_count: 1,
+            relpath: crate::service::hash_group_relpath(&structural_hash),
+            content_sha256: sha256_hex(&group_bytes),
+            ir_node_count: Some(1),
+        }],
+    };
+    store
+        .write_web_index_bytes(
+            crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY,
+            &serde_json::to_vec_pretty(&source_manifest).expect("serialize source manifest"),
+        )
+        .expect("write structural manifest");
+
+    let snapshot_dir = root.join("snapshot");
+    build_static_snapshot(
+        &store,
+        &test_repo_root(),
+        &BuildStaticSnapshotOptions {
+            out_dir: snapshot_dir.clone(),
+            overwrite: false,
+            skip_rebuild_web_indices: true,
+        },
+    )
+    .expect("build snapshot");
+    let site_dir = root.join("site");
+    build_static_site(&BuildStaticSiteOptions {
+        snapshot_dir,
+        out_dir: site_dir.clone(),
+        base_url: "/".into(),
+        overwrite: false,
+    })
+    .expect("build site");
+
+    let manifest_path = site_dir
+        .join("data")
+        .join(crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY);
+    let static_manifest: StaticStructuralManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read static manifest"))
+            .expect("decode static manifest");
+    assert_eq!(
+        static_manifest.source.logical_key,
+        crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY
+    );
+    assert_eq!(
+        static_manifest.source.manifest.distinct_structural_hashes,
+        1
+    );
+    assert_eq!(static_manifest.shards.len(), 1);
+    let shard = &static_manifest.shards[0];
+    assert_eq!(shard.prefix, "77");
+    assert_eq!(shard.group_count, 1);
+    assert_eq!(shard.member_count, 1);
+    assert!(site_dir.join("data").join(&shard.index_key).is_file());
+    assert!(
+        !site_dir.join("data").join(&group_key).exists(),
+        "per-hash compatibility files would exceed the hosting file limit"
+    );
+    verify_static_site(&site_dir).expect("verify site");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
 fn site_build_and_verify_supports_subdirectory_base() {
     let root = temp_root();
     let store = ArtifactStore::new(root.join("store"));
