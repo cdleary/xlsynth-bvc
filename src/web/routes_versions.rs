@@ -105,7 +105,7 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
     match tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         let rss_mib_start = process_rss_mib().unwrap_or(0);
-        let report = if let Some(indexed) = load_versions_cards_index(&store)? {
+        let report = if let Some(indexed) = load_versions_cards_index(&store, &repo_root)? {
             indexed
         } else {
             let summary = rebuild_versions_cards_index(&store, &repo_root)?;
@@ -116,7 +116,7 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
                 summary.index_bytes,
                 summary.elapsed_ms
             );
-            load_versions_cards_index(&store)?.ok_or_else(|| {
+            load_versions_cards_index(&store, &repo_root)?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "versions summary index rebuild completed but index remained unavailable"
                 )

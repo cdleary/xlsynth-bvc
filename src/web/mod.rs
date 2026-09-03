@@ -242,7 +242,9 @@ pub(crate) fn serve_web_ui(
         thread::spawn(move || {
             let versions_started = Instant::now();
             match (|| -> Result<()> {
-                let report = if let Some(indexed) = load_versions_cards_index(&prewarm_store)? {
+                let report = if let Some(indexed) =
+                    load_versions_cards_index(&prewarm_store, &prewarm_repo_root)?
+                {
                     indexed
                 } else {
                     let summary = rebuild_versions_cards_index(&prewarm_store, &prewarm_repo_root)?;
@@ -253,7 +255,7 @@ pub(crate) fn serve_web_ui(
                         summary.index_bytes,
                         summary.elapsed_ms
                     );
-                    load_versions_cards_index(&prewarm_store)?.ok_or_else(|| {
+                    load_versions_cards_index(&prewarm_store, &prewarm_repo_root)?.ok_or_else(|| {
                         anyhow::anyhow!(
                             "versions summary index rebuild completed but index remained unavailable"
                         )

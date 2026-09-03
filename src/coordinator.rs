@@ -39,7 +39,7 @@ use crate::store::ArtifactStore;
 use crate::versioning::normalize_tag_version;
 use crate::{
     DEFAULT_QUEUE_LEASE_SECONDS, DEFAULT_WEB_RUNNER_DRAIN_BATCH_SIZE,
-    DEFAULT_WEB_RUNNER_POLL_MILLIS,
+    DEFAULT_WEB_RUNNER_POLL_MILLIS, VERSION_COMPAT_PATH, XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
 };
 
 const COORDINATOR_RECORD_VERSION: u32 = 2;
@@ -379,7 +379,7 @@ fn stage_succeeded(state: &pb::CoordinatorState, stage: pb::CoordinatorStage) ->
     })
 }
 
-fn indexed_source_fingerprint(store: &ArtifactStore) -> Result<pb::Sha256Digest> {
+fn indexed_source_fingerprint(store: &ArtifactStore, repo_root: &Path) -> Result<pb::Sha256Digest> {
     let mut records = store
         .list_provenances()?
         .into_iter()
@@ -392,6 +392,17 @@ fn indexed_source_fingerprint(store: &ArtifactStore) -> Result<pb::Sha256Digest>
 
     let mut hasher = Sha256::new();
     hasher.update(INDEXED_SOURCE_FINGERPRINT_DOMAIN);
+    for relpath in [
+        VERSION_COMPAT_PATH,
+        XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
+    ] {
+        let bytes = fs::read(repo_root.join(relpath))
+            .with_context(|| format!("reading indexed metadata source {relpath}"))?;
+        hasher.update((relpath.len() as u64).to_be_bytes());
+        hasher.update(relpath.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
     for (action_id, bytes) in records {
         hasher.update((action_id.len() as u64).to_be_bytes());
         hasher.update(action_id.as_bytes());
@@ -635,7 +646,7 @@ pub(crate) fn coordinate_release(
         },
     )?;
 
-    let current_indexed_source_fingerprint = indexed_source_fingerprint(&store)?;
+    let current_indexed_source_fingerprint = indexed_source_fingerprint(&store, repo_root)?;
     let current_indexed_source_fingerprint_hex = digest_hex(
         &current_indexed_source_fingerprint,
         "coordinator.indexed_source_fingerprint",
@@ -704,7 +715,7 @@ pub(crate) fn coordinate_release(
         pb::CoordinatorStageStatus::FailedDeterministic,
         || {
             let current = load_campaign_run_by_id(&store, &plan.run_id)?;
-            let summary = finalize_stored_campaign_run(&store, &current)?;
+            let summary = finalize_stored_campaign_run(&store, repo_root, &current)?;
             if !matches!(summary.status.as_str(), "complete" | "degraded") {
                 bail!(
                     "campaign finalization refused publication: status={} missing_outputs={:?}",
@@ -1081,7 +1092,9 @@ mod tests {
         let root = temp_path("indexed-source-fingerprint");
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("layout");
-        let source_before = indexed_source_fingerprint(&store).expect("empty source fingerprint");
+        let repo_root = std::env::current_dir().expect("current repo root");
+        let source_before =
+            indexed_source_fingerprint(&store, &repo_root).expect("empty source fingerprint");
         let output_before = indexed_output_fingerprint(&store).expect("empty output fingerprint");
         let previous_policy_output =
             indexed_output_fingerprint_for_policy(&store, PUBLICATION_POLICY_VERSION - 1)
@@ -1137,7 +1150,7 @@ mod tests {
             .write_provenance(&provenance)
             .expect("write newly completed action");
         let source_after_action =
-            indexed_source_fingerprint(&store).expect("updated source fingerprint");
+            indexed_source_fingerprint(&store, &repo_root).expect("updated source fingerprint");
         assert_ne!(source_before, source_after_action);
         assert!(!indexed_checkpoint_matches(
             &state,
@@ -1156,7 +1169,7 @@ mod tests {
             .write_provenance(&provenance)
             .expect("refresh provenance contents");
         let source_after_refresh =
-            indexed_source_fingerprint(&store).expect("refreshed source fingerprint");
+            indexed_source_fingerprint(&store, &repo_root).expect("refreshed source fingerprint");
         assert_ne!(source_after_action, source_after_refresh);
         assert!(!indexed_checkpoint_matches(
             &state,
@@ -1208,6 +1221,35 @@ mod tests {
         ));
 
         drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn indexed_source_fingerprint_binds_release_metadata_files() {
+        let root = temp_path("indexed-release-metadata-fingerprint");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let source_root = std::env::current_dir().expect("current repo root");
+        let repo_root = root.join("repo");
+        for relpath in [
+            VERSION_COMPAT_PATH,
+            XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
+        ] {
+            let destination = repo_root.join(relpath);
+            fs::create_dir_all(destination.parent().unwrap()).expect("create metadata parent");
+            fs::copy(source_root.join(relpath), destination).expect("copy metadata source");
+        }
+
+        let before =
+            indexed_source_fingerprint(&store, &repo_root).expect("initial source fingerprint");
+        let observation_path = repo_root.join(XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH);
+        let mut observation = fs::read(&observation_path).expect("read observation");
+        observation.push(b'\n');
+        fs::write(observation_path, observation).expect("change observation bytes");
+        let after =
+            indexed_source_fingerprint(&store, &repo_root).expect("changed source fingerprint");
+
+        assert_ne!(before, after);
         fs::remove_dir_all(root).expect("cleanup");
     }
 

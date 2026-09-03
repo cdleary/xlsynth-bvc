@@ -6806,8 +6806,31 @@ pub(crate) fn rebuild_stdlib_fns_trend_dataset_index(
     })
 }
 
+fn versions_summary_matches_sources(
+    index_file: &VersionsSummaryIndexFile,
+    repo_root: &Path,
+) -> Result<bool> {
+    let compat = load_version_compat_map(repo_root)?;
+    if index_file.report.releases.len() != compat.len() {
+        return Ok(false);
+    }
+    for release in &index_file.report.releases {
+        let Some(entry) = compat.get(&release.crate_version) else {
+            return Ok(false);
+        };
+        if release.crate_release_datetime != entry.crate_release_datetime
+            || release.dso_version != normalize_tag_version(&entry.xlsynth_release_version)
+        {
+            return Ok(false);
+        }
+    }
+    let source_observation = load_xlsynth_crate_repository_head_observation(repo_root)?;
+    Ok(index_file.report.repository_head_observation == source_observation)
+}
+
 pub(crate) fn load_versions_cards_index(
     store: &ArtifactStore,
+    repo_root: &Path,
 ) -> Result<Option<VersionCardsReport>> {
     let key = WEB_VERSIONS_SUMMARY_INDEX_FILENAME;
     let location = store.web_index_location(key);
@@ -6828,6 +6851,13 @@ pub(crate) fn load_versions_cards_index(
     }
     public_projection::validate_versions_summary(&index_file)
         .with_context(|| format!("validating versions summary web index: {}", location))?;
+    if !versions_summary_matches_sources(&index_file, repo_root)? {
+        info!(
+            "query versions summary web index source mismatch location={}; rebuild required",
+            location
+        );
+        return Ok(None);
+    }
     info!(
         "query versions summary web index hit location={} generated_utc={} cards={} unattributed={}",
         location,
@@ -8665,11 +8695,70 @@ mod tests {
             )
             .expect("write malformed cached versions index");
 
-        let error = load_versions_cards_index(&store)
+        let repo_root = std::env::current_dir().expect("current repo root");
+        let error = load_versions_cards_index(&store, &repo_root)
             .expect_err("malformed cached observation must be rejected");
         assert!(
             format!("{error:#}").contains("head_commit"),
             "unexpected error: {error:#}"
+        );
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn cached_versions_index_is_bound_to_release_metadata_sources() {
+        let (store, root) = make_test_store("versions-source-binding");
+        let source_root = std::env::current_dir().expect("current repo root");
+        let test_repo_root = root.join("repo");
+        for relpath in [
+            crate::VERSION_COMPAT_PATH,
+            crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
+        ] {
+            let source = source_root.join(relpath);
+            let destination = test_repo_root.join(relpath);
+            fs::create_dir_all(destination.parent().unwrap()).expect("create metadata parent");
+            fs::copy(source, destination).expect("copy release metadata source");
+        }
+        rebuild_versions_cards_index(&store, &test_repo_root)
+            .expect("build source-bound versions index");
+        assert!(
+            load_versions_cards_index(&store, &test_repo_root)
+                .expect("load current versions index")
+                .is_some()
+        );
+
+        let observation_path =
+            test_repo_root.join(crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH);
+        let original_observation = fs::read(&observation_path).expect("read observation");
+        let mut observation: serde_json::Value =
+            serde_json::from_slice(&original_observation).expect("parse observation");
+        observation["observed_at_utc"] = json!("2099-01-01T00:00:00Z");
+        fs::write(
+            &observation_path,
+            serde_json::to_vec_pretty(&observation).unwrap(),
+        )
+        .expect("change observation source");
+        assert!(
+            load_versions_cards_index(&store, &test_repo_root)
+                .expect("check stale observation binding")
+                .is_none()
+        );
+
+        fs::write(&observation_path, original_observation).expect("restore observation source");
+        let compat_path = test_repo_root.join(crate::VERSION_COMPAT_PATH);
+        let mut compat: serde_json::Value =
+            serde_json::from_slice(&fs::read(&compat_path).unwrap()).expect("parse compatibility");
+        let first_entry = compat
+            .as_object_mut()
+            .and_then(|entries| entries.values_mut().next())
+            .expect("compatibility entry");
+        first_entry["crate_release_datetime"] = json!("2099-01-01 00:00:00 UTC");
+        fs::write(&compat_path, serde_json::to_vec_pretty(&compat).unwrap())
+            .expect("change compatibility source");
+        assert!(
+            load_versions_cards_index(&store, &test_repo_root)
+                .expect("check stale compatibility binding")
+                .is_none()
         );
         fs::remove_dir_all(root).expect("cleanup temp store");
     }
