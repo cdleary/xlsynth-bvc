@@ -18,7 +18,7 @@ pub(crate) struct VersionCardView {
     pub(crate) failures: Vec<FailedActionRowView>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CrateReleaseStatusView {
     pub(crate) crate_version: String,
     pub(crate) crate_release_datetime: String,
@@ -29,7 +29,7 @@ pub(crate) struct CrateReleaseStatusView {
     pub(crate) stdlib_enumeration_state: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RepositoryHeadObservationView {
     pub(crate) schema_version: u32,

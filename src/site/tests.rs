@@ -1366,6 +1366,68 @@ fn site_verifier_rejects_self_consistent_script_and_unknown_catalog_field() {
 }
 
 #[test]
+fn site_verifier_binds_release_catalog_to_versions_dataset() {
+    let root = temp_root();
+    let store = ArtifactStore::new(root.join("store"));
+    store.ensure_layout().expect("store layout");
+    store
+        .write_web_index_bytes(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &empty_versions_index_bytes(),
+        )
+        .expect("write dataset");
+    let snapshot_dir = root.join("snapshot");
+    build_static_snapshot(
+        &store,
+        &test_repo_root(),
+        &BuildStaticSnapshotOptions {
+            out_dir: snapshot_dir.clone(),
+            overwrite: false,
+            skip_rebuild_web_indices: true,
+        },
+    )
+    .expect("build snapshot");
+    let site_dir = root.join("site");
+    build_static_site(&BuildStaticSiteOptions {
+        snapshot_dir,
+        out_dir: site_dir.clone(),
+        base_url: "/".into(),
+        overwrite: false,
+    })
+    .expect("build site");
+
+    let catalog_path = site_dir.join("catalog.json");
+    let mut catalog: BrowserCatalog =
+        serde_json::from_slice(&fs::read(&catalog_path).expect("read catalog"))
+            .expect("decode catalog");
+    catalog.releases.push(CrateReleaseStatusView {
+        crate_version: "0.35.0".to_string(),
+        crate_release_datetime: "2026-08-28 17:52:54 PDT".to_string(),
+        dso_version: "0.35.0".to_string(),
+        processed: false,
+        materialized_actions: 0,
+        failed_actions: 0,
+        stdlib_enumeration_state: "not run".to_string(),
+    });
+    let embedded_snapshot =
+        load_static_snapshot_manifest(&site_dir).expect("load embedded snapshot");
+    for (relpath, bytes) in
+        expected_fixed_site_files(&catalog, &embedded_snapshot).expect("render fixed files")
+    {
+        fs::write(site_dir.join(&relpath), bytes).expect("rewrite fixed site file");
+        refresh_site_manifest_entry(&site_dir, &relpath);
+    }
+
+    let error =
+        verify_static_site(&site_dir).expect_err("catalog release rows must come from the dataset");
+    assert!(
+        format!("{error:#}").contains("release processing projection disagrees"),
+        "unexpected error: {error:#}"
+    );
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
 fn site_output_rejects_protected_root_ancestors_and_descendants() {
     let root = temp_root();
     let snapshot_dir = root.join("snapshot");

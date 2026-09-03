@@ -2209,6 +2209,19 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     }
     site_shards::verify_static_site_dataset_projection(site_dir, &catalog, &source_snapshot)
         .context("verifying static-site dataset projection against source snapshot")?;
+    let versions = load_versions_report_from_site(site_dir, &catalog.datasets)?;
+    let expected_releases = versions
+        .as_ref()
+        .map(|versions| versions.releases.as_slice())
+        .unwrap_or(&[]);
+    let expected_observation = versions
+        .as_ref()
+        .and_then(|versions| versions.repository_head_observation.as_ref());
+    if catalog.releases.as_slice() != expected_releases
+        || catalog.repository_head_observation.as_ref() != expected_observation
+    {
+        bail!("browser release processing projection disagrees with source dataset");
+    }
     let expected_progression =
         build_browser_progression_catalog_from_site(site_dir, &catalog.datasets, &catalog.runs)?;
     if catalog.progression != expected_progression {
