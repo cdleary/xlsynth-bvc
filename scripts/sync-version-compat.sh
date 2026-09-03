@@ -132,7 +132,7 @@ observation_error="repository head observation is missing: ${observation_path}"
 if [[ -f "${observation_path}" ]]; then
   if observation_error="$(
     python3 "${metadata_helper}" validate-observation \
-      "${observation_path}" "${repository}" "${latest_crate_version}" 2>&1
+      "${observation_path}" "${repository}" "${latest_crate_version}" "${head_commit}" 2>&1
   )"; then
     observation_valid="true"
   fi
@@ -203,7 +203,7 @@ with open(output_path, "w", encoding="utf-8") as f:
     f.write("\n")
 PY
 python3 "${metadata_helper}" validate-observation \
-  "${observation_tmp}" "${repository}" "${latest_crate_version}"
+  "${observation_tmp}" "${repository}" "${latest_crate_version}" "${head_commit}"
 
 mkdir -p "$(dirname "${output_path}")"
 if [[ "${same}" != "true" ]]; then

@@ -24,6 +24,15 @@ def valid_observation() -> dict[str, object]:
     }
 
 
+def validate(observation: object, *, expected_head_commit: str = "a" * 40) -> None:
+    validate_observation(
+        observation,
+        repository="xlsynth/xlsynth-crate",
+        latest_crate_version="0.67.1",
+        expected_head_commit=expected_head_commit,
+    )
+
+
 class VersionCompatMetadataTest(unittest.TestCase):
     def test_latest_release_uses_publication_order_for_backport(self) -> None:
         versions = {
@@ -42,67 +51,46 @@ class VersionCompatMetadataTest(unittest.TestCase):
         self.assertEqual(latest_release_version(versions), "0.68.0")
 
     def test_validate_observation_accepts_consistent_metadata(self) -> None:
-        validate_observation(
-            valid_observation(),
-            repository="xlsynth/xlsynth-crate",
-            latest_crate_version="0.67.1",
-        )
+        validate(valid_observation())
 
     def test_validate_observation_rejects_latest_release_mismatch(self) -> None:
         observation = valid_observation()
         observation["latest_crate_version"] = "0.68.0"
 
         with self.assertRaisesRegex(ValueError, "publication-latest"):
-            validate_observation(
-                observation,
-                repository="xlsynth/xlsynth-crate",
-                latest_crate_version="0.67.1",
-            )
+            validate(observation)
 
     def test_validate_observation_rejects_malformed_commit(self) -> None:
         observation = valid_observation()
         observation["head_commit"] = "not-a-commit"
 
         with self.assertRaisesRegex(ValueError, "head_commit"):
-            validate_observation(
-                observation,
-                repository="xlsynth/xlsynth-crate",
-                latest_crate_version="0.67.1",
-            )
+            validate(observation)
 
     def test_validate_observation_rejects_inconsistent_comparison(self) -> None:
         observation = valid_observation()
         observation["comparison_status"] = "diverged"
 
         with self.assertRaisesRegex(ValueError, "comparison_status"):
-            validate_observation(
-                observation,
-                repository="xlsynth/xlsynth-crate",
-                latest_crate_version="0.67.1",
-            )
+            validate(observation)
 
+    def test_validate_observation_rejects_different_resolved_head(self) -> None:
+        with self.assertRaisesRegex(ValueError, "resolved upstream head"):
+            validate(valid_observation(), expected_head_commit="c" * 40)
 
     def test_validate_observation_rejects_date_only_timestamp(self) -> None:
         observation = valid_observation()
         observation["observed_at_utc"] = "2026-09-03Z"
 
         with self.assertRaisesRegex(ValueError, "RFC 3339"):
-            validate_observation(
-                observation,
-                repository="xlsynth/xlsynth-crate",
-                latest_crate_version="0.67.1",
-            )
+            validate(observation)
 
     def test_validate_observation_rejects_observation_before_commit(self) -> None:
         observation = valid_observation()
         observation["observed_at_utc"] = "2026-09-03T15:00:00Z"
 
         with self.assertRaisesRegex(ValueError, "must not predate"):
-            validate_observation(
-                observation,
-                repository="xlsynth/xlsynth-crate",
-                latest_crate_version="0.67.1",
-            )
+            validate(observation)
 
     def test_validate_observation_rejects_identical_with_distinct_commits(self) -> None:
         observation = valid_observation()
@@ -111,22 +99,14 @@ class VersionCompatMetadataTest(unittest.TestCase):
         observation["latest_release_commit"] = "b" * 40
 
         with self.assertRaisesRegex(ValueError, "commit equality"):
-            validate_observation(
-                observation,
-                repository="xlsynth/xlsynth-crate",
-                latest_crate_version="0.67.1",
-            )
+            validate(observation)
 
     def test_validate_observation_rejects_nonzero_distance_for_same_commit(self) -> None:
         observation = valid_observation()
         observation["latest_release_commit"] = observation["head_commit"]
 
         with self.assertRaisesRegex(ValueError, "commit equality"):
-            validate_observation(
-                observation,
-                repository="xlsynth/xlsynth-crate",
-                latest_crate_version="0.67.1",
-            )
+            validate(observation)
 
 
 if __name__ == "__main__":

@@ -102,7 +102,11 @@ def _require_nonnegative_integer(observation: dict[str, Any], field: str) -> int
 
 
 def validate_observation(
-    observation: Any, *, repository: str, latest_crate_version: str
+    observation: Any,
+    *,
+    repository: str,
+    latest_crate_version: str,
+    expected_head_commit: str,
 ) -> None:
     if not isinstance(observation, dict):
         raise ValueError("repository observation must be an object")
@@ -128,6 +132,10 @@ def validate_observation(
         value = observation[field]
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value) is None:
             raise ValueError(f"{field} must be a lowercase 40-character Git commit")
+    if re.fullmatch(r"[0-9a-f]{40}", expected_head_commit) is None:
+        raise ValueError("expected_head_commit must be a lowercase 40-character Git commit")
+    if observation["head_commit"] != expected_head_commit:
+        raise ValueError("head_commit does not match the resolved upstream head")
     observed_at = _require_utc_timestamp(observation, "observed_at_utc")
     head_committed_at = _require_utc_timestamp(observation, "head_committed_at_utc")
     release_committed_at = _require_utc_timestamp(
@@ -170,6 +178,7 @@ def main() -> int:
     validate_parser.add_argument("observation_json")
     validate_parser.add_argument("repository")
     validate_parser.add_argument("latest_crate_version")
+    validate_parser.add_argument("expected_head_commit")
     args = parser.parse_args()
     try:
         if args.command == "latest-release":
@@ -179,6 +188,7 @@ def main() -> int:
                 _load_json(args.observation_json),
                 repository=args.repository,
                 latest_crate_version=args.latest_crate_version,
+                expected_head_commit=args.expected_head_commit,
             )
     except (OSError, json.JSONDecodeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
