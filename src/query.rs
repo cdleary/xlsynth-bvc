@@ -6826,6 +6826,8 @@ pub(crate) fn load_versions_cards_index(
         );
         return Ok(None);
     }
+    public_projection::validate_versions_summary(&index_file)
+        .with_context(|| format!("validating versions summary web index: {}", location))?;
     info!(
         "query versions summary web index hit location={} generated_utc={} cards={} unattributed={}",
         location,
@@ -8619,6 +8621,57 @@ mod tests {
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("ensure test store layout");
         (store, root)
+    }
+
+    #[test]
+    fn cached_versions_index_rejects_malformed_unicode_commit() {
+        let (store, root) = make_test_store("versions-invalid-unicode-commit");
+        let payload = json!({
+            "schema_version": WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
+            "generated_utc": "2026-09-03T22:34:04Z",
+            "report": {
+                "cards": [],
+                "unattributed_actions": [],
+                "releases": [{
+                    "crate_version": "0.67.1",
+                    "crate_release_datetime": "2026-09-03 09:00:00 PDT",
+                    "dso_version": "0.67.1",
+                    "processed": false,
+                    "materialized_actions": 0,
+                    "failed_actions": 0,
+                    "stdlib_enumeration_state": "not run"
+                }],
+                "repository_head_observation": {
+                    "schema_version": 1,
+                    "repository": "xlsynth/xlsynth-crate",
+                    "observed_at_utc": "2026-09-03T22:34:04Z",
+                    "head_ref": "main",
+                    "head_commit": "aaaaaaaaaaaé",
+                    "head_committed_at_utc": "2026-09-03T17:53:02Z",
+                    "latest_crate_version": "0.67.1",
+                    "latest_release_tag": "v0.67.1",
+                    "latest_release_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "latest_release_committed_at_utc": "2026-09-03T16:00:00Z",
+                    "comparison_status": "ahead",
+                    "commits_ahead": 2,
+                    "commits_behind": 0
+                }
+            }
+        });
+        store
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &serde_json::to_vec(&payload).unwrap(),
+            )
+            .expect("write malformed cached versions index");
+
+        let error = load_versions_cards_index(&store)
+            .expect_err("malformed cached observation must be rejected");
+        assert!(
+            format!("{error:#}").contains("head_commit"),
+            "unexpected error: {error:#}"
+        );
+        fs::remove_dir_all(root).expect("cleanup temp store");
     }
 
     fn make_ir_fn_corpus_sample(

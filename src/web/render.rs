@@ -5305,9 +5305,8 @@ pub(super) fn render_versions_html(
     );
 
     if let Some(observation) = repository_head_observation {
-        let head_short = &observation.head_commit[..12.min(observation.head_commit.len())];
-        let release_short =
-            &observation.latest_release_commit[..12.min(observation.latest_release_commit.len())];
+        let head_short: String = observation.head_commit.chars().take(12).collect();
+        let release_short: String = observation.latest_release_commit.chars().take(12).collect();
         let distance = match (observation.commits_ahead, observation.commits_behind) {
             (0, 0) => format!(
                 "{} is identical to {}",
@@ -5345,11 +5344,11 @@ pub(super) fn render_versions_html(
             html_escape(&observation.repository),
             html_escape(&observation.observed_at_utc),
             html_escape(&head_url),
-            html_escape(head_short),
+            html_escape(&head_short),
             html_escape(&observation.head_ref),
             html_escape(&observation.head_committed_at_utc),
             html_escape(&release_url),
-            html_escape(release_short),
+            html_escape(&release_short),
             html_escape(&observation.latest_release_tag),
             html_escape(&observation.latest_release_committed_at_utc),
         );

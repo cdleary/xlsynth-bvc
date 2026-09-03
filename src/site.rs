@@ -1054,9 +1054,12 @@ fn releases_body(root_site_url: &str, catalog: &BrowserCatalog) -> String {
         .repository_head_observation
         .as_ref()
         .map(|observation| {
-            let head_short = &observation.head_commit[..12.min(observation.head_commit.len())];
-            let release_short = &observation.latest_release_commit
-                [..12.min(observation.latest_release_commit.len())];
+            let head_short: String = observation.head_commit.chars().take(12).collect();
+            let release_short: String = observation
+                .latest_release_commit
+                .chars()
+                .take(12)
+                .collect();
             let distance = if observation.commits_ahead == 0
                 && observation.commits_behind == 0
             {
@@ -1078,12 +1081,12 @@ fn releases_body(root_site_url: &str, catalog: &BrowserCatalog) -> String {
                 escape_html(&distance),
                 escape_html(&observation.repository),
                 escape_html(&observation.head_commit),
-                escape_html(head_short),
+                escape_html(&head_short),
                 escape_html(&observation.head_ref),
                 escape_html(&observation.repository),
                 escape_html(&observation.latest_release_commit),
                 escape_html(&observation.latest_release_tag),
-                escape_html(release_short),
+                escape_html(&release_short),
                 escape_html(&observation.observed_at_utc),
                 escape_html(&observation.head_committed_at_utc),
                 escape_html(&observation.comparison_status),
