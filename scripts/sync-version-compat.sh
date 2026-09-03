@@ -127,45 +127,6 @@ if [[ -f "${output_path}" ]]; then
 fi
 latest_crate_version="$(python3 "${metadata_helper}" latest-release "${tmp}")"
 latest_release_tag="v${latest_crate_version}"
-observation_valid="false"
-observation_error="repository head observation is missing: ${observation_path}"
-if [[ -f "${observation_path}" ]]; then
-  if observation_error="$(
-    python3 "${metadata_helper}" validate-observation \
-      "${observation_path}" "${repository}" "${latest_crate_version}" "${head_commit}" 2>&1
-  )"; then
-    observation_valid="true"
-  fi
-fi
-
-if [[ "${mode}" == "check" ]]; then
-  if [[ "${same}" == "true" && "${observation_valid}" == "true" ]]; then
-    if [[ "${quiet}" != "true" ]]; then
-      echo "version compat JSON is up to date (${remote_sha})"
-    fi
-    exit 0
-  fi
-  if [[ "${quiet}" != "true" ]]; then
-    if [[ "${same}" != "true" ]]; then
-      if [[ -z "${local_sha}" ]]; then
-        echo "version compat JSON is missing; expected sha256 ${remote_sha}" >&2
-      else
-        echo "version compat JSON is out of date: local=${local_sha} remote=${remote_sha}" >&2
-      fi
-    fi
-    if [[ "${observation_valid}" != "true" ]]; then
-      echo "repository head observation is invalid: ${observation_error}" >&2
-    fi
-  fi
-  exit 1
-fi
-
-if [[ "${same}" == "true" && "${observation_valid}" == "true" ]]; then
-  if [[ "${quiet}" != "true" ]]; then
-    echo "version compat JSON already up to date (${remote_sha})"
-  fi
-  exit 0
-fi
 
 curl -fsSL --retry 3 --retry-delay 1 "${github_headers[@]}" "${github_auth_args[@]}" "${repository_api}/commits/${latest_release_tag}" -o "${release_tmp}"
 release_commit="$(read_commit_sha "${release_tmp}")"
@@ -203,7 +164,47 @@ with open(output_path, "w", encoding="utf-8") as f:
     f.write("\n")
 PY
 python3 "${metadata_helper}" validate-observation \
-  "${observation_tmp}" "${repository}" "${latest_crate_version}" "${head_commit}"
+  "${observation_tmp}" "${observation_tmp}" "${repository}" "${latest_crate_version}"
+
+observation_valid="false"
+observation_error="repository head observation is missing: ${observation_path}"
+if [[ -f "${observation_path}" ]]; then
+  if observation_error="$(
+    python3 "${metadata_helper}" validate-observation \
+      "${observation_path}" "${observation_tmp}" "${repository}" "${latest_crate_version}" 2>&1
+  )"; then
+    observation_valid="true"
+  fi
+fi
+
+if [[ "${mode}" == "check" ]]; then
+  if [[ "${same}" == "true" && "${observation_valid}" == "true" ]]; then
+    if [[ "${quiet}" != "true" ]]; then
+      echo "version compat JSON is up to date (${remote_sha})"
+    fi
+    exit 0
+  fi
+  if [[ "${quiet}" != "true" ]]; then
+    if [[ "${same}" != "true" ]]; then
+      if [[ -z "${local_sha}" ]]; then
+        echo "version compat JSON is missing; expected sha256 ${remote_sha}" >&2
+      else
+        echo "version compat JSON is out of date: local=${local_sha} remote=${remote_sha}" >&2
+      fi
+    fi
+    if [[ "${observation_valid}" != "true" ]]; then
+      echo "repository head observation is invalid: ${observation_error}" >&2
+    fi
+  fi
+  exit 1
+fi
+
+if [[ "${same}" == "true" && "${observation_valid}" == "true" ]]; then
+  if [[ "${quiet}" != "true" ]]; then
+    echo "version compat JSON already up to date (${remote_sha})"
+  fi
+  exit 0
+fi
 
 mkdir -p "$(dirname "${output_path}")"
 if [[ "${same}" != "true" ]]; then

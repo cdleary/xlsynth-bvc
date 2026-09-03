@@ -24,12 +24,18 @@ def valid_observation() -> dict[str, object]:
     }
 
 
-def validate(observation: object, *, expected_head_commit: str = "a" * 40) -> None:
+def validate(
+    observation: object, *, expected_remote_observation: object | None = None
+) -> None:
     validate_observation(
         observation,
         repository="xlsynth/xlsynth-crate",
         latest_crate_version="0.67.1",
-        expected_head_commit=expected_head_commit,
+        expected_remote_observation=(
+            valid_observation()
+            if expected_remote_observation is None
+            else expected_remote_observation
+        ),
     )
 
 
@@ -75,8 +81,25 @@ class VersionCompatMetadataTest(unittest.TestCase):
             validate(observation)
 
     def test_validate_observation_rejects_different_resolved_head(self) -> None:
-        with self.assertRaisesRegex(ValueError, "resolved upstream head"):
-            validate(valid_observation(), expected_head_commit="c" * 40)
+        expected = valid_observation()
+        expected["head_commit"] = "c" * 40
+        with self.assertRaisesRegex(ValueError, "head_commit.*remote repository state"):
+            validate(valid_observation(), expected_remote_observation=expected)
+
+    def test_validate_observation_rejects_fabricated_remote_fields(self) -> None:
+        for field, value in [
+            ("latest_release_commit", "0" * 40),
+            ("head_committed_at_utc", "2000-01-01T00:00:00Z"),
+            ("latest_release_committed_at_utc", "2000-01-01T00:00:00Z"),
+            ("commits_ahead", 999_999),
+        ]:
+            with self.subTest(field=field):
+                observation = valid_observation()
+                observation[field] = value
+                with self.assertRaisesRegex(
+                    ValueError, f"{field}.*remote repository state"
+                ):
+                    validate(observation)
 
     def test_validate_observation_rejects_date_only_timestamp(self) -> None:
         observation = valid_observation()

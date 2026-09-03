@@ -41,6 +41,15 @@ _OBSERVATION_FIELDS = {
     "commits_ahead",
     "commits_behind",
 }
+_REMOTE_OBSERVATION_FIELDS = (
+    "head_commit",
+    "head_committed_at_utc",
+    "latest_release_commit",
+    "latest_release_committed_at_utc",
+    "comparison_status",
+    "commits_ahead",
+    "commits_behind",
+)
 
 
 def _version_key(value: str) -> tuple[int, ...]:
@@ -106,7 +115,7 @@ def validate_observation(
     *,
     repository: str,
     latest_crate_version: str,
-    expected_head_commit: str,
+    expected_remote_observation: Any,
 ) -> None:
     if not isinstance(observation, dict):
         raise ValueError("repository observation must be an object")
@@ -132,10 +141,6 @@ def validate_observation(
         value = observation[field]
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value) is None:
             raise ValueError(f"{field} must be a lowercase 40-character Git commit")
-    if re.fullmatch(r"[0-9a-f]{40}", expected_head_commit) is None:
-        raise ValueError("expected_head_commit must be a lowercase 40-character Git commit")
-    if observation["head_commit"] != expected_head_commit:
-        raise ValueError("head_commit does not match the resolved upstream head")
     observed_at = _require_utc_timestamp(observation, "observed_at_utc")
     head_committed_at = _require_utc_timestamp(observation, "head_committed_at_utc")
     release_committed_at = _require_utc_timestamp(
@@ -162,6 +167,11 @@ def validate_observation(
     zero_distance = ahead == 0 and behind == 0
     if commits_match != zero_distance:
         raise ValueError("commit equality must agree with zero ahead/behind distance")
+    if not isinstance(expected_remote_observation, dict):
+        raise ValueError("expected remote repository observation must be an object")
+    for field in _REMOTE_OBSERVATION_FIELDS:
+        if observation[field] != expected_remote_observation.get(field):
+            raise ValueError(f"{field} does not match remote repository state")
 
 
 def _load_json(path: str) -> Any:
@@ -176,9 +186,9 @@ def main() -> int:
     latest_parser.add_argument("compatibility_json")
     validate_parser = subparsers.add_parser("validate-observation")
     validate_parser.add_argument("observation_json")
+    validate_parser.add_argument("expected_remote_observation_json")
     validate_parser.add_argument("repository")
     validate_parser.add_argument("latest_crate_version")
-    validate_parser.add_argument("expected_head_commit")
     args = parser.parse_args()
     try:
         if args.command == "latest-release":
@@ -188,7 +198,9 @@ def main() -> int:
                 _load_json(args.observation_json),
                 repository=args.repository,
                 latest_crate_version=args.latest_crate_version,
-                expected_head_commit=args.expected_head_commit,
+                expected_remote_observation=_load_json(
+                    args.expected_remote_observation_json
+                ),
             )
     except (OSError, json.JSONDecodeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
