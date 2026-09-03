@@ -7028,6 +7028,46 @@ pub(crate) fn build_versions_cards(
         )
     });
 
+    let mut releases = compat
+        .iter()
+        .map(|(crate_version, entry)| {
+            let card = cards
+                .iter()
+                .find(|card| card.crate_version == *crate_version);
+            CrateReleaseStatusView {
+                crate_version: crate_version.clone(),
+                crate_release_datetime: entry.crate_release_datetime.clone(),
+                dso_version: normalize_tag_version(&entry.xlsynth_release_version).to_string(),
+                processed: card
+                    .map(|card| card.total_materialized > 0)
+                    .unwrap_or(false),
+                materialized_actions: card.map(|card| card.total_materialized).unwrap_or(0),
+                failed_actions: card.map(|card| card.failed_total).unwrap_or(0),
+                stdlib_enumeration_state: card
+                    .map(|card| card.stdlib_enumeration.badge_label().to_string())
+                    .unwrap_or_else(|| "not run".to_string()),
+            }
+        })
+        .collect::<Vec<_>>();
+    releases.sort_by(|a, b| {
+        cmp_crate_versions_by_release_datetime(
+            &a.crate_version,
+            &b.crate_version,
+            &crate_release_utc_by_crate,
+        )
+    });
+    let repository_head_observation = load_xlsynth_crate_repository_head_observation(repo_root)?;
+    if let (Some(latest), Some(observation)) =
+        (releases.first(), repository_head_observation.as_ref())
+        && latest.crate_version != observation.latest_crate_version
+    {
+        bail!(
+            "repository-head observation is for crate v{}, but the latest compatibility release is v{}; refresh both with scripts/sync-version-compat.sh --update",
+            observation.latest_crate_version,
+            latest.crate_version
+        );
+    }
+
     unattributed_actions.sort_by(|a, b| {
         a.action_id
             .cmp(&b.action_id)
@@ -7048,10 +7088,13 @@ pub(crate) fn build_versions_cards(
     let report = VersionCardsReport {
         cards,
         unattributed_actions,
+        releases,
+        repository_head_observation,
     };
     info!(
-        "query build_versions_cards cards={} unattributed={} elapsed_ms={}",
+        "query build_versions_cards cards={} releases={} unattributed={} elapsed_ms={}",
         report.cards.len(),
+        report.releases.len(),
         report.unattributed_actions.len(),
         started.elapsed().as_millis(),
     );
@@ -11558,5 +11601,28 @@ fn only(z: bits[1] id=1) -> bits[1] {
         provenance.details = json!({"dslx_list_fns_discovery_error": "boom"});
         assert!(dslx_root_provenance_needs_discovery_refresh(&provenance));
         assert!(ensure_dslx_root_has_suggested_actions(&provenance).is_err());
+    }
+
+    #[test]
+    fn versions_report_includes_all_releases_and_repository_position() {
+        let (store, root) = make_test_store("release-inventory");
+        let repo_root = std::env::current_dir().expect("current repo root");
+        let compat = load_version_compat_map(&repo_root).expect("load compatibility map");
+
+        let report = build_versions_cards(&store, &repo_root).expect("build versions report");
+
+        assert_eq!(report.releases.len(), compat.len());
+        assert!(report.releases.iter().all(|release| !release.processed));
+        let latest = report.releases.first().expect("latest release");
+        let observation = report
+            .repository_head_observation
+            .as_ref()
+            .expect("repository head observation");
+        assert_eq!(
+            latest.crate_version, observation.latest_crate_version,
+            "the observation must describe the latest release in the ledger"
+        );
+        assert_eq!(observation.head_commit.len(), 40);
+        fs::remove_dir_all(root).expect("cleanup test store");
     }
 }

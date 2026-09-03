@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "repository": "xlsynth/xlsynth-crate",
+  "observed_at_utc": "2026-09-03T22:34:04Z",
+  "head_ref": "main",
+  "head_commit": "bf793b2de3a2208f09fb6e04044d500243ae5d6c",
+  "head_committed_at_utc": "2026-09-03T17:53:02Z",
+  "latest_crate_version": "0.68.0",
+  "latest_release_tag": "v0.68.0",
+  "latest_release_commit": "e2693a3de89c701f06abe183c26adc0f67dafcbd",
+  "latest_release_committed_at_utc": "2026-08-29T00:52:54Z",
+  "comparison_status": "ahead",
+  "commits_ahead": 9,
+  "commits_behind": 0
+}

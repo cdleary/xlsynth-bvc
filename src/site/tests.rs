@@ -30,7 +30,12 @@ fn empty_versions_index_bytes() -> Vec<u8> {
     serde_json::to_vec(&json!({
         "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
         "generated_utc": "2026-08-29T12:00:00Z",
-        "report": {"cards": [], "unattributed_actions": []}
+        "report": {
+            "cards": [],
+            "unattributed_actions": [],
+            "releases": [],
+            "repository_head_observation": null
+        }
     }))
     .expect("serialize empty versions index")
 }
@@ -265,6 +270,11 @@ fn site_build_and_verify_supports_subdirectory_base() {
     assert!(progression_html.contains("Signed G8r − Yosys/ABC"));
     assert!(progression_html.contains("id=\"include-incomplete\""));
     assert!(progression_html.contains("id=\"progression-inventory\""));
+    let releases_html =
+        fs::read_to_string(site_dir.join("releases.html")).expect("read releases HTML");
+    assert!(releases_html.contains("Crate release processing"));
+    assert!(releases_html.contains("No crate release inventory was published."));
+    assert!(index_html.contains("Processing status"));
     assert!(APP_JS.contains("Release progression data is not available in this snapshot."));
     assert!(APP_JS.contains("At least two cohort-complete releases are needed"));
     assert!(APP_JS.contains("negative means G8r is better"));
@@ -1210,6 +1220,12 @@ fn public_site_never_contains_private_executor_error_text() {
     })
     .expect("build site");
     verify_static_site(&site_dir).expect("verify site");
+    let releases_html =
+        fs::read_to_string(site_dir.join("releases.html")).expect("read releases page");
+    assert!(releases_html.contains("Repository position at release sync"));
+    assert!(releases_html.contains("Release ledger"));
+    assert!(releases_html.contains("processed"));
+    assert!(releases_html.contains("not processed"));
     for entry in WalkDir::new(&site_dir) {
         let entry = entry.expect("walk public site");
         if !entry.file_type().is_file()
@@ -1673,7 +1689,9 @@ fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() 
                 "failed_by_kind": [],
                 "failures": []
             }],
-            "unattributed_actions": []
+            "unattributed_actions": [],
+            "releases": [],
+            "repository_head_observation": null
         }
     }))
     .expect("serialize versions dataset");
@@ -1738,6 +1756,7 @@ fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() 
     verify_static_site(&site_dir).expect("verify run site");
     assert!(site_dir.join("runs.html").exists());
     assert!(site_dir.join("progression.html").exists());
+    assert!(site_dir.join("releases.html").exists());
     assert!(site_dir.join("mffc-discrepancies.html").exists());
     assert!(
         site_dir

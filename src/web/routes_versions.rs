@@ -157,6 +157,8 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
         let html = render_versions_html(
             &report.cards,
             &report.unattributed_actions,
+            &report.releases,
+            report.repository_head_observation.as_ref(),
             &unprocessed,
             &live_status,
             show_live_queue,

@@ -1461,7 +1461,9 @@ mod tests {
             "generated_utc": Utc::now(),
             "report": {
                 "cards": [],
-                "unattributed_actions": []
+                "unattributed_actions": [],
+                "releases": [],
+                "repository_head_observation": null
             }
         }))
         .expect("serialize empty versions index")

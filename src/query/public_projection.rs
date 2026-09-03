@@ -241,6 +241,99 @@ fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
             validate_version("unattributed_action.dso_version", version)?;
         }
     }
+    validate_unique_strings(
+        "versions_summary.releases.crate_version",
+        index
+            .report
+            .releases
+            .iter()
+            .map(|release| &release.crate_version),
+    )?;
+    for release in &index.report.releases {
+        validate_version("release_status.crate_version", &release.crate_version)?;
+        validate_version("release_status.dso_version", &release.dso_version)?;
+        if crate::versioning::parse_compat_release_datetime_utc(&release.crate_release_datetime)
+            .is_none()
+        {
+            bail!("release_status.crate_release_datetime is invalid");
+        }
+        if release.processed != (release.materialized_actions > 0) {
+            bail!("release_status.processed disagrees with materialized_actions");
+        }
+        if !matches!(
+            release.stdlib_enumeration_state.as_str(),
+            "unknown" | "not run" | "failed" | "partial" | "ok"
+        ) {
+            bail!("release_status.stdlib_enumeration_state is invalid");
+        }
+        if let Some(card) = index
+            .report
+            .cards
+            .iter()
+            .find(|card| card.crate_version == release.crate_version)
+            && (release.materialized_actions != card.total_materialized
+                || release.failed_actions != card.failed_total
+                || release.stdlib_enumeration_state != card.stdlib_enumeration.badge_label())
+        {
+            bail!("release_status disagrees with its version card");
+        }
+    }
+    if let Some(observation) = &index.report.repository_head_observation {
+        if observation.schema_version != 1
+            || observation.repository != "xlsynth/xlsynth-crate"
+            || observation.head_ref != "main"
+        {
+            bail!("repository_head_observation identity is invalid");
+        }
+        for (field, commit) in [
+            ("head_commit", observation.head_commit.as_str()),
+            (
+                "latest_release_commit",
+                observation.latest_release_commit.as_str(),
+            ),
+        ] {
+            if commit.len() != 40
+                || !commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                bail!("repository_head_observation.{field} is not a git commit");
+            }
+        }
+        for (field, timestamp) in [
+            ("observed_at_utc", observation.observed_at_utc.as_str()),
+            (
+                "head_committed_at_utc",
+                observation.head_committed_at_utc.as_str(),
+            ),
+            (
+                "latest_release_committed_at_utc",
+                observation.latest_release_committed_at_utc.as_str(),
+            ),
+        ] {
+            if DateTime::parse_from_rfc3339(timestamp).is_err() || !timestamp.ends_with('Z') {
+                bail!("repository_head_observation.{field} is not a UTC timestamp");
+            }
+        }
+        validate_version(
+            "repository_head_observation.latest_crate_version",
+            &observation.latest_crate_version,
+        )?;
+        if observation.latest_release_tag != format!("v{}", observation.latest_crate_version)
+            || !matches!(
+                observation.comparison_status.as_str(),
+                "ahead" | "behind" | "diverged" | "identical"
+            )
+            || index
+                .report
+                .releases
+                .first()
+                .map(|release| &release.crate_version)
+                != Some(&observation.latest_crate_version)
+        {
+            bail!("repository_head_observation release comparison is inconsistent");
+        }
+    }
     Ok(())
 }
 
@@ -1135,7 +1228,12 @@ mod tests {
         json!({
             "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
             "generated_utc": "2026-08-29T12:00:00Z",
-            "report": {"cards": [], "unattributed_actions": []}
+            "report": {
+                "cards": [],
+                "unattributed_actions": [],
+                "releases": [],
+                "repository_head_observation": null
+            }
         })
     }
 

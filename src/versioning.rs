@@ -12,6 +12,7 @@ use crate::model::{
     VersionCompatEntry,
 };
 use crate::store::ArtifactStore;
+use crate::view::RepositoryHeadObservationView;
 
 pub(crate) fn normalize_tag_version(version: &str) -> &str {
     version.strip_prefix('v').unwrap_or(version)
@@ -122,6 +123,52 @@ pub(crate) fn load_version_compat_map(
             )
         })?;
     Ok(map)
+}
+
+pub(crate) fn load_xlsynth_crate_repository_head_observation(
+    repo_root: &Path,
+) -> Result<Option<RepositoryHeadObservationView>> {
+    let path = repo_root.join(crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "reading xlsynth-crate repository observation: {}",
+                    path.display()
+                )
+            });
+        }
+    };
+    let observation: RepositoryHeadObservationView = serde_json::from_str(&text)
+        .with_context(|| format!("parsing repository observation JSON at {}", path.display()))?;
+    if observation.schema_version != 1 {
+        bail!(
+            "unsupported xlsynth-crate repository observation schema {}; expected 1",
+            observation.schema_version
+        );
+    }
+    for (label, commit) in [
+        ("head_commit", observation.head_commit.as_str()),
+        (
+            "latest_release_commit",
+            observation.latest_release_commit.as_str(),
+        ),
+    ] {
+        if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("repository observation {label} is not a full hexadecimal commit");
+        }
+    }
+    if observation.latest_release_tag
+        != format!(
+            "v{}",
+            normalize_tag_version(&observation.latest_crate_version)
+        )
+    {
+        bail!("repository observation latest release tag/version disagree");
+    }
+    Ok(Some(observation))
 }
 
 pub(crate) fn latest_known_driver_version(repo_root: &Path) -> Result<String> {

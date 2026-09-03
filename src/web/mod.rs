@@ -290,6 +290,8 @@ pub(crate) fn serve_web_ui(
                 let html = render_versions_html(
                     &report.cards,
                     &report.unattributed_actions,
+                    &report.releases,
+                    report.repository_head_observation.as_ref(),
                     &unprocessed,
                     &live_status,
                     false,

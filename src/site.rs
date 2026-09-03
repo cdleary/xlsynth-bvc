@@ -26,8 +26,8 @@ use crate::snapshot::{
 };
 use crate::versioning::cmp_dotted_numeric_version;
 use crate::view::{
-    StdlibAigStatsPoint, StdlibEnumerationState, StdlibG8rVsYosysDataset, StdlibG8rVsYosysSample,
-    VersionCardsReport,
+    CrateReleaseStatusView, RepositoryHeadObservationView, StdlibAigStatsPoint,
+    StdlibEnumerationState, StdlibG8rVsYosysDataset, StdlibG8rVsYosysSample, VersionCardsReport,
 };
 
 pub(crate) const STATIC_SITE_RECORD_VERSION: u32 = 1;
@@ -42,7 +42,7 @@ const PLOTLY_NOTICE: &[u8] =
 
 const STYLE_CSS: &str = include_str!("site_assets/style.css");
 const APP_JS: &str = include_str!("site_assets/app.js");
-const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 2;
+const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 3;
 const STATIC_COMPARISON_SHARD_SCHEMA_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_PREFIX_HEX_CHARS: u8 = 1;
 const STATIC_STRUCTURAL_SHARD_SCHEMA_VERSION: u32 = 1;
@@ -93,6 +93,8 @@ struct BrowserCatalog {
     datasets: Vec<BrowserDataset>,
     runs: Vec<BrowserRun>,
     progression: BrowserProgressionCatalog,
+    releases: Vec<CrateReleaseStatusView>,
+    repository_head_observation: Option<RepositoryHeadObservationView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -656,6 +658,26 @@ fn build_browser_progression_catalog_from_site(
     )
 }
 
+fn load_versions_report_from_site(
+    site_dir: &Path,
+    datasets: &[BrowserDataset],
+) -> Result<Option<VersionCardsReport>> {
+    let Some(entry) = datasets
+        .iter()
+        .find(|dataset| dataset.logical_key == crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+    else {
+        return Ok(None);
+    };
+    let bytes = fs::read(site_dir.join(&entry.url))
+        .with_context(|| format!("reading versions dataset: {}", entry.url))?;
+    let versions: ProgressionVersionsIndexFile =
+        serde_json::from_slice(&bytes).context("decoding typed versions dataset")?;
+    if versions.schema_version != crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION {
+        bail!("versions dataset has the wrong schema");
+    }
+    Ok(Some(versions.report))
+}
+
 fn normalize_base_url(value: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() || !value.starts_with('/') {
@@ -928,6 +950,7 @@ fn expected_catalog_site_relpaths(
         "index.html".to_string(),
         "runs.html".to_string(),
         "progression.html".to_string(),
+        "releases.html".to_string(),
         "mffc-discrepancies.html".to_string(),
         "ir-fn-corpus-g8r-vs-yosys-abc/index.html".to_string(),
         "ir-fn-g8r-abc-vs-codegen-yosys-abc/index.html".to_string(),
@@ -1016,6 +1039,89 @@ fn progression_body(root_site_url: &str) -> String {
     )
 }
 
+fn releases_body(root_site_url: &str, catalog: &BrowserCatalog) -> String {
+    let processed = catalog
+        .releases
+        .iter()
+        .filter(|release| release.processed)
+        .count();
+    let latest = catalog
+        .releases
+        .first()
+        .map(|release| format!("v{}", release.crate_version))
+        .unwrap_or_else(|| "—".to_string());
+    let position = catalog
+        .repository_head_observation
+        .as_ref()
+        .map(|observation| {
+            let head_short = &observation.head_commit[..12.min(observation.head_commit.len())];
+            let release_short = &observation.latest_release_commit
+                [..12.min(observation.latest_release_commit.len())];
+            let distance = if observation.commits_behind == 0 {
+                format!(
+                    "{} commit{} ahead",
+                    observation.commits_ahead,
+                    if observation.commits_ahead == 1 { "" } else { "s" }
+                )
+            } else {
+                format!(
+                    "{} ahead / {} behind",
+                    observation.commits_ahead, observation.commits_behind
+                )
+            };
+            format!(
+                "<article class=\"card\"><h2>Repository position at release sync</h2><p class=\"stat-value\">{}</p><p><a href=\"https://github.com/{}/commit/{}\"><code>{}</code></a> {} versus <a href=\"https://github.com/{}/commit/{}\">{} <code>{}</code></a></p><p class=\"meta\">Observed {} · head committed {} · comparison status {}</p></article>",
+                escape_html(&distance),
+                escape_html(&observation.repository),
+                escape_html(&observation.head_commit),
+                escape_html(head_short),
+                escape_html(&observation.head_ref),
+                escape_html(&observation.repository),
+                escape_html(&observation.latest_release_commit),
+                escape_html(&observation.latest_release_tag),
+                escape_html(release_short),
+                escape_html(&observation.observed_at_utc),
+                escape_html(&observation.head_committed_at_utc),
+                escape_html(&observation.comparison_status),
+            )
+        })
+        .unwrap_or_else(|| {
+            "<article class=\"card warning-card\"><h2>Repository position</h2><p>No processing-time repository observation was published.</p></article>".to_string()
+        });
+    let rows = if catalog.releases.is_empty() {
+        "<tr><td colspan=\"7\">No crate release inventory was published.</td></tr>".to_string()
+    } else {
+        catalog
+            .releases
+            .iter()
+            .map(|release| {
+                let (status_class, status) = if release.processed {
+                    ("delta-improved", "processed")
+                } else {
+                    ("muted", "not processed")
+                };
+                format!(
+                    "<tr><td><code>v{}</code></td><td class=\"nowrap\">{}</td><td><code>v{}</code></td><td class=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    escape_html(&release.crate_version),
+                    escape_html(&release.crate_release_datetime),
+                    escape_html(&release.dso_version),
+                    status_class,
+                    status,
+                    release.materialized_actions,
+                    release.failed_actions,
+                    escape_html(&release.stdlib_enumeration_state),
+                )
+            })
+            .collect::<String>()
+    };
+    format!(
+        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Crate release processing</h1><p class=\"meta\">Release dates, published processing coverage, and the xlsynth-crate repository position captured with the release metadata.</p></header><main><div class=\"grid\"><article class=\"card\"><h2>Release coverage</h2><p class=\"stat-value\">{} / {}</p><p class=\"meta\">crate releases processed · latest release {}</p></article>{position}</div><h2>Release ledger</h2><p class=\"meta\">Processed means at least one action for the crate release materialized in the source artifact store before this snapshot was built.</p><div class=\"table-wrap\"><table><thead><tr><th>Crate release</th><th>Published</th><th>Mapped DSO</th><th>Status</th><th>Materialized actions</th><th>Failed actions</th><th>Stdlib enumeration</th></tr></thead><tbody>{rows}</tbody></table></div></main>",
+        processed,
+        catalog.releases.len(),
+        escape_html(&latest),
+    )
+}
+
 fn comparison_plots_body(
     root_site_url: &str,
     title: &str,
@@ -1060,7 +1166,7 @@ fn homepage_body(
         .get(..12)
         .unwrap_or(&snapshot.snapshot_id);
     format!(
-        r#"<header class="science-header"><div class="science-topline"><div><p class="science-label">xlsynth-bvc / static result corpus</p><h1>Boolean synthesis comparison</h1></div><nav class="science-nav" aria-label="Primary navigation"><a href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">QoR explorer</a><a href="{root_site_url}progression.html">Release history</a><a href="{root_site_url}runs.html">Runs</a><a href="{root_site_url}dataset.html">Data</a></nav></div><p class="science-abstract">Paired measurements of XLS IR through G8r+ABC and codegen+Yosys/ABC. Both paths share ABC downstream, so the overview isolates frontend structure; the full explorers provide sample-level links to immutable exported evidence.</p><dl class="science-meta"><div><dt>snapshot</dt><dd><code title="{}">{}</code></dd></div><div><dt>verified runs</dt><dd>{}</dd></div><div><dt>datasets</dt><dd>{}</dd></div><div><dt>generated</dt><dd>{}</dd></div></dl><p id="error" role="alert"></p></header><main class="science-main"><section id="home-overview" data-dataset-key="{}" data-lhs-label="G8r+ABC" data-rhs-label="codegen+Yosys/ABC" aria-labelledby="overview-title"><div class="overview-heading"><div><p class="science-label">latest crate release / G8r+ABC vs codegen+Yosys/ABC</p><h2 id="overview-title">Corpus overview</h2><p id="home-overview-status" class="meta" aria-live="polite">Loading paired synthesis measurements…</p></div><a id="home-full-explorer-link" class="text-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">Open the full interactive view →</a></div><p id="home-coverage-warning" class="coverage-warning" hidden role="status"></p><dl class="metric-row"><div><dt>crate release</dt><dd id="home-overview-release">—</dd></div><div><dt>paired IR samples</dt><dd id="home-sample-count">—</dd></div><div><dt>Q1 pure wins</dt><dd id="home-pure-win-count">—</dd></div><div><dt>Q3 strict losses</dt><dd id="home-strict-loss-count">—</dd></div><div><dt>median signed product Δ</dt><dd id="home-median-loss">—</dd></div></dl><div class="home-plot-grid"><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic levels</h3><span>log / log · y=x · zero→1 disclosed</span></div><div id="home-plot-levels" class="home-plot" aria-label="G8r plus ABC versus codegen plus Yosys ABC logic levels"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic nodes</h3><span>log / log · y=x · zero→1 disclosed</span></div><div id="home-plot-nodes" class="home-plot" aria-label="G8r plus ABC versus codegen plus Yosys ABC logic nodes"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Node / level delta quadrants</h3><span>positive = G8r+ABC better</span></div><div id="home-plot-deltas" class="home-plot" aria-label="Four quadrant node and level delta plot"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Strict product losses vs IR size</h3><span>Q3 positive only · click to inspect</span></div><div id="home-plot-loss" class="home-plot" aria-label="G8r plus ABC strict product loss versus IR size"></div></article></div></section><section class="analysis-index" aria-labelledby="analysis-title"><div class="analysis-index-header"><h2 id="analysis-title">Analysis views</h2><p>Focused views of the same exported corpus</p></div><nav class="analysis-list" aria-label="Analysis views"><a class="analysis-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/"><span>01</span><span><strong>G8r+ABC vs codegen+Yosys/ABC</strong><small>Frontend structure comparison with a shared downstream optimizer.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/"><span>02</span><span><strong>G8r vs Yosys/ABC</strong><small>Direct backend comparison across releases, filters, quadrants, and sample evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}mffc-discrepancies.html"><span>03</span><span><strong>MFFC discrepancies</strong><small>Local cone ranking with paired IR and synthesis evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}progression.html"><span>04</span><span><strong>Release progression</strong><small>Median and tail product-loss changes across verified runs.</small></span><span>→</span></a></nav></section><footer class="publication-bar"><span>Self-contained static publication · no live database at request time</span><nav aria-label="Publication details"><a href="{root_site_url}runs.html">Campaign runs</a><a href="{root_site_url}dataset.html">Raw datasets</a></nav></footer></main>"#,
+        r#"<header class="science-header"><div class="science-topline"><div><p class="science-label">xlsynth-bvc / static result corpus</p><h1>Boolean synthesis comparison</h1></div><nav class="science-nav" aria-label="Primary navigation"><a href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">QoR explorer</a><a href="{root_site_url}progression.html">Release history</a><a href="{root_site_url}releases.html">Processing status</a><a href="{root_site_url}runs.html">Runs</a><a href="{root_site_url}dataset.html">Data</a></nav></div><p class="science-abstract">Paired measurements of XLS IR through G8r+ABC and codegen+Yosys/ABC. Both paths share ABC downstream, so the overview isolates frontend structure; the full explorers provide sample-level links to immutable exported evidence.</p><dl class="science-meta"><div><dt>snapshot</dt><dd><code title="{}">{}</code></dd></div><div><dt>verified runs</dt><dd>{}</dd></div><div><dt>datasets</dt><dd>{}</dd></div><div><dt>generated</dt><dd>{}</dd></div></dl><p id="error" role="alert"></p></header><main class="science-main"><section id="home-overview" data-dataset-key="{}" data-lhs-label="G8r+ABC" data-rhs-label="codegen+Yosys/ABC" aria-labelledby="overview-title"><div class="overview-heading"><div><p class="science-label">latest crate release / G8r+ABC vs codegen+Yosys/ABC</p><h2 id="overview-title">Corpus overview</h2><p id="home-overview-status" class="meta" aria-live="polite">Loading paired synthesis measurements…</p></div><a id="home-full-explorer-link" class="text-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">Open the full interactive view →</a></div><p id="home-coverage-warning" class="coverage-warning" hidden role="status"></p><dl class="metric-row"><div><dt>crate release</dt><dd id="home-overview-release">—</dd></div><div><dt>paired IR samples</dt><dd id="home-sample-count">—</dd></div><div><dt>Q1 pure wins</dt><dd id="home-pure-win-count">—</dd></div><div><dt>Q3 strict losses</dt><dd id="home-strict-loss-count">—</dd></div><div><dt>median signed product Δ</dt><dd id="home-median-loss">—</dd></div></dl><div class="home-plot-grid"><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic levels</h3><span>log / log · y=x · zero→1 disclosed</span></div><div id="home-plot-levels" class="home-plot" aria-label="G8r plus ABC versus codegen plus Yosys ABC logic levels"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic nodes</h3><span>log / log · y=x · zero→1 disclosed</span></div><div id="home-plot-nodes" class="home-plot" aria-label="G8r plus ABC versus codegen plus Yosys ABC logic nodes"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Node / level delta quadrants</h3><span>positive = G8r+ABC better</span></div><div id="home-plot-deltas" class="home-plot" aria-label="Four quadrant node and level delta plot"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Strict product losses vs IR size</h3><span>Q3 positive only · click to inspect</span></div><div id="home-plot-loss" class="home-plot" aria-label="G8r plus ABC strict product loss versus IR size"></div></article></div></section><section class="analysis-index" aria-labelledby="analysis-title"><div class="analysis-index-header"><h2 id="analysis-title">Analysis views</h2><p>Focused views of the same exported corpus</p></div><nav class="analysis-list" aria-label="Analysis views"><a class="analysis-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/"><span>01</span><span><strong>G8r+ABC vs codegen+Yosys/ABC</strong><small>Frontend structure comparison with a shared downstream optimizer.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/"><span>02</span><span><strong>G8r vs Yosys/ABC</strong><small>Direct backend comparison across releases, filters, quadrants, and sample evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}mffc-discrepancies.html"><span>03</span><span><strong>MFFC discrepancies</strong><small>Local cone ranking with paired IR and synthesis evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}progression.html"><span>04</span><span><strong>Release progression</strong><small>Median and tail product-loss changes across verified runs.</small></span><span>→</span></a></nav></section><footer class="publication-bar"><span>Self-contained static publication · no live database at request time</span><nav aria-label="Publication details"><a href="{root_site_url}runs.html">Campaign runs</a><a href="{root_site_url}dataset.html">Raw datasets</a></nav></footer></main>"#,
         escape_html(&snapshot.snapshot_id),
         escape_html(snapshot_short),
         catalog.runs.len(),
@@ -1102,6 +1208,17 @@ fn expected_fixed_site_files(
             &progression_body(&root_site_url),
             &css_name,
             Some(&js_name),
+        )
+        .into_bytes(),
+    );
+    files.insert(
+        "releases.html".to_string(),
+        html_shell(
+            "xlsynth-bvc crate release processing",
+            &root_site_url,
+            &releases_body(&root_site_url, catalog),
+            &css_name,
+            None,
         )
         .into_bytes(),
     );
@@ -1423,6 +1540,7 @@ pub(crate) fn build_static_site_with_protected_roots(
     }
     let progression =
         build_browser_progression_catalog_from_site(&options.out_dir, &datasets, &runs)?;
+    let versions = load_versions_report_from_site(&options.out_dir, &datasets)?;
     let catalog = BrowserCatalog {
         schema_version: BROWSER_CATALOG_SCHEMA_VERSION,
         snapshot_id: snapshot.snapshot_id.clone(),
@@ -1430,6 +1548,12 @@ pub(crate) fn build_static_site_with_protected_roots(
         datasets,
         runs,
         progression,
+        releases: versions
+            .as_ref()
+            .map(|versions| versions.releases.clone())
+            .unwrap_or_default(),
+        repository_head_observation: versions
+            .and_then(|versions| versions.repository_head_observation),
     };
     write_file(
         &options.out_dir,
@@ -1450,6 +1574,18 @@ pub(crate) fn build_static_site_with_protected_roots(
             &progression_body(&root_site_url),
             &css_name,
             Some(&js_name),
+        )
+        .as_bytes(),
+    )?;
+    write_file(
+        &options.out_dir,
+        "releases.html",
+        html_shell(
+            "xlsynth-bvc crate release processing",
+            &root_site_url,
+            &releases_body(&root_site_url, &catalog),
+            &css_name,
+            None,
         )
         .as_bytes(),
     )?;
@@ -2406,6 +2542,7 @@ pub(crate) fn smoke_static_site(
             "Release progression",
             progression_markers,
         ),
+        ("releases.html", "Crate release processing", Vec::new()),
         ("mffc-discrepancies.html", "MFFC discrepancies", Vec::new()),
         (
             "ir-fn-corpus-g8r-vs-yosys-abc/",

@@ -1869,6 +1869,8 @@ mod tests {
                 failures: Vec::new(),
             }],
             unattributed_actions: Vec::new(),
+            releases: Vec::new(),
+            repository_head_observation: None,
         };
         assert!(versions_summary_contains_crate(&versions, "v0.40.0"));
         assert!(!versions_summary_contains_crate(&versions, "0.41.0"));
