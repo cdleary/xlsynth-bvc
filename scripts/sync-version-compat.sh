@@ -41,6 +41,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 output_path="${repo_root}/third_party/xlsynth-crate/generated_version_compat.json"
 observation_path="${repo_root}/third_party/xlsynth-crate/repository_head_observation.json"
+metadata_helper="${script_dir}/version_compat_metadata.py"
 source_url="https://raw.githubusercontent.com/xlsynth/xlsynth-crate/main/generated_version_compat.json"
 repository="xlsynth/xlsynth-crate"
 repository_api="https://api.github.com/repos/${repository}"
@@ -55,6 +56,10 @@ if ! command -v sha256sum >/dev/null 2>&1; then
 fi
 if ! command -v python3 >/dev/null 2>&1; then
   echo "error: python3 is required but was not found in PATH" >&2
+  exit 2
+fi
+if [[ ! -f "${metadata_helper}" ]]; then
+  echo "error: version compatibility metadata helper is missing: ${metadata_helper}" >&2
   exit 2
 fi
 
@@ -83,45 +88,47 @@ if [[ -f "${output_path}" ]]; then
     same="true"
   fi
 fi
+latest_crate_version="$(python3 "${metadata_helper}" latest-release "${tmp}")"
+latest_release_tag="v${latest_crate_version}"
+observation_valid="false"
+observation_error="repository head observation is missing: ${observation_path}"
+if [[ -f "${observation_path}" ]]; then
+  if observation_error="$(
+    python3 "${metadata_helper}" validate-observation \
+      "${observation_path}" "${repository}" "${latest_crate_version}" 2>&1
+  )"; then
+    observation_valid="true"
+  fi
+fi
 
 if [[ "${mode}" == "check" ]]; then
-  if [[ "${same}" == "true" && -f "${observation_path}" ]]; then
+  if [[ "${same}" == "true" && "${observation_valid}" == "true" ]]; then
     if [[ "${quiet}" != "true" ]]; then
       echo "version compat JSON is up to date (${remote_sha})"
     fi
     exit 0
   fi
   if [[ "${quiet}" != "true" ]]; then
-    if [[ -z "${local_sha}" ]]; then
-      echo "version compat JSON is missing; expected sha256 ${remote_sha}" >&2
-    else
-      echo "version compat JSON is out of date: local=${local_sha} remote=${remote_sha}" >&2
+    if [[ "${same}" != "true" ]]; then
+      if [[ -z "${local_sha}" ]]; then
+        echo "version compat JSON is missing; expected sha256 ${remote_sha}" >&2
+      else
+        echo "version compat JSON is out of date: local=${local_sha} remote=${remote_sha}" >&2
+      fi
     fi
-    if [[ ! -f "${observation_path}" ]]; then
-      echo "repository head observation is missing: ${observation_path}" >&2
+    if [[ "${observation_valid}" != "true" ]]; then
+      echo "repository head observation is invalid: ${observation_error}" >&2
     fi
   fi
   exit 1
 fi
 
-if [[ "${same}" == "true" && -f "${observation_path}" ]]; then
+if [[ "${same}" == "true" && "${observation_valid}" == "true" ]]; then
   if [[ "${quiet}" != "true" ]]; then
     echo "version compat JSON already up to date (${remote_sha})"
   fi
   exit 0
 fi
-
-latest_crate_version="$(python3 -c '
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as f:
-    versions = json.load(f)
-if not versions:
-    raise SystemExit("version compatibility map is empty")
-print(max(versions, key=lambda value: tuple(int(part) for part in value.split("."))))
-' "${tmp}")"
-latest_release_tag="v${latest_crate_version}"
 
 github_headers=(
   -H "Accept: application/vnd.github+json"
@@ -166,6 +173,8 @@ with open(output_path, "w", encoding="utf-8") as f:
     json.dump(observation, f, indent=2)
     f.write("\n")
 PY
+python3 "${metadata_helper}" validate-observation \
+  "${observation_tmp}" "${repository}" "${latest_crate_version}"
 
 mkdir -p "$(dirname "${output_path}")"
 if [[ "${same}" != "true" ]]; then
