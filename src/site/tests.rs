@@ -180,6 +180,13 @@ fn site_build_and_verify_supports_subdirectory_base() {
         frontend_comparison_html
             .contains(crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME)
     );
+    assert!(frontend_comparison_html.contains(crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME));
+    assert!(frontend_comparison_html.contains("id=\"comparison-detail-ir\""));
+    assert!(frontend_comparison_html.contains("id=\"comparison-detail-raw\""));
+    assert!(frontend_comparison_html.contains("Raw sample metadata"));
+    assert!(APP_JS.contains("loadIrFnCorpusIrEntry"));
+    assert!(APP_JS.contains("data-copy-comparison-ir"));
+    assert!(APP_JS.contains("Loading exact XLS IR"));
     assert!(frontend_comparison_html.contains("G8r+ABC vs codegen+Yosys/ABC"));
     assert!(APP_JS.contains("renderComparisonQuadrants"));
     assert!(APP_JS.contains("renderComparisonLoss"));
@@ -194,12 +201,13 @@ fn site_build_and_verify_supports_subdirectory_base() {
     assert!(
         mffc_html.contains(crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME)
     );
-    assert!(mffc_html.contains(crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME));
+    assert!(mffc_html.contains(crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME));
     assert!(mffc_html.contains("positive means G8r is worse"));
     assert!(APP_JS.contains("No paired MFFC samples are available in this snapshot."));
     assert!(APP_JS.contains("Largest G8r product losses"));
     assert!(APP_JS.contains("Both evidence paths reference this same action and top."));
-    assert!(APP_JS.contains("entry.mffc_structural_hash===sample.structural_hash"));
+    assert!(APP_JS.contains("entry.g8r_stats_action_id===sample.g8r_stats_action_id"));
+    assert!(APP_JS.contains("entry.yosys_abc_stats_action_id===sample.yosys_abc_stats_action_id"));
     assert!(APP_JS.contains("mffcIrPanel('G8r'"));
     assert!(APP_JS.contains("mffcIrPanel('Yosys/ABC'"));
     assert!(APP_JS.contains("Representative subject"));
@@ -743,7 +751,9 @@ const fs = require('fs');
 const elements = {
   'comparison-detail-empty': {hidden: false},
   'comparison-detail-json': {hidden: true, textContent: ''},
+  'comparison-detail-raw': {hidden: true},
   'comparison-detail-evidence': {textContent: '', innerHTML: ''},
+  'comparison-detail-ir': {hidden: true, innerHTML: '', querySelectorAll: () => []},
   'comparison-max-ir-nodes': {value: '100'},
   'comparison-crate-version': {value: '0.31.0'},
   'comparison-sample-mode': {value: 'all'},
@@ -761,14 +771,18 @@ const prefix = app.slice(0, app.indexOf('async function main()'));
 const api = new Function(prefix + '\nreturn {showComparisonDetail};')();
 const firstHash = '1'.repeat(64);
 const secondHash = '2'.repeat(64);
-const datasetKey = hash => `ir-fn-corpus-structural.v2/by-hash/${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}.json`;
+const structuralDatasetKey = hash => `ir-fn-corpus-structural.v2/by-hash/${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}.json`;
+const irDatasetKey = hash => `ir-fn-corpus-ir.v1/by-hash-prefix/${hash.slice(0, 2)}.json`;
 const state = {
   catalog: {datasets: [
-{logical_key: datasetKey(firstHash), url: 'first.json'},
-{logical_key: datasetKey(secondHash), url: 'second.json'},
+{logical_key: structuralDatasetKey(firstHash), url: 'first.json'},
+{logical_key: structuralDatasetKey(secondHash), url: 'second.json'},
+{logical_key: irDatasetKey(firstHash), url: 'first-ir.json'},
+{logical_key: irDatasetKey(secondHash), url: 'second-ir.json'},
   ]},
   lhs: 'G8r',
   rhs: 'Yosys/ABC',
+  irDatasetKey: 'ir-fn-corpus-ir.v1.json',
   selectedSampleKey: null,
 };
 const sample = (name, hash) => ({
@@ -782,7 +796,7 @@ const sample = (name, hash) => ({
   g8r_stats_action_id: `g8r-${name}`,
   yosys_abc_stats_action_id: `yabc-${name}`,
 });
-const response = name => ({
+const structuralResponse = name => ({
   ok: true,
   json: async () => ({members: [{
 crate_version: '0.31.0',
@@ -792,20 +806,41 @@ source_ir_action_id: `source-${name}`,
 dslx_origin: {dslx_file: `${name}.x`, dslx_fn_name: name},
   }]}),
 });
+const irResponse = (name, hash) => ({
+  ok: true,
+  json: async () => ({entries: [{
+crate_version: '0.31.0',
+structural_hash: hash,
+g8r_stats_action_id: `g8r-${name}`,
+yosys_abc_stats_action_id: `yabc-${name}`,
+g8r: {ir_action_id: `ir-${name}`, ir_top: `top-${name}`, ir_text: `fn top-${name}() -> bits[1] { ret literal.1: bits[1] = literal(value=1, id=1) }`},
+yosys_abc: {ir_action_id: `ir-${name}`, ir_top: `top-${name}`, ir_text: `fn top-${name}() -> bits[1] { ret literal.1: bits[1] = literal(value=1, id=1) }`},
+  }]}),
+});
 (async () => {
   const first = api.showComparisonDetail(sample('first', firstHash), 'plot-levels', state);
   const second = api.showComparisonDetail(sample('second', secondHash), 'plot-nodes', state);
-  pending.get('second.json')(response('second'));
+  pending.get('second.json')(structuralResponse('second'));
+  pending.get('second-ir.json')(irResponse('second', secondHash));
   await second;
   const secondHtml = elements['comparison-detail-evidence'].innerHTML;
   if (!secondHtml.includes(secondHash) || !secondHtml.includes('source-second')) {
 throw new Error(`second selection did not render: ${secondHtml}`);
   }
-  pending.get('first.json')(response('first'));
+  const secondIrHtml = elements['comparison-detail-ir'].innerHTML;
+  if (!secondIrHtml.includes('Exact XLS IR') || !secondIrHtml.includes('fn top-second')) {
+throw new Error(`second selection IR did not render: ${secondIrHtml}`);
+  }
+  pending.get('first.json')(structuralResponse('first'));
+  pending.get('first-ir.json')(irResponse('first', firstHash));
   await first;
   const finalHtml = elements['comparison-detail-evidence'].innerHTML;
   if (finalHtml !== secondHtml || finalHtml.includes(firstHash) || finalHtml.includes('source-first')) {
 throw new Error(`stale first selection replaced second: ${finalHtml}`);
+  }
+  const finalIrHtml = elements['comparison-detail-ir'].innerHTML;
+  if (finalIrHtml !== secondIrHtml || finalIrHtml.includes('fn top-first')) {
+throw new Error(`stale first selection replaced second IR: ${finalIrHtml}`);
   }
 })().catch(error => {
   console.error(error);
@@ -852,7 +887,7 @@ global.document = {
 };
 const app = fs.readFileSync(0, 'utf8');
 const prefix = app.slice(0, app.indexOf('async function main()'));
-const api = new Function(prefix + '\nreturn {mffcComparisonKey,mffcLossPresentation,mffcSamples,mffcStructuralGroupKey,rankMffcSamples,sameMffcIrIdentity};')();
+const api = new Function(prefix + '\nreturn {mffcComparisonKey,mffcLossPresentation,mffcSamples,mffcStructuralGroupKey,irFnCorpusIrShardKey,rankMffcSamples,sameIrIdentity};')();
 const sample = (ir_top, ir_node_count, g8r_product_loss) => ({
   ir_top,
   ir_node_count,
@@ -880,6 +915,9 @@ const sourceHash = 'd'.repeat(64);
 if (api.mffcStructuralGroupKey(sourceHash) !== `ir-fn-corpus-structural.v2/by-hash/dd/dd/${sourceHash}.json`) {
   throw new Error('unexpected source structural group key');
 }
+if (api.irFnCorpusIrShardKey('ir-fn-corpus-ir.v1.json', sourceHash) !== 'ir-fn-corpus-ir.v1/by-hash-prefix/dd.json') {
+  throw new Error('unexpected IR function corpus shard key');
+}
 if (api.mffcComparisonKey('0.31.0', 'c'.repeat(64)) !== `0.31.0:${'c'.repeat(64)}`) {
   throw new Error('unexpected MFFC comparison key');
 }
@@ -887,7 +925,7 @@ const pairedEntry = {
   g8r: {ir_action_id: 'a', ir_top: '__mffc_left', source_ir_top: '__source_left'},
   yosys_abc: {ir_action_id: 'b', ir_top: '__mffc_right', source_ir_top: '__source_right'},
 };
-if (api.sameMffcIrIdentity(pairedEntry.g8r, pairedEntry.yosys_abc)) {
+if (api.sameIrIdentity(pairedEntry.g8r, pairedEntry.yosys_abc)) {
   throw new Error('different backend IR identities were treated as shared');
 }
 const presentations = [api.mffcLossPresentation(12.5), api.mffcLossPresentation(-12.5), api.mffcLossPresentation(0)];

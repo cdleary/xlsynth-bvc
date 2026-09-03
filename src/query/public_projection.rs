@@ -8,7 +8,7 @@ use std::path::{Component, Path};
 
 const MAX_PUBLIC_LABEL_BYTES: usize = 512;
 const MAX_PUBLIC_SIGNATURE_BYTES: usize = 4096;
-const MAX_PUBLIC_MFFC_IR_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PUBLIC_IR_FUNCTION_BYTES: usize = 2 * 1024 * 1024;
 
 pub(crate) fn validate_safe_public_text(field: &str, value: &str, max_bytes: usize) -> Result<()> {
     if value.is_empty() || value.trim() != value || value.len() > max_bytes {
@@ -601,32 +601,75 @@ fn validate_structural_group(group: &IrFnCorpusStructuralGroupFile) -> Result<()
     Ok(())
 }
 
-fn validate_mffc_ir_index(index: &MffcIrIndexFile) -> Result<()> {
-    if index.schema_version != crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_SCHEMA_VERSION {
-        bail!("MFFC IR index schema version mismatch");
+fn validate_ir_fn_corpus_ir_manifest(index: &IrFnCorpusIrIndexManifest) -> Result<()> {
+    if index.schema_version != crate::WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION {
+        bail!("IR function corpus manifest schema version mismatch");
     }
-    fn validate_side(label: &str, side: &MffcIrSide) -> Result<()> {
-        validate_hex_digest(&format!("mffc_ir.{label}.ir_action_id"), &side.ir_action_id)?;
+    if index.shard_prefix_hex_chars != 2 || index.shards.len() != 256 {
+        bail!("IR function corpus manifest must declare all two-hex-digit shards");
+    }
+    let mut entry_count = 0usize;
+    for (byte, shard) in (u8::MIN..=u8::MAX).zip(&index.shards) {
+        let expected_prefix = format!("{byte:02x}");
+        let expected_key = format!(
+            "{}/{expected_prefix}.json",
+            crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE
+        );
+        if shard.prefix != expected_prefix || shard.index_key != expected_key {
+            bail!("IR function corpus manifest shard identity is invalid");
+        }
+        validate_hex_digest("ir_fn_corpus_ir.shard.sha256", &shard.sha256)?;
+        usize::try_from(shard.bytes).context("IR function corpus shard byte count overflow")?;
+        entry_count = entry_count
+            .checked_add(shard.entry_count)
+            .context("IR function corpus manifest entry count overflow")?;
+    }
+    if entry_count != index.entry_count {
+        bail!("IR function corpus manifest entry count is inconsistent");
+    }
+    Ok(())
+}
+
+fn validate_ir_fn_corpus_ir_shard(index: &IrFnCorpusIrShardFile) -> Result<()> {
+    if index.schema_version != crate::WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION {
+        bail!("IR function corpus shard schema version mismatch");
+    }
+    if index.prefix.len() != 2
+        || !index
+            .prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("IR function corpus shard prefix is invalid");
+    }
+    fn validate_side(label: &str, side: &IrFnCorpusIrSide) -> Result<()> {
         validate_hex_digest(
-            &format!("mffc_ir.{label}.extracted_package_sha256"),
+            &format!("ir_fn_corpus_ir.{label}.ir_action_id"),
+            &side.ir_action_id,
+        )?;
+        validate_hex_digest(
+            &format!("ir_fn_corpus_ir.{label}.extracted_package_sha256"),
             &side.extracted_package_sha256,
         )?;
         validate_hex_digest(
-            &format!("mffc_ir.{label}.source_ir_action_id"),
+            &format!("ir_fn_corpus_ir.{label}.source_ir_action_id"),
             &side.source_ir_action_id,
         )?;
         validate_hex_digest(
-            &format!("mffc_ir.{label}.source_structural_hash"),
+            &format!("ir_fn_corpus_ir.{label}.source_structural_hash"),
             &side.source_structural_hash,
         )?;
-        validate_version(&format!("mffc_ir.{label}.dso_version"), &side.dso_version)?;
+        validate_version(
+            &format!("ir_fn_corpus_ir.{label}.dso_version"),
+            &side.dso_version,
+        )?;
         validate_safe_public_text(
-            &format!("mffc_ir.{label}.ir_top"),
+            &format!("ir_fn_corpus_ir.{label}.ir_top"),
             &side.ir_top,
             MAX_PUBLIC_LABEL_BYTES,
         )?;
         validate_safe_public_text(
-            &format!("mffc_ir.{label}.source_ir_top"),
+            &format!("ir_fn_corpus_ir.{label}.source_ir_top"),
             &side.source_ir_top,
             MAX_PUBLIC_LABEL_BYTES,
         )?;
@@ -648,40 +691,293 @@ fn validate_mffc_ir_index(index: &MffcIrIndexFile) -> Result<()> {
             }
         }
         if side.ir_text.is_empty()
-            || side.ir_text.len() > MAX_PUBLIC_MFFC_IR_BYTES
+            || side.ir_text.len() > MAX_PUBLIC_IR_FUNCTION_BYTES
             || side.ir_text.contains(['\0', '\r'])
         {
-            bail!("MFFC IR text is empty, oversized, or contains forbidden control data");
+            bail!("IR function text is empty, oversized, or contains forbidden control data");
         }
         let extracted = extract_ir_fn_block_by_name(&side.ir_text, &side.ir_top)
-            .context("validating public MFFC IR function block")?;
+            .context("validating public IR function block")?;
         if extracted != side.ir_text {
-            bail!("MFFC IR text contains data outside its selected function block");
+            bail!("IR function text contains data outside its selected function block");
         }
         let actual_root_text_id = extract_ir_ret_text_id(&side.ir_text)
-            .context("validating public MFFC IR root text id")?;
+            .context("validating public IR function root text id")?;
         if actual_root_text_id != side.root_ir_text_id {
-            bail!("MFFC IR root text id does not identify the return node");
+            bail!("IR function root text id does not identify the return node");
         }
         Ok(())
     }
 
-    let mut previous_key: Option<(&str, &str)> = None;
+    let mut previous_key: Option<(&str, &str, &str, &str)> = None;
     for entry in &index.entries {
-        validate_hex_digest("mffc_ir.mffc_structural_hash", &entry.mffc_structural_hash)?;
-        validate_version("mffc_ir.crate_version", &entry.crate_version)?;
+        validate_hex_digest("ir_fn_corpus_ir.structural_hash", &entry.structural_hash)?;
+        validate_hex_digest(
+            "ir_fn_corpus_ir.g8r_stats_action_id",
+            &entry.g8r_stats_action_id,
+        )?;
+        validate_hex_digest(
+            "ir_fn_corpus_ir.yosys_abc_stats_action_id",
+            &entry.yosys_abc_stats_action_id,
+        )?;
+        if !entry.structural_hash.starts_with(&index.prefix) {
+            bail!("IR function corpus entry is stored in the wrong shard");
+        }
+        validate_version("ir_fn_corpus_ir.crate_version", &entry.crate_version)?;
         validate_side("g8r", &entry.g8r)?;
         validate_side("yosys_abc", &entry.yosys_abc)?;
         let key = (
             entry.crate_version.as_str(),
-            entry.mffc_structural_hash.as_str(),
+            entry.structural_hash.as_str(),
+            entry.g8r_stats_action_id.as_str(),
+            entry.yosys_abc_stats_action_id.as_str(),
         );
         if previous_key.is_some_and(|previous| previous >= key) {
-            bail!("MFFC IR entries are not strictly sorted and unique");
+            bail!("IR function corpus entries are not strictly sorted and unique");
         }
         previous_key = Some(key);
     }
     Ok(())
+}
+
+type IrFnCorpusIrPairKey = (String, String, String, String);
+type IrFnCorpusIrPairSides = ((String, String), (String, String));
+
+fn collect_expected_ir_fn_corpus_ir_pairs(
+    comparison: &IrFnCorpusG8rVsYosysIndexFile,
+    expected_schema_version: u32,
+    expected: &mut BTreeMap<IrFnCorpusIrPairKey, IrFnCorpusIrPairSides>,
+) -> Result<()> {
+    validate_corpus_index(comparison, expected_schema_version)?;
+
+    let mut g8r_by_entity = BTreeMap::new();
+    for row in &comparison.g8r_points {
+        let key = (row.structural_hash.as_str(), row.crate_version.as_str());
+        if g8r_by_entity.insert(key, &row.point).is_some() {
+            bail!("IR corpus comparison has duplicate G8r entity points");
+        }
+    }
+    let mut yosys_by_entity = BTreeMap::new();
+    for row in &comparison.yosys_points {
+        let key = (row.structural_hash.as_str(), row.crate_version.as_str());
+        if yosys_by_entity.insert(key, &row.point).is_some() {
+            bail!("IR corpus comparison has duplicate Yosys/ABC entity points");
+        }
+    }
+
+    for sample in &comparison.dataset.samples {
+        let structural_hash = sample
+            .structural_hash
+            .as_deref()
+            .context("IR corpus comparison sample has no structural hash")?;
+        let sample_top = sample
+            .ir_top
+            .as_deref()
+            .context("IR corpus comparison sample has no IR top")?;
+        let entity_key = (structural_hash, sample.crate_version.as_str());
+        let g8r = g8r_by_entity
+            .get(&entity_key)
+            .context("IR corpus comparison sample is missing its G8r entity point")?;
+        let yosys_abc = yosys_by_entity
+            .get(&entity_key)
+            .context("IR corpus comparison sample is missing its Yosys/ABC entity point")?;
+        let yosys_top = yosys_abc
+            .ir_top
+            .as_deref()
+            .context("IR corpus comparison Yosys/ABC point has no IR top")?;
+        if sample.ir_action_id != g8r.ir_action_id
+            || Some(sample_top) != g8r.ir_top.as_deref()
+            || sample.g8r_stats_action_id != g8r.stats_action_id
+            || sample.yosys_abc_stats_action_id != yosys_abc.stats_action_id
+        {
+            bail!("IR corpus comparison sample disagrees with its concrete entity points");
+        }
+        let key = (
+            sample.crate_version.clone(),
+            structural_hash.to_string(),
+            sample.g8r_stats_action_id.clone(),
+            sample.yosys_abc_stats_action_id.clone(),
+        );
+        let sides = (
+            (g8r.ir_action_id.clone(), sample_top.to_string()),
+            (yosys_abc.ir_action_id.clone(), yosys_top.to_string()),
+        );
+        match expected.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(sides);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &sides => {
+                bail!("IR corpus comparison indices disagree for one concrete sample");
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_ir_fn_corpus_ir_index_closure<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<()> {
+    let namespace_prefix = format!("{}/", crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE);
+    let mut ir_entries = BTreeMap::new();
+    let mut comparison_entries = BTreeMap::new();
+    for (key, bytes) in entries {
+        if key == crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME || key.starts_with(&namespace_prefix) {
+            if ir_entries.insert(key, bytes).is_some() {
+                bail!("duplicate IR function corpus index key: {key}");
+            }
+        } else if matches!(
+            key,
+            crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
+                | crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
+        ) && comparison_entries.insert(key, bytes).is_some()
+        {
+            bail!("duplicate IR function corpus comparison index key: {key}");
+        }
+    }
+    if ir_entries.is_empty() && comparison_entries.is_empty() {
+        return Ok(());
+    }
+
+    let manifest_bytes = ir_entries
+        .get(crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME)
+        .copied()
+        .context("IR function corpus comparison indexes or shards exist without their manifest")?;
+    let manifest: IrFnCorpusIrIndexManifest = serde_json::from_slice(manifest_bytes)
+        .context("parsing IR function corpus manifest during closure validation")?;
+    validate_ir_fn_corpus_ir_manifest(&manifest)?;
+
+    let mut expected_pairs = BTreeMap::new();
+    for (index_key, schema_version) in [
+        (
+            crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+            crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+        ),
+        (
+            crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
+            crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
+        ),
+    ] {
+        let bytes = comparison_entries
+            .get(index_key)
+            .copied()
+            .with_context(|| {
+                format!("IR function corpus IR index is missing comparison dataset {index_key}")
+            })?;
+        let comparison: IrFnCorpusG8rVsYosysIndexFile = serde_json::from_slice(bytes)
+            .with_context(|| format!("parsing IR function corpus comparison {index_key}"))?;
+        collect_expected_ir_fn_corpus_ir_pairs(&comparison, schema_version, &mut expected_pairs)
+            .with_context(|| format!("validating IR function corpus comparison {index_key}"))?;
+    }
+
+    let mut expected_keys = BTreeSet::from([crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME.to_string()]);
+    let mut actual_entry_count = 0usize;
+    let mut actual_pairs = BTreeMap::new();
+    for summary in &manifest.shards {
+        expected_keys.insert(summary.index_key.clone());
+        let shard_bytes = ir_entries
+            .get(summary.index_key.as_str())
+            .copied()
+            .with_context(|| {
+                format!(
+                    "IR function corpus manifest declares missing shard {}",
+                    summary.index_key
+                )
+            })?;
+        if shard_bytes.len() as u64 != summary.bytes {
+            bail!(
+                "IR function corpus shard {} byte count disagrees with its manifest summary",
+                summary.index_key
+            );
+        }
+        if sha256_bytes_hex(shard_bytes) != summary.sha256 {
+            bail!(
+                "IR function corpus shard {} SHA-256 disagrees with its manifest summary",
+                summary.index_key
+            );
+        }
+        let shard: IrFnCorpusIrShardFile = serde_json::from_slice(shard_bytes)
+            .with_context(|| format!("parsing IR function corpus shard {}", summary.index_key))?;
+        validate_ir_fn_corpus_ir_shard(&shard).with_context(|| {
+            format!("validating IR function corpus shard {}", summary.index_key)
+        })?;
+        if shard.prefix != summary.prefix || shard.entries.len() != summary.entry_count {
+            bail!(
+                "IR function corpus shard {} disagrees with its manifest summary",
+                summary.index_key
+            );
+        }
+        for entry in &shard.entries {
+            let key = (
+                entry.crate_version.clone(),
+                entry.structural_hash.clone(),
+                entry.g8r_stats_action_id.clone(),
+                entry.yosys_abc_stats_action_id.clone(),
+            );
+            let sides = (
+                (entry.g8r.ir_action_id.clone(), entry.g8r.ir_top.clone()),
+                (
+                    entry.yosys_abc.ir_action_id.clone(),
+                    entry.yosys_abc.ir_top.clone(),
+                ),
+            );
+            if actual_pairs.insert(key, sides).is_some() {
+                bail!("IR function corpus shards contain a duplicate concrete comparison identity");
+            }
+        }
+        actual_entry_count = actual_entry_count
+            .checked_add(shard.entries.len())
+            .context("IR function corpus shard entry count overflow")?;
+    }
+
+    let actual_keys = ir_entries
+        .keys()
+        .map(|key| (*key).to_string())
+        .collect::<BTreeSet<_>>();
+    if actual_keys != expected_keys {
+        bail!("IR function corpus index contains undeclared or missing shard keys");
+    }
+    if actual_entry_count != manifest.entry_count {
+        bail!(
+            "IR function corpus shard entry count mismatch: manifest={} actual={}",
+            manifest.entry_count,
+            actual_entry_count
+        );
+    }
+    if actual_pairs != expected_pairs {
+        let missing = expected_pairs
+            .keys()
+            .filter(|key| !actual_pairs.contains_key(*key))
+            .count();
+        let unexpected = actual_pairs
+            .keys()
+            .filter(|key| !expected_pairs.contains_key(*key))
+            .count();
+        let mismatched = actual_pairs
+            .iter()
+            .filter(|(key, sides)| {
+                expected_pairs
+                    .get(*key)
+                    .is_some_and(|value| value != *sides)
+            })
+            .count();
+        bail!(
+            "IR function corpus shards do not exactly match comparison datasets: missing={missing} unexpected={unexpected} mismatched={mismatched}"
+        );
+    }
+    Ok(())
+}
+
+fn ir_fn_corpus_ir_shard_prefix(index_key: &str) -> Option<&str> {
+    let prefix = index_key
+        .strip_prefix(crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE)?
+        .strip_prefix('/')?
+        .strip_suffix(".json")?;
+    (prefix.len() == 2
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(prefix)
 }
 
 pub(crate) fn canonicalize_public_web_index_json(index_key: &str, bytes: &[u8]) -> Result<Vec<u8>> {
@@ -760,13 +1056,26 @@ pub(crate) fn canonicalize_public_web_index_json(index_key: &str, bytes: &[u8]) 
                 },
             )
         }
-        crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME => canonicalize_typed::<MffcIrIndexFile>(
-            index_key,
-            bytes,
-            false,
-            false,
-            validate_mffc_ir_index,
-        ),
+        crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME => {
+            canonicalize_typed::<IrFnCorpusIrIndexManifest>(
+                index_key,
+                bytes,
+                false,
+                false,
+                validate_ir_fn_corpus_ir_manifest,
+            )
+        }
+        key if ir_fn_corpus_ir_shard_prefix(key).is_some() => {
+            let expected_prefix = ir_fn_corpus_ir_shard_prefix(key)
+                .context("validated IR function corpus shard key has no prefix")?;
+            canonicalize_typed::<IrFnCorpusIrShardFile>(index_key, bytes, false, false, |index| {
+                validate_ir_fn_corpus_ir_shard(index)?;
+                if index.prefix != expected_prefix {
+                    bail!("IR function corpus shard key does not match its payload prefix");
+                }
+                Ok(())
+            })
+        }
         crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY => {
             canonicalize_typed::<IrFnCorpusStructuralManifest>(
                 index_key,
@@ -861,12 +1170,77 @@ mod tests {
         value
     }
 
-    fn empty_mffc_ir_value() -> Value {
-        json!({
-            "schema_version": crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_SCHEMA_VERSION,
-            "generated_utc": "2026-08-29T12:00:00Z",
+    fn empty_ir_fn_corpus_ir_shard_bytes(prefix: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema_version": crate::WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION,
+            "prefix": prefix,
             "entries": []
+        }))
+        .unwrap()
+    }
+
+    fn empty_ir_fn_corpus_ir_value() -> Value {
+        let shards = (u8::MIN..=u8::MAX)
+            .map(|byte| {
+                let prefix = format!("{byte:02x}");
+                let bytes = empty_ir_fn_corpus_ir_shard_bytes(&prefix);
+                json!({
+                    "prefix": prefix,
+                    "index_key": format!(
+                        "{}/{prefix}.json",
+                        crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE
+                    ),
+                    "entry_count": 0,
+                    "bytes": bytes.len(),
+                    "sha256": sha256_bytes_hex(&bytes)
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "schema_version": crate::WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION,
+            "generated_utc": "2026-08-29T12:00:00Z",
+            "shard_prefix_hex_chars": 2,
+            "entry_count": 0,
+            "shards": shards
         })
+    }
+
+    fn empty_ir_fn_corpus_ir_entries() -> Vec<(String, Vec<u8>)> {
+        let mut entries = vec![
+            (
+                crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME.to_string(),
+                serde_json::to_vec(&empty_ir_fn_corpus_ir_value()).unwrap(),
+            ),
+            (
+                crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME.to_string(),
+                serde_json::to_vec(&empty_comparison_value(
+                    crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+                    false,
+                    true,
+                ))
+                .unwrap(),
+            ),
+            (
+                crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME.to_string(),
+                serde_json::to_vec(&empty_comparison_value(
+                    crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
+                    false,
+                    true,
+                ))
+                .unwrap(),
+            ),
+        ];
+        entries.extend((u8::MIN..=u8::MAX).map(|byte| {
+            let prefix = format!("{byte:02x}");
+            (
+                format!(
+                    "{}/{prefix}.json",
+                    crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE
+                ),
+                empty_ir_fn_corpus_ir_shard_bytes(&prefix),
+            )
+        }));
+        entries
     }
 
     fn structural_group_fixture() -> (String, Vec<u8>) {
@@ -991,8 +1365,8 @@ mod tests {
                 .unwrap(),
             ),
             (
-                crate::WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME.to_string(),
-                serde_json::to_vec(&empty_mffc_ir_value()).unwrap(),
+                crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME.to_string(),
+                serde_json::to_vec(&empty_ir_fn_corpus_ir_value()).unwrap(),
             ),
             (
                 crate::WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY.to_string(),
@@ -1078,6 +1452,65 @@ mod tests {
         let error = format!("{error:#}");
         assert!(error.contains("absolute host path"));
         assert!(!error.contains(marker));
+    }
+
+    #[test]
+    fn ir_fn_corpus_ir_closure_requires_every_declared_shard_and_exact_counts() {
+        let entries = empty_ir_fn_corpus_ir_entries();
+        validate_ir_fn_corpus_ir_index_closure(
+            entries
+                .iter()
+                .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+        )
+        .expect("complete empty IR corpus index closure");
+
+        let mut tampered = entries.clone();
+        let (_, shard_bytes) = tampered
+            .iter_mut()
+            .find(|(index_key, _)| index_key.ends_with("/00.json"))
+            .expect("find shard to tamper with");
+        let mut shard: Value = serde_json::from_slice(shard_bytes).unwrap();
+        shard["prefix"] = json!("01");
+        *shard_bytes = serde_json::to_vec(&shard).unwrap();
+        let error = validate_ir_fn_corpus_ir_index_closure(
+            tampered
+                .iter()
+                .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+        )
+        .expect_err("same-size shard content change must fail closure validation");
+        assert!(
+            format!("{error:#}").contains("SHA-256 disagrees"),
+            "unexpected error: {error:#}"
+        );
+
+        let mut missing = entries.clone();
+        let (missing_key, _) = missing.pop().expect("remove final shard");
+        let error = validate_ir_fn_corpus_ir_index_closure(
+            missing
+                .iter()
+                .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+        )
+        .expect_err("missing declared shard must fail closure validation");
+        assert!(
+            format!("{error:#}").contains(&format!("declares missing shard {missing_key}")),
+            "unexpected error: {error:#}"
+        );
+
+        let mut count_mismatch = entries;
+        let mut manifest = empty_ir_fn_corpus_ir_value();
+        manifest["entry_count"] = json!(1);
+        manifest["shards"][0]["entry_count"] = json!(1);
+        count_mismatch[0].1 = serde_json::to_vec(&manifest).unwrap();
+        let error = validate_ir_fn_corpus_ir_index_closure(
+            count_mismatch
+                .iter()
+                .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+        )
+        .expect_err("manifest/shard count mismatch must fail closure validation");
+        assert!(
+            format!("{error:#}").contains("disagrees with its manifest summary"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

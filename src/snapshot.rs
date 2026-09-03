@@ -15,17 +15,18 @@ use crate::campaign::{campaign_analysis_path, list_finalized_campaign_runs};
 use crate::query::{
     build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_bytes,
     build_ir_fn_corpus_g8r_vs_yosys_dataset_index_bytes,
-    build_mffc_ir_index_bytes_for_paired_index, rebuild_stdlib_fn_version_timeline_dataset_index,
-    rebuild_stdlib_fns_trend_dataset_index, rebuild_stdlib_g8r_vs_yosys_dataset_index,
-    rebuild_versions_cards_index,
+    build_ir_fn_corpus_ir_index_bytes_for_paired_indices,
+    rebuild_stdlib_fn_version_timeline_dataset_index, rebuild_stdlib_fns_trend_dataset_index,
+    rebuild_stdlib_g8r_vs_yosys_dataset_index, rebuild_versions_cards_index,
 };
 use crate::store::ArtifactStore;
 use crate::view::StdlibTrendKind;
 use crate::{
     WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
-    WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME, WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME,
-    WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY, WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE,
-    WEB_STDLIB_FN_TIMELINE_INDEX_FILENAME, WEB_STDLIB_FNS_TREND_G8R_FRAIG_FALSE_INDEX_FILENAME,
+    WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME, WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
+    WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE, WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY,
+    WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE, WEB_STDLIB_FN_TIMELINE_INDEX_FILENAME,
+    WEB_STDLIB_FNS_TREND_G8R_FRAIG_FALSE_INDEX_FILENAME,
     WEB_STDLIB_FNS_TREND_YOSYS_ABC_INDEX_FILENAME,
     WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
     WEB_STDLIB_G8R_VS_YOSYS_FRAIG_TRUE_INDEX_FILENAME, WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
@@ -34,7 +35,7 @@ use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
-pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 8;
+pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 9;
 pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.pb";
 pub(crate) const STATIC_SNAPSHOT_WEB_INDEX_DIR: &str = "web_index";
 
@@ -244,6 +245,20 @@ fn is_public_structural_group_index_key(index_key: &str) -> bool {
         && second_shard == &hash[2..4]
 }
 
+fn is_public_ir_fn_corpus_ir_shard_key(index_key: &str) -> bool {
+    let Some(prefix) = index_key
+        .strip_prefix(WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .and_then(|suffix| suffix.strip_suffix(".json"))
+    else {
+        return false;
+    };
+    prefix.len() == 2
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub(crate) fn should_include_snapshot_index_key(index_key: &str) -> bool {
     matches!(
         index_key,
@@ -255,9 +270,10 @@ pub(crate) fn should_include_snapshot_index_key(index_key: &str) -> bool {
             | WEB_STDLIB_G8R_VS_YOSYS_FRAIG_TRUE_INDEX_FILENAME
             | WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
             | WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
-            | WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME
+            | WEB_IR_FN_CORPUS_IR_INDEX_FILENAME
             | WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY
-    ) || is_public_structural_group_index_key(index_key)
+    ) || is_public_ir_fn_corpus_ir_shard_key(index_key)
+        || is_public_structural_group_index_key(index_key)
 }
 
 fn should_copy_snapshot_store_index(index_key: &str, direct_heavy_indices_written: bool) -> bool {
@@ -265,7 +281,8 @@ fn should_copy_snapshot_store_index(index_key: &str, direct_heavy_indices_writte
         && (!direct_heavy_indices_written
             || (index_key != WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
                 && index_key != WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
-                && index_key != WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME))
+                && index_key != WEB_IR_FN_CORPUS_IR_INDEX_FILENAME
+                && !is_public_ir_fn_corpus_ir_shard_key(index_key)))
 }
 
 fn write_snapshot_dataset_entry(
@@ -611,20 +628,51 @@ fn rebuild_snapshot_web_indices(
         ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc.index_bytes
     );
 
-    warn!("rebuild-snapshot-web-indices phase=ir-fn-corpus-mffc-ir begin");
-    let (mffc_ir_entry_count, mffc_ir_bytes) = build_mffc_ir_index_bytes_for_paired_index(
-        store,
-        &ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_bytes,
+    warn!("rebuild-snapshot-web-indices phase=ir-fn-corpus-ir begin");
+    let comparison_indices = [
+        (
+            WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+            ir_fn_corpus_g8r_vs_yosys_bytes.as_slice(),
+            crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+        ),
+        (
+            WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
+            ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_bytes.as_slice(),
+            crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION,
+        ),
+    ];
+    let ir_build =
+        build_ir_fn_corpus_ir_index_bytes_for_paired_indices(store, &comparison_indices)?;
+    crate::query::validate_ir_fn_corpus_ir_index_closure(
+        std::iter::once((
+            WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
+            ir_build.manifest_bytes.as_slice(),
+        ))
+        .chain(
+            comparison_indices
+                .iter()
+                .map(|(index_key, bytes, _)| (*index_key, *bytes)),
+        )
+        .chain(
+            ir_build
+                .shard_files
+                .iter()
+                .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+        ),
     )?;
+    let mut ir_bytes = ir_build.manifest_bytes.len();
+    for (index_key, bytes) in &ir_build.shard_files {
+        ir_bytes += bytes.len();
+        direct_files.push(write_snapshot_dataset_entry(out_dir, index_key, bytes)?);
+    }
     direct_files.push(write_snapshot_dataset_entry(
         out_dir,
-        WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME,
-        &mffc_ir_bytes,
+        WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
+        &ir_build.manifest_bytes,
     )?);
     warn!(
-        "rebuild-snapshot-web-indices phase=ir-fn-corpus-mffc-ir done entries={} direct_bytes={}",
-        mffc_ir_entry_count,
-        mffc_ir_bytes.len()
+        "rebuild-snapshot-web-indices phase=ir-fn-corpus-ir done entries={} direct_bytes={}",
+        ir_build.entry_count, ir_bytes
     );
 
     warn!("rebuild-snapshot-web-indices done");
@@ -1045,6 +1093,12 @@ pub(crate) fn build_static_snapshot(
     entries.retain(|(index_key, _)| {
         should_copy_snapshot_store_index(index_key, direct_heavy_indices_written)
     });
+    crate::query::validate_ir_fn_corpus_ir_index_closure(
+        entries
+            .iter()
+            .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+    )
+    .context("validating IR function corpus index closure before static snapshot")?;
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (index_key, bytes) in entries {
@@ -1172,7 +1226,7 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
     let mut decoded_run_ids = std::collections::BTreeSet::new();
     let mut decoded_runs = std::collections::BTreeMap::new();
     let mut decoded_analysis_reports = Vec::new();
-    let mut structural_index_entries = Vec::new();
+    let mut public_index_entries = Vec::new();
     declared_relpaths.insert(STATIC_SNAPSHOT_MANIFEST_FILENAME.to_string());
     for entry in &manifest.dataset_files {
         let expected_relpath = if entry.index_key.starts_with("runs/") {
@@ -1299,17 +1353,20 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
         } else if entry.index_key.starts_with("runs/") {
             bail!("unknown run publication file: {}", entry.index_key);
         }
-        if entry
-            .index_key
-            .starts_with(WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE)
-        {
-            structural_index_entries.push((entry.index_key.clone(), bytes));
+        if !entry.index_key.starts_with("runs/") {
+            public_index_entries.push((entry.index_key.clone(), bytes));
         }
         recomputed_total_bytes += actual_bytes;
     }
 
-    crate::service::validate_ir_fn_corpus_structural_index_closure(&structural_index_entries)
+    crate::service::validate_ir_fn_corpus_structural_index_closure(&public_index_entries)
         .context("validating structural index closure in static snapshot")?;
+    crate::query::validate_ir_fn_corpus_ir_index_closure(
+        public_index_entries
+            .iter()
+            .map(|(index_key, bytes)| (index_key.as_str(), bytes.as_slice())),
+    )
+    .context("validating IR function corpus index closure in static snapshot")?;
 
     validate_analysis_public_run_bindings(&decoded_runs, &decoded_analysis_reports)?;
 
@@ -1408,25 +1465,6 @@ mod tests {
             }
         }))
         .expect("serialize empty versions index")
-    }
-
-    fn empty_ir_corpus_index_bytes() -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
-            "generated_utc": Utc::now(),
-            "dataset": {
-                "fraig": false,
-                "samples": [],
-                "min_ir_nodes": 0,
-                "max_ir_nodes": 0,
-                "g8r_only_count": 0,
-                "yosys_only_count": 0,
-                "available_crate_versions": []
-            },
-            "g8r_points": [],
-            "yosys_points": []
-        }))
-        .expect("serialize empty IR corpus index")
     }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
@@ -1617,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_snapshot_includes_mffc_ir_from_canonical_rebuild() {
+    fn skipped_snapshot_includes_ir_fn_corpus_from_canonical_rebuild() {
         let root = make_temp_dir("skip-rebuild-mffc-ir");
         let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
@@ -1631,11 +1669,11 @@ mod tests {
         .expect("seed empty structural index");
         let rebuild = crate::query::rebuild_web_indices(&store, &test_repo_root())
             .expect("run canonical coordinator index rebuild");
-        assert_eq!(rebuild.ir_fn_corpus_mffc_ir.entry_count, 0);
+        assert_eq!(rebuild.ir_fn_corpus_ir.entry_count, 0);
         assert!(
             store
-                .load_web_index_bytes(WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME)
-                .expect("load MFFC IR web index")
+                .load_web_index_bytes(WEB_IR_FN_CORPUS_IR_INDEX_FILENAME)
+                .expect("load IR function corpus web index")
                 .is_some()
         );
 
@@ -1655,7 +1693,7 @@ mod tests {
             manifest
                 .dataset_files
                 .iter()
-                .any(|entry| { entry.index_key == WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME })
+                .any(|entry| { entry.index_key == WEB_IR_FN_CORPUS_IR_INDEX_FILENAME })
         );
         verify_static_snapshot(&out_dir).expect("verify coordinator-style snapshot");
         fs::remove_dir_all(root).expect("cleanup");
@@ -1976,22 +2014,22 @@ mod tests {
     }
 
     #[test]
-    fn static_snapshot_build_skips_incremental_delta_rows() {
+    fn static_snapshot_build_skips_non_allowlisted_nested_rows() {
         let root = make_temp_dir("skip-incremental");
         let store = ArtifactStore::new(root.join("store"));
         store.ensure_layout().expect("ensure layout");
         store
             .write_web_index_bytes(
-                "ir-fn-corpus-g8r-vs-yosys-abc.v3.json",
-                &empty_ir_corpus_index_bytes(),
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
             )
             .expect("write base index");
         store
             .write_web_index_bytes(
-                "ir-fn-corpus-g8r-vs-yosys-abc.v3.json/incremental-delta/row-1.json",
+                &format!("{WEB_VERSIONS_SUMMARY_INDEX_FILENAME}/nested/row-1.json"),
                 br#"{"row":1}"#,
             )
-            .expect("write incremental delta row");
+            .expect("write nested row");
 
         let out_dir = root.join("snapshot-out");
         let summary = build_static_snapshot(
@@ -2010,15 +2048,15 @@ mod tests {
         assert_eq!(manifest.dataset_files.len(), 1);
         assert_eq!(
             manifest.dataset_files[0].index_key,
-            "ir-fn-corpus-g8r-vs-yosys-abc.v3.json"
+            WEB_VERSIONS_SUMMARY_INDEX_FILENAME
         );
         let delta_path = out_dir
             .join("web_index")
-            .join("ir-fn-corpus-g8r-vs-yosys-abc.v3.json")
-            .join("incremental-delta");
+            .join(WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .join("nested");
         assert!(
             !delta_path.exists(),
-            "incremental delta path should be skipped"
+            "non-allowlisted nested path should be skipped"
         );
     }
 
@@ -2136,7 +2174,7 @@ mod tests {
             WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
         ));
         assert!(should_include_snapshot_index_key(
-            WEB_IR_FN_CORPUS_MFFC_IR_INDEX_FILENAME
+            WEB_IR_FN_CORPUS_IR_INDEX_FILENAME
         ));
         assert!(should_include_snapshot_index_key(
             WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY
