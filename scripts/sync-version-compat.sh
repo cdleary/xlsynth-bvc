@@ -82,8 +82,12 @@ observation_tmp="$(mktemp "${TMPDIR:-/tmp}/xlsynth-repository-observation.XXXXXX
 head_tmp="$(mktemp "${TMPDIR:-/tmp}/xlsynth-repository-head.XXXXXX")"
 release_tmp="$(mktemp "${TMPDIR:-/tmp}/xlsynth-repository-release.XXXXXX")"
 compare_tmp="$(mktemp "${TMPDIR:-/tmp}/xlsynth-repository-compare.XXXXXX")"
+auth_config_tmp=""
 cleanup() {
   rm -f "${tmp}" "${observation_tmp}" "${head_tmp}" "${release_tmp}" "${compare_tmp}"
+  if [[ -n "${auth_config_tmp}" ]]; then
+    rm -f "${auth_config_tmp}"
+  fi
 }
 trap cleanup EXIT
 
@@ -92,10 +96,18 @@ github_headers=(
   -H "X-GitHub-Api-Version: 2022-11-28"
   -H "User-Agent: xlsynth-bvc-version-sync"
 )
+github_auth_args=()
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-  github_headers+=( -H "Authorization: Bearer ${GITHUB_TOKEN}" )
+  if [[ ! "${GITHUB_TOKEN}" =~ ^[A-Za-z0-9_]+$ ]]; then
+    echo "error: GITHUB_TOKEN contains unsupported characters" >&2
+    exit 2
+  fi
+  auth_config_tmp="$(mktemp "${TMPDIR:-/tmp}/xlsynth-github-auth.XXXXXX")"
+  chmod 600 "${auth_config_tmp}"
+  printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_TOKEN}" >"${auth_config_tmp}"
+  github_auth_args=( --config "${auth_config_tmp}" )
 fi
-curl -fsSL --retry 3 --retry-delay 1 "${github_headers[@]}" "${repository_api}/commits/main" -o "${head_tmp}"
+curl -fsSL --retry 3 --retry-delay 1 "${github_headers[@]}" "${github_auth_args[@]}" "${repository_api}/commits/main" -o "${head_tmp}"
 head_commit="$(read_commit_sha "${head_tmp}")"
 source_url="https://raw.githubusercontent.com/${repository}/${head_commit}/generated_version_compat.json"
 curl -fsSL --retry 3 --retry-delay 1 "${source_url}" -o "${tmp}"
@@ -155,9 +167,9 @@ if [[ "${same}" == "true" && "${observation_valid}" == "true" ]]; then
   exit 0
 fi
 
-curl -fsSL --retry 3 --retry-delay 1 "${github_headers[@]}" "${repository_api}/commits/${latest_release_tag}" -o "${release_tmp}"
+curl -fsSL --retry 3 --retry-delay 1 "${github_headers[@]}" "${github_auth_args[@]}" "${repository_api}/commits/${latest_release_tag}" -o "${release_tmp}"
 release_commit="$(read_commit_sha "${release_tmp}")"
-curl -fsSL --retry 3 --retry-delay 1 "${github_headers[@]}" "${repository_api}/compare/${release_commit}...${head_commit}" -o "${compare_tmp}"
+curl -fsSL --retry 3 --retry-delay 1 "${github_headers[@]}" "${github_auth_args[@]}" "${repository_api}/compare/${release_commit}...${head_commit}" -o "${compare_tmp}"
 
 python3 - "${head_tmp}" "${release_tmp}" "${compare_tmp}" "${observation_tmp}" "${repository}" "${latest_crate_version}" "${latest_release_tag}" <<'PY'
 from datetime import datetime, timezone
