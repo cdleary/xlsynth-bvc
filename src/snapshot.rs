@@ -35,7 +35,9 @@ use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
-pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 9;
+// Version 10 invalidates checkpoints that may contain versions-summary.v4 but not the
+// release-ledger-bearing versions-summary.v5 dataset.
+pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 10;
 pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.pb";
 pub(crate) const STATIC_SNAPSHOT_WEB_INDEX_DIR: &str = "web_index";
 
