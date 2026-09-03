@@ -117,6 +117,82 @@ pub(crate) fn repository_comparison_status(
     }
 }
 
+fn parse_repository_utc_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    if value.as_bytes().get(10) != Some(&b'T') || !value.ends_with('Z') {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .filter(|timestamp| timestamp.offset().local_minus_utc() == 0)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+pub(crate) fn validate_repository_head_observation(
+    observation: &RepositoryHeadObservationView,
+) -> Result<()> {
+    if observation.schema_version != 1
+        || observation.repository != "xlsynth/xlsynth-crate"
+        || observation.head_ref != "main"
+    {
+        bail!("repository observation identity is invalid");
+    }
+    for (label, commit) in [
+        ("head_commit", observation.head_commit.as_str()),
+        (
+            "latest_release_commit",
+            observation.latest_release_commit.as_str(),
+        ),
+    ] {
+        if commit.len() != 40
+            || !commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("repository observation {label} is not a lowercase full commit");
+        }
+    }
+    let Some(observed_at) = parse_repository_utc_timestamp(&observation.observed_at_utc) else {
+        bail!("repository observation observed_at_utc is not an RFC 3339 UTC date-time");
+    };
+    let Some(head_committed_at) =
+        parse_repository_utc_timestamp(&observation.head_committed_at_utc)
+    else {
+        bail!("repository observation head_committed_at_utc is not an RFC 3339 UTC date-time");
+    };
+    let Some(release_committed_at) =
+        parse_repository_utc_timestamp(&observation.latest_release_committed_at_utc)
+    else {
+        bail!(
+            "repository observation latest_release_committed_at_utc is not an RFC 3339 UTC date-time"
+        );
+    };
+    if observed_at < head_committed_at || observed_at < release_committed_at {
+        bail!("repository observation time predates an observed commit");
+    }
+    if observation.latest_release_tag
+        != format!(
+            "v{}",
+            normalize_tag_version(&observation.latest_crate_version)
+        )
+    {
+        bail!("repository observation latest release tag/version disagree");
+    }
+    let expected_status =
+        repository_comparison_status(observation.commits_ahead, observation.commits_behind);
+    if observation.comparison_status != expected_status {
+        bail!(
+            "repository observation comparison status is {}; expected {expected_status} from ahead/behind counts",
+            observation.comparison_status
+        );
+    }
+    let commits_match = observation.head_commit == observation.latest_release_commit;
+    let zero_distance = observation.commits_ahead == 0 && observation.commits_behind == 0;
+    if commits_match != zero_distance {
+        bail!("repository observation commit equality disagrees with ahead/behind distance");
+    }
+    Ok(())
+}
+
 pub(crate) fn load_version_compat_map(
     repo_root: &Path,
 ) -> Result<BTreeMap<String, VersionCompatEntry>> {
@@ -155,39 +231,8 @@ pub(crate) fn load_xlsynth_crate_repository_head_observation(
     };
     let observation: RepositoryHeadObservationView = serde_json::from_str(&text)
         .with_context(|| format!("parsing repository observation JSON at {}", path.display()))?;
-    if observation.schema_version != 1 {
-        bail!(
-            "unsupported xlsynth-crate repository observation schema {}; expected 1",
-            observation.schema_version
-        );
-    }
-    for (label, commit) in [
-        ("head_commit", observation.head_commit.as_str()),
-        (
-            "latest_release_commit",
-            observation.latest_release_commit.as_str(),
-        ),
-    ] {
-        if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            bail!("repository observation {label} is not a full hexadecimal commit");
-        }
-    }
-    if observation.latest_release_tag
-        != format!(
-            "v{}",
-            normalize_tag_version(&observation.latest_crate_version)
-        )
-    {
-        bail!("repository observation latest release tag/version disagree");
-    }
-    let expected_status =
-        repository_comparison_status(observation.commits_ahead, observation.commits_behind);
-    if observation.comparison_status != expected_status {
-        bail!(
-            "repository observation comparison status is {}; expected {expected_status} from ahead/behind counts",
-            observation.comparison_status
-        );
-    }
+    validate_repository_head_observation(&observation)
+        .with_context(|| format!("validating repository observation at {}", path.display()))?;
     Ok(Some(observation))
 }
 
@@ -397,5 +442,54 @@ mod tests {
         assert_eq!(repository_comparison_status(1, 1), "diverged");
         assert_eq!(repository_comparison_status(u64::MAX, 0), "ahead");
         assert_eq!(repository_comparison_status(u64::MAX, u64::MAX), "diverged");
+    }
+
+    fn repository_observation() -> RepositoryHeadObservationView {
+        RepositoryHeadObservationView {
+            schema_version: 1,
+            repository: "xlsynth/xlsynth-crate".to_string(),
+            observed_at_utc: "2026-09-03T22:34:04Z".to_string(),
+            head_ref: "main".to_string(),
+            head_commit: "a".repeat(40),
+            head_committed_at_utc: "2026-09-03T17:53:02Z".to_string(),
+            latest_crate_version: "0.67.1".to_string(),
+            latest_release_tag: "v0.67.1".to_string(),
+            latest_release_commit: "b".repeat(40),
+            latest_release_committed_at_utc: "2026-09-03T16:00:00Z".to_string(),
+            comparison_status: "ahead".to_string(),
+            commits_ahead: 2,
+            commits_behind: 0,
+        }
+    }
+
+    #[test]
+    fn repository_observation_requires_rfc3339_utc_date_times() {
+        let mut observation = repository_observation();
+        observation.observed_at_utc = "2026-09-03Z".to_string();
+        let error = validate_repository_head_observation(&observation)
+            .expect_err("date-only timestamps must be rejected");
+        assert!(format!("{error:#}").contains("RFC 3339 UTC date-time"));
+
+        let mut observation = repository_observation();
+        observation.observed_at_utc = "2026-09-03T15:00:00Z".to_string();
+        let error = validate_repository_head_observation(&observation)
+            .expect_err("observation time must follow commit times");
+        assert!(format!("{error:#}").contains("predates"));
+    }
+
+    #[test]
+    fn repository_observation_binds_commit_equality_to_distance() {
+        let mut observation = repository_observation();
+        observation.comparison_status = "identical".to_string();
+        observation.commits_ahead = 0;
+        let error = validate_repository_head_observation(&observation)
+            .expect_err("distinct commits cannot be identical");
+        assert!(format!("{error:#}").contains("commit equality"));
+
+        let mut observation = repository_observation();
+        observation.latest_release_commit = observation.head_commit.clone();
+        let error = validate_repository_head_observation(&observation)
+            .expect_err("equal commits cannot have nonzero distance");
+        assert!(format!("{error:#}").contains("commit equality"));
     }
 }

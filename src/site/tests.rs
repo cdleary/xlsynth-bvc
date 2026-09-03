@@ -9,7 +9,9 @@ use crate::snapshot::{
     BuildStaticSnapshotOptions, STATIC_SNAPSHOT_MANIFEST_FILENAME, build_static_snapshot,
 };
 use crate::store::ArtifactStore;
-use crate::versioning::{load_version_compat_map, resolve_xlsynth_version_for_driver};
+use crate::versioning::{
+    load_version_compat_map, normalize_tag_version, resolve_xlsynth_version_for_driver,
+};
 use chrono::Utc;
 use serde_json::json;
 use std::io::Write as _;
@@ -1720,13 +1722,16 @@ fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() 
     let store = ArtifactStore::new(root.join("store"));
     store.ensure_layout().expect("store layout");
     let repo_root = std::env::current_dir().expect("current dir");
-    let crate_version = load_version_compat_map(&repo_root)
-        .expect("compat map")
-        .into_keys()
-        .next()
-        .expect("known crate version");
+    let compat = load_version_compat_map(&repo_root).expect("compat map");
+    let crate_version = compat.keys().next().expect("known crate version").clone();
+    let crate_release_datetime = compat
+        .get(&crate_version)
+        .expect("compat entry")
+        .crate_release_datetime
+        .clone();
     let dso_version =
         resolve_xlsynth_version_for_driver(&repo_root, &crate_version).expect("dso version");
+    let release_dso_version = normalize_tag_version(&dso_version).to_string();
     for action in canonical_root_actions_for_crate_version(&repo_root, &crate_version, &dso_version)
         .expect("root actions")
     {
@@ -1766,7 +1771,7 @@ fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() 
         "report": {
             "cards": [{
                 "crate_version": crate_version,
-                "crate_release_datetime": null,
+                "crate_release_datetime": crate_release_datetime,
                 "total_materialized": 1,
                 "failed_total": 0,
                 "dso_versions": [dso_version],
@@ -1782,7 +1787,15 @@ fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() 
                 "failures": []
             }],
             "unattributed_actions": [],
-            "releases": [],
+            "releases": [{
+                "crate_version": crate_version,
+                "crate_release_datetime": crate_release_datetime,
+                "dso_version": release_dso_version,
+                "processed": true,
+                "materialized_actions": 1,
+                "failed_actions": 0,
+                "stdlib_enumeration_state": "ok"
+            }],
             "repository_head_observation": null
         }
     }))

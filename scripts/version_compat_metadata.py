@@ -75,14 +75,23 @@ def latest_release_version(versions: Any) -> str:
     return max(versions.items(), key=ordering)[0]
 
 
-def _require_utc_timestamp(observation: dict[str, Any], field: str) -> None:
+def _require_utc_timestamp(observation: dict[str, Any], field: str) -> datetime:
     value = observation.get(field)
-    if not isinstance(value, str) or not value.endswith("Z"):
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", value
+        )
+        is None
+    ):
         raise ValueError(f"{field} must be an RFC 3339 UTC timestamp")
     try:
-        datetime.fromisoformat(value[:-1] + "+00:00")
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
     except ValueError as error:
         raise ValueError(f"{field} must be an RFC 3339 UTC timestamp") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"{field} must be an RFC 3339 UTC timestamp")
+    return parsed
 
 
 def _require_nonnegative_integer(observation: dict[str, Any], field: str) -> int:
@@ -119,12 +128,13 @@ def validate_observation(
         value = observation[field]
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value) is None:
             raise ValueError(f"{field} must be a lowercase 40-character Git commit")
-    for field in (
-        "observed_at_utc",
-        "head_committed_at_utc",
-        "latest_release_committed_at_utc",
-    ):
-        _require_utc_timestamp(observation, field)
+    observed_at = _require_utc_timestamp(observation, "observed_at_utc")
+    head_committed_at = _require_utc_timestamp(observation, "head_committed_at_utc")
+    release_committed_at = _require_utc_timestamp(
+        observation, "latest_release_committed_at_utc"
+    )
+    if observed_at < head_committed_at or observed_at < release_committed_at:
+        raise ValueError("observed_at_utc must not predate either observed commit")
     ahead = _require_nonnegative_integer(observation, "commits_ahead")
     behind = _require_nonnegative_integer(observation, "commits_behind")
     expected_status = (
@@ -140,6 +150,10 @@ def validate_observation(
         raise ValueError(
             f"comparison_status must be {expected_status!r} for ahead={ahead} behind={behind}"
         )
+    commits_match = observation["head_commit"] == observation["latest_release_commit"]
+    zero_distance = ahead == 0 and behind == 0
+    if commits_match != zero_distance:
+        raise ValueError("commit equality must agree with zero ahead/behind distance")
 
 
 def _load_json(path: str) -> Any:

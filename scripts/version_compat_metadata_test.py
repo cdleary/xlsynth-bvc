@@ -82,5 +82,52 @@ class VersionCompatMetadataTest(unittest.TestCase):
             )
 
 
+    def test_validate_observation_rejects_date_only_timestamp(self) -> None:
+        observation = valid_observation()
+        observation["observed_at_utc"] = "2026-09-03Z"
+
+        with self.assertRaisesRegex(ValueError, "RFC 3339"):
+            validate_observation(
+                observation,
+                repository="xlsynth/xlsynth-crate",
+                latest_crate_version="0.67.1",
+            )
+
+    def test_validate_observation_rejects_observation_before_commit(self) -> None:
+        observation = valid_observation()
+        observation["observed_at_utc"] = "2026-09-03T15:00:00Z"
+
+        with self.assertRaisesRegex(ValueError, "must not predate"):
+            validate_observation(
+                observation,
+                repository="xlsynth/xlsynth-crate",
+                latest_crate_version="0.67.1",
+            )
+
+    def test_validate_observation_rejects_identical_with_distinct_commits(self) -> None:
+        observation = valid_observation()
+        observation["comparison_status"] = "identical"
+        observation["commits_ahead"] = 0
+        observation["latest_release_commit"] = "b" * 40
+
+        with self.assertRaisesRegex(ValueError, "commit equality"):
+            validate_observation(
+                observation,
+                repository="xlsynth/xlsynth-crate",
+                latest_crate_version="0.67.1",
+            )
+
+    def test_validate_observation_rejects_nonzero_distance_for_same_commit(self) -> None:
+        observation = valid_observation()
+        observation["latest_release_commit"] = observation["head_commit"]
+
+        with self.assertRaisesRegex(ValueError, "commit equality"):
+            validate_observation(
+                observation,
+                repository="xlsynth/xlsynth-crate",
+                latest_crate_version="0.67.1",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

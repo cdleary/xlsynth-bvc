@@ -275,7 +275,12 @@ fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
             .find(|card| card.crate_version == release.crate_version);
         match card {
             Some(card)
-                if release.materialized_actions != card.total_materialized
+                if card.crate_release_datetime.as_deref()
+                    != Some(release.crate_release_datetime.as_str())
+                    || card.dso_versions.iter().any(|version| {
+                        crate::versioning::normalize_tag_version(version) != release.dso_version
+                    })
+                    || release.materialized_actions != card.total_materialized
                     || release.failed_actions != card.failed_total
                     || release.stdlib_enumeration_state
                         != card.stdlib_enumeration.badge_label() =>
@@ -290,6 +295,19 @@ fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
                 bail!("release_status without a version card is not empty");
             }
             _ => {}
+        }
+    }
+    for card in &index.report.cards {
+        if !index
+            .report
+            .releases
+            .iter()
+            .any(|release| release.crate_version == card.crate_version)
+        {
+            bail!(
+                "version_card for crate {} is missing from release_status",
+                card.crate_version
+            );
         }
     }
     if !index.report.releases.windows(2).all(|pair| {
@@ -310,54 +328,14 @@ fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
         )
     });
     if let Some(observation) = &index.report.repository_head_observation {
-        if observation.schema_version != 1
-            || observation.repository != "xlsynth/xlsynth-crate"
-            || observation.head_ref != "main"
-        {
-            bail!("repository_head_observation identity is invalid");
-        }
-        for (field, commit) in [
-            ("head_commit", observation.head_commit.as_str()),
-            (
-                "latest_release_commit",
-                observation.latest_release_commit.as_str(),
-            ),
-        ] {
-            if commit.len() != 40
-                || !commit
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                bail!("repository_head_observation.{field} is not a git commit");
-            }
-        }
-        for (field, timestamp) in [
-            ("observed_at_utc", observation.observed_at_utc.as_str()),
-            (
-                "head_committed_at_utc",
-                observation.head_committed_at_utc.as_str(),
-            ),
-            (
-                "latest_release_committed_at_utc",
-                observation.latest_release_committed_at_utc.as_str(),
-            ),
-        ] {
-            if DateTime::parse_from_rfc3339(timestamp).is_err() || !timestamp.ends_with('Z') {
-                bail!("repository_head_observation.{field} is not a UTC timestamp");
-            }
-        }
         validate_version(
             "repository_head_observation.latest_crate_version",
             &observation.latest_crate_version,
         )?;
-        let expected_status = crate::versioning::repository_comparison_status(
-            observation.commits_ahead,
-            observation.commits_behind,
-        );
-        if observation.latest_release_tag != format!("v{}", observation.latest_crate_version)
-            || observation.comparison_status != expected_status
-            || latest_release.map(|release| &release.crate_version)
-                != Some(&observation.latest_crate_version)
+        crate::versioning::validate_repository_head_observation(observation)
+            .context("validating public repository-head observation")?;
+        if latest_release.map(|release| &release.crate_version)
+            != Some(&observation.latest_crate_version)
         {
             bail!("repository_head_observation release comparison is inconsistent");
         }
@@ -1301,6 +1279,86 @@ mod tests {
         })
     }
 
+    fn processed_version_card(crate_version: &str, released: &str, dso_version: &str) -> Value {
+        json!({
+            "crate_version": crate_version,
+            "crate_release_datetime": released,
+            "total_materialized": 1,
+            "failed_total": 0,
+            "dso_versions": [dso_version],
+            "stdlib_enumeration": {
+                "state": "ok",
+                "reason": "discovery_counts",
+                "scanned_files": 1,
+                "failed_files": 0,
+                "concrete_functions": 1,
+                "suggested_actions": 1
+            },
+            "failed_by_kind": [],
+            "failures": []
+        })
+    }
+
+    fn processed_release(crate_version: &str, released: &str, dso_version: &str) -> Value {
+        json!({
+            "crate_version": crate_version,
+            "crate_release_datetime": released,
+            "dso_version": dso_version,
+            "processed": true,
+            "materialized_actions": 1,
+            "failed_actions": 0,
+            "stdlib_enumeration_state": "ok"
+        })
+    }
+
+    #[test]
+    fn public_projection_requires_every_card_in_release_ledger() {
+        let mut versions = empty_versions_value();
+        versions["report"]["cards"] = json!([processed_version_card(
+            "0.35.0",
+            "2026-08-28 17:52:54 PDT",
+            "0.35.0"
+        )]);
+
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &serde_json::to_vec(&versions).unwrap(),
+        )
+        .expect_err("every version card must have a release row");
+        assert!(
+            format!("{error:#}").contains("is missing from release_status"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn public_projection_binds_card_release_date_and_dso() {
+        let card = processed_version_card("0.35.0", "2026-08-28 17:52:54 PDT", "v0.35.0");
+        for (label, release) in [
+            (
+                "release date",
+                processed_release("0.35.0", "2026-08-29 17:52:54 PDT", "0.35.0"),
+            ),
+            (
+                "DSO version",
+                processed_release("0.35.0", "2026-08-28 17:52:54 PDT", "0.36.0"),
+            ),
+        ] {
+            let mut versions = empty_versions_value();
+            versions["report"]["cards"] = json!([card.clone()]);
+            versions["report"]["releases"] = json!([release]);
+            let error = canonicalize_public_web_index_json(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &serde_json::to_vec(&versions).unwrap(),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("disagrees with its version card"),
+                "{label}: unexpected error: {error:#}"
+            );
+        }
+    }
+
     #[test]
     fn public_projection_rejects_releases_out_of_publication_order() {
         let mut versions = empty_versions_value();
@@ -1347,8 +1405,18 @@ mod tests {
         )
         .expect_err("comparison status must agree with ahead/behind counts");
         assert!(
-            format!("{error:#}")
-                .contains("repository_head_observation release comparison is inconsistent"),
+            format!("{error:#}").contains("repository observation comparison status"),
+            "unexpected error: {error:#}"
+        );
+
+        versions["report"]["repository_head_observation"]["commits_ahead"] = json!(0);
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &serde_json::to_vec(&versions).unwrap(),
+        )
+        .expect_err("zero-distance identical metadata must name one commit");
+        assert!(
+            format!("{error:#}").contains("commit equality"),
             "unexpected error: {error:#}"
         );
     }
