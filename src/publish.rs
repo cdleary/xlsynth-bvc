@@ -26,7 +26,7 @@ pub(crate) const PUBLICATION_LOCK_FILENAME: &str = ".publication.lock";
 const PUBLISHED_ROOT_INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>xlsynth-bvc results</title></head>
 <body><p id="status">Loading current xlsynth-bvc results…</p><script>
-function currentSiteTarget(current,locationValue){const requested=locationValue.pathname.replace(/^\/+/, '');const reserved=requested===''||requested==='index.html'||requested==='current.json'||requested==='current.pb'||requested.startsWith('sites/')||requested.startsWith('catalogs/');const aliases={'progression':'progression.html','progression/':'progression.html','runs':'runs.html','runs/':'runs.html','dataset':'dataset.html','dataset/':'dataset.html','mffc-discrepancies':'mffc-discrepancies.html','mffc-discrepancies/':'mffc-discrepancies.html'};const suffix=reserved?'':(aliases[requested]||requested);return `/${current.site_url}${suffix}${locationValue.search}${locationValue.hash}`}
+function currentSiteTarget(current,locationValue){const requested=locationValue.pathname.replace(/^\/+/, '');const reserved=requested===''||requested==='index.html'||requested==='current.json'||requested==='current.pb'||requested.startsWith('sites/')||requested.startsWith('catalogs/');const aliases={'progression':'progression.html','progression/':'progression.html','runs':'runs.html','runs/':'runs.html','dataset':'dataset.html','dataset/':'dataset.html','releases':'releases.html','releases/':'releases.html','mffc-discrepancies':'mffc-discrepancies.html','mffc-discrepancies/':'mffc-discrepancies.html'};const suffix=reserved?'':(aliases[requested]||requested);return `/${current.site_url}${suffix}${locationValue.search}${locationValue.hash}`}
 fetch('/current.json',{cache:'no-store'}).then(response=>{if(!response.ok)throw new Error(`current.json ${response.status}`);return response.json()}).then(current=>{if(current.schema_version!==1||!/^sites\/[0-9a-f]{64}\/$/.test(current.site_url))throw new Error('invalid current site pointer');window.location.replace(currentSiteTarget(current,window.location))}).catch(error=>{document.getElementById('status').textContent=`Unable to load current results: ${error.message}`});
 </script></body></html>
 "#;
@@ -743,6 +743,8 @@ const cases = [
   [{pathname: '/progression/', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/progression.html'],
   [{pathname: '/runs', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/runs.html'],
   [{pathname: '/dataset', search: '?key=versions', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/dataset.html?key=versions'],
+  [{pathname: '/releases', search: '?view=all', hash: '#latest'}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/releases.html?view=all#latest'],
+  [{pathname: '/releases/', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/releases.html'],
   [{pathname: '/mffc-discrepancies', search: '', hash: '#detail'}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/mffc-discrepancies.html#detail'],
   [{pathname: '/progression.html', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/progression.html'],
   [{pathname: '/runs/abc', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/runs/abc'],
