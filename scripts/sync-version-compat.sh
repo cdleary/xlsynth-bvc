@@ -42,7 +42,6 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 output_path="${repo_root}/third_party/xlsynth-crate/generated_version_compat.json"
 observation_path="${repo_root}/third_party/xlsynth-crate/repository_head_observation.json"
 metadata_helper="${script_dir}/version_compat_metadata.py"
-source_url="https://raw.githubusercontent.com/xlsynth/xlsynth-crate/main/generated_version_compat.json"
 repository="xlsynth/xlsynth-crate"
 repository_api="https://api.github.com/repos/${repository}"
 
@@ -63,6 +62,21 @@ if [[ ! -f "${metadata_helper}" ]]; then
   exit 2
 fi
 
+read_commit_sha() {
+  python3 - "$1" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    response = json.load(f)
+sha = response.get("sha")
+if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+    raise SystemExit("GitHub commit response has an invalid sha")
+print(sha)
+PY
+}
+
 tmp="$(mktemp "${TMPDIR:-/tmp}/xlsynth-version-compat.XXXXXX")"
 observation_tmp="$(mktemp "${TMPDIR:-/tmp}/xlsynth-repository-observation.XXXXXX")"
 head_tmp="$(mktemp "${TMPDIR:-/tmp}/xlsynth-repository-head.XXXXXX")"
@@ -73,6 +87,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+github_headers=(
+  -H "Accept: application/vnd.github+json"
+  -H "X-GitHub-Api-Version: 2022-11-28"
+  -H "User-Agent: xlsynth-bvc-version-sync"
+)
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  github_headers+=( -H "Authorization: Bearer ${GITHUB_TOKEN}" )
+fi
+curl -fsSL --retry 3 --retry-delay 1 "${github_headers[@]}" "${repository_api}/commits/main" -o "${head_tmp}"
+head_commit="$(read_commit_sha "${head_tmp}")"
+source_url="https://raw.githubusercontent.com/${repository}/${head_commit}/generated_version_compat.json"
 curl -fsSL --retry 3 --retry-delay 1 "${source_url}" -o "${tmp}"
 
 if command -v jq >/dev/null 2>&1; then
@@ -130,17 +155,9 @@ if [[ "${same}" == "true" && "${observation_valid}" == "true" ]]; then
   exit 0
 fi
 
-github_headers=(
-  -H "Accept: application/vnd.github+json"
-  -H "X-GitHub-Api-Version: 2022-11-28"
-  -H "User-Agent: xlsynth-bvc-version-sync"
-)
-if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-  github_headers+=( -H "Authorization: Bearer ${GITHUB_TOKEN}" )
-fi
-curl -fsSL --retry 3 --retry-delay 1 "${github_headers[@]}" "${repository_api}/commits/main" -o "${head_tmp}"
 curl -fsSL --retry 3 --retry-delay 1 "${github_headers[@]}" "${repository_api}/commits/${latest_release_tag}" -o "${release_tmp}"
-curl -fsSL --retry 3 --retry-delay 1 "${github_headers[@]}" "${repository_api}/compare/${latest_release_tag}...main" -o "${compare_tmp}"
+release_commit="$(read_commit_sha "${release_tmp}")"
+curl -fsSL --retry 3 --retry-delay 1 "${github_headers[@]}" "${repository_api}/compare/${release_commit}...${head_commit}" -o "${compare_tmp}"
 
 python3 - "${head_tmp}" "${release_tmp}" "${compare_tmp}" "${observation_tmp}" "${repository}" "${latest_crate_version}" "${latest_release_tag}" <<'PY'
 from datetime import datetime, timezone
