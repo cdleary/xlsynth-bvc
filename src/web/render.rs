@@ -5309,6 +5309,10 @@ pub(super) fn render_versions_html(
         let release_short =
             &observation.latest_release_commit[..12.min(observation.latest_release_commit.len())];
         let distance = match (observation.commits_ahead, observation.commits_behind) {
+            (0, 0) => format!(
+                "{} is identical to {}",
+                observation.head_ref, observation.latest_release_tag
+            ),
             (ahead, 0) => format!(
                 "{} is {} commit{} ahead of {}",
                 observation.head_ref,

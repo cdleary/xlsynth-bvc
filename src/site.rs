@@ -1057,7 +1057,11 @@ fn releases_body(root_site_url: &str, catalog: &BrowserCatalog) -> String {
             let head_short = &observation.head_commit[..12.min(observation.head_commit.len())];
             let release_short = &observation.latest_release_commit
                 [..12.min(observation.latest_release_commit.len())];
-            let distance = if observation.commits_behind == 0 {
+            let distance = if observation.commits_ahead == 0
+                && observation.commits_behind == 0
+            {
+                "identical".to_string()
+            } else if observation.commits_behind == 0 {
                 format!(
                     "{} commit{} ahead",
                     observation.commits_ahead,
