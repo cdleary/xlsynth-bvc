@@ -299,7 +299,10 @@ fn validate_trend_index(
     Ok(())
 }
 
-fn validate_comparison_sample(field: &str, sample: &StdlibG8rVsYosysSample) -> Result<()> {
+pub(crate) fn validate_comparison_sample(
+    field: &str,
+    sample: &StdlibG8rVsYosysSample,
+) -> Result<()> {
     validate_safe_public_text(
         &format!("{field}.fn_key"),
         &sample.fn_key,
@@ -353,7 +356,10 @@ fn validate_comparison_sample(field: &str, sample: &StdlibG8rVsYosysSample) -> R
     Ok(())
 }
 
-fn validate_comparison_dataset(field: &str, dataset: &StdlibG8rVsYosysDataset) -> Result<()> {
+pub(crate) fn validate_comparison_dataset(
+    field: &str,
+    dataset: &StdlibG8rVsYosysDataset,
+) -> Result<()> {
     if dataset.min_ir_nodes > dataset.max_ir_nodes {
         bail!("{field} has inverted IR-node bounds");
     }

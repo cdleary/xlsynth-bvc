@@ -10,11 +10,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use prost::Message;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
+#[path = "site_shards.rs"]
+mod site_shards;
 
 use crate::analysis::decode_analysis_report;
 use crate::proto::v1 as pb;
@@ -22,7 +25,10 @@ use crate::snapshot::{
     load_static_snapshot_manifest, should_include_snapshot_index_key, verify_static_snapshot,
 };
 use crate::versioning::cmp_dotted_numeric_version;
-use crate::view::{StdlibEnumerationState, StdlibG8rVsYosysDataset, VersionCardsReport};
+use crate::view::{
+    StdlibAigStatsPoint, StdlibEnumerationState, StdlibG8rVsYosysDataset, StdlibG8rVsYosysSample,
+    VersionCardsReport,
+};
 
 pub(crate) const STATIC_SITE_RECORD_VERSION: u32 = 1;
 pub(crate) const STATIC_SITE_MANIFEST_FILENAME: &str = "site_manifest.v1.pb";
@@ -37,6 +43,11 @@ const PLOTLY_NOTICE: &[u8] =
 const STYLE_CSS: &str = include_str!("site_assets/style.css");
 const APP_JS: &str = include_str!("site_assets/app.js");
 const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 2;
+const STATIC_COMPARISON_SHARD_SCHEMA_VERSION: u32 = 1;
+const STATIC_COMPARISON_SHARD_PREFIX_HEX_CHARS: u8 = 1;
+const STATIC_STRUCTURAL_SHARD_SCHEMA_VERSION: u32 = 1;
+const STATIC_STRUCTURAL_SHARD_PREFIX_HEX_CHARS: u8 = 2;
+const STATIC_STRUCTURAL_SHARD_NAMESPACE: &str = "ir-fn-corpus-structural.v2/by-hash-prefix";
 
 #[derive(Debug, Clone)]
 pub(crate) struct BuildStaticSiteOptions {
@@ -91,6 +102,124 @@ struct BrowserDataset {
     url: String,
     bytes: u64,
     sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ComparisonSourceIndex {
+    schema_version: u32,
+    generated_utc: DateTime<Utc>,
+    dataset: StdlibG8rVsYosysDataset,
+    #[serde(default)]
+    g8r_points: Vec<StaticCorpusEntityPoint>,
+    #[serde(default)]
+    yosys_points: Vec<StaticCorpusEntityPoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StaticCorpusEntityPoint {
+    structural_hash: String,
+    crate_version: String,
+    point: StdlibAigStatsPoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticComparisonSource {
+    logical_key: String,
+    schema_version: u32,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticComparisonShardSummary {
+    prefix: String,
+    index_key: String,
+    row_count: usize,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticComparisonManifest {
+    schema_version: u32,
+    generated_utc: DateTime<Utc>,
+    source: StaticComparisonSource,
+    shard_prefix_hex_chars: u8,
+    sample_count: usize,
+    dataset: StdlibG8rVsYosysDataset,
+    sample_shards: Vec<StaticComparisonShardSummary>,
+    g8r_point_shards: Vec<StaticComparisonShardSummary>,
+    yosys_point_shards: Vec<StaticComparisonShardSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticComparisonSampleShard {
+    schema_version: u32,
+    prefix: String,
+    rows: Vec<StaticComparisonSampleRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticComparisonSampleRow {
+    source_ordinal: usize,
+    sample: StdlibG8rVsYosysSample,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticComparisonEntityShard {
+    schema_version: u32,
+    prefix: String,
+    rows: Vec<StaticComparisonEntityRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticComparisonEntityRow {
+    source_ordinal: usize,
+    entity: StaticCorpusEntityPoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticStructuralShard {
+    schema_version: u32,
+    prefix: String,
+    groups: Vec<crate::model::IrFnCorpusStructuralGroupFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticStructuralSource {
+    logical_key: String,
+    bytes: u64,
+    sha256: String,
+    manifest: crate::model::IrFnCorpusStructuralManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticStructuralShardSummary {
+    prefix: String,
+    index_key: String,
+    group_count: usize,
+    member_count: usize,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticStructuralManifest {
+    schema_version: u32,
+    source: StaticStructuralSource,
+    shard_prefix_hex_chars: u8,
+    shards: Vec<StaticStructuralShardSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -854,32 +983,6 @@ fn expected_catalog_site_relpaths(
     Ok((all, data))
 }
 
-fn expected_snapshot_site_data_relpaths(
-    snapshot: &crate::snapshot::StaticSnapshotManifest,
-) -> Result<BTreeSet<String>> {
-    let mut expected = BTreeSet::new();
-    for entry in &snapshot.dataset_files {
-        let relpath = if entry.relpath.ends_with(".json") {
-            let suffix = entry
-                .relpath
-                .strip_prefix("web_index/")
-                .unwrap_or(&entry.relpath);
-            format!("data/{suffix}")
-        } else if entry.index_key.starts_with("runs/")
-            && (entry.relpath.ends_with("/run.pb") || entry.relpath.ends_with("/findings.pb"))
-        {
-            format!("data/{}", entry.relpath)
-        } else {
-            bail!(
-                "source snapshot contains unsupported static-site dataset: {}",
-                entry.relpath
-            );
-        };
-        insert_unique_site_relpath(&mut expected, relpath)?;
-    }
-    Ok(expected)
-}
-
 fn actual_site_relpaths(site_dir: &Path) -> Result<BTreeSet<String>> {
     let mut found = BTreeSet::new();
     for entry in WalkDir::new(site_dir).sort_by_file_name() {
@@ -1264,34 +1367,11 @@ pub(crate) fn build_static_site_with_protected_roots(
         PLOTLY_NOTICE,
     )?;
 
-    let mut datasets = Vec::new();
-    for entry in &snapshot.dataset_files {
-        if !entry.relpath.ends_with(".json") {
-            continue;
-        }
-        let source = options.snapshot_dir.join(&entry.relpath);
-        let suffix = entry
-            .relpath
-            .strip_prefix("web_index/")
-            .unwrap_or(&entry.relpath);
-        let target_relpath = format!("data/{suffix}");
-        let bytes = fs::read(&source)
-            .with_context(|| format!("reading snapshot dataset: {}", source.display()))?;
-        if sha256_hex(&bytes) != entry.sha256 {
-            bail!(
-                "snapshot dataset changed after verification: {}",
-                entry.relpath
-            );
-        }
-        write_file(&options.out_dir, &target_relpath, &bytes)?;
-        datasets.push(BrowserDataset {
-            logical_key: entry.index_key.clone(),
-            url: target_relpath,
-            bytes: entry.bytes,
-            sha256: entry.sha256.clone(),
-        });
-    }
-    datasets.sort_by(|a, b| a.logical_key.cmp(&b.logical_key));
+    let datasets = site_shards::build_static_site_datasets(
+        &options.snapshot_dir,
+        &options.out_dir,
+        &snapshot,
+    )?;
     let mut runs = Vec::new();
     for entry in &snapshot.dataset_files {
         if !entry.index_key.starts_with("runs/") || !entry.relpath.ends_with("/run.pb") {
@@ -1579,11 +1659,9 @@ pub(crate) fn build_static_site_with_protected_roots(
         .as_bytes(),
     )?;
 
-    let (relpaths, catalog_data_relpaths) = expected_catalog_site_relpaths(&catalog)?;
-    let snapshot_data_relpaths = expected_snapshot_site_data_relpaths(&snapshot)?;
-    if catalog_data_relpaths != snapshot_data_relpaths {
-        bail!("static site catalog does not exactly project the source snapshot");
-    }
+    let (relpaths, _catalog_data_relpaths) = expected_catalog_site_relpaths(&catalog)?;
+    site_shards::verify_static_site_dataset_projection(&options.out_dir, &catalog, &snapshot)
+        .context("verifying generated static-site dataset projection")?;
     let found = actual_site_relpaths(&options.out_dir)?;
     if found != relpaths {
         let unexpected = found.difference(&relpaths).collect::<Vec<_>>();
@@ -1893,7 +1971,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     {
         bail!("browser catalog does not match protobuf site manifest");
     }
-    let (expected_relpaths, catalog_data_relpaths) = expected_catalog_site_relpaths(&catalog)?;
+    let (expected_relpaths, _catalog_data_relpaths) = expected_catalog_site_relpaths(&catalog)?;
     if declared_relpaths != expected_relpaths {
         let unexpected = declared_relpaths
             .difference(&expected_relpaths)
@@ -1912,20 +1990,11 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         bail!("embedded source snapshot identity disagrees with site manifest");
     }
     verify_exact_fixed_site_files(site_dir, &catalog, &source_snapshot)?;
-    let snapshot_data_relpaths = expected_snapshot_site_data_relpaths(&source_snapshot)?;
-    if catalog_data_relpaths != snapshot_data_relpaths {
-        bail!("static site catalog does not exactly project the embedded source snapshot");
-    }
     for entry in &source_snapshot.dataset_files {
-        let relpath = if entry.relpath.ends_with(".json") {
-            let suffix = entry
-                .relpath
-                .strip_prefix("web_index/")
-                .unwrap_or(&entry.relpath);
-            format!("data/{suffix}")
-        } else {
-            format!("data/{}", entry.relpath)
-        };
+        if !entry.index_key.starts_with("runs/") {
+            continue;
+        }
+        let relpath = format!("data/{}", entry.relpath);
         let bytes = fs::read(site_dir.join(&relpath))
             .with_context(|| format!("reading snapshot-bound site dataset: {relpath}"))?;
         if bytes.len() as u64 != entry.bytes || sha256_hex(&bytes) != entry.sha256 {
@@ -1959,7 +2028,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     let mut catalog_dataset_keys = BTreeSet::new();
     let mut catalog_dataset_urls = BTreeSet::new();
     for dataset in &catalog.datasets {
-        if !should_include_snapshot_index_key(&dataset.logical_key) {
+        if !site_shards::should_include_static_site_dataset_key(&dataset.logical_key) {
             bail!(
                 "browser catalog contains a non-public dataset key: {}",
                 dataset.logical_key
@@ -1985,7 +2054,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
             );
         }
         let canonical =
-            crate::query::canonicalize_public_web_index_json(&dataset.logical_key, &bytes)
+            site_shards::canonicalize_static_site_dataset_json(&dataset.logical_key, &bytes)
                 .with_context(|| {
                     format!(
                         "validating typed browser dataset during site verification: {}",
@@ -2002,6 +2071,8 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     if catalog_dataset_urls != declared_dataset_urls {
         bail!("browser catalog datasets do not exactly match declared public JSON files");
     }
+    site_shards::verify_static_site_dataset_projection(site_dir, &catalog, &source_snapshot)
+        .context("verifying static-site dataset projection against source snapshot")?;
     let expected_progression =
         build_browser_progression_catalog_from_site(site_dir, &catalog.datasets, &catalog.runs)?;
     if catalog.progression != expected_progression {
