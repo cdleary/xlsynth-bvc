@@ -1424,6 +1424,36 @@ fn site_verifier_binds_release_catalog_to_versions_dataset() {
         format!("{error:#}").contains("release processing projection disagrees"),
         "unexpected error: {error:#}"
     );
+
+    catalog.releases.clear();
+    catalog.repository_head_observation = Some(RepositoryHeadObservationView {
+        schema_version: 1,
+        repository: "xlsynth/xlsynth-crate".to_string(),
+        observed_at_utc: "2026-08-29T12:00:00Z".to_string(),
+        head_ref: "main".to_string(),
+        head_commit: "a".repeat(40),
+        head_committed_at_utc: "2026-08-29T11:00:00Z".to_string(),
+        latest_crate_version: "0.35.0".to_string(),
+        latest_release_tag: "v0.35.0".to_string(),
+        latest_release_commit: "b".repeat(40),
+        latest_release_committed_at_utc: "2026-08-28T11:00:00Z".to_string(),
+        comparison_status: "identical".to_string(),
+        commits_ahead: 9,
+        commits_behind: 0,
+    });
+    for (relpath, bytes) in
+        expected_fixed_site_files(&catalog, &embedded_snapshot).expect("render fixed files")
+    {
+        fs::write(site_dir.join(&relpath), bytes).expect("rewrite fixed site file");
+        refresh_site_manifest_entry(&site_dir, &relpath);
+    }
+
+    let error = verify_static_site(&site_dir)
+        .expect_err("catalog repository observation must come from the dataset");
+    assert!(
+        format!("{error:#}").contains("release processing projection disagrees"),
+        "unexpected error: {error:#}"
+    );
     fs::remove_dir_all(root).expect("cleanup");
 }
 

@@ -105,6 +105,18 @@ pub(crate) fn cmp_crate_versions_by_release_datetime(
     }
 }
 
+pub(crate) fn repository_comparison_status(
+    commits_ahead: u64,
+    commits_behind: u64,
+) -> &'static str {
+    match (commits_ahead > 0, commits_behind > 0) {
+        (true, true) => "diverged",
+        (true, false) => "ahead",
+        (false, true) => "behind",
+        (false, false) => "identical",
+    }
+}
+
 pub(crate) fn load_version_compat_map(
     repo_root: &Path,
 ) -> Result<BTreeMap<String, VersionCompatEntry>> {
@@ -167,6 +179,14 @@ pub(crate) fn load_xlsynth_crate_repository_head_observation(
         )
     {
         bail!("repository observation latest release tag/version disagree");
+    }
+    let expected_status =
+        repository_comparison_status(observation.commits_ahead, observation.commits_behind);
+    if observation.comparison_status != expected_status {
+        bail!(
+            "repository observation comparison status is {}; expected {expected_status} from ahead/behind counts",
+            observation.comparison_status
+        );
     }
     Ok(Some(observation))
 }
@@ -367,5 +387,15 @@ mod tests {
         assert_eq!(xlsynth_release_tag("0.45.0"), "v0.45.0");
         assert_eq!(xlsynth_release_tag("v0.45.0"), "v0.45.0");
         assert_eq!(xlsynth_release_tag("0.45.0-1"), "v0.45.0-1");
+    }
+
+    #[test]
+    fn repository_comparison_status_is_derived_from_both_counts() {
+        assert_eq!(repository_comparison_status(0, 0), "identical");
+        assert_eq!(repository_comparison_status(1, 0), "ahead");
+        assert_eq!(repository_comparison_status(0, 1), "behind");
+        assert_eq!(repository_comparison_status(1, 1), "diverged");
+        assert_eq!(repository_comparison_status(u64::MAX, 0), "ahead");
+        assert_eq!(repository_comparison_status(u64::MAX, u64::MAX), "diverged");
     }
 }

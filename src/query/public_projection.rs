@@ -249,14 +249,16 @@ fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
             .iter()
             .map(|release| &release.crate_version),
     )?;
+    let mut release_utc_by_crate = BTreeMap::new();
     for release in &index.report.releases {
         validate_version("release_status.crate_version", &release.crate_version)?;
         validate_version("release_status.dso_version", &release.dso_version)?;
-        if crate::versioning::parse_compat_release_datetime_utc(&release.crate_release_datetime)
-            .is_none()
-        {
+        let Some(released_utc) =
+            crate::versioning::parse_compat_release_datetime_utc(&release.crate_release_datetime)
+        else {
             bail!("release_status.crate_release_datetime is invalid");
-        }
+        };
+        release_utc_by_crate.insert(release.crate_version.clone(), released_utc);
         if release.processed != (release.materialized_actions > 0) {
             bail!("release_status.processed disagrees with materialized_actions");
         }
@@ -290,6 +292,23 @@ fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
             _ => {}
         }
     }
+    if !index.report.releases.windows(2).all(|pair| {
+        crate::versioning::cmp_crate_versions_by_release_datetime(
+            &pair[0].crate_version,
+            &pair[1].crate_version,
+            &release_utc_by_crate,
+        )
+        .is_lt()
+    }) {
+        bail!("release_status rows are not strictly sorted by publication time");
+    }
+    let latest_release = index.report.releases.iter().min_by(|a, b| {
+        crate::versioning::cmp_crate_versions_by_release_datetime(
+            &a.crate_version,
+            &b.crate_version,
+            &release_utc_by_crate,
+        )
+    });
     if let Some(observation) = &index.report.repository_head_observation {
         if observation.schema_version != 1
             || observation.repository != "xlsynth/xlsynth-crate"
@@ -331,16 +350,13 @@ fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
             "repository_head_observation.latest_crate_version",
             &observation.latest_crate_version,
         )?;
+        let expected_status = crate::versioning::repository_comparison_status(
+            observation.commits_ahead,
+            observation.commits_behind,
+        );
         if observation.latest_release_tag != format!("v{}", observation.latest_crate_version)
-            || !matches!(
-                observation.comparison_status.as_str(),
-                "ahead" | "behind" | "diverged" | "identical"
-            )
-            || index
-                .report
-                .releases
-                .first()
-                .map(|release| &release.crate_version)
+            || observation.comparison_status != expected_status
+            || latest_release.map(|release| &release.crate_version)
                 != Some(&observation.latest_crate_version)
         {
             bail!("repository_head_observation release comparison is inconsistent");
@@ -1269,6 +1285,70 @@ mod tests {
         .expect_err("a release without a card must have exact empty counts");
         assert!(
             format!("{error:#}").contains("release_status without a version card is not empty"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    fn unprocessed_release(crate_version: &str, released: &str) -> Value {
+        json!({
+            "crate_version": crate_version,
+            "crate_release_datetime": released,
+            "dso_version": crate_version,
+            "processed": false,
+            "materialized_actions": 0,
+            "failed_actions": 0,
+            "stdlib_enumeration_state": "not run"
+        })
+    }
+
+    #[test]
+    fn public_projection_rejects_releases_out_of_publication_order() {
+        let mut versions = empty_versions_value();
+        versions["report"]["releases"] = json!([
+            unprocessed_release("0.68.0", "2026-08-28 17:52:54 PDT"),
+            unprocessed_release("0.67.1", "2026-09-04 17:52:54 PDT")
+        ]);
+
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &serde_json::to_vec(&versions).unwrap(),
+        )
+        .expect_err("releases must be newest-publication first");
+        assert!(
+            format!("{error:#}").contains("not strictly sorted by publication time"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn public_projection_rejects_contradictory_repository_comparison() {
+        let mut versions = empty_versions_value();
+        versions["report"]["releases"] =
+            json!([unprocessed_release("0.35.0", "2026-08-28 17:52:54 PDT")]);
+        versions["report"]["repository_head_observation"] = json!({
+            "schema_version": 1,
+            "repository": "xlsynth/xlsynth-crate",
+            "observed_at_utc": "2026-08-29T12:00:00Z",
+            "head_ref": "main",
+            "head_commit": "a".repeat(40),
+            "head_committed_at_utc": "2026-08-29T11:00:00Z",
+            "latest_crate_version": "0.35.0",
+            "latest_release_tag": "v0.35.0",
+            "latest_release_commit": "b".repeat(40),
+            "latest_release_committed_at_utc": "2026-08-28T11:00:00Z",
+            "comparison_status": "identical",
+            "commits_ahead": 9,
+            "commits_behind": 0
+        });
+
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &serde_json::to_vec(&versions).unwrap(),
+        )
+        .expect_err("comparison status must agree with ahead/behind counts");
+        assert!(
+            format!("{error:#}")
+                .contains("repository_head_observation release comparison is inconsistent"),
             "unexpected error: {error:#}"
         );
     }
