@@ -181,7 +181,7 @@ fn validate_enumeration_status(status: &StdlibEnumerationStatusView) -> Result<(
     Ok(())
 }
 
-fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
+pub(super) fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
     if index.schema_version != crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION {
         bail!("versions summary schema version mismatch");
     }
@@ -277,9 +277,18 @@ fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
             Some(card)
                 if card.crate_release_datetime.as_deref()
                     != Some(release.crate_release_datetime.as_str())
+                    || ((card.total_materialized > 0 || card.failed_total > 0)
+                        && card.dso_versions.is_empty())
                     || card.dso_versions.iter().any(|version| {
                         crate::versioning::normalize_tag_version(version) != release.dso_version
                     })
+                    || card
+                        .failures
+                        .iter()
+                        .filter_map(|failure| failure.dso_version.as_deref())
+                        .any(|version| {
+                            crate::versioning::normalize_tag_version(version) != release.dso_version
+                        })
                     || release.materialized_actions != card.total_materialized
                     || release.failed_actions != card.failed_total
                     || release.stdlib_enumeration_state
@@ -1357,6 +1366,29 @@ mod tests {
                 "{label}: unexpected error: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn public_projection_requires_dso_evidence_for_processed_card() {
+        let mut card = processed_version_card("0.35.0", "2026-08-28 17:52:54 PDT", "0.35.0");
+        card["dso_versions"] = json!([]);
+        let mut versions = empty_versions_value();
+        versions["report"]["cards"] = json!([card]);
+        versions["report"]["releases"] = json!([processed_release(
+            "0.35.0",
+            "2026-08-28 17:52:54 PDT",
+            "0.35.0"
+        )]);
+
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &serde_json::to_vec(&versions).unwrap(),
+        )
+        .expect_err("a processed card must identify its DSO version");
+        assert!(
+            format!("{error:#}").contains("disagrees with its version card"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
