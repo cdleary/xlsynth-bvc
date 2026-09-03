@@ -771,7 +771,7 @@ const prefix = app.slice(0, app.indexOf('async function main()'));
 const api = new Function(prefix + '\nreturn {showComparisonDetail};')();
 const firstHash = '1'.repeat(64);
 const secondHash = '2'.repeat(64);
-const structuralDatasetKey = hash => `ir-fn-corpus-structural.v2/by-hash/${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}.json`;
+const structuralDatasetKey = hash => `ir-fn-corpus-structural.v2/by-hash-prefix/${hash.slice(0, 2)}.json`;
 const irDatasetKey = hash => `ir-fn-corpus-ir.v1/by-hash-prefix/${hash.slice(0, 2)}.json`;
 const state = {
   catalog: {datasets: [
@@ -796,15 +796,15 @@ const sample = (name, hash) => ({
   g8r_stats_action_id: `g8r-${name}`,
   yosys_abc_stats_action_id: `yabc-${name}`,
 });
-const structuralResponse = name => ({
+const structuralResponse = (name, hash) => ({
   ok: true,
-  json: async () => ({members: [{
+  json: async () => ({groups: [{structural_hash: hash, members: [{
 crate_version: '0.31.0',
 opt_ir_action_id: `action-${name}`,
 ir_top: `top-${name}`,
 source_ir_action_id: `source-${name}`,
 dslx_origin: {dslx_file: `${name}.x`, dslx_fn_name: name},
-  }]}),
+  }]}]}),
 });
 const irResponse = (name, hash) => ({
   ok: true,
@@ -820,7 +820,7 @@ yosys_abc: {ir_action_id: `ir-${name}`, ir_top: `top-${name}`, ir_text: `fn top-
 (async () => {
   const first = api.showComparisonDetail(sample('first', firstHash), 'plot-levels', state);
   const second = api.showComparisonDetail(sample('second', secondHash), 'plot-nodes', state);
-  pending.get('second.json')(structuralResponse('second'));
+  pending.get('second.json')(structuralResponse('second', secondHash));
   pending.get('second-ir.json')(irResponse('second', secondHash));
   await second;
   const secondHtml = elements['comparison-detail-evidence'].innerHTML;
@@ -831,7 +831,7 @@ throw new Error(`second selection did not render: ${secondHtml}`);
   if (!secondIrHtml.includes('Exact XLS IR') || !secondIrHtml.includes('fn top-second')) {
 throw new Error(`second selection IR did not render: ${secondIrHtml}`);
   }
-  pending.get('first.json')(structuralResponse('first'));
+  pending.get('first.json')(structuralResponse('first', firstHash));
   pending.get('first-ir.json')(irResponse('first', firstHash));
   await first;
   const finalHtml = elements['comparison-detail-evidence'].innerHTML;
@@ -912,7 +912,7 @@ if (ranked.map(row => row.ir_top).join(',') !== '__mffc_large,__mffc_small') {
   throw new Error(`unexpected MFFC ranking: ${ranked.map(row => row.ir_top)}`);
 }
 const sourceHash = 'd'.repeat(64);
-if (api.mffcStructuralGroupKey(sourceHash) !== `ir-fn-corpus-structural.v2/by-hash/dd/dd/${sourceHash}.json`) {
+if (api.mffcStructuralGroupKey(sourceHash) !== 'ir-fn-corpus-structural.v2/by-hash-prefix/dd.json') {
   throw new Error('unexpected source structural group key');
 }
 if (api.irFnCorpusIrShardKey('ir-fn-corpus-ir.v1.json', sourceHash) !== 'ir-fn-corpus-ir.v1/by-hash-prefix/dd.json') {
@@ -1401,7 +1401,7 @@ fn site_verifier_binds_dataset_bytes_to_source_snapshot() {
     let error =
         verify_static_site(&site_dir).expect_err("site data must remain bound to source snapshot");
     assert!(
-        format!("{error:#}").contains("does not match embedded source snapshot"),
+        format!("{error:#}").contains("does not match snapshot source"),
         "unexpected error: {error:#}"
     );
     fs::remove_dir_all(root).expect("cleanup");
