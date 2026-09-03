@@ -266,16 +266,28 @@ fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
         ) {
             bail!("release_status.stdlib_enumeration_state is invalid");
         }
-        if let Some(card) = index
+        let card = index
             .report
             .cards
             .iter()
-            .find(|card| card.crate_version == release.crate_version)
-            && (release.materialized_actions != card.total_materialized
-                || release.failed_actions != card.failed_total
-                || release.stdlib_enumeration_state != card.stdlib_enumeration.badge_label())
-        {
-            bail!("release_status disagrees with its version card");
+            .find(|card| card.crate_version == release.crate_version);
+        match card {
+            Some(card)
+                if release.materialized_actions != card.total_materialized
+                    || release.failed_actions != card.failed_total
+                    || release.stdlib_enumeration_state
+                        != card.stdlib_enumeration.badge_label() =>
+            {
+                bail!("release_status disagrees with its version card");
+            }
+            None if release.processed
+                || release.materialized_actions != 0
+                || release.failed_actions != 0
+                || release.stdlib_enumeration_state != "not run" =>
+            {
+                bail!("release_status without a version card is not empty");
+            }
+            _ => {}
         }
     }
     if let Some(observation) = &index.report.repository_head_observation {
@@ -1235,6 +1247,30 @@ mod tests {
                 "repository_head_observation": null
             }
         })
+    }
+
+    #[test]
+    fn public_projection_rejects_unbacked_release_counts() {
+        let mut versions = empty_versions_value();
+        versions["report"]["releases"] = json!([{
+            "crate_version": "0.35.0",
+            "crate_release_datetime": "2026-08-28 17:52:54 PDT",
+            "dso_version": "0.35.0",
+            "processed": true,
+            "materialized_actions": 1,
+            "failed_actions": 0,
+            "stdlib_enumeration_state": "not run"
+        }]);
+
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &serde_json::to_vec(&versions).unwrap(),
+        )
+        .expect_err("a release without a card must have exact empty counts");
+        assert!(
+            format!("{error:#}").contains("release_status without a version card is not empty"),
+            "unexpected error: {error:#}"
+        );
     }
 
     fn empty_trend_value(kind: &str) -> Value {
