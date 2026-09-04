@@ -707,11 +707,18 @@ pub(crate) fn filter_ir_fn_corpus_g8r_vs_yosys_samples(
     ir_node_count_lt: u64,
 ) -> Vec<StdlibG8rVsYosysSample> {
     let target_crate_version = normalize_tag_version(crate_version).to_string();
+    let latest_dso_version = dataset
+        .samples
+        .iter()
+        .filter(|sample| normalize_tag_version(&sample.crate_version) == target_crate_version)
+        .map(|sample| normalize_tag_version(&sample.dso_version).to_string())
+        .max_by(|a, b| cmp_dotted_numeric_version(a, b));
     dataset
         .samples
         .iter()
         .filter(|sample| {
             normalize_tag_version(&sample.crate_version) == target_crate_version
+                && latest_dso_version.as_deref() == Some(normalize_tag_version(&sample.dso_version))
                 && sample.yosys_abc_levels < yosys_levels_lt
                 && sample.ir_node_count < ir_node_count_lt
         })
@@ -10244,6 +10251,36 @@ mod tests {
             BTreeSet::from(["0.29.0", "0.30.0"])
         );
 
+        let mut frontend_comparison = comparison.clone();
+        frontend_comparison.schema_version =
+            WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION;
+        let frontend_comparison_bytes =
+            serde_json::to_vec(&frontend_comparison).expect("serialize frontend comparison");
+        validate_ir_fn_corpus_ir_index_closure(
+            [
+                (
+                    WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+                    comparison_bytes.as_slice(),
+                ),
+                (
+                    WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
+                    frontend_comparison_bytes.as_slice(),
+                ),
+                (
+                    WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
+                    build.manifest_bytes.as_slice(),
+                ),
+            ]
+            .into_iter()
+            .chain(
+                build
+                    .shard_files
+                    .iter()
+                    .map(|(key, bytes)| (key.as_str(), bytes.as_slice())),
+            ),
+        )
+        .expect("multi-DSO reused imports satisfy public IR closure");
+
         fs::remove_dir_all(root).expect("cleanup temp store");
     }
 
@@ -11402,7 +11439,7 @@ mod tests {
 
     #[test]
     fn filter_ir_fn_corpus_g8r_vs_yosys_samples_applies_thresholds() {
-        let dataset = StdlibG8rVsYosysDataset {
+        let mut dataset = StdlibG8rVsYosysDataset {
             fraig: false,
             samples: vec![
                 StdlibG8rVsYosysSample {
@@ -11469,6 +11506,11 @@ mod tests {
             yosys_only_count: 0,
             available_crate_versions: vec!["0.32.0".to_string(), "0.33.0".to_string()],
         };
+
+        let mut stale_dso_sample = dataset.samples[0].clone();
+        stale_dso_sample.fn_key = "f::stale-dso".to_string();
+        stale_dso_sample.dso_version = "0.34.0".to_string();
+        dataset.samples.push(stale_dso_sample);
 
         let filtered = filter_ir_fn_corpus_g8r_vs_yosys_samples(&dataset, "v0.33.0", 6.0, 50);
         assert_eq!(filtered.len(), 1);

@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -352,6 +352,79 @@ pub(crate) fn enqueue_action(store: &ArtifactStore, action: ActionSpec) -> Resul
     enqueue_action_with_priority(store, action, crate::DEFAULT_QUEUE_PRIORITY)
 }
 
+fn replace_dependency_action_id(
+    action_id: &mut String,
+    replacements: &BTreeMap<String, String>,
+) -> bool {
+    let original = action_id.clone();
+    for _ in 0..=replacements.len() {
+        let Some(replacement) = replacements.get(action_id) else {
+            break;
+        };
+        if replacement == action_id {
+            break;
+        }
+        *action_id = replacement.clone();
+    }
+    *action_id != original
+}
+
+fn replace_action_dependency_ids(
+    action: &mut ActionSpec,
+    replacements: &BTreeMap<String, String>,
+) -> bool {
+    let mut changed = false;
+    let mut replace = |action_id: &mut String| {
+        changed |= replace_dependency_action_id(action_id, replacements);
+    };
+    match action {
+        ActionSpec::ImportIrPackageFile { .. }
+        | ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. }
+        | ActionSpec::DownloadAndExtractXlsynthSourceSubtree { .. } => {}
+        ActionSpec::DriverDslxFnToIr {
+            dslx_subtree_action_id,
+            ..
+        } => replace(dslx_subtree_action_id),
+        ActionSpec::DriverIrToOpt { ir_action_id, .. }
+        | ActionSpec::DriverIrToDelayInfo { ir_action_id, .. }
+        | ActionSpec::DriverIrToG8rAig { ir_action_id, .. }
+        | ActionSpec::IrFnToCombinationalVerilog { ir_action_id, .. }
+        | ActionSpec::IrFnToKBoolConeCorpus { ir_action_id, .. }
+        | ActionSpec::IrFnToMffcCorpus { ir_action_id, .. } => replace(ir_action_id),
+        ActionSpec::DriverIrEquiv {
+            lhs_ir_action_id,
+            rhs_ir_action_id,
+            ..
+        } => {
+            replace(lhs_ir_action_id);
+            replace(rhs_ir_action_id);
+        }
+        ActionSpec::DriverIrAigEquiv {
+            ir_action_id,
+            aig_action_id,
+            ..
+        } => {
+            replace(ir_action_id);
+            replace(aig_action_id);
+        }
+        ActionSpec::ComboVerilogToYosysAbcAig {
+            verilog_action_id, ..
+        } => replace(verilog_action_id),
+        ActionSpec::AigToYosysAbcAig { aig_action_id, .. }
+        | ActionSpec::DriverAigToStats { aig_action_id, .. } => replace(aig_action_id),
+        ActionSpec::AigStatDiff {
+            opt_ir_action_id,
+            g8r_aig_stats_action_id,
+            yosys_abc_aig_stats_action_id,
+        } => {
+            replace(opt_ir_action_id);
+            replace(g8r_aig_stats_action_id);
+            replace(yosys_abc_aig_stats_action_id);
+        }
+    }
+    changed
+}
+
 fn requeue_pending_action_with_canonical_identity(
     store: &ArtifactStore,
     pending_path: &Path,
@@ -370,10 +443,65 @@ fn requeue_pending_action_with_canonical_identity(
         return Ok(None);
     }
     enqueue_action_with_priority(store, canonical, priority)?;
+
+    // Existing queue graphs were fingerprinted from the old producer identity. Rewrite every
+    // pending transitive dependent before retiring that identity, otherwise the next readiness
+    // scan would cancel those descendants as having a missing dependency.
+    let mut replacements = BTreeMap::from([(record_action_id.to_string(), canonical_id.clone())]);
+    let mut pending_records = Vec::new();
+    for path in list_queue_files(&store.queue_pending_dir())? {
+        if path == pending_path {
+            continue;
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading pending queue record: {}", path.display()));
+            }
+        };
+        let (action_id, _, priority, action) = parse_queue_work_item(&bytes, &path)?;
+        pending_records.push((path, action_id, priority, action));
+    }
+
+    let mut rewrites = BTreeMap::new();
+    loop {
+        let mut changed = false;
+        for (path, action_id, priority, original_action) in &pending_records {
+            let mut rewritten_action = original_action.clone();
+            if !replace_action_dependency_ids(&mut rewritten_action, &replacements) {
+                continue;
+            }
+            rewritten_action = crate::executor::canonicalize_action_identity(rewritten_action);
+            let rewritten_id = crate::executor::compute_action_id(&rewritten_action)?;
+            if replacements.get(action_id) != Some(&rewritten_id) {
+                replacements.insert(action_id.clone(), rewritten_id.clone());
+                changed = true;
+            }
+            rewrites.insert(
+                action_id.clone(),
+                (path.clone(), *priority, rewritten_action, rewritten_id),
+            );
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for (_, priority, action, _) in rewrites.values() {
+        enqueue_action_with_priority(store, action.clone(), *priority)?;
+    }
+    for (old_action_id, (old_path, _, _, _)) in &rewrites {
+        let _dependent_lock = QueueTransitionLock::acquire(store, old_action_id)?;
+        remove_file_if_exists(old_path)?;
+    }
     remove_file_if_exists(pending_path)?;
     eprintln!(
-        "requeued pending action under canonical identity: old={} new={}",
-        record_action_id, canonical_id
+        "requeued pending action graph under canonical identity: old={} new={} descendants={}",
+        record_action_id,
+        canonical_id,
+        rewrites.len()
     );
     Ok(None)
 }
@@ -2543,6 +2671,7 @@ mod tests {
         let input_action_id = write_completed_provenance(&store, &"1".repeat(64));
         let mut runtime = sample_runtime();
         runtime.driver_version = "0.25.0".to_string();
+        let legacy_runtime = runtime.clone();
         let legacy = ActionSpec::DriverIrToG8rAig {
             ir_action_id: input_action_id,
             top_fn_name: Some("main".to_string()),
@@ -2586,13 +2715,61 @@ mod tests {
         )
         .expect("write legacy pending");
 
+        let legacy_stats = ActionSpec::DriverAigToStats {
+            aig_action_id: pre_upgrade_id.clone(),
+            version: "v0.29.0".to_string(),
+            runtime: legacy_runtime.clone(),
+        };
+        let legacy_stats_id = enqueue_action(&store, legacy_stats.clone()).expect("enqueue stats");
+        let opt_ir_action_id = write_completed_provenance(&store, &"2".repeat(64));
+        let yosys_stats_action_id = write_completed_provenance(&store, &"3".repeat(64));
+        let legacy_diff = ActionSpec::AigStatDiff {
+            opt_ir_action_id: opt_ir_action_id.clone(),
+            g8r_aig_stats_action_id: legacy_stats_id.clone(),
+            yosys_abc_aig_stats_action_id: yosys_stats_action_id.clone(),
+        };
+        let legacy_diff_id = enqueue_action(&store, legacy_diff).expect("enqueue diff");
+
+        let canonical_stats = ActionSpec::DriverAigToStats {
+            aig_action_id: canonical_id.clone(),
+            version: "v0.29.0".to_string(),
+            runtime: legacy_runtime,
+        };
+        let canonical_stats_id =
+            crate::executor::compute_action_id(&canonical_stats).expect("canonical stats id");
+        let canonical_diff = ActionSpec::AigStatDiff {
+            opt_ir_action_id,
+            g8r_aig_stats_action_id: canonical_stats_id.clone(),
+            yosys_abc_aig_stats_action_id: yosys_stats_action_id,
+        };
+        let canonical_diff_id =
+            crate::executor::compute_action_id(&canonical_diff).expect("canonical diff id");
+
         assert!(
             claim_next_pending_item(&store, "worker-migrate", 60)
                 .expect("migrate legacy pending")
                 .is_none()
         );
         assert!(!legacy_path.exists());
+        assert!(!store.pending_queue_path(&legacy_stats_id).exists());
+        assert!(!store.pending_queue_path(&legacy_diff_id).exists());
         assert!(store.pending_queue_path(&canonical_id).exists());
+        let rewritten_stats = load_queue_pending_record(&store, &canonical_stats_id)
+            .expect("load rewritten stats")
+            .expect("rewritten stats exists");
+        assert!(matches!(
+            rewritten_stats.action,
+            ActionSpec::DriverAigToStats { aig_action_id, .. }
+                if aig_action_id == canonical_id
+        ));
+        let rewritten_diff = load_queue_pending_record(&store, &canonical_diff_id)
+            .expect("load rewritten diff")
+            .expect("rewritten diff exists");
+        assert!(matches!(
+            rewritten_diff.action,
+            ActionSpec::AigStatDiff { g8r_aig_stats_action_id, .. }
+                if g8r_aig_stats_action_id == canonical_stats_id
+        ));
         let running = claim_next_pending_item(&store, "worker-migrate", 60)
             .expect("claim canonical pending")
             .expect("canonical action should be claimable");

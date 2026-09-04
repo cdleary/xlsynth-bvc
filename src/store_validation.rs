@@ -134,6 +134,21 @@ fn validate_action_record_identity(
     let computed = compute_action_id(action)
         .with_context(|| format!("computing {state} queue action identity"))?;
     if computed != action_id {
+        let is_pre_upgrade_historical_g8r = matches!(
+            action,
+            crate::model::ActionSpec::DriverIrToG8rAig {
+                execution_recipe_revision: 0,
+                runtime,
+                ..
+            } if crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version
+            ) != 0
+        );
+        if is_pre_upgrade_historical_g8r
+            && crate::proto::compute_model_action_id_v2(action)?.to_hex() == action_id
+        {
+            return Ok(());
+        }
         bail!("{state} queue action_id does not match its typed action identity");
     }
     Ok(())
@@ -532,6 +547,39 @@ mod tests {
         let error = validate_done_record_identity(&done)
             .expect_err("done output ownership mismatch must fail");
         assert!(format!("{error:#}").contains("output artifact action_id"));
+    }
+
+    #[test]
+    fn queue_identity_validation_accepts_pre_upgrade_historical_g8r_records() {
+        let action = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: "1".repeat(64),
+            top_fn_name: Some("main".to_string()),
+            fraig: false,
+            lowering_mode: crate::model::G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
+            version: "v0.29.0".to_string(),
+            runtime: crate::model::DriverRuntimeSpec {
+                driver_version: "0.25.0".to_string(),
+                release_platform: "linux-x86_64".to_string(),
+                docker_image: "driver:0.25.0".to_string(),
+                dockerfile: "docker/driver.Dockerfile".to_string(),
+                docker_image_id: "2".repeat(64),
+                dockerfile_sha256: "3".repeat(64),
+                release_cache_input_sha256: "4".repeat(64),
+            },
+        };
+        let pre_upgrade_id = crate::proto::compute_model_action_id_v2(&action)
+            .expect("pre-upgrade action id")
+            .to_hex();
+        assert_ne!(
+            pre_upgrade_id,
+            compute_action_id(&action).expect("canonical action id")
+        );
+        for state in ["pending", "running", "failed", "canceled"] {
+            validate_action_record_identity(state, &pre_upgrade_id, &action)
+                .unwrap_or_else(|error| panic!("{state}: {error:#}"));
+        }
+        assert!(validate_action_record_identity("failed", &"f".repeat(64), &action).is_err());
     }
 
     #[test]

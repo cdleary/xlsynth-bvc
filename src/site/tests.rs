@@ -448,6 +448,7 @@ const prefix = app.slice(0, app.indexOf('async function main()'));
 const api = new Function(prefix + '\nreturn {homepageSummary,homepageExplorerHref,homepagePairPlot,renderComparisonPair};')();
 const sample = (crate_version, fn_key, g8r_nodes, g8r_levels, yosys_abc_nodes, yosys_abc_levels, g8r_product_loss, ir_top = fn_key) => ({
   crate_version,
+  dso_version: crate_version,
   fn_key,
   ir_top,
   ir_node_count: 20,
@@ -464,12 +465,13 @@ const samples = [
   sample('0.68.0', 'partial', 10, 5, 12, 7, -34),
   ...Array.from({length: 4}, (_, i) => sample('0.68.0', `mffc-${i}`, 1, 1, 1, 1, 0, `__mffc_${i}`)),
   ...Array.from({length: 4}, (_, i) => sample('0.68.0', `k3-${i}`, 1, 1, 1, 1, 0, `__k3_cone_${i}`)),
+  {...sample('0.68.0', 'stale-dso', 100, 100, 1, 1, 9999), dso_version: '0.67.0'},
 ];
 const summary = api.homepageSummary(samples);
 if (JSON.stringify(summary.versions) !== JSON.stringify(['0.66.0', '0.68.0']) || summary.latestVersion !== '0.68.0' || summary.samples.length !== 9) {
   throw new Error(`unexpected latest-release summary: ${JSON.stringify(summary)}`);
 }
-if (summary.selection !== 'latest crate release v0.68.0' || summary.wholeFunctionCount !== 1 || summary.mffcCount !== 4 || summary.k3Count !== 4) {
+if (summary.selection !== 'latest crate release v0.68.0 · DSO v0.68.0' || summary.wholeFunctionCount !== 1 || summary.mffcCount !== 4 || summary.k3Count !== 4) {
   throw new Error(`unexpected latest-release policy: ${JSON.stringify(summary)}`);
 }
 if (summary.pureWins !== 1 || summary.strictLosses !== 0 || summary.medianLoss !== 0) {
@@ -837,7 +839,7 @@ global.document = {
 };
 const app = fs.readFileSync(0, 'utf8');
 const prefix = app.slice(0, app.indexOf('async function main()'));
-const api = new Function(prefix + '\nreturn {comparisonDefaultVersion,comparisonIsLoss,comparisonQuadrant,comparisonSelectionKey};')();
+const api = new Function(prefix + '\nreturn {comparisonDefaultVersion,comparisonIsLoss,comparisonQuadrant,comparisonSelectionKey,latestDsoSamplesByCrate};')();
 const state = {lhs: 'G8r', rhs: 'Yosys/ABC'};
 const sample = (g8r_nodes, g8r_levels, yosys_abc_nodes, yosys_abc_levels) => ({
   g8r_nodes,
@@ -877,6 +879,14 @@ if (api.comparisonDefaultVersion(versions, 'invalid') !== '0.10.0') {
 }
 if (api.comparisonDefaultVersion([], null) !== '') {
   throw new Error('empty version list did not stay empty');
+}
+const latestDso = api.latestDsoSamplesByCrate([
+  {crate_version: '0.25.0', dso_version: '0.9.0', fn_key: 'stale'},
+  {crate_version: '0.25.0', dso_version: '0.10.0', fn_key: 'current'},
+  {crate_version: '0.26.0', dso_version: '0.8.0', fn_key: 'other'},
+]);
+if (JSON.stringify(latestDso.map(sample => sample.fn_key)) !== JSON.stringify(['current', 'other'])) {
+  throw new Error(`stale DSO generations were not removed: ${JSON.stringify(latestDso)}`);
 }
 
 "#;
