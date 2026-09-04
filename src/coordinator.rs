@@ -427,6 +427,17 @@ fn indexed_checkpoint_matches(
         && state.indexed_output_fingerprint.as_ref() == Some(output_fingerprint)
 }
 
+fn indexed_checkpoint_reusable(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    fingerprints_match: bool,
+) -> Result<bool> {
+    if !fingerprints_match {
+        return Ok(false);
+    }
+    Ok(crate::query::load_versions_cards_index(store, repo_root)?.is_some())
+}
+
 fn ensure_structural_index_current(
     store: &ArtifactStore,
     repo_root: &Path,
@@ -632,7 +643,7 @@ pub(crate) fn coordinate_release(
         &current_indexed_output_fingerprint,
         "coordinator.indexed_output_fingerprint",
     )?;
-    let indexed_already_succeeded = indexed_checkpoint_matches(
+    let indexed_checkpoint_fingerprints_match = indexed_checkpoint_matches(
         &state,
         &current_indexed_source_fingerprint,
         &current_indexed_output_fingerprint,
@@ -644,7 +655,11 @@ pub(crate) fn coordinate_release(
         pb::CoordinatorStage::Indexed,
         pb::CoordinatorStageStatus::FailedTransient,
         || {
-            if indexed_already_succeeded {
+            if indexed_checkpoint_reusable(
+                &store,
+                repo_root,
+                indexed_checkpoint_fingerprints_match,
+            )? {
                 Ok((
                     current_indexed_output_fingerprint.clone(),
                     format!(
@@ -1250,6 +1265,64 @@ mod tests {
             indexed_source_fingerprint(&store, &repo_root).expect("changed source fingerprint");
 
         assert_ne!(before, after);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn indexed_checkpoint_rejects_stale_runtime_recipe_identity() {
+        let root = temp_path("indexed-runtime-recipe-fingerprint");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let repo_root = std::env::current_dir().expect("current repo root");
+        crate::query::rebuild_versions_cards_index(&store, &repo_root)
+            .expect("build current versions index");
+        let source = indexed_source_fingerprint(&store, &repo_root).expect("source fingerprint");
+        let output = indexed_output_fingerprint(&store).expect("output fingerprint");
+        let mut state = pb::CoordinatorState {
+            stage_results: vec![pb::CoordinatorStageResult {
+                stage: pb::CoordinatorStage::Indexed as i32,
+                status: pb::CoordinatorStageStatus::Succeeded as i32,
+                ..Default::default()
+            }],
+            indexed_source_fingerprint: Some(source.clone()),
+            indexed_output_fingerprint: Some(output.clone()),
+            ..Default::default()
+        };
+        assert!(
+            indexed_checkpoint_reusable(
+                &store,
+                &repo_root,
+                indexed_checkpoint_matches(&state, &source, &output),
+            )
+            .expect("validate current checkpoint")
+        );
+
+        let bytes = store
+            .load_web_index_bytes(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .expect("load versions index")
+            .expect("versions index exists");
+        let mut versions: crate::query::VersionsSummaryIndexFile =
+            serde_json::from_slice(&bytes).expect("decode versions index");
+        versions.resolved_recipe_fingerprint_sha256 = "f".repeat(64);
+        store
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &serde_json::to_vec(&versions).expect("encode stale versions index"),
+            )
+            .expect("write stale versions index");
+        let stale_output = indexed_output_fingerprint(&store).expect("stale output fingerprint");
+        state.indexed_output_fingerprint = Some(stale_output.clone());
+        assert!(indexed_checkpoint_matches(&state, &source, &stale_output));
+        assert!(
+            !indexed_checkpoint_reusable(
+                &store,
+                &repo_root,
+                indexed_checkpoint_matches(&state, &source, &stale_output),
+            )
+            .expect("validate stale checkpoint"),
+            "checkpoint fingerprint matches must not bypass live runtime-recipe validation"
+        );
+
         fs::remove_dir_all(root).expect("cleanup");
     }
 
