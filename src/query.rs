@@ -53,6 +53,10 @@ pub(crate) use public_projection::*;
 
 type ProvenanceLookup<'a> = BTreeMap<&'a str, &'a Provenance>;
 const VERSIONS_SUMMARY_INPUT_FINGERPRINT_DOMAIN: &[u8] = b"xlsynth-bvc/versions-summary-input/v1\0";
+const VERSIONS_SUMMARY_RECIPE_CACHE_KEY_DOMAIN: &[u8] =
+    b"xlsynth-bvc/versions-summary-recipe-cache-key/v1\0";
+const VERSIONS_SUMMARY_RESOLVED_RECIPE_FINGERPRINT_DOMAIN: &[u8] =
+    b"xlsynth-bvc/versions-summary-resolved-recipe/v1\0";
 
 fn build_provenance_lookup<'a>(provenances: &'a [Provenance]) -> ProvenanceLookup<'a> {
     provenances
@@ -1303,6 +1307,7 @@ pub(crate) struct VersionsSummaryIndexFile {
     pub(crate) schema_version: u32,
     pub(crate) generated_utc: DateTime<Utc>,
     pub(crate) input_fingerprint_sha256: String,
+    pub(crate) resolved_recipe_fingerprint_sha256: String,
     pub(crate) report: VersionCardsReport,
 }
 
@@ -6830,6 +6835,19 @@ fn versions_summary_matches_sources(
     Ok(index_file.report.repository_head_observation == source_observation)
 }
 
+pub(crate) fn validate_complete_versions_summary(
+    index_file: &VersionsSummaryIndexFile,
+) -> Result<()> {
+    public_projection::validate_versions_summary(index_file)?;
+    if index_file.report.releases.is_empty() {
+        bail!("versions summary release ledger is empty");
+    }
+    if index_file.report.repository_head_observation.is_none() {
+        bail!("versions summary is missing its repository-head observation");
+    }
+    Ok(())
+}
+
 pub(crate) fn versions_summary_input_fingerprint(
     _store: &ArtifactStore,
     repo_root: &Path,
@@ -6875,7 +6893,82 @@ pub(crate) fn versions_summary_input_fingerprint(
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn versions_summary_resolved_recipe_fingerprint(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    report: &VersionCardsReport,
+    input_fingerprint_sha256: &str,
+) -> Result<String> {
+    let release_by_crate: BTreeMap<&str, &str> = report
+        .releases
+        .iter()
+        .map(|release| (release.crate_version.as_str(), release.dso_version.as_str()))
+        .collect();
+    let mut card_recipes = report
+        .cards
+        .iter()
+        .map(|card| {
+            let dso_version = release_by_crate
+                .get(card.crate_version.as_str())
+                .with_context(|| {
+                    format!(
+                        "release ledger card for crate v{} has no release row",
+                        card.crate_version
+                    )
+                })?;
+            Ok((card.crate_version.clone(), (*dso_version).to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    card_recipes.sort();
+
+    let mut cache_key_hasher = Sha256::new();
+    cache_key_hasher.update(VERSIONS_SUMMARY_RECIPE_CACHE_KEY_DOMAIN);
+    cache_key_hasher.update(input_fingerprint_sha256.as_bytes());
+    for (crate_version, dso_version) in &card_recipes {
+        for value in [crate_version, dso_version] {
+            cache_key_hasher.update((value.len() as u64).to_be_bytes());
+            cache_key_hasher.update(value.as_bytes());
+        }
+    }
+    let cache_key = hex::encode(cache_key_hasher.finalize());
+    store.cached_versions_summary_recipe_fingerprint(&cache_key, || {
+        let mut hasher = Sha256::new();
+        hasher.update(VERSIONS_SUMMARY_RESOLVED_RECIPE_FINGERPRINT_DOMAIN);
+        for (crate_version, dso_version) in &card_recipes {
+            for value in [crate_version, dso_version] {
+                hasher.update((value.len() as u64).to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+            let roots = canonical_root_actions_for_crate_version(
+                repo_root,
+                crate_version,
+                dso_version,
+            )
+            .with_context(|| {
+                format!(
+                    "resolving release-ledger recipe for crate v{crate_version} / dso v{dso_version}"
+                )
+            })?;
+            for root in roots {
+                let action_id = compute_action_id(&root)?;
+                hasher.update((action_id.len() as u64).to_be_bytes());
+                hasher.update(action_id.as_bytes());
+            }
+        }
+        Ok(hex::encode(hasher.finalize()))
+    })
+}
+
 pub(crate) fn load_versions_cards_index(
+    store: &ArtifactStore,
+    repo_root: &Path,
+) -> Result<Option<VersionsSummaryIndexFile>> {
+    store.with_versions_summary_input_snapshot(|| {
+        load_versions_cards_index_from_locked_inputs(store, repo_root)
+    })
+}
+
+fn load_versions_cards_index_from_locked_inputs(
     store: &ArtifactStore,
     repo_root: &Path,
 ) -> Result<Option<VersionsSummaryIndexFile>> {
@@ -6896,7 +6989,7 @@ pub(crate) fn load_versions_cards_index(
         );
         return Ok(None);
     }
-    public_projection::validate_versions_summary(&index_file)
+    validate_complete_versions_summary(&index_file)
         .with_context(|| format!("validating versions summary web index: {}", location))?;
     if store.is_snapshot_backend() {
         return Ok(Some(index_file));
@@ -6916,6 +7009,19 @@ pub(crate) fn load_versions_cards_index(
         );
         return Ok(None);
     }
+    let current_recipe_fingerprint = versions_summary_resolved_recipe_fingerprint(
+        store,
+        repo_root,
+        &index_file.report,
+        &current_input_fingerprint,
+    )?;
+    if index_file.resolved_recipe_fingerprint_sha256 != current_recipe_fingerprint {
+        info!(
+            "query versions summary web index resolved recipe fingerprint mismatch location={}; rebuild required",
+            location
+        );
+        return Ok(None);
+    }
     info!(
         "query versions summary web index hit location={} generated_utc={} cards={} unattributed={}",
         location,
@@ -6930,6 +7036,7 @@ fn write_versions_cards_index(
     store: &ArtifactStore,
     report: &VersionCardsReport,
     input_fingerprint_sha256: String,
+    resolved_recipe_fingerprint_sha256: String,
 ) -> Result<(String, u64, DateTime<Utc>)> {
     let key = WEB_VERSIONS_SUMMARY_INDEX_FILENAME;
     let location = store.web_index_location(key);
@@ -6938,6 +7045,7 @@ fn write_versions_cards_index(
         schema_version: WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
         generated_utc,
         input_fingerprint_sha256,
+        resolved_recipe_fingerprint_sha256,
         report: report.clone(),
     };
     let bytes = serde_json::to_vec(&payload).context("serializing versions summary web index")?;
@@ -6963,8 +7071,18 @@ pub(crate) fn rebuild_versions_cards_index(
         .with_versions_summary_input_snapshot(|| {
             let input_fingerprint_sha256 = versions_summary_input_fingerprint(store, repo_root)?;
             let report = build_versions_cards(store, repo_root)?;
-            let (index_location, index_bytes, generated_utc) =
-                write_versions_cards_index(store, &report, input_fingerprint_sha256)?;
+            let resolved_recipe_fingerprint_sha256 = versions_summary_resolved_recipe_fingerprint(
+                store,
+                repo_root,
+                &report,
+                &input_fingerprint_sha256,
+            )?;
+            let (index_location, index_bytes, generated_utc) = write_versions_cards_index(
+                store,
+                &report,
+                input_fingerprint_sha256,
+                resolved_recipe_fingerprint_sha256,
+            )?;
             Ok((report, index_location, index_bytes, generated_utc))
         })?;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -7160,7 +7278,7 @@ pub(crate) fn build_versions_cards(
         && latest.crate_version != observation.latest_crate_version
     {
         bail!(
-            "repository-head observation is for crate v{}, but the latest compatibility release is v{}; refresh both with scripts/sync-version-compat.sh --update",
+            "repository-head observation is for crate v{}, but the latest compatibility release is v{}; refresh both with scripts/sync_version_compat.py --update",
             observation.latest_crate_version,
             latest.crate_version
         );
@@ -7466,7 +7584,7 @@ pub(crate) fn build_unprocessed_version_rows(
             crate_release_datetime: entry.crate_release_datetime,
             dso_version: normalize_tag_version(&dso).to_string(),
             materialized_actions,
-            active_queue_actions,
+            active_queue_actions: Some(active_queue_actions),
             root_queue_state_key: queue_state_key(&root_queue_state).to_string(),
             root_queue_state_label: queue_state_display_label(&root_queue_state).to_string(),
         });
@@ -7500,9 +7618,9 @@ pub(crate) fn build_snapshot_unprocessed_version_rows(
             crate_release_datetime: release.crate_release_datetime.clone(),
             dso_version: release.dso_version.clone(),
             materialized_actions: release.materialized_actions,
-            active_queue_actions: 0,
-            root_queue_state_key: "not_queued".to_string(),
-            root_queue_state_label: "Not queued".to_string(),
+            active_queue_actions: None,
+            root_queue_state_key: "unavailable".to_string(),
+            root_queue_state_label: "Unavailable in snapshot".to_string(),
         })
         .collect()
 }
@@ -8744,6 +8862,7 @@ mod tests {
             "schema_version": WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
             "generated_utc": "2026-09-03T22:34:04Z",
             "input_fingerprint_sha256": "a".repeat(64),
+            "resolved_recipe_fingerprint_sha256": "b".repeat(64),
             "report": {
                 "cards": [],
                 "unattributed_actions": [],
@@ -8757,8 +8876,9 @@ mod tests {
                     "stdlib_enumeration_state": "not run"
                 }],
                 "repository_head_observation": {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "repository": "xlsynth/xlsynth-crate",
+                    "version_compat_sha256": "c".repeat(64),
                     "observed_at_utc": "2026-09-03T22:34:04Z",
                     "head_ref": "main",
                     "head_commit": "aaaaaaaaaaaé",
@@ -8806,6 +8926,45 @@ mod tests {
             fs::create_dir_all(destination.parent().unwrap()).expect("create metadata parent");
             fs::copy(source, destination).expect("copy release metadata source");
         }
+        let recipe_report = VersionCardsReport {
+            cards: vec![VersionCardView {
+                crate_version: "0.31.0".to_string(),
+                crate_release_datetime: None,
+                total_materialized: 1,
+                failed_total: 0,
+                dso_versions: vec!["0.35.0".to_string()],
+                stdlib_enumeration: StdlibEnumerationStatusView {
+                    state: StdlibEnumerationState::Missing,
+                    reason: StdlibEnumerationReason::RootNotMaterialized,
+                    scanned_files: 0,
+                    failed_files: 0,
+                    concrete_functions: 0,
+                    suggested_actions: 0,
+                },
+                failed_by_kind: Vec::new(),
+                failures: Vec::new(),
+            }],
+            releases: vec![CrateReleaseStatusView {
+                crate_version: "0.31.0".to_string(),
+                crate_release_datetime: "2026-01-01 00:00:00 UTC".to_string(),
+                dso_version: "0.35.0".to_string(),
+                processed: true,
+                materialized_actions: 1,
+                failed_actions: 0,
+                stdlib_enumeration_state: "not run".to_string(),
+            }],
+            ..VersionCardsReport::default()
+        };
+        let original_input_fingerprint =
+            versions_summary_input_fingerprint(&store, &test_repo_root)
+                .expect("original input fingerprint");
+        let original_recipe_fingerprint = versions_summary_resolved_recipe_fingerprint(
+            &store,
+            &test_repo_root,
+            &recipe_report,
+            &original_input_fingerprint,
+        )
+        .expect("original resolved recipe fingerprint");
         rebuild_versions_cards_index(&store, &test_repo_root)
             .expect("build source-bound versions index");
         assert!(
@@ -8837,6 +8996,16 @@ mod tests {
         let mut dockerfile = original_dockerfile.clone();
         dockerfile.extend_from_slice(b"\n# recipe change\n");
         fs::write(&dockerfile_path, dockerfile).expect("change Dockerfile source");
+        let changed_input_fingerprint = versions_summary_input_fingerprint(&store, &test_repo_root)
+            .expect("changed input fingerprint");
+        let changed_recipe_fingerprint = versions_summary_resolved_recipe_fingerprint(
+            &store,
+            &test_repo_root,
+            &recipe_report,
+            &changed_input_fingerprint,
+        )
+        .expect("changed resolved recipe fingerprint");
+        assert_ne!(original_recipe_fingerprint, changed_recipe_fingerprint);
         assert!(
             load_versions_cards_index(&store, &test_repo_root)
                 .expect("check stale runtime-recipe binding")
@@ -8857,6 +9026,33 @@ mod tests {
         assert!(
             load_versions_cards_index(&store, &test_repo_root)
                 .expect("check stale compatibility binding")
+                .is_none()
+        );
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn cached_versions_index_is_bound_to_resolved_recipe_identity() {
+        let (store, root) = make_test_store("versions-resolved-recipe-binding");
+        let repo_root = std::env::current_dir().expect("current repo root");
+        rebuild_versions_cards_index(&store, &repo_root).expect("build versions index");
+        let bytes = store
+            .load_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .expect("load versions index")
+            .expect("versions index exists");
+        let mut index: VersionsSummaryIndexFile =
+            serde_json::from_slice(&bytes).expect("decode versions index");
+        index.resolved_recipe_fingerprint_sha256 = "f".repeat(64);
+        store
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &serde_json::to_vec(&index).expect("encode tampered versions index"),
+            )
+            .expect("write tampered versions index");
+
+        assert!(
+            load_versions_cards_index(&store, &repo_root)
+                .expect("check resolved recipe binding")
                 .is_none()
         );
         fs::remove_dir_all(root).expect("cleanup temp store");

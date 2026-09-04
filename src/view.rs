@@ -34,6 +34,7 @@ pub(crate) struct CrateReleaseStatusView {
 pub(crate) struct RepositoryHeadObservationView {
     pub(crate) schema_version: u32,
     pub(crate) repository: String,
+    pub(crate) version_compat_sha256: String,
     pub(crate) observed_at_utc: String,
     pub(crate) head_ref: String,
     pub(crate) head_commit: String,
@@ -151,7 +152,7 @@ pub(crate) struct UnprocessedVersionRowView {
     pub(crate) crate_release_datetime: String,
     pub(crate) dso_version: String,
     pub(crate) materialized_actions: usize,
-    pub(crate) active_queue_actions: usize,
+    pub(crate) active_queue_actions: Option<usize>,
     pub(crate) root_queue_state_key: String,
     pub(crate) root_queue_state_label: String,
 }

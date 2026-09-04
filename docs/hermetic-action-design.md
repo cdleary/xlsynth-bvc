@@ -276,7 +276,7 @@ Sort keys:
   - uses `(ir_action_id, ir_top)` identity for referential integrity when one IR package action contains multiple functions.
 - `enqueue-structural-opt-ir-g8r --crate-version vA.B.C --fraig {true|false} [--recompute-missing-hashes] [--dry-run]` enqueues at most one canonical `DriverIrToG8rAig` action per unique optimized-IR structural hash for that crate/dso/fraig target, skipping hashes already represented in done/pending/running/failed/canceled states.
 - `backfill-k-bool-cone-suggestions [--enqueue] [--dry-run]` repairs historical `IrFnToKBoolConeCorpus` provenances by reconstructing owned k-cone follow-up suggestions from manifests (global ownership by first-seen `(created_utc, action_id)` per cone structural hash); with `--enqueue` it also enqueues missing immediate follow-ups.
-- `scripts/sync-version-compat.sh [--check]` is the repo-level update/check script for `third_party/xlsynth-crate/generated_version_compat.json`.
+- `scripts/sync_version_compat.py [--check]` is the repo-level update/check script for `third_party/xlsynth-crate/generated_version_compat.json`.
 - `dslx-to-mangled-ir-fn-name --dslx-module-name M --dslx-fn-name F` computes a typical mangled IR function name for planning.
 - `show-provenance <action_id>` prints provenance.
 - `resolve <action_id>` prints output path.

@@ -25,7 +25,7 @@ periodic source-tree write violates this invariant and must be redesigned or
 classified as out-of-band maintenance.
 
 Repository-maintenance tools are outside the invariant's runtime side. For
-example, `scripts/sync-version-compat.sh` deliberately updates the checked-in
+example, `scripts/sync_version_compat.py` deliberately updates the checked-in
 crate-to-xlsynth compatibility map. That operation is performed by a
 maintainer, reviewed as a source change, and deployed normally; the coordinator
 does not invoke it. A deployed binary whose map does not contain a requested

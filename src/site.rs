@@ -327,6 +327,7 @@ struct ProgressionVersionsIndexFile {
     schema_version: u32,
     generated_utc: chrono::DateTime<chrono::Utc>,
     input_fingerprint_sha256: String,
+    resolved_recipe_fingerprint_sha256: String,
     report: VersionCardsReport,
 }
 
@@ -662,12 +663,12 @@ fn build_browser_progression_catalog_from_site(
 fn load_versions_report_from_site(
     site_dir: &Path,
     datasets: &[BrowserDataset],
-) -> Result<Option<VersionCardsReport>> {
+) -> Result<VersionCardsReport> {
     let Some(entry) = datasets
         .iter()
         .find(|dataset| dataset.logical_key == crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
     else {
-        return Ok(None);
+        bail!("static site is missing the required versions summary dataset");
     };
     let bytes = fs::read(site_dir.join(&entry.url))
         .with_context(|| format!("reading versions dataset: {}", entry.url))?;
@@ -676,7 +677,13 @@ fn load_versions_report_from_site(
     if versions.schema_version != crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION {
         bail!("versions dataset has the wrong schema");
     }
-    Ok(Some(versions.report))
+    if versions.report.releases.is_empty() {
+        bail!("versions dataset release ledger is empty");
+    }
+    if versions.report.repository_head_observation.is_none() {
+        bail!("versions dataset is missing its repository-head observation");
+    }
+    Ok(versions.report)
 }
 
 fn normalize_base_url(value: &str) -> Result<String> {
@@ -1556,12 +1563,8 @@ pub(crate) fn build_static_site_with_protected_roots(
         datasets,
         runs,
         progression,
-        releases: versions
-            .as_ref()
-            .map(|versions| versions.releases.clone())
-            .unwrap_or_default(),
-        repository_head_observation: versions
-            .and_then(|versions| versions.repository_head_observation),
+        releases: versions.releases,
+        repository_head_observation: versions.repository_head_observation,
     };
     write_file(
         &options.out_dir,
@@ -2218,13 +2221,8 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     site_shards::verify_static_site_dataset_projection(site_dir, &catalog, &source_snapshot)
         .context("verifying static-site dataset projection against source snapshot")?;
     let versions = load_versions_report_from_site(site_dir, &catalog.datasets)?;
-    let expected_releases = versions
-        .as_ref()
-        .map(|versions| versions.releases.as_slice())
-        .unwrap_or(&[]);
-    let expected_observation = versions
-        .as_ref()
-        .and_then(|versions| versions.repository_head_observation.as_ref());
+    let expected_releases = versions.releases.as_slice();
+    let expected_observation = versions.repository_head_observation.as_ref();
     if catalog.releases.as_slice() != expected_releases
         || catalog.repository_head_observation.as_ref() != expected_observation
     {

@@ -302,10 +302,10 @@ cargo run --bin xlsynth_bvc -- discover-releases --after v0.37.0 --dry-run
 
 ```bash
 # Maintainer operation: update the checked-in map if needed
-scripts/sync-version-compat.sh
+scripts/sync_version_compat.py
 
 # CI/check mode: exit non-zero if out of date
-scripts/sync-version-compat.sh --check
+scripts/sync_version_compat.py --check
 ```
 
 Compatibility-map refresh is reviewed, out-of-band repository maintenance. A

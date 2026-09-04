@@ -1,15 +1,16 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "repository": "xlsynth/xlsynth-crate",
-  "observed_at_utc": "2026-09-03T22:34:04Z",
+  "version_compat_sha256": "aef5d6333c318723185ef1d45d9a8cd0998086fe04fd715bb7d5b6d1adf7029c",
+  "observed_at_utc": "2026-09-04T00:51:54Z",
   "head_ref": "main",
-  "head_commit": "bf793b2de3a2208f09fb6e04044d500243ae5d6c",
-  "head_committed_at_utc": "2026-09-03T17:53:02Z",
+  "head_commit": "f5fec3aa4bf7d3b3a0bc6e2dddf8e8f3211473d8",
+  "head_committed_at_utc": "2026-09-04T00:49:40Z",
   "latest_crate_version": "0.68.0",
   "latest_release_tag": "v0.68.0",
   "latest_release_commit": "e2693a3de89c701f06abe183c26adc0f67dafcbd",
   "latest_release_committed_at_utc": "2026-08-29T00:52:54Z",
   "comparison_status": "ahead",
-  "commits_ahead": 9,
+  "commits_ahead": 11,
   "commits_behind": 0
 }

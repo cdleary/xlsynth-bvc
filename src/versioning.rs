@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 use reqwest::blocking::Client;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -130,11 +131,19 @@ fn parse_repository_utc_timestamp(value: &str) -> Option<DateTime<Utc>> {
 pub(crate) fn validate_repository_head_observation(
     observation: &RepositoryHeadObservationView,
 ) -> Result<()> {
-    if observation.schema_version != 1
+    if observation.schema_version != 2
         || observation.repository != "xlsynth/xlsynth-crate"
         || observation.head_ref != "main"
     {
         bail!("repository observation identity is invalid");
+    }
+    if observation.version_compat_sha256.len() != 64
+        || !observation
+            .version_compat_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("repository observation version_compat_sha256 is not a lowercase SHA-256 digest");
     }
     for (label, commit) in [
         ("head_commit", observation.head_commit.as_str()),
@@ -199,7 +208,7 @@ pub(crate) fn load_version_compat_map(
     let path = repo_root.join(crate::VERSION_COMPAT_PATH);
     let text = fs::read_to_string(&path).with_context(|| {
         format!(
-            "reading deployed version compatibility map: {} (update it out of band with `scripts/sync-version-compat.sh` and redeploy)",
+            "reading deployed version compatibility map: {} (update it out of band with `scripts/sync_version_compat.py` and redeploy)",
             path.display()
         )
     })?;
@@ -233,6 +242,21 @@ pub(crate) fn load_xlsynth_crate_repository_head_observation(
         .with_context(|| format!("parsing repository observation JSON at {}", path.display()))?;
     validate_repository_head_observation(&observation)
         .with_context(|| format!("validating repository observation at {}", path.display()))?;
+    let compat_path = repo_root.join(crate::VERSION_COMPAT_PATH);
+    let compat_bytes = fs::read(&compat_path).with_context(|| {
+        format!(
+            "reading compatibility map while validating repository observation: {}",
+            compat_path.display()
+        )
+    })?;
+    let compat_sha256 = hex::encode(Sha256::digest(&compat_bytes));
+    if observation.version_compat_sha256 != compat_sha256 {
+        bail!(
+            "repository observation belongs to compatibility map {}, but deployed map is {}; rerun scripts/sync_version_compat.py",
+            observation.version_compat_sha256,
+            compat_sha256
+        );
+    }
     Ok(Some(observation))
 }
 
@@ -258,7 +282,7 @@ pub(crate) fn resolve_xlsynth_version_for_driver(
     let key = normalize_tag_version(driver_version);
     let entry = compat.get(key).ok_or_else(|| {
         anyhow!(
-            "driver crate version `{}` was not found in deployed compatibility map {}; update it out of band with `scripts/sync-version-compat.sh` and redeploy, or choose a known version",
+            "driver crate version `{}` was not found in deployed compatibility map {}; update it out of band with `scripts/sync_version_compat.py` and redeploy, or choose a known version",
             driver_version,
             crate::VERSION_COMPAT_PATH
         )
@@ -446,8 +470,9 @@ mod tests {
 
     fn repository_observation() -> RepositoryHeadObservationView {
         RepositoryHeadObservationView {
-            schema_version: 1,
+            schema_version: 2,
             repository: "xlsynth/xlsynth-crate".to_string(),
+            version_compat_sha256: "c".repeat(64),
             observed_at_utc: "2026-09-03T22:34:04Z".to_string(),
             head_ref: "main".to_string(),
             head_commit: "a".repeat(40),

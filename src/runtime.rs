@@ -201,7 +201,7 @@ pub(crate) fn resolve_driver_version(
             .max_by(|a, b| crate::versioning::cmp_dotted_numeric_version(a, b))
             .unwrap_or("unknown");
         bail!(
-            "no compatible driver crate version is known for {}; newest mapped xlsynth version in {} is v{} (update the map out of band with `scripts/sync-version-compat.sh` and redeploy if needed)",
+            "no compatible driver crate version is known for {}; newest mapped xlsynth version in {} is v{} (update the map out of band with `scripts/sync_version_compat.py` and redeploy if needed)",
             requested_xlsynth_version,
             crate::VERSION_COMPAT_PATH,
             newest_mapped_xlsynth
@@ -314,7 +314,7 @@ pub(crate) fn ensure_driver_runtime_compatibility(
     let driver_version = crate::versioning::normalize_tag_version(&runtime.driver_version);
     let entry = compat.get(driver_version).ok_or_else(|| {
         anyhow!(
-            "driver crate version `{}` was not found in deployed compatibility map {}; update it out of band with `scripts/sync-version-compat.sh` and redeploy, or choose a known version",
+            "driver crate version `{}` was not found in deployed compatibility map {}; update it out of band with `scripts/sync_version_compat.py` and redeploy, or choose a known version",
             runtime.driver_version,
             crate::VERSION_COMPAT_PATH
         )

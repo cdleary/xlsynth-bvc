@@ -189,6 +189,10 @@ pub(super) fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Res
         "versions_summary.input_fingerprint_sha256",
         &index.input_fingerprint_sha256,
     )?;
+    validate_hex_digest(
+        "versions_summary.resolved_recipe_fingerprint_sha256",
+        &index.resolved_recipe_fingerprint_sha256,
+    )?;
     validate_unique_strings(
         "versions_summary.cards.crate_version",
         index.report.cards.iter().map(|card| &card.crate_version),
@@ -1248,6 +1252,7 @@ mod tests {
             "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
             "generated_utc": "2026-08-29T12:00:00Z",
             "input_fingerprint_sha256": "a".repeat(64),
+            "resolved_recipe_fingerprint_sha256": "b".repeat(64),
             "report": {
                 "cards": [],
                 "unattributed_actions": [],
@@ -1421,8 +1426,9 @@ mod tests {
         versions["report"]["releases"] =
             json!([unprocessed_release("0.35.0", "2026-08-28 17:52:54 PDT")]);
         versions["report"]["repository_head_observation"] = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "repository": "xlsynth/xlsynth-crate",
+            "version_compat_sha256": "c".repeat(64),
             "observed_at_utc": "2026-08-29T12:00:00Z",
             "head_ref": "main",
             "head_commit": "a".repeat(40),

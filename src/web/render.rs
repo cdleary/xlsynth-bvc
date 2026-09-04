@@ -5700,8 +5700,13 @@ pub(super) fn render_versions_html(
             let root_state_class = html_escape(&row.root_queue_state_key);
             let root_state =
                 QueueState::from_key(&row.root_queue_state_key).unwrap_or(QueueState::None);
-            let enqueue_disabled =
-                !show_live_queue || root_state.is_active() || row.active_queue_actions > 0;
+            let enqueue_disabled = !show_live_queue
+                || root_state.is_active()
+                || row.active_queue_actions.is_some_and(|count| count > 0);
+            let active_queue_actions = row
+                .active_queue_actions
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "Unavailable".to_string());
             let button_text = if !show_live_queue {
                 "Runner disabled"
             } else if enqueue_disabled {
@@ -5726,7 +5731,7 @@ pub(super) fn render_versions_html(
                 html_escape(&row.crate_release_datetime),
                 html_escape(&row.dso_version),
                 row.materialized_actions,
-                row.active_queue_actions,
+                active_queue_actions,
                 root_state_class,
                 html_escape(&row.root_queue_state_label),
                 html_escape(&row.crate_version),

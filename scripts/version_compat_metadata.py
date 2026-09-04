@@ -29,6 +29,7 @@ _TIMEZONE_OFFSETS = {
 _OBSERVATION_FIELDS = {
     "schema_version",
     "repository",
+    "version_compat_sha256",
     "observed_at_utc",
     "head_ref",
     "head_commit",
@@ -115,6 +116,7 @@ def validate_observation(
     *,
     repository: str,
     latest_crate_version: str,
+    version_compat_sha256: str,
     expected_remote_observation: Any,
 ) -> None:
     if not isinstance(observation, dict):
@@ -125,10 +127,12 @@ def validate_observation(
         raise ValueError(
             f"repository observation fields differ: missing={sorted(missing)} unknown={sorted(unknown)}"
         )
-    if type(observation["schema_version"]) is not int or observation["schema_version"] != 1:
-        raise ValueError("schema_version must be 1")
+    if type(observation["schema_version"]) is not int or observation["schema_version"] != 2:
+        raise ValueError("schema_version must be 2")
     if observation["repository"] != repository:
         raise ValueError(f"repository must be {repository!r}")
+    if observation["version_compat_sha256"] != version_compat_sha256:
+        raise ValueError("version_compat_sha256 does not match the compatibility map")
     if observation["head_ref"] != "main":
         raise ValueError("head_ref must be 'main'")
     if observation["latest_crate_version"] != latest_crate_version:
@@ -189,6 +193,7 @@ def main() -> int:
     validate_parser.add_argument("expected_remote_observation_json")
     validate_parser.add_argument("repository")
     validate_parser.add_argument("latest_crate_version")
+    validate_parser.add_argument("version_compat_sha256")
     args = parser.parse_args()
     try:
         if args.command == "latest-release":
@@ -198,6 +203,7 @@ def main() -> int:
                 _load_json(args.observation_json),
                 repository=args.repository,
                 latest_crate_version=args.latest_crate_version,
+                version_compat_sha256=args.version_compat_sha256,
                 expected_remote_observation=_load_json(
                     args.expected_remote_observation_json
                 ),

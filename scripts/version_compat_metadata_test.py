@@ -8,8 +8,9 @@ from version_compat_metadata import latest_release_version, validate_observation
 
 def valid_observation() -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "repository": "xlsynth/xlsynth-crate",
+        "version_compat_sha256": "c" * 64,
         "observed_at_utc": "2026-09-03T22:34:04Z",
         "head_ref": "main",
         "head_commit": "a" * 40,
@@ -31,6 +32,7 @@ def validate(
         observation,
         repository="xlsynth/xlsynth-crate",
         latest_crate_version="0.67.1",
+        version_compat_sha256="c" * 64,
         expected_remote_observation=(
             valid_observation()
             if expected_remote_observation is None
@@ -64,6 +66,13 @@ class VersionCompatMetadataTest(unittest.TestCase):
         observation["latest_crate_version"] = "0.68.0"
 
         with self.assertRaisesRegex(ValueError, "publication-latest"):
+            validate(observation)
+
+    def test_validate_observation_rejects_compatibility_digest_mismatch(self) -> None:
+        observation = valid_observation()
+        observation["version_compat_sha256"] = "d" * 64
+
+        with self.assertRaisesRegex(ValueError, "compatibility map"):
             validate(observation)
 
     def test_validate_observation_rejects_malformed_commit(self) -> None:

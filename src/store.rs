@@ -2723,6 +2723,7 @@ pub(crate) struct ArtifactStore {
     failed_records_cache: Mutex<Option<TimedCache<Vec<QueueFailed>>>>,
     db_size_cache: Mutex<Option<TimedCache<u64>>>,
     versions_summary_input_lock: RwLock<()>,
+    versions_summary_recipe_cache: Mutex<Option<(String, String)>>,
 }
 
 impl ArtifactStore {
@@ -2764,6 +2765,7 @@ impl ArtifactStore {
             failed_records_cache: Mutex::new(None),
             db_size_cache: Mutex::new(None),
             versions_summary_input_lock: RwLock::new(()),
+            versions_summary_recipe_cache: Mutex::new(None),
         }
     }
 
@@ -2782,6 +2784,7 @@ impl ArtifactStore {
             failed_records_cache: Mutex::new(None),
             db_size_cache: Mutex::new(None),
             versions_summary_input_lock: RwLock::new(()),
+            versions_summary_recipe_cache: Mutex::new(None),
         }
     }
 
@@ -2871,6 +2874,28 @@ impl ArtifactStore {
             .read()
             .map_err(|_| anyhow!("locking versions summary inputs for rebuild"))?;
         operation()
+    }
+
+    pub(crate) fn cached_versions_summary_recipe_fingerprint(
+        &self,
+        cache_key: &str,
+        resolve: impl FnOnce() -> Result<String>,
+    ) -> Result<String> {
+        // Resolution can inspect/build the bound driver image and fetch immutable release
+        // inputs. Hold this small, process-local lock through resolution so concurrent page
+        // requests do that work once for a given source/report identity.
+        let mut cached = self
+            .versions_summary_recipe_cache
+            .lock()
+            .map_err(|_| anyhow!("locking versions summary recipe cache"))?;
+        if let Some((cached_key, fingerprint)) = cached.as_ref()
+            && cached_key == cache_key
+        {
+            return Ok(fingerprint.clone());
+        }
+        let fingerprint = resolve()?;
+        *cached = Some((cache_key.to_string(), fingerprint.clone()));
+        Ok(fingerprint)
     }
 
     #[cfg(test)]

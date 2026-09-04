@@ -131,7 +131,11 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
             build_unprocessed_version_rows(&store, &repo_root, &index.report.cards)?
         };
         let after_unprocessed = Instant::now();
-        let db_size_bytes = store.artifacts_db_size_bytes().ok();
+        let db_size_bytes = if show_db_size_link {
+            store.artifacts_db_size_bytes().ok()
+        } else {
+            None
+        };
         let live_status = if show_live_queue {
             let status = build_queue_live_status(&store, &repo_root, runner_owner_prefix.as_deref())?;
             apply_runner_control_status(status, true, runner_control.as_deref())

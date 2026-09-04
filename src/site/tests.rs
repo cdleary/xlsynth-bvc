@@ -1428,8 +1428,9 @@ fn site_verifier_binds_release_catalog_to_versions_dataset() {
 
     catalog.releases.clear();
     catalog.repository_head_observation = Some(RepositoryHeadObservationView {
-        schema_version: 1,
+        schema_version: 2,
         repository: "xlsynth/xlsynth-crate".to_string(),
+        version_compat_sha256: "c".repeat(64),
         observed_at_utc: "2026-08-29T12:00:00Z".to_string(),
         head_ref: "main".to_string(),
         head_commit: "a".repeat(40),

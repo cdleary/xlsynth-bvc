@@ -23,10 +23,10 @@ driver action identities.
 - Upstream source: `main` branch file `generated_version_compat.json`
 
 This compatibility JSON is the only third-party artifact intended to be updated
-from head as needed, via the local `refresh-version-compat` CLI command.
+from head as needed, via `scripts/sync_version_compat.py`.
 
-The same sync records `repository_head_observation.json` when the compatibility
-map changes. The observation binds the then-current `xlsynth-crate` `main`
+The same sync records `repository_head_observation.json`. The observation binds
+the exact compatibility-map SHA-256 and the then-current `xlsynth-crate` `main`
 commit to the latest crate release tag and records GitHub's ahead/behind commit
 counts. It is publication metadata rather than an action input: it makes the
 release-status page reproducible without contacting GitHub while rendering the

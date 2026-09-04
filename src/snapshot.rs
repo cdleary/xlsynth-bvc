@@ -36,7 +36,7 @@ use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
 // Version 10 invalidates checkpoints that may contain versions-summary.v4 but not the
-// release-ledger-bearing versions-summary.v5 dataset.
+// release-ledger-bearing versions-summary.v6 dataset.
 pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 10;
 pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.pb";
 pub(crate) const STATIC_SNAPSHOT_WEB_INDEX_DIR: &str = "web_index";
@@ -1379,6 +1379,17 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
     )
     .context("validating IR function corpus index closure in static snapshot")?;
 
+    let versions_bytes = public_index_entries
+        .iter()
+        .find_map(|(index_key, bytes)| {
+            (index_key == WEB_VERSIONS_SUMMARY_INDEX_FILENAME).then_some(bytes.as_slice())
+        })
+        .context("static snapshot is missing the required versions summary dataset")?;
+    let versions: crate::query::VersionsSummaryIndexFile =
+        serde_json::from_slice(versions_bytes).context("decoding snapshot versions summary")?;
+    crate::query::validate_complete_versions_summary(&versions)
+        .context("validating complete snapshot versions summary")?;
+
     validate_analysis_public_run_bindings(&decoded_runs, &decoded_analysis_reports)?;
 
     if decoded_campaign_ids.into_iter().collect::<Vec<_>>() != manifest.campaign_ids
@@ -1680,6 +1691,7 @@ mod tests {
             schema_version: crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
             generated_utc: Utc::now(),
             input_fingerprint_sha256,
+            resolved_recipe_fingerprint_sha256: "b".repeat(64),
             report: crate::view::VersionCardsReport::default(),
         };
         store
@@ -1700,7 +1712,7 @@ mod tests {
         )
         .expect_err("skip mode must reject a source-incomplete release ledger");
         assert!(
-            format!("{error:#}").contains("missing or stale"),
+            format!("{error:#}").contains("release ledger is empty"),
             "unexpected error: {error:#}"
         );
         fs::remove_dir_all(root).expect("cleanup");
@@ -1967,6 +1979,48 @@ mod tests {
                 || err.to_string().contains("size mismatch"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn static_snapshot_verify_rejects_self_consistent_missing_versions_ledger() {
+        let root = make_temp_dir("missing-versions-ledger");
+        let store = ArtifactStore::new(root.join("store"));
+        store.ensure_layout().expect("ensure layout");
+        store
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
+            .expect("write web index");
+        let snapshot_dir = root.join("snapshot-out");
+        build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+
+        let mut manifest = load_static_snapshot_manifest(&snapshot_dir).expect("load manifest");
+        let removed = manifest
+            .dataset_files
+            .iter()
+            .position(|entry| entry.index_key == WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .map(|index| manifest.dataset_files.remove(index))
+            .expect("versions dataset entry");
+        fs::remove_file(snapshot_dir.join(removed.relpath)).expect("remove versions dataset");
+        rewrite_snapshot_manifest(&snapshot_dir, manifest);
+
+        let error = verify_static_snapshot(&snapshot_dir)
+            .expect_err("self-consistent snapshot without versions ledger must fail");
+        assert!(
+            format!("{error:#}").contains("missing the required versions summary"),
+            "unexpected error: {error:#}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
