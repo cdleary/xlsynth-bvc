@@ -77,6 +77,7 @@ message DriverIrToG8rAigAction {
   G8rLoweringMode lowering_mode = 4;
   DsoVersion dso_version = 5;
   DriverRuntimeSpec runtime = 6;
+  uint32 execution_recipe_revision = 7;
 }
 
 message IrFnToCombinationalVerilogAction {

@@ -25,7 +25,8 @@ use crate::query::{
     load_versions_cards_index, stdlib_enumeration_status_from_provenance,
 };
 use crate::queue::{
-    QueueState, action_dependency_action_ids, load_queue_canceled_record, queue_state_for_action,
+    QueueState, action_dependency_action_ids, load_queue_canceled_record,
+    project_action_identity_for_read, queue_state_for_action, resolve_queue_identity_alias,
 };
 use crate::runtime::{
     explicit_driver_runtime_for_crate_version, explicit_driver_runtime_recipe_for_crate_version,
@@ -979,6 +980,7 @@ fn evaluate_completion(
         .root_actions
         .iter()
         .map(action_id_from_root)
+        .map(|action_id| action_id.and_then(|id| resolve_queue_identity_alias(store, &id)))
         .collect::<Result<_>>()?;
     let mut discovered = root_ids.clone();
     let mut queue: VecDeque<String> = root_ids.iter().cloned().collect();
@@ -988,8 +990,10 @@ fn evaluate_completion(
         }
         let provenance = store.load_provenance(&action_id)?;
         for suggestion in provenance.suggested_next_actions {
-            if discovered.insert(suggestion.action_id.clone()) {
-                queue.push_back(suggestion.action_id);
+            let (suggested_action_id, _) =
+                project_action_identity_for_read(store, &suggestion.action_id, &suggestion.action)?;
+            if discovered.insert(suggested_action_id.clone()) {
+                queue.push_back(suggested_action_id);
             }
         }
     }
@@ -1417,6 +1421,7 @@ pub(crate) fn finalize_campaign_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ArtifactRef, ArtifactType, Provenance, SuggestedAction};
     use crate::queue::list_queue_files;
     use crate::versioning::load_version_compat_map;
     use crate::view::{
@@ -1424,6 +1429,35 @@ mod tests {
         VersionCardView, VersionCardsReport,
     };
     use std::collections::BTreeMap;
+
+    fn write_test_provenance(
+        store: &ArtifactStore,
+        action: ActionSpec,
+        suggested_next_actions: Vec<SuggestedAction>,
+    ) -> String {
+        let action_id = compute_model_action_id_v2(&action)
+            .expect("test action id")
+            .to_hex();
+        store
+            .write_provenance(&Provenance {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: action_id.clone(),
+                created_utc: Utc::now(),
+                action,
+                dependencies: Vec::new(),
+                output_artifact: ArtifactRef {
+                    action_id: action_id.clone(),
+                    artifact_type: ArtifactType::IrPackageFile,
+                    relpath: "payload/test.ir".to_string(),
+                },
+                output_files: Vec::new(),
+                commands: Vec::new(),
+                details: serde_json::json!({}),
+                suggested_next_actions,
+            })
+            .expect("write test provenance");
+        action_id
+    }
 
     fn temp_path(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1975,6 +2009,88 @@ mod tests {
             "\\0oops\\0"
         );
         assert_eq!(normalize_completion_error(" \n\t", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn completion_projects_legacy_suggestion_without_identity_alias() {
+        let root = temp_path("completion-legacy-suggestion");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let runtime = crate::model::DriverRuntimeSpec {
+            driver_version: "0.25.0".to_string(),
+            release_platform: "ubuntu2004".to_string(),
+            docker_image: "test-driver:0.25.0".to_string(),
+            dockerfile: "docker/test.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
+        };
+        let target_action = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: "2".repeat(64),
+            top_fn_name: Some("target".to_string()),
+            fraig: false,
+            lowering_mode: crate::model::G8rLoweringMode::Default,
+            execution_recipe_revision: 1,
+            version: "v0.25.0".to_string(),
+            runtime: runtime.clone(),
+        };
+        let target_action_id = write_test_provenance(&store, target_action.clone(), Vec::new());
+        let mut legacy_target_action = target_action.clone();
+        let ActionSpec::DriverIrToG8rAig {
+            execution_recipe_revision,
+            ..
+        } = &mut legacy_target_action
+        else {
+            unreachable!("test target is G8r")
+        };
+        *execution_recipe_revision = 0;
+        let legacy_target_action_id = compute_model_action_id_v2(&legacy_target_action)
+            .expect("legacy target action id")
+            .to_hex();
+        assert_ne!(legacy_target_action_id, target_action_id);
+        let root_action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "1".repeat(64),
+            top_fn_name: Some("root".to_string()),
+        };
+        let root_action_id = write_test_provenance(
+            &store,
+            root_action.clone(),
+            vec![SuggestedAction {
+                reason: "migrated target".to_string(),
+                action_id: legacy_target_action_id,
+                action: legacy_target_action,
+            }],
+        );
+        let manifest = pb::CampaignRunManifest {
+            campaign: Some(pb::CampaignSpec {
+                failure_policy: Some(pb::CampaignFailurePolicy {
+                    allow_sample_action_failures: false,
+                    root_action_failure_is_terminal: true,
+                }),
+                work_policy: Some(pb::CampaignWorkPolicy::default()),
+                ..Default::default()
+            }),
+            crate_version: Some(pb::CrateVersion {
+                value: "0.1.0".to_string(),
+            }),
+            root_actions: vec![pb::CampaignRootAction {
+                action_id: Some(
+                    action_id_to_proto(&root_action_id, "test.root_action_id")
+                        .expect("root action id proto"),
+                ),
+                action: Some(action_spec_to_proto(&root_action).expect("root action proto")),
+            }],
+            ..Default::default()
+        };
+
+        let completion = evaluate_completion(&store, Path::new("."), &manifest)
+            .expect("evaluate completion through projected suggestion");
+        assert_eq!(completion.status, pb::CampaignRunStatus::Complete as i32);
+        assert_eq!(completion.completed_root_count, 1);
+        assert_eq!(completion.pending_count, 0);
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

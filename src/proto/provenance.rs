@@ -436,6 +436,11 @@ fn details_to_proto(action: &model::ActionSpec, details: &Value) -> Result<pb::A
                 output_kind: string(map, "driver_ir2g8r_output_kind"),
                 top_ignored_reason: string(map, "driver_ir2g8r_top_ignored_reason"),
                 lowering_mode_flags: string(map, "g8r_lowering_mode_flags").unwrap_or_default(),
+                execution_recipe_revision: u64_value(
+                    map,
+                    "driver_ir2g8r_execution_recipe_revision",
+                )
+                .and_then(|value| u32::try_from(value).ok()),
             })
         }
         M::IrFnToCombinationalVerilog {
@@ -919,6 +924,12 @@ fn details_from_proto(action: &model::ActionSpec, value: &pb::ActionDetails) -> 
             }
             if let Some(value) = &details.top_ignored_reason {
                 map.insert("driver_ir2g8r_top_ignored_reason".into(), json!(value));
+            }
+            if let Some(value) = details.execution_recipe_revision {
+                map.insert(
+                    "driver_ir2g8r_execution_recipe_revision".into(),
+                    json!(value),
+                );
             }
         }
         (M::IrFnToCombinationalVerilog { .. }, Kind::IrFnToCombinationalVerilog(details)) => {
@@ -1549,6 +1560,55 @@ mod tests {
             original.output_files[0].sha256
         );
         assert_eq!(decoded.details["import_kind"], "local_ir_file");
+    }
+
+    #[test]
+    fn g8r_execution_recipe_revision_round_trips_in_typed_details() {
+        let action = model::ActionSpec::DriverIrToG8rAig {
+            ir_action_id: "1".repeat(64),
+            top_fn_name: Some("main".to_string()),
+            fraig: false,
+            lowering_mode: model::G8rLoweringMode::Default,
+            execution_recipe_revision: 1,
+            version: "v0.29.0".to_string(),
+            runtime: model::DriverRuntimeSpec {
+                driver_version: "0.25.0".to_string(),
+                release_platform: "ubuntu2004".to_string(),
+                docker_image: "xlsynth-bvc-driver:0.25.0".to_string(),
+                dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+                dockerfile_sha256: "2".repeat(64),
+                docker_image_id: "3".repeat(64),
+                release_cache_input_sha256: "4".repeat(64),
+            },
+        };
+        let action_id = crate::proto::compute_model_action_id_v2(&action)
+            .expect("action id")
+            .to_hex();
+        let provenance = model::Provenance {
+            schema_version: PROVENANCE_RECORD_VERSION,
+            action_id: action_id.clone(),
+            created_utc: Utc.with_ymd_and_hms(2026, 9, 3, 1, 2, 3).unwrap(),
+            action,
+            dependencies: Vec::new(),
+            output_artifact: model::ArtifactRef {
+                action_id,
+                artifact_type: model::ArtifactType::AigFile,
+                relpath: "payload/output.aig".to_string(),
+            },
+            output_files: Vec::new(),
+            commands: Vec::new(),
+            details: json!({"driver_ir2g8r_execution_recipe_revision": 1}),
+            suggested_next_actions: Vec::new(),
+        };
+
+        let decoded = decode_provenance(
+            &encode_provenance(&provenance).expect("encode typed G8r provenance"),
+        )
+        .expect("decode typed G8r provenance");
+        assert_eq!(
+            decoded.details["driver_ir2g8r_execution_recipe_revision"],
+            1
+        );
     }
 
     #[test]

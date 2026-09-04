@@ -3789,6 +3789,7 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
             top_fn_name: Some("top_a".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: version.to_string(),
             runtime: runtime_a.clone(),
         };
@@ -3797,6 +3798,7 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
             top_fn_name: Some("top_b".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: version.to_string(),
             runtime: runtime_a.clone(),
         };
@@ -3805,6 +3807,7 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
             top_fn_name: Some("top_c".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: version.to_string(),
             runtime: runtime_b.clone(),
         };
@@ -3813,6 +3816,7 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
             top_fn_name: Some("top_a".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+            execution_recipe_revision: 0,
             version: version.to_string(),
             runtime: runtime_a.clone(),
         };

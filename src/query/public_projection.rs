@@ -877,14 +877,22 @@ fn collect_expected_ir_fn_corpus_ir_pairs(
 
     let mut g8r_by_entity = BTreeMap::new();
     for row in &comparison.g8r_points {
-        let key = (row.structural_hash.as_str(), row.crate_version.as_str());
+        let key = (
+            row.structural_hash.as_str(),
+            row.crate_version.as_str(),
+            row.point.dso_version.as_str(),
+        );
         if g8r_by_entity.insert(key, &row.point).is_some() {
             bail!("IR corpus comparison has duplicate G8r entity points");
         }
     }
     let mut yosys_by_entity = BTreeMap::new();
     for row in &comparison.yosys_points {
-        let key = (row.structural_hash.as_str(), row.crate_version.as_str());
+        let key = (
+            row.structural_hash.as_str(),
+            row.crate_version.as_str(),
+            row.point.dso_version.as_str(),
+        );
         if yosys_by_entity.insert(key, &row.point).is_some() {
             bail!("IR corpus comparison has duplicate Yosys/ABC entity points");
         }
@@ -899,7 +907,11 @@ fn collect_expected_ir_fn_corpus_ir_pairs(
             .ir_top
             .as_deref()
             .context("IR corpus comparison sample has no IR top")?;
-        let entity_key = (structural_hash, sample.crate_version.as_str());
+        let entity_key = (
+            structural_hash,
+            sample.crate_version.as_str(),
+            sample.dso_version.as_str(),
+        );
         let g8r = g8r_by_entity
             .get(&entity_key)
             .context("IR corpus comparison sample is missing its G8r entity point")?;

@@ -2357,9 +2357,9 @@ mod tests {
         assert!(!should_include_snapshot_index_key(
             "stdlib-file-action-graph.v1.json"
         ));
-        assert!(!should_include_snapshot_index_key(
-            "ir-fn-corpus-g8r-vs-yosys-abc.v3.json/incremental-delta/row.json"
-        ));
+        assert!(!should_include_snapshot_index_key(&format!(
+            "{WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME}/incremental-delta/row.json"
+        )));
         assert!(!should_include_snapshot_index_key(&format!(
             "{WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE}/by-hash/ff/ff/{hash}.json"
         )));

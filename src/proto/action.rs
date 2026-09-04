@@ -847,6 +847,7 @@ fn action_spec_from_model(action: &model::ActionSpec) -> Result<pb::ActionSpec> 
             top_fn_name,
             fraig,
             lowering_mode,
+            execution_recipe_revision,
             version,
             runtime,
         } => Kind::DriverIrToG8rAig(pb::DriverIrToG8rAigAction {
@@ -862,6 +863,7 @@ fn action_spec_from_model(action: &model::ActionSpec) -> Result<pb::ActionSpec> 
                     pb::G8rLoweringMode::FrontendNoPrepRewrite as i32
                 }
             },
+            execution_recipe_revision: *execution_recipe_revision,
             dso_version: Some(dso_version(version, "driver_ir_to_g8r_aig.dso_version")?),
             runtime: Some(driver_runtime_to_proto(
                 runtime,
@@ -1275,6 +1277,7 @@ pub(crate) fn action_spec_from_proto(action: &pb::ActionSpec) -> Result<model::A
                     bail!("driver_ir_to_g8r_aig lowering mode unspecified")
                 }
             },
+            execution_recipe_revision: value.execution_recipe_revision,
             version: version_value(&value.dso_version, "driver_ir_to_g8r_aig.dso_version")?,
             runtime: driver_runtime_from_proto(
                 required(&value.runtime, "driver_ir_to_g8r_aig.runtime")?,
@@ -1537,6 +1540,7 @@ mod tests {
                     top_fn_name: Some("main".to_string()),
                     fraig: true,
                     lowering_mode: model::G8rLoweringMode::FrontendNoPrepRewrite,
+                    execution_recipe_revision: 0,
                     version: "v0.47.0".to_string(),
                     runtime: runtime.clone(),
                 },

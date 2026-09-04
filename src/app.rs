@@ -980,12 +980,13 @@ pub(crate) fn run() -> Result<()> {
             );
         }
         TopCommand::Rematerialize { action_id } => {
-            let provenance = store.load_provenance(&action_id)?;
-            let (computed, artifact_ref) = execute_action(&store, provenance.action.clone())?;
-            if computed != action_id {
+            let (expected_action_id, action) =
+                prepare_action_for_rematerialization(&store, &action_id)?;
+            let (computed, artifact_ref) = execute_action(&store, action)?;
+            if computed != expected_action_id {
                 bail!(
                     "action id mismatch when rematerializing; stored={} computed={}",
-                    action_id,
+                    expected_action_id,
                     computed
                 );
             }
@@ -1019,6 +1020,25 @@ pub(crate) fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn prepare_action_for_rematerialization(
+    store: &ArtifactStore,
+    requested_action_id: &str,
+) -> Result<(String, ActionSpec)> {
+    let resolved_action_id = resolve_queue_identity_alias(store, requested_action_id)?;
+    let provenance = store.load_provenance(&resolved_action_id)?;
+    let (projected_action_id, projected_action) =
+        project_action_identity_for_read(store, &provenance.action_id, &provenance.action)?;
+    if projected_action_id != provenance.action_id {
+        bail!(
+            "action identity changed since it was stored; requested={} stored={} canonical={}; refusing to rematerialize before execution",
+            requested_action_id,
+            provenance.action_id,
+            projected_action_id
+        );
+    }
+    Ok((projected_action_id, projected_action))
 }
 
 pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<ActionSpec> {
@@ -1113,14 +1133,21 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
             fraig,
             version,
             driver,
-        } => Ok(ActionSpec::DriverIrToG8rAig {
-            ir_action_id,
-            top_fn_name,
-            fraig,
-            lowering_mode: crate::model::G8rLoweringMode::Default,
-            runtime: driver.into_runtime(repo_root, &version)?,
-            version,
-        }),
+        } => {
+            let runtime = driver.into_runtime(repo_root, &version)?;
+            Ok(ActionSpec::DriverIrToG8rAig {
+                ir_action_id,
+                top_fn_name,
+                fraig,
+                lowering_mode: crate::model::G8rLoweringMode::Default,
+                execution_recipe_revision:
+                    crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                        &runtime.driver_version,
+                    ),
+                runtime,
+                version,
+            })
+        }
         RunAction::IrToComboVerilog {
             ir_action_id,
             top_fn_name,
@@ -1353,37 +1380,17 @@ pub(crate) fn drain_queue(
                             running,
                             output_artifact,
                             worker_id,
-                            || {
-                                if let Err(err) =
-                                    note_completed_action_for_previous_loss_k_cone_policy(
-                                        store,
-                                        running.action_id(),
-                                    )
-                                {
-                                    eprintln!(
-                                        "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
-                                        running.action_id(),
-                                        err
-                                    );
-                                }
-                                if crate::auto_suggested_enqueue_enabled()
-                                    && let Err(err) = enqueue_suggested_actions(
-                                        store,
-                                        repo_root,
-                                        running.action_id(),
-                                        false,
-                                        1,
-                                        running.priority(),
-                                    )
-                                {
-                                    eprintln!(
-                                        "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
-                                        running.action_id(),
-                                        err
-                                    );
-                                }
-                            },
                         )?;
+                        if let Err(err) = note_completed_action_for_previous_loss_k_cone_policy(
+                            store,
+                            running.action_id(),
+                        ) {
+                            eprintln!(
+                                "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
+                                running.action_id(),
+                                err
+                            );
+                        }
                     }
                 }
                 Ok(execution_result)
@@ -1425,6 +1432,7 @@ pub(crate) fn drain_queue(
                     continue;
                 };
                 if result.output_artifact.is_some() {
+                    enqueue_suggested_actions_after_lease_fence(store, repo_root, running);
                     drained += 1;
                 } else {
                     let error_text = result
@@ -1451,35 +1459,17 @@ pub(crate) fn drain_queue(
                         &running_batch[0],
                         output_artifact,
                         worker_id,
-                        || {
-                            if let Err(err) = note_completed_action_for_previous_loss_k_cone_policy(
-                                store,
-                                running_batch[0].action_id(),
-                            ) {
-                                eprintln!(
-                                    "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
-                                    running_batch[0].action_id(),
-                                    err
-                                );
-                            }
-                            if crate::auto_suggested_enqueue_enabled()
-                                && let Err(err) = enqueue_suggested_actions(
-                                    store,
-                                    repo_root,
-                                    running_batch[0].action_id(),
-                                    false,
-                                    1,
-                                    running_batch[0].priority(),
-                                )
-                            {
-                                eprintln!(
-                                    "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
-                                    running_batch[0].action_id(),
-                                    err
-                                );
-                            }
-                        },
                     )?;
+                    if let Err(err) = note_completed_action_for_previous_loss_k_cone_policy(
+                        store,
+                        running_batch[0].action_id(),
+                    ) {
+                        eprintln!(
+                            "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
+                            running_batch[0].action_id(),
+                            err
+                        );
+                    }
                     Ok(Ok(()))
                 }
                 Err(error) => Ok(Err(error)),
@@ -1489,7 +1479,10 @@ pub(crate) fn drain_queue(
             continue;
         };
         match action_result {
-            Ok(()) => drained += 1,
+            Ok(()) => {
+                enqueue_suggested_actions_after_lease_fence(store, repo_root, &running_batch[0]);
+                drained += 1;
+            }
             Err(err) => {
                 let error_text = format!("{:#}", err);
                 if let Some(canceled_now) = record_queue_failure_and_cancel(
@@ -1519,43 +1512,50 @@ pub(crate) fn drain_queue(
     Ok(drained)
 }
 
+fn enqueue_suggested_actions_after_lease_fence(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    running: &QueueRunningWithPath,
+) {
+    // Enqueue acquires the global identity-migration lock. This helper must run only after the
+    // per-action lease fence has been released, preserving migration-lock -> action-lock order.
+    if crate::auto_suggested_enqueue_enabled()
+        && let Err(err) = enqueue_suggested_actions(
+            store,
+            repo_root,
+            running.action_id(),
+            false,
+            1,
+            running.priority(),
+        )
+    {
+        eprintln!(
+            "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
+            running.action_id(),
+            err
+        );
+    }
+}
+
 #[cfg(test)]
-fn finalize_successful_queue_action<F>(
+fn finalize_successful_queue_action(
     store: &ArtifactStore,
     running: &QueueRunningWithPath,
     output_artifact: ArtifactRef,
     worker_id: &str,
-    before_mark_done: F,
-) -> Result<()>
-where
-    F: FnOnce(),
-{
+) -> Result<()> {
     with_current_running_lease(store, running, || {
-        finalize_successful_queue_action_locked(
-            store,
-            running,
-            output_artifact,
-            worker_id,
-            before_mark_done,
-        )
+        finalize_successful_queue_action_locked(store, running, output_artifact, worker_id)
     })?;
     Ok(())
 }
 
-fn finalize_successful_queue_action_locked<F>(
+fn finalize_successful_queue_action_locked(
     store: &ArtifactStore,
     running: &QueueRunningWithPath,
     output_artifact: ArtifactRef,
     worker_id: &str,
-    before_mark_done: F,
-) -> Result<()>
-where
-    F: FnOnce(),
-{
-    // Keep the running lease visible until post-success bookkeeping finishes so
-    // queue status does not briefly report the worker as idle while it is still
-    // expanding follow-up work.
-    before_mark_done();
+) -> Result<()> {
     store.delete_failed_action_record(running.action_id())?;
     remove_file_if_exists(&store.canceled_queue_path(running.action_id()))?;
     write_done_record(store, running, output_artifact, worker_id)?;
@@ -1570,7 +1570,8 @@ pub(crate) fn build_suggested_report(
     recursive: bool,
     max_depth: u32,
 ) -> Result<SuggestedReport> {
-    let _root = store.load_provenance(root_action_id).with_context(|| {
+    let root_action_id = resolve_queue_identity_alias(store, root_action_id)?;
+    let _root = store.load_provenance(&root_action_id).with_context(|| {
         format!(
             "cannot build suggested report; root action provenance missing: {}",
             root_action_id
@@ -1589,17 +1590,19 @@ pub(crate) fn build_suggested_report(
         let provenance = store.load_provenance(&action_id)?;
         let mut statuses = Vec::new();
         for suggested in &provenance.suggested_next_actions {
-            let completed = store.action_exists(&suggested.action_id);
-            let queue_state = queue_state_for_action(store, &suggested.action_id).as_label();
+            let (suggested_action_id, suggested_action) =
+                project_action_identity_for_read(store, &suggested.action_id, &suggested.action)?;
+            let completed = store.action_exists(&suggested_action_id);
+            let queue_state = queue_state_for_action(store, &suggested_action_id).as_label();
             statuses.push(SuggestedStatus {
                 reason: suggested.reason.clone(),
-                action_id: suggested.action_id.clone(),
+                action_id: suggested_action_id.clone(),
                 completed,
                 queue_state,
-                action: suggested.action.clone(),
+                action: suggested_action,
             });
             if recursive && depth < max_depth && completed {
-                queue.push_back((suggested.action_id.clone(), depth + 1));
+                queue.push_back((suggested_action_id, depth + 1));
             }
         }
         nodes.push(SuggestedNode {
@@ -1610,7 +1613,7 @@ pub(crate) fn build_suggested_report(
     }
 
     Ok(SuggestedReport {
-        root_action_id: root_action_id.to_string(),
+        root_action_id,
         recursive,
         max_depth,
         nodes,
@@ -1630,7 +1633,9 @@ pub(crate) fn build_suggested_audit_report(
         total_sources += 1;
         for suggested in &provenance.suggested_next_actions {
             total_suggestions += 1;
-            let completed = store.action_exists(&suggested.action_id);
+            let (suggested_action_id, suggested_action) =
+                project_action_identity_for_read(store, &suggested.action_id, &suggested.action)?;
+            let completed = store.action_exists(&suggested_action_id);
             if completed {
                 completed_suggestions += 1;
             }
@@ -1638,10 +1643,10 @@ pub(crate) fn build_suggested_audit_report(
                 entries.push(SuggestedAuditEntry {
                     source_action_id: provenance.action_id.clone(),
                     reason: suggested.reason.clone(),
-                    action_id: suggested.action_id.clone(),
+                    action_id: suggested_action_id.clone(),
                     completed,
-                    queue_state: queue_state_for_action(store, &suggested.action_id).as_label(),
-                    action: suggested.action.clone(),
+                    queue_state: queue_state_for_action(store, &suggested_action_id).as_label(),
+                    action: suggested_action,
                 });
             }
         }
@@ -2260,6 +2265,10 @@ fn canonicalize_k3_cone_suggested_action(
                 top_fn_name: top_fn_name.clone(),
                 fraig: *fraig,
                 lowering_mode: lowering_mode.clone(),
+                execution_recipe_revision:
+                    crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                        &runtime.driver_version,
+                    ),
                 version: version.clone(),
                 runtime: runtime.clone(),
             },
@@ -2500,6 +2509,10 @@ pub(crate) fn backfill_stdlib_opt_ir_aig_equiv_suggestions(
                     top_fn_name: None,
                     fraig: false,
                     lowering_mode: crate::model::G8rLoweringMode::Default,
+                    execution_recipe_revision:
+                        crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                            &runtime.driver_version,
+                        ),
                     version: version.clone(),
                     runtime: runtime.clone(),
                 };
@@ -2508,6 +2521,10 @@ pub(crate) fn backfill_stdlib_opt_ir_aig_equiv_suggestions(
                     top_fn_name: None,
                     fraig: true,
                     lowering_mode: crate::model::G8rLoweringMode::Default,
+                    execution_recipe_revision:
+                        crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                            &runtime.driver_version,
+                        ),
                     version: version.clone(),
                     runtime: runtime.clone(),
                 };
@@ -2703,6 +2720,9 @@ pub(crate) fn backfill_opt_ir_frontend_compare_suggestions(
             top_fn_name: None,
             fraig: false,
             lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+            execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version,
+            ),
             version: version.clone(),
             runtime: runtime.clone(),
         };
@@ -2882,12 +2902,12 @@ pub(crate) fn enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
     )?;
 
     let mut keys = BTreeSet::new();
-    for key @ (_, version) in state.g8r_by_entity.keys() {
+    for key @ (_, version, _) in state.g8r_by_entity.keys() {
         if version == &crate_version {
             keys.insert(key.clone());
         }
     }
-    for key @ (_, version) in state.yosys_by_entity.keys() {
+    for key @ (_, version, _) in state.yosys_by_entity.keys() {
         if version == &crate_version {
             keys.insert(key.clone());
         }
@@ -2949,6 +2969,10 @@ pub(crate) fn enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
                     top_fn_name: point.ir_top.clone(),
                     fraig: false,
                     lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+                    execution_recipe_revision:
+                        crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                            &runtime.driver_version,
+                        ),
                     version: format!("v{}", normalize_tag_version(&point.dso_version)),
                     runtime,
                 }
@@ -3659,6 +3683,13 @@ mod tests {
             .expect("reload written provenance")
     }
 
+    fn write_test_identity_alias(store: &ArtifactStore, old: &str, new: &str) {
+        let path = store.queue_identity_alias_path(old);
+        fs::create_dir_all(path.parent().expect("identity alias parent"))
+            .expect("create identity alias parent");
+        fs::write(path, new).expect("write identity alias");
+    }
+
     fn make_opt_action(ir_action_id: &str, runtime: &DriverRuntimeSpec) -> ActionSpec {
         ActionSpec::DriverIrToOpt {
             ir_action_id: ir_action_id.to_string(),
@@ -3666,6 +3697,168 @@ mod tests {
             version: "v0.39.0".to_string(),
             runtime: runtime.clone(),
         }
+    }
+
+    #[test]
+    fn suggested_reports_resolve_migrated_action_identities() {
+        let (store, root) = make_test_store("suggested-identity-alias");
+        let mut runtime = test_runtime();
+        runtime.driver_version = "0.25.0".to_string();
+        let target_action = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: "2".repeat(64),
+            top_fn_name: Some("target".to_string()),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version,
+            ),
+            version: "v0.25.0".to_string(),
+            runtime,
+        };
+        let target_action_id = compute_action_id(&target_action).expect("target action id");
+        write_provenance_record(
+            &store,
+            target_action.clone(),
+            make_artifact(
+                &target_action_id,
+                ArtifactType::IrPackageFile,
+                "payload/target.ir",
+            ),
+            json!({}),
+            Vec::new(),
+            vec![("payload/target.ir".to_string(), b"package target".to_vec())],
+        );
+        let mut legacy_target_action = target_action.clone();
+        let ActionSpec::DriverIrToG8rAig {
+            execution_recipe_revision,
+            ..
+        } = &mut legacy_target_action
+        else {
+            unreachable!("test target is G8r")
+        };
+        *execution_recipe_revision = 0;
+        let legacy_target_action_id =
+            crate::proto::compute_model_action_id_v2(&legacy_target_action)
+                .expect("legacy target action id")
+                .to_hex();
+        write_test_identity_alias(&store, &legacy_target_action_id, &target_action_id);
+        let root_action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "1".repeat(64),
+            top_fn_name: Some("root".to_string()),
+        };
+        let root_action_id = compute_action_id(&root_action).expect("root action id");
+        write_provenance_record(
+            &store,
+            root_action,
+            make_artifact(
+                &root_action_id,
+                ArtifactType::IrPackageFile,
+                "payload/root.ir",
+            ),
+            json!({}),
+            vec![SuggestedAction {
+                reason: "migrated target".to_string(),
+                action_id: legacy_target_action_id,
+                action: legacy_target_action,
+            }],
+            vec![("payload/root.ir".to_string(), b"package root".to_vec())],
+        );
+
+        let report = build_suggested_report(&store, &root_action_id, true, 1)
+            .expect("build recursive suggested report");
+        assert_eq!(report.nodes.len(), 2);
+        assert_eq!(report.nodes[0].suggestions.len(), 1);
+        assert_eq!(report.nodes[0].suggestions[0].action_id, target_action_id);
+        assert_eq!(
+            compute_action_id(&report.nodes[0].suggestions[0].action)
+                .expect("projected report action id"),
+            target_action_id
+        );
+        assert!(report.nodes[0].suggestions[0].completed);
+        assert_eq!(report.nodes[1].source_action_id, target_action_id);
+
+        let audit = build_suggested_audit_report(&store, true).expect("build suggested audit");
+        let entry = audit
+            .entries
+            .iter()
+            .find(|entry| entry.source_action_id == root_action_id)
+            .expect("root suggestion audit entry");
+        assert_eq!(entry.action_id, target_action_id);
+        assert_eq!(
+            compute_action_id(&entry.action).expect("projected audit action id"),
+            target_action_id
+        );
+        assert!(entry.completed);
+        assert_eq!(audit.completed_suggestions, 1);
+        assert_eq!(audit.missing_suggestions, 0);
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn rematerialize_rejects_legacy_identity_before_execution() {
+        let (store, root) = make_test_store("rematerialize-legacy-identity");
+        let mut runtime = test_runtime();
+        runtime.driver_version = "0.25.0".to_string();
+        let legacy_action = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: "2".repeat(64),
+            top_fn_name: Some("target".to_string()),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
+            version: "v0.25.0".to_string(),
+            runtime,
+        };
+        let legacy_action_id = crate::proto::compute_model_action_id_v2(&legacy_action)
+            .expect("legacy action id")
+            .to_hex();
+        let canonical_action_id = compute_action_id(&legacy_action).expect("canonical action id");
+        assert_ne!(legacy_action_id, canonical_action_id);
+        let output_relpath = "payload/legacy.aig";
+        let output_bytes = b"legacy artifact";
+        let provenance = Provenance {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id: legacy_action_id.clone(),
+            created_utc: Utc::now(),
+            action: legacy_action,
+            dependencies: Vec::new(),
+            output_artifact: make_artifact(
+                &legacy_action_id,
+                ArtifactType::AigFile,
+                output_relpath,
+            ),
+            output_files: vec![OutputFile {
+                path: output_relpath.to_string(),
+                bytes: output_bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(output_bytes)),
+            }],
+            commands: Vec::new(),
+            details: json!({}),
+            suggested_next_actions: Vec::new(),
+        };
+        let staging_dir = store.staging_dir().join("legacy-rematerialize-staged");
+        fs::create_dir_all(staging_dir.join("payload")).expect("create legacy staging payload");
+        fs::write(staging_dir.join(output_relpath), output_bytes)
+            .expect("write legacy staged artifact");
+        fs::write(
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode legacy provenance"),
+        )
+        .expect("write legacy staged provenance");
+        store
+            .promote_staging_action_dir(&legacy_action_id, &staging_dir)
+            .expect("promote legacy action");
+
+        let error = prepare_action_for_rematerialization(&store, &legacy_action_id)
+            .expect_err("legacy identity must be rejected before execution");
+        let error = format!("{error:#}");
+        assert!(error.contains(&legacy_action_id));
+        assert!(error.contains(&canonical_action_id));
+        assert!(!store.action_exists(&canonical_action_id));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup temp store");
     }
 
     fn make_k_bool_action(source_opt_action_id: &str, runtime: &DriverRuntimeSpec) -> ActionSpec {
@@ -3879,7 +4072,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_successful_queue_action_keeps_running_visible_until_done_write() {
+    fn finalize_successful_queue_action_replaces_running_with_done() {
         let (store, root) = make_test_store("finalize-success-order");
         let runtime = test_runtime();
         let action = make_opt_action(&test_action_id("finalize-success-order-ir"), &runtime);
@@ -3932,7 +4125,8 @@ mod tests {
         )
         .expect("write stale cancellation");
 
-        let mut before_mark_done_called = false;
+        assert!(running.path.exists());
+        assert!(!store.done_queue_path(&action_id).exists());
         finalize_successful_queue_action(
             &store,
             &running,
@@ -3942,15 +4136,9 @@ mod tests {
                 "payload/finalized.ir",
             ),
             "worker-1",
-            || {
-                before_mark_done_called = true;
-                assert!(running.path.exists());
-                assert!(!store.done_queue_path(&action_id).exists());
-            },
         )
         .expect("finalize successful queue action");
 
-        assert!(before_mark_done_called);
         assert!(!running.path.exists());
         assert!(!store.failed_action_record_exists(&action_id));
         assert!(!store.canceled_queue_path(&action_id).exists());

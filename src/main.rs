@@ -75,11 +75,11 @@ const IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION: u32 = 2;
 const WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE: &str = "ir-fn-corpus-structural.v2";
 const WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY: &str =
     "ir-fn-corpus-structural.v2/manifest.json";
-const WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME: &str = "ir-fn-corpus-g8r-vs-yosys-abc.v3.json";
-const WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION: u32 = 3;
+const WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME: &str = "ir-fn-corpus-g8r-vs-yosys-abc.v4.json";
+const WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION: u32 = 4;
 const WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME: &str =
-    "ir-fn-corpus-g8r-abc-vs-codegen-yosys-abc.v1.json";
-const WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION: u32 = 1;
+    "ir-fn-corpus-g8r-abc-vs-codegen-yosys-abc.v2.json";
+const WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION: u32 = 2;
 const WEB_IR_FN_CORPUS_IR_INDEX_FILENAME: &str = "ir-fn-corpus-ir.v1.json";
 const WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION: u32 = 1;
 const WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE: &str = "ir-fn-corpus-ir.v1/by-hash-prefix";
@@ -97,7 +97,7 @@ const WEB_STDLIB_G8R_VS_YOSYS_FRAIG_TRUE_INDEX_FILENAME: &str =
     "stdlib-g8r-vs-yosys-fraig-true.v1.json";
 const WEB_STDLIB_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION: u32 = 1;
 const WEB_STDLIB_FILE_ACTION_GRAPH_INDEX_FILENAME: &str = "stdlib-file-action-graph.v1.json";
-const WEB_STDLIB_FILE_ACTION_GRAPH_INDEX_SCHEMA_VERSION: u32 = 1;
+const WEB_STDLIB_FILE_ACTION_GRAPH_INDEX_SCHEMA_VERSION: u32 = 2;
 const WEB_STDLIB_FN_TIMELINE_INDEX_FILENAME: &str = "stdlib-fn-timeline.v1.json";
 const WEB_STDLIB_FN_TIMELINE_INDEX_SCHEMA_VERSION: u32 = 1;
 const STRUCTURAL_SCAN_PROGRESS_EVERY_ACTIONS: usize = 50;
@@ -627,6 +627,7 @@ mod tests {
             top_fn_name: None,
             fraig: true,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: "v0.35.0".to_string(),
             runtime,
         };

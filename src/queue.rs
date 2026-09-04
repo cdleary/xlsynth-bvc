@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -31,6 +31,7 @@ static QUEUE_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_READY_CANDIDATES_PER_CLAIM: usize = 32;
 const MAX_PENDING_SCAN_PER_CLAIM: usize = 128;
 const MAX_PENDING_SCAN_PER_COMPATIBLE_CLAIM: usize = 256;
+const QUEUE_IDENTITY_MIGRATION_LOCK_KEY: &str = "queue-identity-migration";
 
 struct QueueTransitionLock {
     file: File,
@@ -99,6 +100,131 @@ fn new_queue_lease_token(action_id: &str, worker_id: &str) -> String {
 
 fn write_bytes_atomic(store: &ArtifactStore, path: &Path, contents: &[u8]) -> Result<()> {
     store.write_record_atomic("queue", path, contents)
+}
+
+fn is_action_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn load_queue_identity_alias(store: &ArtifactStore, action_id: &str) -> Result<Option<String>> {
+    if !is_action_id(action_id) {
+        bail!("queue identity alias lookup requires an action id");
+    }
+    let path = store.queue_identity_alias_path(action_id);
+    let value = match fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading queue identity alias: {}", path.display()));
+        }
+    };
+    let target = value.trim();
+    if !is_action_id(target) || target == action_id {
+        bail!(
+            "queue identity alias contains an invalid target: {}",
+            path.display()
+        );
+    }
+    Ok(Some(target.to_string()))
+}
+
+pub(crate) fn resolve_queue_identity_alias(
+    store: &ArtifactStore,
+    action_id: &str,
+) -> Result<String> {
+    let mut current = action_id.to_string();
+    let mut seen = HashSet::new();
+    while let Some(target) = load_queue_identity_alias(store, &current)? {
+        if !seen.insert(current) {
+            bail!("queue identity aliases contain a cycle");
+        }
+        current = target;
+    }
+    Ok(current)
+}
+
+fn write_queue_identity_alias(
+    store: &ArtifactStore,
+    old_action_id: &str,
+    new_action_id: &str,
+) -> Result<()> {
+    if !is_action_id(old_action_id)
+        || !is_action_id(new_action_id)
+        || old_action_id == new_action_id
+    {
+        bail!("queue identity alias requires two distinct action ids");
+    }
+    if let Some(existing) = load_queue_identity_alias(store, old_action_id)? {
+        if existing != new_action_id {
+            let existing_resolved = resolve_queue_identity_alias(store, old_action_id)?;
+            let requested_resolved = resolve_queue_identity_alias(store, new_action_id)?;
+            if existing_resolved != requested_resolved {
+                bail!(
+                    "queue identity alias already resolves to a different action id: old={} existing={} requested={}",
+                    old_action_id,
+                    existing_resolved,
+                    requested_resolved
+                );
+            }
+        }
+        return Ok(());
+    }
+    let path = store.queue_identity_alias_path(old_action_id);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("queue identity alias path missing parent"))?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "creating queue identity alias directory: {}",
+            parent.display()
+        )
+    })?;
+    write_bytes_atomic(store, &path, new_action_id.as_bytes())
+}
+
+fn replace_action_dependency_aliases(
+    store: &ArtifactStore,
+    action: &mut ActionSpec,
+) -> Result<bool> {
+    let mut replacements = BTreeMap::new();
+    for dependency in action_dependency_action_ids(action) {
+        let target = resolve_queue_identity_alias(store, dependency)?;
+        if target != dependency {
+            replacements.insert(dependency.to_string(), target);
+        }
+    }
+    Ok(replace_action_dependency_ids(action, &replacements))
+}
+
+fn canonicalize_action_with_queue_aliases(
+    store: &ArtifactStore,
+    mut action: ActionSpec,
+) -> Result<ActionSpec> {
+    replace_action_dependency_aliases(store, &mut action)?;
+    Ok(crate::executor::canonicalize_action_identity(action))
+}
+
+pub(crate) fn project_action_identity_for_read(
+    store: &ArtifactStore,
+    action_id: &str,
+    action: &ActionSpec,
+) -> Result<(String, ActionSpec)> {
+    let resolved_action_id = resolve_queue_identity_alias(store, action_id)?;
+    let projected_action = canonicalize_action_with_queue_aliases(store, action.clone())?;
+    let projected_action_id = crate::executor::compute_action_id(&projected_action)?;
+    if resolved_action_id != action_id && resolved_action_id != projected_action_id {
+        bail!(
+            "queue identity alias target disagrees with projected action identity: old={} alias={} projected={}",
+            action_id,
+            resolved_action_id,
+            projected_action_id
+        );
+    }
+    Ok((projected_action_id, projected_action))
 }
 
 pub(crate) fn quarantine_corrupt_queue_file(path: &Path, reason: &str) -> Result<()> {
@@ -268,6 +394,24 @@ pub(crate) fn enqueue_action_with_priority(
     action: ActionSpec,
     priority: i32,
 ) -> Result<String> {
+    let _migration_lock = if action_dependency_action_ids(&action).is_empty() {
+        None
+    } else {
+        Some(QueueTransitionLock::acquire(
+            store,
+            QUEUE_IDENTITY_MIGRATION_LOCK_KEY,
+        )?)
+    };
+    enqueue_action_with_priority_under_migration_lock(store, action, priority)
+}
+
+fn enqueue_action_with_priority_under_migration_lock(
+    store: &ArtifactStore,
+    mut action: ActionSpec,
+    priority: i32,
+) -> Result<String> {
+    replace_action_dependency_aliases(store, &mut action)?;
+    let action = crate::executor::canonicalize_action_identity(action);
     let action_id = crate::executor::compute_action_id(&action)?;
     let _transition_lock = QueueTransitionLock::acquire(store, &action_id)?;
     enqueue_action_with_priority_locked(store, action, priority, action_id)
@@ -331,9 +475,19 @@ fn enqueue_action_with_priority_locked(
 
 pub(crate) fn retry_action_with_priority(
     store: &ArtifactStore,
-    action: ActionSpec,
+    mut action: ActionSpec,
     priority: i32,
 ) -> Result<String> {
+    let _migration_lock = if action_dependency_action_ids(&action).is_empty() {
+        None
+    } else {
+        Some(QueueTransitionLock::acquire(
+            store,
+            QUEUE_IDENTITY_MIGRATION_LOCK_KEY,
+        )?)
+    };
+    replace_action_dependency_aliases(store, &mut action)?;
+    let action = crate::executor::canonicalize_action_identity(action);
     let action_id = crate::executor::compute_action_id(&action)?;
     let _transition_lock = QueueTransitionLock::acquire(store, &action_id)?;
     if !store.running_queue_path(&action_id).exists()
@@ -348,6 +502,182 @@ pub(crate) fn retry_action_with_priority(
 
 pub(crate) fn enqueue_action(store: &ArtifactStore, action: ActionSpec) -> Result<String> {
     enqueue_action_with_priority(store, action, crate::DEFAULT_QUEUE_PRIORITY)
+}
+
+fn replace_dependency_action_id(
+    action_id: &mut String,
+    replacements: &BTreeMap<String, String>,
+) -> bool {
+    let original = action_id.clone();
+    for _ in 0..=replacements.len() {
+        let Some(replacement) = replacements.get(action_id) else {
+            break;
+        };
+        if replacement == action_id {
+            break;
+        }
+        *action_id = replacement.clone();
+    }
+    *action_id != original
+}
+
+fn replace_action_dependency_ids(
+    action: &mut ActionSpec,
+    replacements: &BTreeMap<String, String>,
+) -> bool {
+    let mut changed = false;
+    let mut replace = |action_id: &mut String| {
+        changed |= replace_dependency_action_id(action_id, replacements);
+    };
+    match action {
+        ActionSpec::ImportIrPackageFile { .. }
+        | ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. }
+        | ActionSpec::DownloadAndExtractXlsynthSourceSubtree { .. } => {}
+        ActionSpec::DriverDslxFnToIr {
+            dslx_subtree_action_id,
+            ..
+        } => replace(dslx_subtree_action_id),
+        ActionSpec::DriverIrToOpt { ir_action_id, .. }
+        | ActionSpec::DriverIrToDelayInfo { ir_action_id, .. }
+        | ActionSpec::DriverIrToG8rAig { ir_action_id, .. }
+        | ActionSpec::IrFnToCombinationalVerilog { ir_action_id, .. }
+        | ActionSpec::IrFnToKBoolConeCorpus { ir_action_id, .. }
+        | ActionSpec::IrFnToMffcCorpus { ir_action_id, .. } => replace(ir_action_id),
+        ActionSpec::DriverIrEquiv {
+            lhs_ir_action_id,
+            rhs_ir_action_id,
+            ..
+        } => {
+            replace(lhs_ir_action_id);
+            replace(rhs_ir_action_id);
+        }
+        ActionSpec::DriverIrAigEquiv {
+            ir_action_id,
+            aig_action_id,
+            ..
+        } => {
+            replace(ir_action_id);
+            replace(aig_action_id);
+        }
+        ActionSpec::ComboVerilogToYosysAbcAig {
+            verilog_action_id, ..
+        } => replace(verilog_action_id),
+        ActionSpec::AigToYosysAbcAig { aig_action_id, .. }
+        | ActionSpec::DriverAigToStats { aig_action_id, .. } => replace(aig_action_id),
+        ActionSpec::AigStatDiff {
+            opt_ir_action_id,
+            g8r_aig_stats_action_id,
+            yosys_abc_aig_stats_action_id,
+        } => {
+            replace(opt_ir_action_id);
+            replace(g8r_aig_stats_action_id);
+            replace(yosys_abc_aig_stats_action_id);
+        }
+    }
+    changed
+}
+
+fn requeue_pending_action_with_canonical_identity(
+    store: &ArtifactStore,
+    pending_path: &Path,
+    record_action_id: &str,
+    priority: i32,
+    action: ActionSpec,
+) -> Result<Option<ActionSpec>> {
+    let canonical = canonicalize_action_with_queue_aliases(store, action)?;
+    let canonical_id = crate::executor::compute_action_id(&canonical)?;
+    if canonical_id == record_action_id {
+        return Ok(Some(canonical));
+    }
+
+    // A migration snapshots and rewrites the transitive pending graph. Serialize migrations for
+    // different roots so shared descendants cannot be published with only one root rewritten.
+    let _migration_lock = QueueTransitionLock::acquire(store, QUEUE_IDENTITY_MIGRATION_LOCK_KEY)?;
+    let _transition_lock = QueueTransitionLock::acquire(store, record_action_id)?;
+    if !pending_path.exists() {
+        return Ok(None);
+    }
+    enqueue_action_with_priority_under_migration_lock(store, canonical, priority)?;
+    write_queue_identity_alias(store, record_action_id, &canonical_id)?;
+
+    // Existing queue graphs were fingerprinted from the old producer identity. Rewrite every
+    // pending transitive dependent before retiring that identity, otherwise the next readiness
+    // scan would cancel those descendants as having a missing dependency.
+    let mut replacements = BTreeMap::from([(record_action_id.to_string(), canonical_id.clone())]);
+    let mut pending_records = Vec::new();
+    for path in list_queue_files(&store.queue_pending_dir())? {
+        if path == pending_path {
+            continue;
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading pending queue record: {}", path.display()));
+            }
+        };
+        let (action_id, _, priority, action) = match parse_queue_work_item(&bytes, &path) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                quarantine_corrupt_queue_file(
+                    &path,
+                    &format!(
+                        "parse error while migrating pending queue identities: {:#}",
+                        error
+                    ),
+                )?;
+                continue;
+            }
+        };
+        pending_records.push((path, action_id, priority, action));
+    }
+
+    let mut rewrites = BTreeMap::new();
+    loop {
+        let mut changed = false;
+        for (path, action_id, priority, original_action) in &pending_records {
+            let mut rewritten_action = original_action.clone();
+            let aliases_changed = replace_action_dependency_aliases(store, &mut rewritten_action)?;
+            let replacements_changed =
+                replace_action_dependency_ids(&mut rewritten_action, &replacements);
+            if !aliases_changed && !replacements_changed {
+                continue;
+            }
+            rewritten_action = crate::executor::canonicalize_action_identity(rewritten_action);
+            let rewritten_id = crate::executor::compute_action_id(&rewritten_action)?;
+            if replacements.get(action_id) != Some(&rewritten_id) {
+                replacements.insert(action_id.clone(), rewritten_id.clone());
+                changed = true;
+            }
+            rewrites.insert(
+                action_id.clone(),
+                (path.clone(), *priority, rewritten_action, rewritten_id),
+            );
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for (old_action_id, (_, _, _, new_action_id)) in &rewrites {
+        write_queue_identity_alias(store, old_action_id, new_action_id)?;
+    }
+    for (_, priority, action, _) in rewrites.values() {
+        enqueue_action_with_priority_under_migration_lock(store, action.clone(), *priority)?;
+    }
+    for (old_action_id, (old_path, _, _, _)) in &rewrites {
+        let _dependent_lock = QueueTransitionLock::acquire(store, old_action_id)?;
+        remove_file_if_exists(old_path)?;
+    }
+    remove_file_if_exists(pending_path)?;
+    eprintln!(
+        "requeued pending action graph under canonical identity: old={} new={} descendants={}",
+        record_action_id,
+        canonical_id,
+        rewrites.len()
+    );
+    Ok(None)
 }
 
 pub(crate) fn claim_next_pending_item(
@@ -417,6 +747,16 @@ pub(crate) fn claim_next_pending_item(
                     continue;
                 }
             };
+        let Some(action) = requeue_pending_action_with_canonical_identity(
+            store,
+            &pending_path,
+            &action_id,
+            priority,
+            action,
+        )?
+        else {
+            continue;
+        };
         match classify_action_readiness(store, &action)? {
             ActionReadiness::Ready => {
                 insert_ready_candidate(
@@ -534,6 +874,16 @@ pub(crate) fn claim_compatible_pending_items(
                     continue;
                 }
             };
+        let Some(action) = requeue_pending_action_with_canonical_identity(
+            store,
+            &pending_path,
+            &action_id,
+            priority,
+            action,
+        )?
+        else {
+            continue;
+        };
         if action_batch_key(&action).as_ref() != Some(batch_key) {
             continue;
         }
@@ -1728,9 +2078,9 @@ mod tests {
     use crate::model::{ArtifactType, G8rLoweringMode, OutputFile, Provenance};
     use serde_json::json;
     use sha2::{Digest, Sha256};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, mpsc};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn make_test_store() -> (ArtifactStore, PathBuf) {
         let nanos = SystemTime::now()
@@ -2080,6 +2430,7 @@ mod tests {
             top_fn_name: Some("__cone_a".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: "v0.39.0".to_string(),
             runtime: sample_runtime(),
         };
@@ -2088,6 +2439,7 @@ mod tests {
             top_fn_name: Some("__cone_b".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: "v0.39.0".to_string(),
             runtime: sample_runtime(),
         };
@@ -2096,6 +2448,7 @@ mod tests {
             top_fn_name: Some("__cone_c".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+            execution_recipe_revision: 0,
             version: "v0.39.0".to_string(),
             runtime: sample_runtime(),
         };
@@ -2104,6 +2457,7 @@ mod tests {
             top_fn_name: Some("__cone_d".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: "v0.39.0".to_string(),
             runtime: sample_runtime(),
         };
@@ -2408,6 +2762,7 @@ mod tests {
             top_fn_name: Some("__top".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: "v0.35.0".to_string(),
             runtime: runtime.clone(),
         };
@@ -2482,6 +2837,316 @@ mod tests {
         assert!(!pending_path.exists());
 
         fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn legacy_ir2g8r_pending_identity_is_requeued_before_claim() {
+        let (store, root) = make_test_store();
+        let input_action_id = write_completed_provenance(&store, &"1".repeat(64));
+        let mut runtime = sample_runtime();
+        runtime.driver_version = "0.25.0".to_string();
+        let legacy_runtime = runtime.clone();
+        let legacy = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: input_action_id,
+            top_fn_name: Some("main".to_string()),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
+            version: "v0.29.0".to_string(),
+            runtime,
+        };
+        let pre_upgrade_id = crate::proto::compute_model_action_id_v2(&legacy)
+            .expect("pre-upgrade id")
+            .to_hex();
+        let canonical_id = enqueue_action(&store, legacy.clone()).expect("canonical enqueue");
+        assert_ne!(pre_upgrade_id, canonical_id);
+        let pending = load_queue_pending_record(&store, &canonical_id)
+            .expect("load canonical pending")
+            .expect("canonical pending exists");
+        assert!(matches!(
+            pending.action,
+            ActionSpec::DriverIrToG8rAig {
+                execution_recipe_revision: 1,
+                ..
+            }
+        ));
+        remove_file_if_exists(&store.pending_queue_path(&canonical_id))
+            .expect("remove canonical setup record");
+
+        let legacy_item = QueueItem {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id: pre_upgrade_id.clone(),
+            enqueued_utc: Utc::now(),
+            priority: 7,
+            action: legacy,
+        };
+        let legacy_path = store.pending_queue_path(&pre_upgrade_id);
+        fs::create_dir_all(legacy_path.parent().expect("legacy pending parent"))
+            .expect("create legacy pending parent");
+        fs::write(
+            &legacy_path,
+            encode_queue_item(&legacy_item).expect("encode legacy pending"),
+        )
+        .expect("write legacy pending");
+        let corrupt_path = store.pending_queue_path(&"c".repeat(64));
+        fs::create_dir_all(corrupt_path.parent().expect("corrupt pending parent"))
+            .expect("create corrupt pending parent");
+        fs::write(&corrupt_path, b"not a queue record").expect("write corrupt pending record");
+
+        let legacy_stats = ActionSpec::DriverAigToStats {
+            aig_action_id: pre_upgrade_id.clone(),
+            version: "v0.29.0".to_string(),
+            runtime: legacy_runtime.clone(),
+        };
+        let legacy_stats_id = enqueue_action(&store, legacy_stats.clone()).expect("enqueue stats");
+        let legacy_equiv = ActionSpec::DriverIrAigEquiv {
+            ir_action_id: pre_upgrade_id.clone(),
+            aig_action_id: legacy_stats_id.clone(),
+            top_fn_name: Some("main".to_string()),
+            version: "v0.29.0".to_string(),
+            runtime: legacy_runtime.clone(),
+        };
+        let legacy_equiv_id = enqueue_action(&store, legacy_equiv).expect("enqueue equivalence");
+        let opt_ir_action_id = write_completed_provenance(&store, &"2".repeat(64));
+        let yosys_stats_action_id = write_completed_provenance(&store, &"3".repeat(64));
+        let legacy_diff = ActionSpec::AigStatDiff {
+            opt_ir_action_id: opt_ir_action_id.clone(),
+            g8r_aig_stats_action_id: legacy_stats_id.clone(),
+            yosys_abc_aig_stats_action_id: yosys_stats_action_id.clone(),
+        };
+        let legacy_diff_id = enqueue_action(&store, legacy_diff).expect("enqueue diff");
+
+        let canonical_stats = ActionSpec::DriverAigToStats {
+            aig_action_id: canonical_id.clone(),
+            version: "v0.29.0".to_string(),
+            runtime: legacy_runtime.clone(),
+        };
+        let canonical_stats_id =
+            crate::executor::compute_action_id(&canonical_stats).expect("canonical stats id");
+        let canonical_equiv = ActionSpec::DriverIrAigEquiv {
+            ir_action_id: canonical_id.clone(),
+            aig_action_id: canonical_stats_id.clone(),
+            top_fn_name: Some("main".to_string()),
+            version: "v0.29.0".to_string(),
+            runtime: legacy_runtime,
+        };
+        let canonical_equiv_id =
+            crate::executor::compute_action_id(&canonical_equiv).expect("canonical equivalence id");
+        let canonical_diff = ActionSpec::AigStatDiff {
+            opt_ir_action_id,
+            g8r_aig_stats_action_id: canonical_stats_id.clone(),
+            yosys_abc_aig_stats_action_id: yosys_stats_action_id,
+        };
+        let canonical_diff_id =
+            crate::executor::compute_action_id(&canonical_diff).expect("canonical diff id");
+
+        assert!(
+            claim_next_pending_item(&store, "worker-migrate", 60)
+                .expect("migrate legacy pending")
+                .is_none()
+        );
+        assert!(!legacy_path.exists());
+        assert!(!corrupt_path.exists());
+        let quarantined_path = fs::read_dir(corrupt_path.parent().expect("corrupt pending parent"))
+            .expect("read corrupt pending shard")
+            .map(|entry| entry.expect("corrupt pending shard entry").path())
+            .find(|path| {
+                path.file_name()
+                    .expect("quarantined filename")
+                    .to_string_lossy()
+                    .contains(".corrupt-")
+            })
+            .expect("corrupt record was quarantined");
+        fs::remove_file(quarantined_path).expect("remove quarantined test record");
+        assert!(!store.pending_queue_path(&legacy_stats_id).exists());
+        assert!(!store.pending_queue_path(&legacy_equiv_id).exists());
+        assert!(!store.pending_queue_path(&legacy_diff_id).exists());
+        assert!(store.pending_queue_path(&canonical_id).exists());
+        assert_eq!(
+            resolve_queue_identity_alias(&store, &pre_upgrade_id).expect("resolve producer alias"),
+            canonical_id
+        );
+        assert_eq!(
+            resolve_queue_identity_alias(&store, &legacy_stats_id).expect("resolve stats alias"),
+            canonical_stats_id
+        );
+        assert_eq!(
+            resolve_queue_identity_alias(&store, &legacy_equiv_id)
+                .expect("resolve equivalence alias"),
+            canonical_equiv_id
+        );
+        assert_eq!(
+            resolve_queue_identity_alias(&store, &legacy_diff_id).expect("resolve diff alias"),
+            canonical_diff_id
+        );
+        let rewritten_stats = load_queue_pending_record(&store, &canonical_stats_id)
+            .expect("load rewritten stats")
+            .expect("rewritten stats exists");
+        assert!(matches!(
+            rewritten_stats.action,
+            ActionSpec::DriverAigToStats { aig_action_id, .. }
+                if aig_action_id == canonical_id
+        ));
+        let rewritten_equiv = load_queue_pending_record(&store, &canonical_equiv_id)
+            .expect("load rewritten equivalence")
+            .expect("rewritten equivalence exists");
+        assert!(matches!(
+            rewritten_equiv.action,
+            ActionSpec::DriverIrAigEquiv { ir_action_id, aig_action_id, .. }
+                if ir_action_id == canonical_id && aig_action_id == canonical_stats_id
+        ));
+        let rewritten_diff = load_queue_pending_record(&store, &canonical_diff_id)
+            .expect("load rewritten diff")
+            .expect("rewritten diff exists");
+        assert!(matches!(
+            rewritten_diff.action,
+            ActionSpec::AigStatDiff { g8r_aig_stats_action_id, .. }
+                if g8r_aig_stats_action_id == canonical_stats_id
+        ));
+        let validation = crate::store_validation::validate_store(&store, false)
+            .expect("validate migrated queue and identity aliases");
+        assert_eq!(validation.identity_alias_records, 4);
+
+        // Model a rolling old worker that writes a dependent record after the
+        // producer migration has already published its identity alias.
+        let late_legacy_stats_item = QueueItem {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id: legacy_stats_id.clone(),
+            enqueued_utc: Utc::now(),
+            priority: 7,
+            action: legacy_stats,
+        };
+        let late_legacy_stats_path = store.pending_queue_path(&legacy_stats_id);
+        fs::create_dir_all(
+            late_legacy_stats_path
+                .parent()
+                .expect("late legacy stats pending parent"),
+        )
+        .expect("create late legacy stats pending parent");
+        fs::write(
+            &late_legacy_stats_path,
+            encode_queue_item(&late_legacy_stats_item).expect("encode late legacy stats pending"),
+        )
+        .expect("write late legacy stats pending");
+
+        let running = claim_next_pending_item(&store, "worker-migrate", 60)
+            .expect("claim canonical pending")
+            .expect("canonical action should be claimable");
+        assert!(!late_legacy_stats_path.exists());
+        assert!(!store.canceled_queue_path(&legacy_stats_id).exists());
+        assert!(store.pending_queue_path(&canonical_stats_id).exists());
+        assert_eq!(running.action_id(), canonical_id);
+        assert!(matches!(
+            running.action(),
+            ActionSpec::DriverIrToG8rAig {
+                execution_recipe_revision: 1,
+                ..
+            }
+        ));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn identity_migration_lock_blocks_concurrent_dependency_enqueue() {
+        let (store, root) = make_test_store();
+        let held = QueueTransitionLock::acquire(&store, QUEUE_IDENTITY_MIGRATION_LOCK_KEY)
+            .expect("acquire migration lock");
+        let old_dependency_id = "a".repeat(64);
+        let new_dependency_id = "b".repeat(64);
+        let action = ActionSpec::DriverAigToStats {
+            aig_action_id: old_dependency_id.clone(),
+            version: "v0.35.0".to_string(),
+            runtime: sample_runtime(),
+        };
+        let canonical_action = ActionSpec::DriverAigToStats {
+            aig_action_id: new_dependency_id.clone(),
+            version: "v0.35.0".to_string(),
+            runtime: sample_runtime(),
+        };
+        let expected_action_id =
+            crate::executor::compute_action_id(&canonical_action).expect("dependency action id");
+        let stale_action_id =
+            crate::executor::compute_action_id(&action).expect("stale dependency action id");
+        write_queue_identity_alias(&store, &old_dependency_id, &new_dependency_id)
+            .expect("publish dependency alias during migration");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (enqueued_tx, enqueued_rx) = mpsc::channel();
+        let other_root = root.clone();
+        let handle = thread::spawn(move || {
+            let other_store = ArtifactStore::new(other_root);
+            started_tx.send(()).expect("signal enqueue attempt");
+            let action_id = enqueue_action(&other_store, action).expect("enqueue dependency");
+            enqueued_tx
+                .send(action_id)
+                .expect("signal completed enqueue");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second store attempted enqueue");
+        assert!(enqueued_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(!store.pending_queue_path(&expected_action_id).exists());
+        drop(held);
+        let action_id = enqueued_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dependency enqueue completes after migration");
+        assert_eq!(action_id, expected_action_id);
+        assert!(store.pending_queue_path(&expected_action_id).exists());
+        assert!(!store.pending_queue_path(&stale_action_id).exists());
+        let pending = load_queue_pending_record(&store, &expected_action_id)
+            .expect("load canonical dependency action")
+            .expect("canonical dependency action exists");
+        assert!(matches!(
+            pending.action,
+            ActionSpec::DriverAigToStats { aig_action_id, .. }
+                if aig_action_id == new_dependency_id
+        ));
+        let retry_id = retry_action_with_priority(
+            &store,
+            ActionSpec::DriverAigToStats {
+                aig_action_id: old_dependency_id,
+                version: "v0.35.0".to_string(),
+                runtime: sample_runtime(),
+            },
+            9,
+        )
+        .expect("retry follows dependency alias");
+        assert_eq!(retry_id, expected_action_id);
+        handle.join().expect("join lock contender");
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn queue_identity_alias_replay_accepts_equivalent_chain_target() {
+        let (store, root) = make_test_store();
+        let old_action_id = "a".repeat(64);
+        let intermediate_action_id = "b".repeat(64);
+        let canonical_action_id = "c".repeat(64);
+
+        write_queue_identity_alias(&store, &old_action_id, &intermediate_action_id)
+            .expect("write initial alias");
+        write_queue_identity_alias(&store, &intermediate_action_id, &canonical_action_id)
+            .expect("extend alias chain");
+        write_queue_identity_alias(&store, &old_action_id, &canonical_action_id)
+            .expect("replay alias directly to canonical target");
+
+        assert_eq!(
+            load_queue_identity_alias(&store, &old_action_id)
+                .expect("load direct alias")
+                .as_deref(),
+            Some(intermediate_action_id.as_str())
+        );
+        assert_eq!(
+            resolve_queue_identity_alias(&store, &old_action_id).expect("resolve alias chain"),
+            canonical_action_id
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     fn terminal_test_action() -> ActionSpec {

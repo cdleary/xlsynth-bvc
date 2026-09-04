@@ -700,6 +700,34 @@ pub(crate) fn build_stdlib_g8r_vs_yosys_dataset(
     Ok(dataset)
 }
 
+pub(crate) fn latest_dso_samples_by_crate(
+    samples: &[StdlibG8rVsYosysSample],
+) -> Vec<&StdlibG8rVsYosysSample> {
+    let mut latest_dso_by_crate: BTreeMap<String, String> = BTreeMap::new();
+    for sample in samples {
+        let crate_version = normalize_tag_version(&sample.crate_version).to_string();
+        let dso_version = normalize_tag_version(&sample.dso_version).to_string();
+        match latest_dso_by_crate.get_mut(&crate_version) {
+            Some(latest) if cmp_dotted_numeric_version(&dso_version, latest).is_gt() => {
+                *latest = dso_version;
+            }
+            None => {
+                latest_dso_by_crate.insert(crate_version, dso_version);
+            }
+            _ => {}
+        }
+    }
+    samples
+        .iter()
+        .filter(|sample| {
+            let crate_version = normalize_tag_version(&sample.crate_version);
+            latest_dso_by_crate
+                .get(crate_version)
+                .is_some_and(|latest| latest == normalize_tag_version(&sample.dso_version))
+        })
+        .collect()
+}
+
 pub(crate) fn filter_ir_fn_corpus_g8r_vs_yosys_samples(
     dataset: &StdlibG8rVsYosysDataset,
     crate_version: &str,
@@ -707,9 +735,8 @@ pub(crate) fn filter_ir_fn_corpus_g8r_vs_yosys_samples(
     ir_node_count_lt: u64,
 ) -> Vec<StdlibG8rVsYosysSample> {
     let target_crate_version = normalize_tag_version(crate_version).to_string();
-    dataset
-        .samples
-        .iter()
+    latest_dso_samples_by_crate(&dataset.samples)
+        .into_iter()
         .filter(|sample| {
             normalize_tag_version(&sample.crate_version) == target_crate_version
                 && sample.yosys_abc_levels < yosys_levels_lt
@@ -1374,9 +1401,11 @@ struct StdlibFnTimelineIndexFile {
 #[derive(Debug, Clone)]
 pub(crate) struct IrFnCorpusG8rVsYosysIndexState {
     pub(crate) dataset: StdlibG8rVsYosysDataset,
-    pub(crate) g8r_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint>,
-    pub(crate) yosys_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint>,
+    pub(crate) g8r_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    pub(crate) yosys_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 }
+
+type IrFnCorpusEntityKey = (String, String, String);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1402,17 +1431,20 @@ fn ir_fn_corpus_incremental_delta_key(
     source_kind: IrFnCorpusStatsSourceKind,
     structural_hash: &str,
     crate_version: &str,
+    dso_version: &str,
 ) -> String {
     let source = match source_kind {
         IrFnCorpusStatsSourceKind::G8r => "g8r",
         IrFnCorpusStatsSourceKind::YosysAbc => "yosys_abc",
     };
     let crate_component = crate_version.replace('/', "_");
+    let dso_component = dso_version.replace('/', "_");
     format!(
-        "{}/{}:{}:{}",
+        "{}/{}:{}:{}:{}",
         ir_fn_corpus_incremental_delta_prefix(index_key),
         source,
         crate_component,
+        dso_component,
         structural_hash
     )
 }
@@ -1440,11 +1472,11 @@ fn short_structural_hash(hash: &str) -> &str {
 }
 
 fn entity_map_to_points(
-    map: &BTreeMap<(String, String), StdlibAigStatsPoint>,
+    map: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 ) -> Vec<IrFnCorpusEntityPoint> {
     map.iter()
         .map(
-            |((structural_hash, crate_version), point)| IrFnCorpusEntityPoint {
+            |((structural_hash, crate_version, _dso_version), point)| IrFnCorpusEntityPoint {
                 structural_hash: structural_hash.clone(),
                 crate_version: crate_version.clone(),
                 point: point.clone(),
@@ -1456,10 +1488,14 @@ fn entity_map_to_points(
 #[allow(dead_code)]
 fn entity_points_to_map(
     points: &[IrFnCorpusEntityPoint],
-) -> BTreeMap<(String, String), StdlibAigStatsPoint> {
+) -> BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> {
     let mut map = BTreeMap::new();
     for row in points {
-        let key = (row.structural_hash.clone(), row.crate_version.clone());
+        let key = (
+            row.structural_hash.clone(),
+            row.crate_version.clone(),
+            row.point.dso_version.clone(),
+        );
         upsert_aig_stats_point_by_key(&mut map, key, row.point.clone());
     }
     map
@@ -1469,8 +1505,8 @@ fn entity_points_to_map(
 fn paired_entity_maps_from_dataset(
     dataset: &StdlibG8rVsYosysDataset,
 ) -> (
-    BTreeMap<(String, String), StdlibAigStatsPoint>,
-    BTreeMap<(String, String), StdlibAigStatsPoint>,
+    BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 ) {
     let mut g8r_by_entity = BTreeMap::new();
     let mut yosys_by_entity = BTreeMap::new();
@@ -1482,7 +1518,11 @@ fn paired_entity_maps_from_dataset(
         else {
             continue;
         };
-        let key = (structural_hash, sample.crate_version.clone());
+        let key = (
+            structural_hash,
+            sample.crate_version.clone(),
+            sample.dso_version.clone(),
+        );
         let g8r = StdlibAigStatsPoint {
             fn_key: sample.fn_key.clone(),
             ir_action_id: sample.ir_action_id.clone(),
@@ -1566,8 +1606,8 @@ fn structural_hash_from_generated_ir_top_prefix(
 
 fn build_ir_fn_corpus_dataset_from_entity_maps(
     store: &ArtifactStore,
-    g8r_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
-    yosys_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
+    g8r_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    yosys_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
     ir_node_count_by_structural_hash: Option<&BTreeMap<String, u64>>,
     ir_node_count_by_source_ir_action_and_top: Option<&BTreeMap<String, BTreeMap<String, u64>>>,
     unique_ir_node_count_by_source_ir_action: Option<&BTreeMap<String, u64>>,
@@ -1636,11 +1676,7 @@ fn build_ir_fn_corpus_dataset_from_entity_maps(
         samples.push(StdlibG8rVsYosysSample {
             fn_key: g8r.fn_key.clone(),
             crate_version: g8r.crate_version.clone(),
-            dso_version: if g8r.dso_version.is_empty() {
-                yosys.dso_version.clone()
-            } else {
-                g8r.dso_version.clone()
-            },
+            dso_version: entity_key.2.clone(),
             stdlib_root_action_id: None,
             ir_action_id: g8r.ir_action_id.clone(),
             ir_top: g8r.ir_top.clone().or_else(|| yosys.ir_top.clone()),
@@ -1661,6 +1697,7 @@ fn build_ir_fn_corpus_dataset_from_entity_maps(
 
     samples.sort_by(|a, b| {
         cmp_dotted_numeric_version(&a.crate_version, &b.crate_version)
+            .then(cmp_dotted_numeric_version(&a.dso_version, &b.dso_version))
             .then(a.fn_key.cmp(&b.fn_key))
             .then(a.ir_action_id.cmp(&b.ir_action_id))
     });
@@ -1712,12 +1749,13 @@ fn build_ir_fn_corpus_state_from_incremental_deltas(
     if deltas.is_empty() {
         return None;
     }
-    let mut g8r_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
-    let mut yosys_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
+    let mut g8r_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> = BTreeMap::new();
+    let mut yosys_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> = BTreeMap::new();
     for delta in deltas {
         let key = (
             delta.row.structural_hash.clone(),
             delta.row.crate_version.clone(),
+            delta.row.point.dso_version.clone(),
         );
         match delta.source_kind {
             IrFnCorpusStatsSourceKind::G8r => {
@@ -1762,6 +1800,7 @@ fn write_ir_fn_corpus_incremental_delta_row(
         point.source_kind,
         &point.structural_hash,
         &point.crate_version,
+        &point.point.dso_version,
     );
     let row = IrFnCorpusIncrementalDeltaRow {
         source_kind: point.source_kind,
@@ -1933,6 +1972,7 @@ fn load_ir_fn_corpus_index_state(
             let key = (
                 delta.row.structural_hash.clone(),
                 delta.row.crate_version.clone(),
+                delta.row.point.dso_version.clone(),
             );
             match delta.source_kind {
                 IrFnCorpusStatsSourceKind::G8r => upsert_aig_stats_point_by_key(
@@ -2012,8 +2052,8 @@ fn write_ir_fn_corpus_index_state(
     index_key: &str,
     schema_version: u32,
     dataset: &StdlibG8rVsYosysDataset,
-    g8r_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
-    yosys_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
+    g8r_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    yosys_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 ) -> Result<(String, u64, DateTime<Utc>)> {
     let location = store.web_index_location(index_key);
     let (bytes, generated_utc) = serialize_ir_fn_corpus_index_state(
@@ -2048,8 +2088,8 @@ fn write_ir_fn_corpus_index_state(
 fn serialize_ir_fn_corpus_index_state(
     schema_version: u32,
     dataset: &StdlibG8rVsYosysDataset,
-    g8r_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
-    yosys_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
+    g8r_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    yosys_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 ) -> Result<(Vec<u8>, DateTime<Utc>)> {
     let generated_utc = Utc::now();
     let payload = IrFnCorpusG8rVsYosysIndexFile {
@@ -2066,8 +2106,8 @@ fn serialize_ir_fn_corpus_index_state(
 fn write_ir_fn_corpus_g8r_vs_yosys_index_state(
     store: &ArtifactStore,
     dataset: &StdlibG8rVsYosysDataset,
-    g8r_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
-    yosys_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
+    g8r_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    yosys_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 ) -> Result<(String, u64, DateTime<Utc>)> {
     write_ir_fn_corpus_index_state(
         store,
@@ -2082,8 +2122,8 @@ fn write_ir_fn_corpus_g8r_vs_yosys_index_state(
 fn write_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_index_state(
     store: &ArtifactStore,
     dataset: &StdlibG8rVsYosysDataset,
-    g8r_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
-    yosys_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
+    g8r_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    yosys_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 ) -> Result<(String, u64, DateTime<Utc>)> {
     write_ir_fn_corpus_index_state(
         store,
@@ -2338,7 +2378,8 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
     store: &ArtifactStore,
     comparison_indices: &[(&str, &[u8], u32)],
 ) -> Result<IrFnCorpusIrIndexBuild> {
-    type SideIdentity = (String, String, String);
+    type ReleaseIdentity = (String, String, String);
+    type SideIdentity = (String, String, String, String);
     #[derive(Debug, PartialEq, Eq)]
     struct PairRequest {
         crate_version: String,
@@ -2349,7 +2390,7 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
         yosys_abc: SideIdentity,
     }
 
-    let mut wanted: BTreeMap<String, BTreeMap<String, (String, String, String)>> = BTreeMap::new();
+    let mut wanted: BTreeMap<String, BTreeMap<String, BTreeSet<ReleaseIdentity>>> = BTreeMap::new();
     let mut pair_requests_by_identity = BTreeMap::new();
     for (_, comparison_index_bytes, expected_schema_version) in comparison_indices {
         let comparison: IrFnCorpusG8rVsYosysIndexFile =
@@ -2370,7 +2411,11 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
             if row.crate_version != row.point.crate_version {
                 bail!("paired corpus G8r point has conflicting crate-version identity");
             }
-            let key = (structural_hash, row.crate_version);
+            let key = (
+                structural_hash,
+                row.crate_version,
+                row.point.dso_version.clone(),
+            );
             if g8r_by_entity.insert(key, row.point).is_some() {
                 bail!("paired corpus index has duplicate G8r entity points");
             }
@@ -2382,7 +2427,11 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
             if row.crate_version != row.point.crate_version {
                 bail!("paired corpus Yosys/ABC point has conflicting crate-version identity");
             }
-            let key = (structural_hash, row.crate_version);
+            let key = (
+                structural_hash,
+                row.crate_version,
+                row.point.dso_version.clone(),
+            );
             if yosys_by_entity.insert(key, row.point).is_some() {
                 bail!("paired corpus index has duplicate Yosys/ABC entity points");
             }
@@ -2398,7 +2447,11 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                 .as_deref()
                 .and_then(normalize_structural_hash_hex)
                 .context("paired corpus sample has no valid canonical structural hash")?;
-            let entity_key = (structural_hash.clone(), sample.crate_version.clone());
+            let entity_key = (
+                structural_hash.clone(),
+                sample.crate_version.clone(),
+                sample.dso_version.clone(),
+            );
             let g8r = g8r_by_entity
                 .get(&entity_key)
                 .context("paired corpus sample is missing its G8r entity point")?;
@@ -2424,22 +2477,17 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                     point.dso_version.clone(),
                     structural_hash.clone(),
                 );
-                if let Some(existing) = wanted
+                wanted
                     .entry(point.ir_action_id.clone())
                     .or_default()
-                    .insert(ir_top.to_string(), release_identity.clone())
-                    && existing != release_identity
-                {
-                    bail!(
-                        "paired corpus index has conflicting release identity for action {} top {}",
-                        point.ir_action_id,
-                        ir_top
-                    );
-                }
+                    .entry(ir_top.to_string())
+                    .or_default()
+                    .insert(release_identity);
                 identities.push((
                     point.ir_action_id.clone(),
                     ir_top.to_string(),
                     sample.crate_version.clone(),
+                    point.dso_version.clone(),
                 ));
             }
             let pair_identity = (
@@ -2474,6 +2522,14 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
             format!("loading MFFC corpus provenance while exporting IR: {ir_action_id}")
         })?;
         generated_utc = generated_utc.max(provenance.created_utc);
+        let requested_tops = requested_tops
+            .into_iter()
+            .flat_map(|(ir_top, releases)| {
+                releases
+                    .into_iter()
+                    .map(move |release| (ir_top.clone(), release))
+            })
+            .collect::<Vec<_>>();
         match &provenance.action {
             ActionSpec::IrFnToMffcCorpus {
                 ir_action_id: expected_source_ir_action_id,
@@ -2595,7 +2651,7 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                         source_ir_action_id: source_ir_action_id.clone(),
                         source_ir_top: source_ir_top.clone(),
                         source_structural_hash: source_structural_hash.clone(),
-                        dso_version,
+                        dso_version: dso_version.clone(),
                         root_ir_text_id,
                         mffc_structure: Some(MffcIrStructure {
                             rank: manifest_entry.rank,
@@ -2616,7 +2672,12 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                     if canonical_hash.is_empty() {
                         bail!("paired MFFC sample has an empty canonical structural hash");
                     }
-                    let identity = (ir_action_id.clone(), ir_top.clone(), crate_version);
+                    let identity = (
+                        ir_action_id.clone(),
+                        ir_top.clone(),
+                        crate_version,
+                        dso_version,
+                    );
                     if sides_by_identity.insert(identity, side).is_some() {
                         bail!(
                             "duplicate exported MFFC side for action {ir_action_id} top {ir_top}"
@@ -2748,12 +2809,17 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                         source_ir_action_id: source_ir_action_id.clone(),
                         source_ir_top: source_ir_top.clone(),
                         source_structural_hash: source_structural_hash.clone(),
-                        dso_version,
+                        dso_version: dso_version.clone(),
                         root_ir_text_id,
                         mffc_structure: None,
                         ir_text,
                     };
-                    let identity = (ir_action_id.clone(), ir_top.clone(), crate_version);
+                    let identity = (
+                        ir_action_id.clone(),
+                        ir_top.clone(),
+                        crate_version,
+                        dso_version,
+                    );
                     if sides_by_identity.insert(identity, side).is_some() {
                         bail!(
                             "duplicate exported k-bool-cone side for action {ir_action_id} top {ir_top}"
@@ -2814,12 +2880,17 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                         source_ir_action_id: ir_action_id.clone(),
                         source_ir_top: ir_top.clone(),
                         source_structural_hash: canonical_hash,
-                        dso_version,
+                        dso_version: dso_version.clone(),
                         root_ir_text_id,
                         mffc_structure: None,
                         ir_text,
                     };
-                    let identity = (ir_action_id.clone(), ir_top.clone(), crate_version);
+                    let identity = (
+                        ir_action_id.clone(),
+                        ir_top.clone(),
+                        crate_version,
+                        dso_version,
+                    );
                     if sides_by_identity.insert(identity, side).is_some() {
                         bail!("duplicate exported IR side for action {ir_action_id} top {ir_top}");
                     }
@@ -2848,12 +2919,17 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                         source_ir_action_id: ir_action_id.clone(),
                         source_ir_top: ir_top.clone(),
                         source_structural_hash: canonical_hash,
-                        dso_version,
+                        dso_version: dso_version.clone(),
                         root_ir_text_id,
                         mffc_structure: None,
                         ir_text,
                     };
-                    let identity = (ir_action_id.clone(), ir_top.clone(), crate_version);
+                    let identity = (
+                        ir_action_id.clone(),
+                        ir_top.clone(),
+                        crate_version,
+                        dso_version,
+                    );
                     if sides_by_identity.insert(identity, side).is_some() {
                         bail!("duplicate exported IR side for action {ir_action_id} top {ir_top}");
                     }
@@ -3152,8 +3228,8 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
         load_generated_ir_node_count_maps(store, provenances.as_ref());
     ir_node_count_by_structural_hash.extend(generated_ir_node_count_by_structural_hash);
 
-    let mut g8r_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
-    let mut yosys_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
+    let mut g8r_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> = BTreeMap::new();
+    let mut yosys_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> = BTreeMap::new();
     let total_provenances = provenances.len();
     let mut stats_actions_seen = 0_usize;
     let mut last_progress_log_at = Instant::now();
@@ -3215,7 +3291,14 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
                 &unique_structural_hash_by_ir_action,
                 &source_ctx.ir_action_id,
                 source_ctx.ir_top.as_deref(),
-            ) else {
+            )
+            .or_else(|| {
+                ir_fn_corpus_structural_hash_hint_for_aig_source(
+                    &provenance_by_action_id,
+                    StdlibTrendKind::G8r,
+                    aig_action_id,
+                )
+            }) else {
                 continue;
             };
             let crate_version = source_ctx.crate_version.clone();
@@ -3241,7 +3324,7 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
             };
             upsert_aig_stats_point_by_key(
                 &mut g8r_by_entity,
-                (structural_hash, crate_version),
+                (structural_hash, crate_version, point.dso_version.clone()),
                 point,
             );
             continue;
@@ -3258,7 +3341,14 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
                 &unique_structural_hash_by_ir_action,
                 &source_ctx.ir_action_id,
                 source_ctx.ir_top.as_deref(),
-            ) else {
+            )
+            .or_else(|| {
+                ir_fn_corpus_structural_hash_hint_for_aig_source(
+                    &provenance_by_action_id,
+                    StdlibTrendKind::YosysAbc,
+                    aig_action_id,
+                )
+            }) else {
                 continue;
             };
             let crate_version = source_ctx.crate_version.clone();
@@ -3284,7 +3374,7 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
             };
             upsert_aig_stats_point_by_key(
                 &mut yosys_by_entity,
-                (structural_hash, crate_version),
+                (structural_hash, crate_version, point.dso_version.clone()),
                 point,
             );
         }
@@ -3449,8 +3539,8 @@ pub(crate) fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_s
             .extend(by_top);
     }
 
-    let mut g8r_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
-    let mut yosys_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
+    let mut g8r_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> = BTreeMap::new();
+    let mut yosys_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> = BTreeMap::new();
     let total_provenances = provenances.len();
     let mut stats_actions_seen = 0_usize;
     let mut last_progress_log_at = Instant::now();
@@ -3552,7 +3642,11 @@ pub(crate) fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_s
             IrFnCorpusStatsSourceKind::G8r => &mut g8r_by_entity,
             IrFnCorpusStatsSourceKind::YosysAbc => &mut yosys_by_entity,
         };
-        upsert_aig_stats_point_by_key(target, (structural_hash, crate_version), point);
+        upsert_aig_stats_point_by_key(
+            target,
+            (structural_hash, crate_version, point.dso_version.clone()),
+            point,
+        );
     }
     maybe_log_web_index_rebuild_progress(
         "ir-fn-g8r-abc-vs-codegen-yosys-abc",
@@ -3767,6 +3861,7 @@ pub(crate) fn maybe_upsert_ir_fn_corpus_g8r_vs_yosys_index_for_completed_action(
         upsert_point.source_kind,
         &upsert_point.structural_hash,
         &upsert_point.crate_version,
+        &upsert_point.point.dso_version,
     );
     if let Some(existing_bytes) = store.load_web_index_bytes(&delta_key)? {
         if let Ok(existing_row) =
@@ -3981,6 +4076,7 @@ pub(crate) fn maybe_upsert_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_index_for_c
         upsert_point.source_kind,
         &upsert_point.structural_hash,
         &upsert_point.crate_version,
+        &upsert_point.point.dso_version,
     );
     if let Some(existing_bytes) = store.load_web_index_bytes(&delta_key)? {
         if let Ok(existing_row) =
@@ -4310,12 +4406,14 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
     for provenance in provenances.iter() {
         action_specs.insert(provenance.action_id.clone(), provenance.action.clone());
         for suggested in &provenance.suggested_next_actions {
+            let (suggested_action_id, suggested_action) =
+                project_action_identity_for_read(store, &suggested.action_id, &suggested.action)?;
             action_specs
-                .entry(suggested.action_id.clone())
-                .or_insert_with(|| suggested.action.clone());
+                .entry(suggested_action_id.clone())
+                .or_insert(suggested_action);
             suggested_edges.push(RawActionGraphEdge {
                 source: provenance.action_id.clone(),
-                target: suggested.action_id.clone(),
+                target: suggested_action_id,
                 edge_kind: "suggested".to_string(),
                 role: suggested.reason.clone(),
             });
@@ -4480,7 +4578,9 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
     available_crate_versions.sort_by(|a, b| cmp_dotted_numeric_version(a, b));
     let selected_action_id = requested_action_id
         .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .map(|action_id| resolve_queue_identity_alias(store, &action_id))
+        .transpose()?;
     let action_focus_found = selected_action_id
         .as_ref()
         .map(|v| action_specs.contains_key(v))
@@ -4853,6 +4953,7 @@ fn apply_runtime_action_specs_to_stdlib_file_action_graph_index_state(
     let compat_by_dso = load_compat_by_dso(repo_root);
     let runtime_action_specs = collect_runtime_action_specs_for_stdlib_file_action_graph(store)?;
     for (action_id, action) in runtime_action_specs {
+        let (action_id, action) = project_action_identity_for_read(store, &action_id, &action)?;
         if state.action_specs.contains_key(&action_id) {
             continue;
         }
@@ -4947,7 +5048,9 @@ fn build_stdlib_file_action_graph_dataset_from_index_state(
     available_crate_versions.sort_by(|a, b| cmp_dotted_numeric_version(a, b));
     let selected_action_id = requested_action_id
         .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .map(|action_id| resolve_queue_identity_alias(store, &action_id))
+        .transpose()?;
     let action_focus_found = selected_action_id
         .as_ref()
         .map(|v| state.action_specs.contains_key(v))
@@ -5238,12 +5341,14 @@ fn build_stdlib_file_action_graph_index_state(
         action_ids_with_provenance.insert(provenance.action_id.clone());
         action_specs.insert(provenance.action_id.clone(), provenance.action.clone());
         for suggested in &provenance.suggested_next_actions {
+            let (suggested_action_id, suggested_action) =
+                project_action_identity_for_read(store, &suggested.action_id, &suggested.action)?;
             action_specs
-                .entry(suggested.action_id.clone())
-                .or_insert_with(|| suggested.action.clone());
+                .entry(suggested_action_id.clone())
+                .or_insert(suggested_action);
             suggested_edges.push(RawActionGraphEdge {
                 source: provenance.action_id.clone(),
-                target: suggested.action_id.clone(),
+                target: suggested_action_id,
                 edge_kind: "suggested".to_string(),
                 role: suggested.reason.clone(),
             });
@@ -5732,6 +5837,30 @@ pub(crate) struct StdlibTrendSourceContext {
     pub(crate) ir_top: Option<String>,
     pub(crate) crate_version: String,
     pub(crate) dso_version: String,
+}
+
+fn ir_fn_corpus_structural_hash_hint_for_aig_source(
+    provenance_by_action_id: &ProvenanceLookup<'_>,
+    kind: StdlibTrendKind,
+    aig_action_id: &str,
+) -> Option<String> {
+    let producer = *provenance_by_action_id.get(aig_action_id)?;
+    match (kind, &producer.action) {
+        (StdlibTrendKind::G8r, ActionSpec::DriverIrToG8rAig { .. }) => {
+            structural_hash_from_details(&producer.details)
+        }
+        (
+            StdlibTrendKind::YosysAbc,
+            ActionSpec::ComboVerilogToYosysAbcAig {
+                verilog_action_id, ..
+            },
+        ) => {
+            let verilog_provenance = *provenance_by_action_id.get(verilog_action_id.as_str())?;
+            structural_hash_from_details(&verilog_provenance.details)
+                .or_else(|| structural_hash_from_details(&producer.details))
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn extract_stdlib_trend_source_context(
@@ -8150,9 +8279,11 @@ fn collect_known_action_specs_and_provenances(
     for provenance in provenances.iter() {
         action_specs.insert(provenance.action_id.clone(), provenance.action.clone());
         for suggested in &provenance.suggested_next_actions {
+            let (suggested_action_id, suggested_action) =
+                project_action_identity_for_read(store, &suggested.action_id, &suggested.action)?;
             action_specs
-                .entry(suggested.action_id.clone())
-                .or_insert_with(|| suggested.action.clone());
+                .entry(suggested_action_id)
+                .or_insert(suggested_action);
         }
         provenance_by_action_id.insert(provenance.action_id.clone(), provenance.clone());
     }
@@ -8956,6 +9087,13 @@ mod tests {
         (store, root)
     }
 
+    fn write_test_identity_alias(store: &ArtifactStore, old: &str, new: &str) {
+        let path = store.queue_identity_alias_path(old);
+        fs::create_dir_all(path.parent().expect("identity alias parent"))
+            .expect("create identity alias parent");
+        fs::write(path, new).expect("write identity alias");
+    }
+
     #[test]
     fn cached_versions_index_rejects_malformed_unicode_commit() {
         let (store, root) = make_test_store("versions-invalid-unicode-commit");
@@ -9470,6 +9608,173 @@ mod tests {
     }
 
     #[test]
+    fn canonical_ir_fn_corpus_rebuild_uses_import_producer_hash_hints() {
+        let (store, root) = make_test_store("fixed-import-canonical-rebuild");
+        let empty_manifest = IrFnCorpusStructuralManifest {
+            schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
+            generated_utc: Utc::now(),
+            recompute_missing_hashes: false,
+            total_actions_scanned: 0,
+            total_driver_ir_to_opt_actions: 0,
+            total_ir_fn_to_k_bool_cone_corpus_actions: 0,
+            indexed_actions: 0,
+            indexed_k_bool_cone_members: 0,
+            distinct_structural_hashes: 0,
+            hash_from_dependency_hint_count: 0,
+            hash_recomputed_count: 0,
+            hash_hint_conflict_count: 0,
+            skipped_missing_output_count: 0,
+            skipped_missing_ir_top_count: 0,
+            skipped_missing_hash_hint_count: 0,
+            skipped_hash_error_count: 0,
+            skipped_k_bool_cone_manifest_errors: 0,
+            skipped_k_bool_cone_empty_count: 0,
+            source_action_set_sha256: None,
+            groups: Vec::new(),
+        };
+        store
+            .write_web_index_bytes(
+                ir_fn_corpus_structural_manifest_index_key(),
+                &serde_json::to_vec(&empty_manifest).expect("serialize empty manifest"),
+            )
+            .expect("write empty structural manifest");
+
+        let runtime = test_runtime();
+        let dso_version = "0.35.0";
+        let ir_top = "main";
+        let structural_hash = "c".repeat(64);
+        let import_action_id = materialize_test_provenance(
+            &store,
+            "import",
+            ActionSpec::ImportIrPackageFile {
+                source_sha256: "d".repeat(64),
+                top_fn_name: Some(ir_top.to_string()),
+            },
+            ArtifactType::IrPackageFile,
+            "payload/input.ir",
+        );
+
+        let g8r_action_id = materialize_test_provenance(
+            &store,
+            "g8r",
+            ActionSpec::DriverIrToG8rAig {
+                ir_action_id: import_action_id.clone(),
+                top_fn_name: Some(ir_top.to_string()),
+                fraig: false,
+                lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: 0,
+                version: dso_version.to_string(),
+                runtime: runtime.clone(),
+            },
+            ArtifactType::AigFile,
+            "payload/g8r.aig",
+        );
+        let mut g8r_provenance = store
+            .load_provenance(&g8r_action_id)
+            .expect("load G8r provenance");
+        g8r_provenance.details = json!({
+            INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY: structural_hash.clone(),
+            "ir_top": ir_top,
+        });
+        store
+            .write_provenance(&g8r_provenance)
+            .expect("write G8r hash hint");
+        let g8r_stats_action_id = materialize_test_provenance(
+            &store,
+            "g8r-stats",
+            ActionSpec::DriverAigToStats {
+                aig_action_id: g8r_action_id,
+                version: dso_version.to_string(),
+                runtime: runtime.clone(),
+            },
+            ArtifactType::AigStatsFile,
+            "payload/stats.json",
+        );
+        overwrite_test_artifact(
+            &store,
+            &g8r_stats_action_id,
+            ArtifactType::AigStatsFile,
+            "payload/stats.json",
+            r#"{"and_nodes": 10, "depth": 3}"#,
+        );
+
+        let verilog_action_id = materialize_test_provenance(
+            &store,
+            "verilog",
+            ActionSpec::IrFnToCombinationalVerilog {
+                ir_action_id: import_action_id.clone(),
+                top_fn_name: Some(ir_top.to_string()),
+                use_system_verilog: false,
+                version: dso_version.to_string(),
+                runtime: runtime.clone(),
+            },
+            ArtifactType::VerilogFile,
+            "payload/module.v",
+        );
+        let mut verilog_provenance = store
+            .load_provenance(&verilog_action_id)
+            .expect("load Verilog provenance");
+        verilog_provenance.details = json!({
+            INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY: structural_hash.clone(),
+            "ir_top": ir_top,
+        });
+        store
+            .write_provenance(&verilog_provenance)
+            .expect("write Verilog hash hint");
+        let yosys_action_id = materialize_test_provenance(
+            &store,
+            "yosys",
+            ActionSpec::ComboVerilogToYosysAbcAig {
+                verilog_action_id,
+                verilog_top_module_name: Some(ir_top.to_string()),
+                frontend: YosysVerilogFrontend::Builtin,
+                yosys_script_ref: ScriptRef {
+                    path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
+                    sha256: "0".repeat(64),
+                },
+                runtime: crate::runtime::test_yosys_runtime(),
+            },
+            ArtifactType::AigFile,
+            "payload/yosys.aig",
+        );
+        let yosys_stats_action_id = materialize_test_provenance(
+            &store,
+            "yosys-stats",
+            ActionSpec::DriverAigToStats {
+                aig_action_id: yosys_action_id,
+                version: dso_version.to_string(),
+                runtime,
+            },
+            ArtifactType::AigStatsFile,
+            "payload/stats.json",
+        );
+        overwrite_test_artifact(
+            &store,
+            &yosys_stats_action_id,
+            ArtifactType::AigStatsFile,
+            "payload/stats.json",
+            r#"{"and_nodes": 8, "depth": 2}"#,
+        );
+
+        let state = build_ir_fn_corpus_g8r_vs_yosys_build_state(
+            &store,
+            &std::env::current_dir().expect("repo root"),
+        )
+        .expect("canonical rebuild");
+        assert_eq!(state.dataset.samples.len(), 1);
+        let sample = &state.dataset.samples[0];
+        assert_eq!(sample.ir_action_id, import_action_id);
+        assert_eq!(
+            sample.structural_hash.as_deref(),
+            Some(structural_hash.as_str())
+        );
+        assert_eq!(sample.g8r_nodes, 10.0);
+        assert_eq!(sample.yosys_abc_nodes, 8.0);
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
     fn ir_fn_corpus_ir_index_exports_only_paired_function_blocks() {
         let (store, root) = make_test_store("mffc-ir-index");
         let source_structural_hash = "d".repeat(64);
@@ -9853,6 +10158,170 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup temp store");
     }
 
+    #[test]
+    fn ir_fn_corpus_ir_index_reuses_one_import_across_release_identities() {
+        let (store, root) = make_test_store("fixed-import-ir-index");
+        let ir_top = "main";
+        let structural_hash = "a".repeat(64);
+        let import_action_id = materialize_test_provenance(
+            &store,
+            "import",
+            ActionSpec::ImportIrPackageFile {
+                source_sha256: "b".repeat(64),
+                top_fn_name: Some(ir_top.to_string()),
+            },
+            ArtifactType::IrPackageFile,
+            "payload/input.ir",
+        );
+        overwrite_test_artifact(
+            &store,
+            &import_action_id,
+            ArtifactType::IrPackageFile,
+            "payload/input.ir",
+            "package p\n\ntop fn main(x: bits[1] id=1) -> bits[1] {\n  ret result: bits[1] = identity(x, id=2)\n}\n",
+        );
+
+        let mut samples = Vec::new();
+        let mut g8r_points = Vec::new();
+        let mut yosys_points = Vec::new();
+        for (index, (crate_version, dso_version)) in [
+            ("0.25.0", "0.29.0"),
+            ("0.25.0", "0.30.0"),
+            ("0.26.0", "0.30.0"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let g8r_stats_action_id = format!("{:064x}", index + 1);
+            let yosys_stats_action_id = format!("{:064x}", index + 11);
+            samples.push(StdlibG8rVsYosysSample {
+                fn_key: "main".to_string(),
+                crate_version: crate_version.to_string(),
+                dso_version: dso_version.to_string(),
+                stdlib_root_action_id: None,
+                ir_action_id: import_action_id.clone(),
+                ir_top: Some(ir_top.to_string()),
+                structural_hash: Some(structural_hash.clone()),
+                ir_node_count: 1,
+                g8r_nodes: 2.0,
+                g8r_levels: 2.0,
+                yosys_abc_nodes: 1.0,
+                yosys_abc_levels: 2.0,
+                g8r_product: 4.0,
+                yosys_abc_product: 2.0,
+                g8r_product_loss: 2.0,
+                g8r_stats_action_id: g8r_stats_action_id.clone(),
+                yosys_abc_stats_action_id: yosys_stats_action_id.clone(),
+            });
+            let point = |stats_action_id: String| IrFnCorpusEntityPoint {
+                structural_hash: structural_hash.clone(),
+                crate_version: crate_version.to_string(),
+                point: StdlibAigStatsPoint {
+                    fn_key: "main".to_string(),
+                    ir_action_id: import_action_id.clone(),
+                    ir_top: Some(ir_top.to_string()),
+                    crate_version: crate_version.to_string(),
+                    dso_version: dso_version.to_string(),
+                    and_nodes: 1.0,
+                    depth: 1.0,
+                    created_utc: Utc::now(),
+                    stats_action_id,
+                },
+            };
+            g8r_points.push(point(g8r_stats_action_id));
+            yosys_points.push(point(yosys_stats_action_id));
+        }
+        let comparison = IrFnCorpusG8rVsYosysIndexFile {
+            schema_version: WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+            generated_utc: Utc::now(),
+            dataset: StdlibG8rVsYosysDataset {
+                fraig: false,
+                samples,
+                min_ir_nodes: 1,
+                max_ir_nodes: 1,
+                g8r_only_count: 0,
+                yosys_only_count: 0,
+                available_crate_versions: vec!["0.25.0".to_string(), "0.26.0".to_string()],
+            },
+            g8r_points,
+            yosys_points,
+        };
+        let comparison_bytes = serde_json::to_vec(&comparison).expect("serialize comparison");
+        let build = build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
+            &store,
+            &[(
+                WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+                comparison_bytes.as_slice(),
+                WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+            )],
+        )
+        .expect("export reused import for both releases");
+        assert_eq!(build.entry_count, 3);
+        let shard_key = format!(
+            "{}/{}.json",
+            WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE,
+            &structural_hash[..2]
+        );
+        let shard: IrFnCorpusIrShardFile = serde_json::from_slice(
+            &build
+                .shard_files
+                .iter()
+                .find(|(key, _)| key == &shard_key)
+                .expect("find hash shard")
+                .1,
+        )
+        .expect("parse hash shard");
+        assert_eq!(shard.entries.len(), 3);
+        assert_eq!(
+            shard
+                .entries
+                .iter()
+                .filter(|entry| entry.crate_version == "0.25.0")
+                .count(),
+            2
+        );
+        assert_eq!(
+            shard
+                .entries
+                .iter()
+                .map(|entry| entry.g8r.dso_version.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["0.29.0", "0.30.0"])
+        );
+
+        let mut frontend_comparison = comparison.clone();
+        frontend_comparison.schema_version =
+            WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION;
+        let frontend_comparison_bytes =
+            serde_json::to_vec(&frontend_comparison).expect("serialize frontend comparison");
+        validate_ir_fn_corpus_ir_index_closure(
+            [
+                (
+                    WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+                    comparison_bytes.as_slice(),
+                ),
+                (
+                    WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
+                    frontend_comparison_bytes.as_slice(),
+                ),
+                (
+                    WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
+                    build.manifest_bytes.as_slice(),
+                ),
+            ]
+            .into_iter()
+            .chain(
+                build
+                    .shard_files
+                    .iter()
+                    .map(|(key, bytes)| (key.as_str(), bytes.as_slice())),
+            ),
+        )
+        .expect("multi-DSO reused imports satisfy public IR closure");
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
     fn synthetic_provenance(
         action_id: &str,
         action: ActionSpec,
@@ -9923,6 +10392,7 @@ mod tests {
                 top_fn_name: Some("__float32__add".to_string()),
                 fraig: false,
                 lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: 0,
                 version: "0.35.0".to_string(),
                 runtime: runtime.clone(),
             },
@@ -10513,6 +10983,7 @@ mod tests {
                 top_fn_name: Some("__float32__add".to_string()),
                 fraig: false,
                 lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: 0,
                 version: "0.35.0".to_string(),
                 runtime: runtime.clone(),
             },
@@ -10541,6 +11012,7 @@ mod tests {
                 top_fn_name: Some("__k3_cone_deadbeef".to_string()),
                 fraig: false,
                 lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: 0,
                 version: "0.35.0".to_string(),
                 runtime,
             },
@@ -10582,6 +11054,106 @@ mod tests {
             expanded_ids.contains(&k3_child_id),
             "k3 descendants should be included when include_k3_descendants=true"
         );
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn stdlib_file_action_graph_projects_migrated_suggestion_identities() {
+        let (store, root) = make_test_store("file-graph-identity-alias");
+        let mut runtime = test_runtime();
+        runtime.driver_version = "0.25.0".to_string();
+        let ir_top = "__float32__add";
+        let root_action_id = materialize_test_provenance(
+            &store,
+            "root",
+            ActionSpec::DriverDslxFnToIr {
+                dslx_subtree_action_id: "f".repeat(64),
+                dslx_file: "xls/dslx/stdlib/float32.x".to_string(),
+                dslx_fn_name: "add".to_string(),
+                version: "0.25.0".to_string(),
+                runtime: runtime.clone(),
+            },
+            ArtifactType::IrPackageFile,
+            "payload/root.ir",
+        );
+        let canonical_target = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: root_action_id.clone(),
+            top_fn_name: Some(ir_top.to_string()),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version,
+            ),
+            version: "0.29.0".to_string(),
+            runtime,
+        };
+        let canonical_target_id =
+            compute_action_id(&canonical_target).expect("canonical target action id");
+        let mut legacy_target = canonical_target.clone();
+        let ActionSpec::DriverIrToG8rAig {
+            execution_recipe_revision,
+            ..
+        } = &mut legacy_target
+        else {
+            unreachable!("test target is G8r")
+        };
+        *execution_recipe_revision = 0;
+        let legacy_target_id = crate::proto::compute_model_action_id_v2(&legacy_target)
+            .expect("legacy target action id")
+            .to_hex();
+        assert_ne!(legacy_target_id, canonical_target_id);
+        write_test_identity_alias(&store, &legacy_target_id, &canonical_target_id);
+
+        let mut root_provenance = store
+            .load_provenance(&root_action_id)
+            .expect("load root provenance");
+        root_provenance.suggested_next_actions = vec![SuggestedAction {
+            reason: "migrated target".to_string(),
+            action_id: legacy_target_id.clone(),
+            action: legacy_target,
+        }];
+        store
+            .write_provenance(&root_provenance)
+            .expect("write legacy suggestion");
+
+        let repo_root = std::env::current_dir().expect("repo root");
+        let index_state = build_stdlib_file_action_graph_index_state(&store, &repo_root)
+            .expect("build graph index state");
+        assert!(index_state.action_specs.contains_key(&canonical_target_id));
+        assert!(!index_state.action_specs.contains_key(&legacy_target_id));
+        assert_eq!(
+            index_state
+                .suggested_edges_by_source
+                .get(&root_action_id)
+                .expect("root suggestion edges")[0]
+                .target,
+            canonical_target_id
+        );
+
+        let dataset = build_stdlib_file_action_graph_dataset_from_index_state(
+            &store,
+            &repo_root,
+            &index_state,
+            None,
+            None,
+            None,
+            Some(&legacy_target_id),
+            false,
+        )
+        .expect("focus graph via legacy identity");
+        let node_ids: BTreeSet<&str> = dataset
+            .nodes
+            .iter()
+            .map(|node| node.action_id.as_str())
+            .collect();
+        assert!(dataset.action_focus_found);
+        assert_eq!(
+            dataset.selected_action_id.as_deref(),
+            Some(canonical_target_id.as_str())
+        );
+        assert!(node_ids.contains(canonical_target_id.as_str()));
+        assert!(!node_ids.contains(legacy_target_id.as_str()));
 
         fs::remove_dir_all(root).expect("cleanup temp store");
     }
@@ -10632,6 +11204,7 @@ mod tests {
             top_fn_name: Some(ir_top.to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: "0.35.0".to_string(),
             runtime: runtime.clone(),
         };
@@ -10719,6 +11292,7 @@ mod tests {
                 top_fn_name: Some(ir_top.to_string()),
                 fraig: false,
                 lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: 0,
                 version: "0.35.0".to_string(),
                 runtime: runtime.clone(),
             },
@@ -10752,6 +11326,7 @@ mod tests {
                 top_fn_name: Some(ir_top.to_string()),
                 fraig: true,
                 lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: 0,
                 version: "0.35.0".to_string(),
                 runtime: runtime.clone(),
             },
@@ -11002,7 +11577,7 @@ mod tests {
 
     #[test]
     fn filter_ir_fn_corpus_g8r_vs_yosys_samples_applies_thresholds() {
-        let dataset = StdlibG8rVsYosysDataset {
+        let mut dataset = StdlibG8rVsYosysDataset {
             fraig: false,
             samples: vec![
                 StdlibG8rVsYosysSample {
@@ -11070,9 +11645,35 @@ mod tests {
             available_crate_versions: vec!["0.32.0".to_string(), "0.33.0".to_string()],
         };
 
+        let mut stale_dso_sample = dataset.samples[0].clone();
+        stale_dso_sample.fn_key = "f::stale-dso".to_string();
+        stale_dso_sample.dso_version = "0.34.0".to_string();
+        dataset.samples.push(stale_dso_sample);
+
         let filtered = filter_ir_fn_corpus_g8r_vs_yosys_samples(&dataset, "v0.33.0", 6.0, 50);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].fn_key, "f::a");
+    }
+
+    #[test]
+    fn latest_dso_samples_by_crate_selects_one_generation_per_crate() {
+        let mut crate_a_old =
+            make_ir_fn_corpus_sample(&"a".repeat(64), "0.33.0", "a_old", "a::old", 8, 1.0);
+        crate_a_old.dso_version = "0.34.0".to_string();
+        let mut crate_a_new =
+            make_ir_fn_corpus_sample(&"b".repeat(64), "0.33.0", "a_new", "a::new", 8, 2.0);
+        crate_a_new.dso_version = "0.35.0".to_string();
+        let mut crate_b =
+            make_ir_fn_corpus_sample(&"c".repeat(64), "0.32.0", "b", "b::only", 8, 3.0);
+        crate_b.dso_version = "0.33.0".to_string();
+        let samples = vec![crate_a_old, crate_a_new, crate_b];
+
+        let selected = latest_dso_samples_by_crate(&samples);
+        let selected_keys: BTreeSet<&str> = selected
+            .iter()
+            .map(|sample| sample.fn_key.as_str())
+            .collect();
+        assert_eq!(selected_keys, BTreeSet::from(["a::new", "b::only"]));
     }
 
     #[test]
@@ -11085,7 +11686,11 @@ mod tests {
         let ir_top = Some("__foo".to_string());
 
         let g8r_by_entity = BTreeMap::from([(
-            (structural_hash.clone(), crate_version.clone()),
+            (
+                structural_hash.clone(),
+                crate_version.clone(),
+                "0.35.0".to_string(),
+            ),
             StdlibAigStatsPoint {
                 fn_key: "foo".to_string(),
                 ir_action_id: g8r_ir_action_id.clone(),
@@ -11099,7 +11704,7 @@ mod tests {
             },
         )]);
         let yosys_by_entity = BTreeMap::from([(
-            (structural_hash, crate_version.clone()),
+            (structural_hash, crate_version.clone(), "0.35.0".to_string()),
             StdlibAigStatsPoint {
                 fn_key: "foo".to_string(),
                 ir_action_id: yosys_ir_action_id.clone(),
@@ -11137,6 +11742,92 @@ mod tests {
         assert_eq!(dataset.samples.len(), 1);
         assert_eq!(dataset.samples[0].crate_version, crate_version);
         assert_eq!(dataset.samples[0].ir_node_count, 123);
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn build_ir_fn_corpus_dataset_never_pairs_different_dso_versions() {
+        let (store, root) = make_test_store("ir-fn-corpus-dso-pairing");
+        let structural_hash = "a".repeat(64);
+        let crate_version = "0.34.0".to_string();
+        let g8r = StdlibAigStatsPoint {
+            fn_key: "foo".to_string(),
+            ir_action_id: "1".repeat(64),
+            ir_top: Some("__foo".to_string()),
+            crate_version: crate_version.clone(),
+            dso_version: "0.35.0".to_string(),
+            and_nodes: 10.0,
+            depth: 2.0,
+            created_utc: DateTime::<Utc>::UNIX_EPOCH,
+            stats_action_id: "3".repeat(64),
+        };
+        let old_yosys = StdlibAigStatsPoint {
+            fn_key: "foo".to_string(),
+            ir_action_id: "2".repeat(64),
+            ir_top: Some("__foo".to_string()),
+            crate_version: crate_version.clone(),
+            dso_version: "0.34.0".to_string(),
+            and_nodes: 8.0,
+            depth: 2.0,
+            created_utc: DateTime::<Utc>::UNIX_EPOCH,
+            stats_action_id: "4".repeat(64),
+        };
+        let g8r_by_entity = BTreeMap::from([(
+            (
+                structural_hash.clone(),
+                crate_version.clone(),
+                g8r.dso_version.clone(),
+            ),
+            g8r,
+        )]);
+        let mut yosys_by_entity = BTreeMap::from([(
+            (
+                structural_hash.clone(),
+                crate_version.clone(),
+                old_yosys.dso_version.clone(),
+            ),
+            old_yosys.clone(),
+        )]);
+
+        let mismatched = build_ir_fn_corpus_dataset_from_entity_maps(
+            &store,
+            &g8r_by_entity,
+            &yosys_by_entity,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(mismatched.samples.is_empty());
+        assert_eq!(mismatched.g8r_only_count, 1);
+        assert_eq!(mismatched.yosys_only_count, 1);
+
+        let mut matching_yosys = old_yosys;
+        matching_yosys.dso_version = "0.35.0".to_string();
+        yosys_by_entity.insert(
+            (
+                structural_hash,
+                crate_version,
+                matching_yosys.dso_version.clone(),
+            ),
+            matching_yosys,
+        );
+        let exact = build_ir_fn_corpus_dataset_from_entity_maps(
+            &store,
+            &g8r_by_entity,
+            &yosys_by_entity,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(exact.samples.len(), 1);
+        assert_eq!(exact.samples[0].dso_version, "0.35.0");
+        assert_eq!(exact.g8r_only_count, 0);
+        assert_eq!(exact.yosys_only_count, 1);
 
         fs::remove_dir_all(root).expect("cleanup temp store");
     }

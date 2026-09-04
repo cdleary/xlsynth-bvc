@@ -277,6 +277,11 @@ fn site_build_and_verify_supports_subdirectory_base() {
     assert_eq!(summary.dataset_count, 1);
     let verified = verify_static_site(&site_dir).expect("verify site");
     assert_eq!(verified.base_url, "/xlsynth-bvc/");
+    let catalog: BrowserCatalog = serde_json::from_slice(
+        &fs::read(site_dir.join("catalog.json")).expect("read browser catalog"),
+    )
+    .expect("decode browser catalog");
+    assert_eq!(catalog.schema_version, 5);
     let index_html = fs::read_to_string(site_dir.join("index.html")).expect("read homepage HTML");
     assert!(index_html.contains("Boolean synthesis comparison"));
     assert!(index_html.contains("id=\"home-overview\""));
@@ -300,8 +305,8 @@ fn site_build_and_verify_supports_subdirectory_base() {
     );
     let progression_html =
         fs::read_to_string(site_dir.join("progression.html")).expect("read progression HTML");
-    assert!(progression_html.contains(crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME));
-    assert!(progression_html.contains("Signed G8r − Yosys/ABC"));
+    assert!(progression_html.contains(crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME));
+    assert!(progression_html.contains("Quality versus distribution"));
     assert!(progression_html.contains("id=\"include-incomplete\""));
     assert!(progression_html.contains("id=\"progression-inventory\""));
     let releases_html =
@@ -312,15 +317,15 @@ fn site_build_and_verify_supports_subdirectory_base() {
     assert!(index_html.contains("Processing status"));
     assert!(APP_JS.contains("Release progression data is not available in this snapshot."));
     assert!(APP_JS.contains("At least two cohort-complete releases are needed"));
-    assert!(APP_JS.contains("negative means G8r is better"));
-    assert!(APP_JS.contains("sample.stdlib_root_action_id"));
-    assert!(APP_JS.contains("contains duplicate samples"));
+    assert!(APP_JS.contains("Aggregate quality"));
+    assert!(APP_JS.contains("sample.structural_hash"));
+    assert!(APP_JS.contains("contains duplicate fixed IR"));
     assert!(APP_JS.contains("query.get('all_versions')==='true'"));
-    assert!(APP_JS.contains("Median paired per-function product-loss change"));
+    assert!(APP_JS.contains("Median paired per-artifact change"));
     assert!(APP_JS.contains("Current-only and baseline-only"));
     assert!(APP_JS.contains("completeGenerations=generations.filter"));
-    assert!(APP_JS.contains("Incomplete cohorts are never selected by default or plotted"));
-    assert!(APP_JS.contains("Incomplete-cohort warning"));
+    assert!(APP_JS.contains("Incomplete generations are never selected by default or plotted"));
+    assert!(APP_JS.contains("Incomplete fixed-IR warning"));
     assert!(!APP_JS.contains("Degraded runs are never selected by default or plotted"));
     assert!(!APP_JS.contains("Selected campaign generation is unavailable"));
     let comparison_html =
@@ -367,7 +372,7 @@ fn site_build_and_verify_supports_subdirectory_base() {
     assert!(APP_JS.contains("renderComparisonLoss"));
     assert!(!APP_JS.contains("scattergl"));
     assert!(!STYLE_CSS.contains(".table-wrap{max-height:60vh;overflow:auto}svg{"));
-    assert!(STYLE_CSS.contains("#plot>svg,.progression-chart>svg{"));
+    assert!(STYLE_CSS.contains(".progression-chart-grid{display:grid"));
     assert!(APP_JS.contains("losses_only"));
     assert!(APP_JS.contains("comparisonSelectionKey"));
     let mffc_html = fs::read_to_string(site_dir.join("mffc-discrepancies.html"))
@@ -443,6 +448,7 @@ const prefix = app.slice(0, app.indexOf('async function main()'));
 const api = new Function(prefix + '\nreturn {homepageSummary,homepageExplorerHref,homepagePairPlot,renderComparisonPair};')();
 const sample = (crate_version, fn_key, g8r_nodes, g8r_levels, yosys_abc_nodes, yosys_abc_levels, g8r_product_loss, ir_top = fn_key) => ({
   crate_version,
+  dso_version: crate_version,
   fn_key,
   ir_top,
   ir_node_count: 20,
@@ -459,12 +465,13 @@ const samples = [
   sample('0.68.0', 'partial', 10, 5, 12, 7, -34),
   ...Array.from({length: 4}, (_, i) => sample('0.68.0', `mffc-${i}`, 1, 1, 1, 1, 0, `__mffc_${i}`)),
   ...Array.from({length: 4}, (_, i) => sample('0.68.0', `k3-${i}`, 1, 1, 1, 1, 0, `__k3_cone_${i}`)),
+  {...sample('0.68.0', 'stale-dso', 100, 100, 1, 1, 9999), dso_version: '0.67.0'},
 ];
 const summary = api.homepageSummary(samples);
 if (JSON.stringify(summary.versions) !== JSON.stringify(['0.66.0', '0.68.0']) || summary.latestVersion !== '0.68.0' || summary.samples.length !== 9) {
   throw new Error(`unexpected latest-release summary: ${JSON.stringify(summary)}`);
 }
-if (summary.selection !== 'latest crate release v0.68.0' || summary.wholeFunctionCount !== 1 || summary.mffcCount !== 4 || summary.k3Count !== 4) {
+if (summary.selection !== 'latest crate release v0.68.0 · DSO v0.68.0' || summary.wholeFunctionCount !== 1 || summary.mffcCount !== 4 || summary.k3Count !== 4) {
   throw new Error(`unexpected latest-release policy: ${JSON.stringify(summary)}`);
 }
 if (summary.pureWins !== 1 || summary.strictLosses !== 0 || summary.medianLoss !== 0) {
@@ -530,20 +537,20 @@ if (href !== 'ir-fn-g8r-abc-vs-codegen-yosys-abc/?crate_version=0.68.0&losses_on
 }
 
 #[test]
-fn progression_catalog_uses_repeated_subject_population_not_campaign_status() {
+fn progression_catalog_uses_fixed_ir_structural_hash_population() {
     fn sample(
         crate_version: &str,
-        stdlib_root_action_id: &str,
+        structural_hash: &str,
         fn_key: &str,
     ) -> crate::view::StdlibG8rVsYosysSample {
         crate::view::StdlibG8rVsYosysSample {
             fn_key: fn_key.to_string(),
             crate_version: crate_version.to_string(),
             dso_version: "0.1.0".to_string(),
-            stdlib_root_action_id: Some(stdlib_root_action_id.to_string()),
+            stdlib_root_action_id: None,
             ir_action_id: format!("ir-{crate_version}-{fn_key}"),
             ir_top: Some(format!("top_{fn_key}")),
-            structural_hash: None,
+            structural_hash: Some(structural_hash.to_string()),
             ir_node_count: 1,
             g8r_nodes: 1.0,
             g8r_levels: 1.0,
@@ -557,23 +564,27 @@ fn progression_catalog_uses_repeated_subject_population_not_campaign_status() {
         }
     }
 
-    let roots = [
-        "1111111111111111111111111111111111111111111111111111111111111111",
-        "2222222222222222222222222222222222222222222222222222222222222222",
-        "3333333333333333333333333333333333333333333333333333333333333333",
-        "4444444444444444444444444444444444444444444444444444444444444444",
-    ];
+    let hashes = release_progression_ir_hashes().expect("pinned fixed IR hashes");
+    assert_eq!(hashes.len(), RELEASE_PROGRESSION_IR_COUNT);
+    let extra_hash = "0".repeat(64);
+    assert!(!hashes.contains(&extra_hash));
+    let mut samples = Vec::new();
+    for (index, hash) in hashes.iter().enumerate() {
+        samples.push(sample("0.1.0", hash, &format!("original-{index}")));
+        samples.push(sample("0.2.0", hash, &format!("renamed-{index}")));
+    }
+    for (index, hash) in hashes[..hashes.len() - 1].iter().enumerate() {
+        samples.push(sample("0.3.0", hash, &format!("partial-{index}")));
+        samples.push(sample("0.4.0", hash, &format!("changed-{index}")));
+    }
+    samples.push(sample("0.2.0", &extra_hash, "unrelated-complete-extra"));
+    samples.push(sample("0.4.0", &extra_hash, "extra"));
+    let mut generated = sample("0.4.0", &extra_hash, "generated");
+    generated.ir_top = Some("__k3_cone_generated".to_string());
+    samples.push(generated);
     let dataset = StdlibG8rVsYosysDataset {
         fraig: false,
-        samples: vec![
-            sample("0.1.0", roots[0], "a"),
-            sample("0.1.0", roots[0], "b"),
-            sample("0.2.0", roots[1], "a"),
-            sample("0.2.0", roots[1], "b"),
-            sample("0.3.0", roots[2], "a"),
-            sample("0.4.0", roots[3], "a"),
-            sample("0.4.0", roots[3], "c"),
-        ],
+        samples,
         min_ir_nodes: 1,
         max_ir_nodes: 1,
         g8r_only_count: 0,
@@ -585,59 +596,22 @@ fn progression_catalog_uses_repeated_subject_population_not_campaign_status() {
             "0.4.0".to_string(),
         ],
     };
-    let version_cards = ["0.1.0", "0.2.0", "0.3.0", "0.4.0"]
-        .into_iter()
-        .map(|crate_version| {
-            json!({
-                "crate_version": crate_version,
-                "crate_release_datetime": null,
-                "total_materialized": 0,
-                "failed_total": 0,
-                "dso_versions": ["0.1.0"],
-                "stdlib_enumeration": {
-                    "state": "ok",
-                    "reason": "discovery_counts",
-                    "scanned_files": 1,
-                    "failed_files": 0,
-                    "concrete_functions": 3,
-                    "suggested_actions": 3
-                },
-                "failed_by_kind": [],
-                "failures": []
-            })
-        })
-        .collect::<Vec<_>>();
-    let versions: VersionCardsReport = serde_json::from_value(json!({
-        "cards": version_cards,
-        "unattributed_actions": []
-    }))
-    .expect("version cards");
-    let degraded_run = BrowserRun {
-        campaign_id: "campaign".to_string(),
-        run_id: "degraded-run".to_string(),
-        campaign_name: "comparison".to_string(),
-        campaign_semantic_version: 1,
-        crate_version: "0.2.0".to_string(),
-        dso_version: "0.1.0".to_string(),
-        status: "degraded".to_string(),
-        updated_utc: "2026-09-01T00:00:00Z".to_string(),
-        root_action_ids: vec![roots[1].to_string()],
-        completed_root_count: 1,
-        failed_count: 1,
-        canceled_count: 0,
-        missing_output_count: 0,
-        failed_sample_count: 1,
-        intentionally_skipped_samples: Vec::new(),
-        protobuf_url: "data/runs/degraded-run.pb".to_string(),
-        page_url: "runs/degraded-run/".to_string(),
-        findings_protobuf_url: None,
-        findings: Vec::new(),
-    };
 
-    let catalog = build_browser_progression_catalog(&dataset, Some(&versions), &[degraded_run])
-        .expect("build progression catalog");
-    assert_eq!(catalog.cohort_subject_count, 2);
-    assert!(catalog.cohort_subject_sha256.is_some());
+    let catalog = build_browser_progression_catalog(&dataset).expect("build progression catalog");
+    assert_eq!(
+        catalog.dataset_key,
+        crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
+    );
+    assert_eq!(catalog.cohort_ir_count, RELEASE_PROGRESSION_IR_COUNT as u64);
+    assert_eq!(&catalog.cohort_ir_hashes, &hashes);
+    assert_eq!(
+        catalog.cohort_ir_sha256.as_deref(),
+        Some(
+            progression_ir_sha256(&hashes)
+                .expect("cohort digest")
+                .as_str()
+        )
+    );
     assert_eq!(catalog.cohort_complete_generation_count, 2);
     assert_eq!(catalog.generations.len(), 4);
 
@@ -652,31 +626,32 @@ fn progression_catalog_uses_repeated_subject_population_not_campaign_status() {
         generation("0.1.0").coverage,
         BrowserProgressionCoverage::CohortComplete
     );
-    let degraded_generation = generation("0.2.0");
     assert_eq!(
-        degraded_generation.coverage,
+        generation("0.2.0").coverage,
         BrowserProgressionCoverage::CohortComplete
     );
-    assert_eq!(degraded_generation.campaign_runs.len(), 1);
-    assert_eq!(degraded_generation.campaign_runs[0].status, "degraded");
-    assert_eq!(degraded_generation.enumerated_subject_count, Some(3));
     assert_eq!(
-        degraded_generation.unmeasured_enumerated_subject_count,
-        Some(1)
+        generation("0.2.0").observed_ir_count,
+        RELEASE_PROGRESSION_IR_COUNT as u64
     );
+    assert_eq!(generation("0.2.0").extra_ir_count, 1);
 
     let partial = generation("0.3.0");
     assert_eq!(partial.coverage, BrowserProgressionCoverage::Partial);
-    assert_eq!(partial.missing_cohort_subject_count, 1);
-    assert_eq!(partial.extra_subject_count, 0);
+    assert_eq!(partial.missing_cohort_ir_count, 1);
+    assert_eq!(partial.extra_ir_count, 0);
 
     let incompatible = generation("0.4.0");
     assert_eq!(
         incompatible.coverage,
         BrowserProgressionCoverage::Incompatible
     );
-    assert_eq!(incompatible.missing_cohort_subject_count, 1);
-    assert_eq!(incompatible.extra_subject_count, 1);
+    assert_eq!(
+        incompatible.observed_ir_count,
+        (RELEASE_PROGRESSION_IR_COUNT - 1) as u64
+    );
+    assert_eq!(incompatible.missing_cohort_ir_count, 1);
+    assert_eq!(incompatible.extra_ir_count, 1);
 
     let mut mixed_dso = dataset.clone();
     for sample in mixed_dso
@@ -691,9 +666,12 @@ fn progression_catalog_uses_repeated_subject_population_not_campaign_status() {
     recomputed.g8r_stats_action_id = "g8r-recomputed".to_string();
     recomputed.yosys_abc_stats_action_id = "yosys-recomputed".to_string();
     mixed_dso.samples.push(recomputed);
-    let mixed_catalog = build_browser_progression_catalog(&mixed_dso, Some(&versions), &[])
+    let mixed_catalog = build_browser_progression_catalog(&mixed_dso)
         .expect("rolling DSO updates keep the static site publishable");
-    assert_eq!(mixed_catalog.cohort_subject_count, 2);
+    assert_eq!(
+        mixed_catalog.cohort_ir_count,
+        RELEASE_PROGRESSION_IR_COUNT as u64
+    );
     assert_eq!(mixed_catalog.cohort_complete_generation_count, 2);
     assert_eq!(mixed_catalog.generations.len(), 5);
     let rolling_generations = mixed_catalog
@@ -703,48 +681,50 @@ fn progression_catalog_uses_repeated_subject_population_not_campaign_status() {
         .collect::<Vec<_>>();
     assert_eq!(rolling_generations.len(), 2);
     assert_eq!(rolling_generations[0].dso_version, "0.9.0");
-    assert_eq!(rolling_generations[0].observed_subject_count, 2);
+    assert_eq!(
+        rolling_generations[0].observed_ir_count,
+        RELEASE_PROGRESSION_IR_COUNT as u64
+    );
     assert_eq!(rolling_generations[1].dso_version, "0.10.0");
-    assert_eq!(rolling_generations[1].observed_subject_count, 1);
+    assert_eq!(rolling_generations[1].observed_ir_count, 1);
     assert_eq!(
         rolling_generations[1].coverage,
         BrowserProgressionCoverage::Partial
     );
 
-    let mut unavailable_enumeration = versions.clone();
-    let unknown_card = unavailable_enumeration
-        .cards
-        .iter_mut()
-        .find(|card| card.crate_version == "0.3.0")
-        .expect("version card");
-    unknown_card.stdlib_enumeration.state = crate::view::StdlibEnumerationState::Unknown;
-    unknown_card.stdlib_enumeration.concrete_functions = 0;
-    let unavailable_enumeration_catalog =
-        build_browser_progression_catalog(&dataset, Some(&unavailable_enumeration), &[])
-            .expect("unavailable enumeration metadata remains publishable");
-    let unknown_generation = unavailable_enumeration_catalog
-        .generations
-        .iter()
-        .find(|generation| generation.crate_version == "0.3.0")
-        .expect("unknown-enumeration generation");
-    assert_eq!(
-        unknown_generation.enumeration_status.as_deref(),
-        Some("unknown")
-    );
-    assert_eq!(unknown_generation.enumerated_subject_count, None);
-    assert_eq!(unknown_generation.unmeasured_enumerated_subject_count, None);
+    let mut missing_hash = dataset.clone();
+    missing_hash.samples[0].structural_hash = None;
+    let error = build_browser_progression_catalog(&missing_hash)
+        .expect_err("whole-function fixed IR must have a structural hash");
+    assert!(error.to_string().contains("has no valid structural hash"));
 
-    let mut lineage_free = dataset.clone();
-    lineage_free.samples[0].stdlib_root_action_id = None;
-    let unavailable = build_browser_progression_catalog(&lineage_free, Some(&versions), &[])
-        .expect("lineage-free datasets keep the rest of the static site publishable");
-    assert_eq!(unavailable.cohort_subject_count, 0);
+    let mut generated_only = dataset.clone();
+    generated_only.samples.retain(|sample| {
+        sample
+            .ir_top
+            .as_deref()
+            .is_some_and(|top| top.starts_with("__k3_cone_"))
+    });
+    let unavailable = build_browser_progression_catalog(&generated_only)
+        .expect("generated-only datasets keep the site publishable");
+    assert_eq!(
+        unavailable.cohort_ir_count,
+        RELEASE_PROGRESSION_IR_COUNT as u64
+    );
+    assert_eq!(
+        unavailable.cohort_ir_hashes.len(),
+        RELEASE_PROGRESSION_IR_COUNT
+    );
+    assert_eq!(
+        unavailable.cohort_ir_sha256.as_deref(),
+        Some(RELEASE_PROGRESSION_IR_SHA256)
+    );
     assert_eq!(unavailable.cohort_complete_generation_count, 0);
     assert!(unavailable.generations.is_empty());
 }
 
 #[test]
-fn progression_javascript_uses_median_of_per_function_deltas() {
+fn progression_javascript_uses_fixed_ir_pairing_and_aggregate_quality() {
     const SCRIPT: &str = r#"
 const fs = require('fs');
 global.document = {
@@ -753,14 +733,22 @@ global.document = {
 };
 const app = fs.readFileSync(0, 'utf8');
 const prefix = app.slice(0, app.indexOf('async function main()'));
-const api = new Function(prefix + '\nreturn {compareSamples,medianPairedProductLossChange,progressionSelection,releaseGenerations};')();
-const sample = (fn_key, g8r_product_loss) => ({fn_key, ir_top: null, g8r_product_loss});
-const before = [sample('a', 0), sample('b', 100), sample('c', 101)];
-const after = [sample('a', 99), sample('b', 98), sample('c', 102)];
+const api = new Function(prefix + '\nreturn {compareSamples,medianPairedProductLossChange,progressionSelection,releaseGenerations,releaseStats};')();
+const hash = value => value.repeat(64);
+const sample = (fn_key, hashValue, g8r_product_loss, g8r_product = 100 + g8r_product_loss, yosys_abc_product = 100) => ({
+  fn_key,
+  ir_top: fn_key,
+  structural_hash: hash(hashValue),
+  g8r_product_loss,
+  g8r_product,
+  yosys_abc_product,
+});
+const before = [sample('old-a', 'a', 0), sample('old-b', 'b', 100), sample('old-c', 'c', 101)];
+const after = [sample('new-a', 'a', 99), sample('new-b', 'b', 98), sample('new-c', 'c', 102)];
 const {pairs} = api.compareSamples(before, after);
 const actual = api.medianPairedProductLossChange(pairs);
-if (actual !== 1) {
-  throw new Error(`expected median paired delta 1, got ${actual}`);
+if (actual !== 1 || pairs[0].key.length !== 64) {
+  throw new Error(`expected structural-hash paired median delta 1, got ${actual}`);
 }
 const one = api.progressionSelection([{generation_id: 'only'}]);
 if (one.baseline !== '' || one.current !== 'only') {
@@ -778,32 +766,37 @@ const duplicate = api.progressionSelection(
 if (duplicate.baseline !== 'before' || duplicate.current !== 'after') {
   throw new Error(`duplicate selections must be separated: ${JSON.stringify(duplicate)}`);
 }
-const root = '1'.repeat(64);
 const generation = (generation_id, dso_version) => ({
   generation_id,
   crate_version: '1.0.0',
   dso_version,
-  stdlib_root_action_id: root,
-  observed_subject_count: 1,
+  observed_ir_count: 1,
   coverage: 'partial',
-  cohort_subject_count: 2,
-  missing_cohort_subject_count: 1,
-  extra_subject_count: 0,
-  enumeration_status: null,
-  enumerated_subject_count: null,
-  unmeasured_enumerated_subject_count: null,
-  campaign_runs: [],
+  cohort_ir_count: 2,
+  missing_cohort_ir_count: 1,
+  extra_ir_count: 0,
 });
 const rolling = api.releaseGenerations(
-  {progression: {generations: [generation('new', '0.10.0'), generation('old', '0.9.0')]}},
+  {progression: {cohort_ir_count: 2, cohort_ir_hashes: [hash('a'), hash('b')], generations: [generation('new', '0.10.0'), generation('old', '0.9.0')]}},
   [
-    {fn_key: 'a', ir_top: null, crate_version: '1.0.0', dso_version: '0.9.0', stdlib_root_action_id: root},
-    {fn_key: 'a', ir_top: null, crate_version: '1.0.0', dso_version: '0.10.0', stdlib_root_action_id: root},
+    {...sample('a', 'a', 0), crate_version: '1.0.0', dso_version: '0.9.0'},
+    {...sample('a', 'a', 0), crate_version: '1.0.0', dso_version: '0.10.0'},
+    {...sample('unrelated-old', 'f', 999999), crate_version: '1.0.0', dso_version: '0.9.0'},
+    {...sample('unrelated-new', 'f', -999999), crate_version: '1.0.0', dso_version: '0.10.0'},
   ],
 );
 if (rolling.length !== 2 || rolling.some(value => value.samples.length !== 1)
     || rolling[0].generation_id !== 'old' || rolling[1].generation_id !== 'new') {
   throw new Error(`mixed DSO populations must remain separate: ${JSON.stringify(rolling)}`);
+}
+const stats = api.releaseStats([{generation_id: 'quality', version: '1.0.0', dso_version: '1.0.0', samples: [
+  sample('larger-regression', 'd', 10, 110, 100),
+  sample('smaller-improvement', 'e', -5, 45, 50),
+]}])[0];
+if (stats.g8r_total !== 155 || stats.yosys_total !== 150 || stats.total_loss !== 5
+    || Math.abs(stats.aggregate_pct - (100 / 30)) > 1e-9
+    || stats.gross_regression !== 10 || stats.gross_improvement !== 5) {
+  throw new Error(`unexpected aggregate quality statistics: ${JSON.stringify(stats)}`);
 }
 "#;
     let mut child = match Command::new("node")
@@ -846,7 +839,7 @@ global.document = {
 };
 const app = fs.readFileSync(0, 'utf8');
 const prefix = app.slice(0, app.indexOf('async function main()'));
-const api = new Function(prefix + '\nreturn {comparisonDefaultVersion,comparisonIsLoss,comparisonQuadrant,comparisonSelectionKey};')();
+const api = new Function(prefix + '\nreturn {comparisonDefaultVersion,comparisonIsLoss,comparisonQuadrant,comparisonSelectionKey,latestDsoSamplesByCrate};')();
 const state = {lhs: 'G8r', rhs: 'Yosys/ABC'};
 const sample = (g8r_nodes, g8r_levels, yosys_abc_nodes, yosys_abc_levels) => ({
   g8r_nodes,
@@ -886,6 +879,14 @@ if (api.comparisonDefaultVersion(versions, 'invalid') !== '0.10.0') {
 }
 if (api.comparisonDefaultVersion([], null) !== '') {
   throw new Error('empty version list did not stay empty');
+}
+const latestDso = api.latestDsoSamplesByCrate([
+  {crate_version: '0.25.0', dso_version: '0.9.0', fn_key: 'stale'},
+  {crate_version: '0.25.0', dso_version: '0.10.0', fn_key: 'current'},
+  {crate_version: '0.26.0', dso_version: '0.8.0', fn_key: 'other'},
+]);
+if (JSON.stringify(latestDso.map(sample => sample.fn_key)) !== JSON.stringify(['current', 'other'])) {
+  throw new Error(`stale DSO generations were not removed: ${JSON.stringify(latestDso)}`);
 }
 
 "#;
