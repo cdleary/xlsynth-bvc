@@ -193,6 +193,9 @@ pub(super) fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Res
         "versions_summary.resolved_recipe_fingerprint_sha256",
         &index.resolved_recipe_fingerprint_sha256,
     )?;
+    if index.version_compat_json.contains('\0') {
+        bail!("versions_summary.version_compat_json contains NUL");
+    }
     validate_unique_strings(
         "versions_summary.cards.crate_version",
         index.report.cards.iter().map(|card| &card.crate_version),
@@ -1253,6 +1256,7 @@ mod tests {
             "generated_utc": "2026-08-29T12:00:00Z",
             "input_fingerprint_sha256": "a".repeat(64),
             "resolved_recipe_fingerprint_sha256": "b".repeat(64),
+            "version_compat_json": "{}",
             "report": {
                 "cards": [],
                 "unattributed_actions": [],

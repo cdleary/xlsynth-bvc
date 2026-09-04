@@ -81,6 +81,40 @@ fn generated_site_links_are_relocatable() {
 }
 
 #[test]
+fn site_versions_loader_rejects_truncated_release_ledger() {
+    let root = temp_root();
+    let dataset_relpath = format!("data/{}", crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME);
+    let dataset_path = root.join(&dataset_relpath);
+    fs::create_dir_all(dataset_path.parent().expect("dataset parent"))
+        .expect("create dataset parent");
+
+    let mut versions: crate::query::VersionsSummaryIndexFile =
+        serde_json::from_slice(&empty_versions_index_bytes()).expect("decode versions fixture");
+    versions
+        .report
+        .releases
+        .pop()
+        .expect("remove an older release row");
+    let bytes = serde_json::to_vec(&versions).expect("encode truncated versions fixture");
+    fs::write(&dataset_path, &bytes).expect("write truncated versions fixture");
+
+    let datasets = vec![BrowserDataset {
+        logical_key: crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME.to_string(),
+        url: dataset_relpath,
+        bytes: bytes.len() as u64,
+        sha256: sha256_hex(&bytes),
+    }];
+    let error = load_versions_report_from_site(&root, &datasets)
+        .expect_err("truncated release ledger must fail site loading");
+    assert!(
+        format!("{error:#}").contains("embedded compatibility map has"),
+        "unexpected error: {error:#}"
+    );
+
+    fs::remove_dir_all(root).expect("cleanup site fixture");
+}
+
+#[test]
 fn structural_static_manifest_advertises_resolvable_shards() {
     let root = temp_root();
     let store = ArtifactStore::new(root.join("store"));

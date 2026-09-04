@@ -1308,6 +1308,7 @@ pub(crate) struct VersionsSummaryIndexFile {
     pub(crate) generated_utc: DateTime<Utc>,
     pub(crate) input_fingerprint_sha256: String,
     pub(crate) resolved_recipe_fingerprint_sha256: String,
+    pub(crate) version_compat_json: String,
     pub(crate) report: VersionCardsReport,
 }
 
@@ -6842,8 +6843,40 @@ pub(crate) fn validate_complete_versions_summary(
     if index_file.report.releases.is_empty() {
         bail!("versions summary release ledger is empty");
     }
-    if index_file.report.repository_head_observation.is_none() {
-        bail!("versions summary is missing its repository-head observation");
+    let observation = index_file
+        .report
+        .repository_head_observation
+        .as_ref()
+        .context("versions summary is missing its repository-head observation")?;
+    let compat_sha256 = hex::encode(Sha256::digest(index_file.version_compat_json.as_bytes()));
+    if compat_sha256 != observation.version_compat_sha256 {
+        bail!("versions summary compatibility-map bytes do not match the repository observation");
+    }
+    let compat: BTreeMap<String, VersionCompatEntry> =
+        serde_json::from_str(&index_file.version_compat_json)
+            .context("parsing embedded versions summary compatibility map")?;
+    if index_file.report.releases.len() != compat.len() {
+        bail!(
+            "versions summary release ledger has {} rows; embedded compatibility map has {}",
+            index_file.report.releases.len(),
+            compat.len()
+        );
+    }
+    for release in &index_file.report.releases {
+        let entry = compat.get(&release.crate_version).with_context(|| {
+            format!(
+                "versions summary release crate v{} is absent from its embedded compatibility map",
+                release.crate_version
+            )
+        })?;
+        if release.crate_release_datetime != entry.crate_release_datetime
+            || release.dso_version != normalize_tag_version(&entry.xlsynth_release_version)
+        {
+            bail!(
+                "versions summary release crate v{} disagrees with its embedded compatibility map",
+                release.crate_version
+            );
+        }
     }
     Ok(())
 }
@@ -6963,15 +6996,46 @@ pub(crate) fn load_versions_cards_index(
     store: &ArtifactStore,
     repo_root: &Path,
 ) -> Result<Option<VersionsSummaryIndexFile>> {
+    let input_generation = store.versions_summary_input_generation();
+    let Some((index_file, current_input_fingerprint)) = store
+        .with_versions_summary_input_snapshot(|| {
+            load_versions_cards_index_candidate(store, repo_root)
+        })?
+    else {
+        return Ok(None);
+    };
+    if store.is_snapshot_backend() {
+        return Ok(Some(index_file));
+    }
+    let current_input_fingerprint = current_input_fingerprint
+        .context("live versions index candidate missing input fingerprint")?;
+    // Runtime binding can inspect/build Docker images and fetch immutable release inputs. Keep it
+    // outside the input read lock so normal runner completion writes are never blocked by that
+    // potentially slow work.
+    let current_recipe_fingerprint = versions_summary_resolved_recipe_fingerprint(
+        store,
+        repo_root,
+        &index_file.report,
+        &current_input_fingerprint,
+    )?;
     store.with_versions_summary_input_snapshot(|| {
-        load_versions_cards_index_from_locked_inputs(store, repo_root)
+        if store.versions_summary_input_generation() != input_generation {
+            return Ok(None);
+        }
+        if index_file.resolved_recipe_fingerprint_sha256 != current_recipe_fingerprint {
+            info!(
+                "query versions summary web index resolved recipe fingerprint mismatch; rebuild required"
+            );
+            return Ok(None);
+        }
+        Ok(Some(index_file))
     })
 }
 
-fn load_versions_cards_index_from_locked_inputs(
+fn load_versions_cards_index_candidate(
     store: &ArtifactStore,
     repo_root: &Path,
-) -> Result<Option<VersionsSummaryIndexFile>> {
+) -> Result<Option<(VersionsSummaryIndexFile, Option<String>)>> {
     let key = WEB_VERSIONS_SUMMARY_INDEX_FILENAME;
     let location = store.web_index_location(key);
     let Some(bytes) = store
@@ -6992,7 +7056,7 @@ fn load_versions_cards_index_from_locked_inputs(
     validate_complete_versions_summary(&index_file)
         .with_context(|| format!("validating versions summary web index: {}", location))?;
     if store.is_snapshot_backend() {
-        return Ok(Some(index_file));
+        return Ok(Some((index_file, None)));
     }
     let current_input_fingerprint = versions_summary_input_fingerprint(store, repo_root)?;
     if index_file.input_fingerprint_sha256 != current_input_fingerprint {
@@ -7009,19 +7073,6 @@ fn load_versions_cards_index_from_locked_inputs(
         );
         return Ok(None);
     }
-    let current_recipe_fingerprint = versions_summary_resolved_recipe_fingerprint(
-        store,
-        repo_root,
-        &index_file.report,
-        &current_input_fingerprint,
-    )?;
-    if index_file.resolved_recipe_fingerprint_sha256 != current_recipe_fingerprint {
-        info!(
-            "query versions summary web index resolved recipe fingerprint mismatch location={}; rebuild required",
-            location
-        );
-        return Ok(None);
-    }
     info!(
         "query versions summary web index hit location={} generated_utc={} cards={} unattributed={}",
         location,
@@ -7029,7 +7080,7 @@ fn load_versions_cards_index_from_locked_inputs(
         index_file.report.cards.len(),
         index_file.report.unattributed_actions.len()
     );
-    Ok(Some(index_file))
+    Ok(Some((index_file, Some(current_input_fingerprint))))
 }
 
 fn write_versions_cards_index(
@@ -7037,6 +7088,7 @@ fn write_versions_cards_index(
     report: &VersionCardsReport,
     input_fingerprint_sha256: String,
     resolved_recipe_fingerprint_sha256: String,
+    version_compat_json: String,
 ) -> Result<(String, u64, DateTime<Utc>)> {
     let key = WEB_VERSIONS_SUMMARY_INDEX_FILENAME;
     let location = store.web_index_location(key);
@@ -7046,6 +7098,7 @@ fn write_versions_cards_index(
         generated_utc,
         input_fingerprint_sha256,
         resolved_recipe_fingerprint_sha256,
+        version_compat_json,
         report: report.clone(),
     };
     let bytes = serde_json::to_vec(&payload).context("serializing versions summary web index")?;
@@ -7066,34 +7119,82 @@ pub(crate) fn rebuild_versions_cards_index(
     store: &ArtifactStore,
     repo_root: &Path,
 ) -> Result<VersionsSummaryIndexSummary> {
+    store.with_versions_summary_rebuild(|| rebuild_versions_cards_index_unlocked(store, repo_root))
+}
+
+pub(crate) fn ensure_versions_cards_index(
+    store: &ArtifactStore,
+    repo_root: &Path,
+) -> Result<VersionsSummaryIndexSummary> {
+    store.with_versions_summary_rebuild(|| {
+        if let Some(index) = load_versions_cards_index(store, repo_root)?
+            && let Some(bytes) = store.load_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME)?
+        {
+            return Ok(VersionsSummaryIndexSummary {
+                generated_utc: index.generated_utc,
+                index_path: store.web_index_location(WEB_VERSIONS_SUMMARY_INDEX_FILENAME),
+                card_count: index.report.cards.len(),
+                unattributed_actions: index.report.unattributed_actions.len(),
+                index_bytes: bytes.len() as u64,
+                elapsed_ms: 0,
+            });
+        }
+        rebuild_versions_cards_index_unlocked(store, repo_root)
+    })
+}
+
+fn rebuild_versions_cards_index_unlocked(
+    store: &ArtifactStore,
+    repo_root: &Path,
+) -> Result<VersionsSummaryIndexSummary> {
+    const MAX_REBUILD_ATTEMPTS: usize = 8;
     let started = Instant::now();
-    let (report, index_location, index_bytes, generated_utc) = store
-        .with_versions_summary_input_snapshot(|| {
-            let input_fingerprint_sha256 = versions_summary_input_fingerprint(store, repo_root)?;
-            let report = build_versions_cards(store, repo_root)?;
-            let resolved_recipe_fingerprint_sha256 = versions_summary_resolved_recipe_fingerprint(
-                store,
-                repo_root,
-                &report,
-                &input_fingerprint_sha256,
-            )?;
-            let (index_location, index_bytes, generated_utc) = write_versions_cards_index(
+    for attempt in 1..=MAX_REBUILD_ATTEMPTS {
+        let input_generation = store.versions_summary_input_generation();
+        let input_fingerprint_sha256 = versions_summary_input_fingerprint(store, repo_root)?;
+        let version_compat_json = fs::read_to_string(repo_root.join(VERSION_COMPAT_PATH))
+            .context("reading compatibility map for versions summary index")?;
+        let report = build_versions_cards(store, repo_root)?;
+        let resolved_recipe_fingerprint_sha256 = versions_summary_resolved_recipe_fingerprint(
+            store,
+            repo_root,
+            &report,
+            &input_fingerprint_sha256,
+        )?;
+        if versions_summary_input_fingerprint(store, repo_root)? != input_fingerprint_sha256 {
+            info!(
+                "versions summary static inputs changed during rebuild attempt {attempt}; retrying"
+            );
+            continue;
+        }
+        let write = store.with_versions_summary_input_snapshot(|| {
+            if store.versions_summary_input_generation() != input_generation {
+                return Ok(None);
+            }
+            write_versions_cards_index(
                 store,
                 &report,
                 input_fingerprint_sha256,
                 resolved_recipe_fingerprint_sha256,
-            )?;
-            Ok((report, index_location, index_bytes, generated_utc))
+                version_compat_json,
+            )
+            .map(Some)
         })?;
-    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    Ok(VersionsSummaryIndexSummary {
-        generated_utc,
-        index_path: index_location,
-        card_count: report.cards.len(),
-        unattributed_actions: report.unattributed_actions.len(),
-        index_bytes,
-        elapsed_ms,
-    })
+        let Some((index_location, index_bytes, generated_utc)) = write else {
+            info!("versions summary records changed during rebuild attempt {attempt}; retrying");
+            continue;
+        };
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        return Ok(VersionsSummaryIndexSummary {
+            generated_utc,
+            index_path: index_location,
+            card_count: report.cards.len(),
+            unattributed_actions: report.unattributed_actions.len(),
+            index_bytes,
+            elapsed_ms,
+        });
+    }
+    bail!("versions summary inputs changed during all {MAX_REBUILD_ATTEMPTS} rebuild attempts")
 }
 
 pub(crate) fn build_versions_cards(
@@ -8863,6 +8964,7 @@ mod tests {
             "generated_utc": "2026-09-03T22:34:04Z",
             "input_fingerprint_sha256": "a".repeat(64),
             "resolved_recipe_fingerprint_sha256": "b".repeat(64),
+            "version_compat_json": "{}",
             "report": {
                 "cards": [],
                 "unattributed_actions": [],
@@ -9055,6 +9157,39 @@ mod tests {
                 .expect("check resolved recipe binding")
                 .is_none()
         );
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn concurrent_versions_index_misses_share_one_rebuild() {
+        let (store, root) = make_test_store("versions-concurrent-rebuild");
+        let store = std::sync::Arc::new(store);
+        let repo_root = std::sync::Arc::new(std::env::current_dir().expect("current repo root"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                let repo_root = repo_root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_versions_cards_index(&store, &repo_root)
+                })
+            })
+            .collect::<Vec<_>>();
+        let summaries = threads
+            .into_iter()
+            .map(|thread| {
+                thread
+                    .join()
+                    .expect("rebuild thread")
+                    .expect("ensure index")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(summaries[0].generated_utc, summaries[1].generated_utc);
+        assert_eq!(summaries[0].index_bytes, summaries[1].index_bytes);
+        assert!(summaries.iter().any(|summary| summary.elapsed_ms == 0));
         fs::remove_dir_all(root).expect("cleanup temp store");
     }
 

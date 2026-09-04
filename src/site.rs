@@ -21,6 +21,7 @@ mod site_shards;
 
 use crate::analysis::decode_analysis_report;
 use crate::proto::v1 as pb;
+use crate::query::{VersionsSummaryIndexFile, validate_complete_versions_summary};
 use crate::snapshot::{
     load_static_snapshot_manifest, should_include_snapshot_index_key, verify_static_snapshot,
 };
@@ -319,16 +320,6 @@ struct ProgressionComparisonIndexFile {
     schema_version: u32,
     generated_utc: chrono::DateTime<chrono::Utc>,
     dataset: StdlibG8rVsYosysDataset,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProgressionVersionsIndexFile {
-    schema_version: u32,
-    generated_utc: chrono::DateTime<chrono::Utc>,
-    input_fingerprint_sha256: String,
-    resolved_recipe_fingerprint_sha256: String,
-    report: VersionCardsReport,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -645,12 +636,11 @@ fn build_browser_progression_catalog_from_site(
                     entry.url
                 )
             })?;
-            let versions: ProgressionVersionsIndexFile = serde_json::from_slice(&bytes)
+            let versions: VersionsSummaryIndexFile = serde_json::from_slice(&bytes)
                 .context("decoding typed release progression versions dataset")?;
-            if versions.schema_version != crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION {
-                bail!("release progression versions dataset has the wrong schema");
-            }
-            Ok(versions)
+            validate_complete_versions_summary(&versions)
+                .context("validating release progression versions dataset")?;
+            Ok::<VersionsSummaryIndexFile, anyhow::Error>(versions)
         })
         .transpose()?;
     build_browser_progression_catalog(
@@ -672,17 +662,9 @@ fn load_versions_report_from_site(
     };
     let bytes = fs::read(site_dir.join(&entry.url))
         .with_context(|| format!("reading versions dataset: {}", entry.url))?;
-    let versions: ProgressionVersionsIndexFile =
+    let versions: VersionsSummaryIndexFile =
         serde_json::from_slice(&bytes).context("decoding typed versions dataset")?;
-    if versions.schema_version != crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION {
-        bail!("versions dataset has the wrong schema");
-    }
-    if versions.report.releases.is_empty() {
-        bail!("versions dataset release ledger is empty");
-    }
-    if versions.report.repository_head_observation.is_none() {
-        bail!("versions dataset is missing its repository-head observation");
-    }
+    validate_complete_versions_summary(&versions).context("validating versions dataset")?;
     Ok(versions.report)
 }
 

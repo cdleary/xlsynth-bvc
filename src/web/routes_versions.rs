@@ -16,7 +16,7 @@ use crate::DASHBOARD_FAVICON_SVG;
 use crate::query::{
     build_queue_live_status, build_snapshot_unprocessed_version_rows,
     build_unprocessed_version_rows, enqueue_processing_for_crate_version,
-    load_versions_cards_index, rebuild_versions_cards_index,
+    ensure_versions_cards_index, load_versions_cards_index,
 };
 use crate::view::QueueLiveStatusView;
 use crate::web::render::{inject_server_timing_badge, render_versions_html};
@@ -110,7 +110,7 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
         let index = if let Some(indexed) = load_versions_cards_index(&store, &repo_root)? {
             indexed
         } else {
-            let summary = rebuild_versions_cards_index(&store, &repo_root)?;
+            let summary = ensure_versions_cards_index(&store, &repo_root)?;
             info!(
                 "web /versions rebuilt versions summary index cards={} unattributed={} index_bytes={} elapsed_ms={}",
                 summary.card_count,

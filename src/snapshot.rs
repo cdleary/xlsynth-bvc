@@ -36,7 +36,7 @@ use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
 // Version 10 invalidates checkpoints that may contain versions-summary.v4 but not the
-// release-ledger-bearing versions-summary.v6 dataset.
+// release-ledger-bearing versions-summary.v7 dataset.
 pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 10;
 pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.pb";
 pub(crate) const STATIC_SNAPSHOT_WEB_INDEX_DIR: &str = "web_index";
@@ -1692,6 +1692,7 @@ mod tests {
             generated_utc: Utc::now(),
             input_fingerprint_sha256,
             resolved_recipe_fingerprint_sha256: "b".repeat(64),
+            version_compat_json: "{}".to_string(),
             report: crate::view::VersionCardsReport::default(),
         };
         store
@@ -2018,6 +2019,61 @@ mod tests {
             .expect_err("self-consistent snapshot without versions ledger must fail");
         assert!(
             format!("{error:#}").contains("missing the required versions summary"),
+            "unexpected error: {error:#}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn static_snapshot_verify_rejects_self_consistent_truncated_versions_ledger() {
+        let root = make_temp_dir("truncated-versions-ledger");
+        let store = ArtifactStore::new(root.join("store"));
+        store.ensure_layout().expect("ensure layout");
+        store
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
+            .expect("write web index");
+        let snapshot_dir = root.join("snapshot-out");
+        build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+
+        let versions_path = snapshot_dir
+            .join(STATIC_SNAPSHOT_WEB_INDEX_DIR)
+            .join(WEB_VERSIONS_SUMMARY_INDEX_FILENAME);
+        let mut versions: crate::query::VersionsSummaryIndexFile =
+            serde_json::from_slice(&fs::read(&versions_path).expect("read versions dataset"))
+                .expect("decode versions dataset");
+        versions
+            .report
+            .releases
+            .pop()
+            .expect("remove an older release row");
+        let truncated_bytes = serde_json::to_vec(&versions).expect("encode truncated dataset");
+        fs::write(&versions_path, &truncated_bytes).expect("write truncated versions dataset");
+        let mut manifest = load_static_snapshot_manifest(&snapshot_dir).expect("load manifest");
+        let entry = manifest
+            .dataset_files
+            .iter_mut()
+            .find(|entry| entry.index_key == WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .expect("versions dataset entry");
+        entry.bytes = truncated_bytes.len() as u64;
+        entry.sha256 = sha256_hex(&truncated_bytes);
+        rewrite_snapshot_manifest(&snapshot_dir, manifest);
+
+        let error = verify_static_snapshot(&snapshot_dir)
+            .expect_err("self-consistent truncated versions ledger must fail");
+        assert!(
+            format!("{error:#}").contains("embedded compatibility map has"),
             "unexpected error: {error:#}"
         );
         fs::remove_dir_all(root).expect("cleanup");

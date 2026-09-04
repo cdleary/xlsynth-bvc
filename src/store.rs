@@ -2706,6 +2706,7 @@ impl ArtifactBackend for SnapshotArtifactBackend {
 }
 
 const DEFAULT_STORE_LIST_CACHE_TTL_SECS: u64 = 60;
+const VERSIONS_SUMMARY_RECIPE_CACHE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 struct TimedCache<T> {
@@ -2723,7 +2724,9 @@ pub(crate) struct ArtifactStore {
     failed_records_cache: Mutex<Option<TimedCache<Vec<QueueFailed>>>>,
     db_size_cache: Mutex<Option<TimedCache<u64>>>,
     versions_summary_input_lock: RwLock<()>,
-    versions_summary_recipe_cache: Mutex<Option<(String, String)>>,
+    versions_summary_input_generation: AtomicU64,
+    versions_summary_rebuild_lock: Mutex<()>,
+    versions_summary_recipe_cache: Mutex<Option<TimedCache<(String, String)>>>,
 }
 
 impl ArtifactStore {
@@ -2765,6 +2768,8 @@ impl ArtifactStore {
             failed_records_cache: Mutex::new(None),
             db_size_cache: Mutex::new(None),
             versions_summary_input_lock: RwLock::new(()),
+            versions_summary_input_generation: AtomicU64::new(0),
+            versions_summary_rebuild_lock: Mutex::new(()),
             versions_summary_recipe_cache: Mutex::new(None),
         }
     }
@@ -2784,6 +2789,8 @@ impl ArtifactStore {
             failed_records_cache: Mutex::new(None),
             db_size_cache: Mutex::new(None),
             versions_summary_input_lock: RwLock::new(()),
+            versions_summary_input_generation: AtomicU64::new(0),
+            versions_summary_rebuild_lock: Mutex::new(()),
             versions_summary_recipe_cache: Mutex::new(None),
         }
     }
@@ -2861,6 +2868,8 @@ impl ArtifactStore {
             crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
         )?;
         let result = operation();
+        self.versions_summary_input_generation
+            .fetch_add(1, Ordering::Release);
         self.invalidate_list_caches();
         result
     }
@@ -2876,25 +2885,46 @@ impl ArtifactStore {
         operation()
     }
 
+    pub(crate) fn versions_summary_input_generation(&self) -> u64 {
+        self.versions_summary_input_generation
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn with_versions_summary_rebuild<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _guard = self
+            .versions_summary_rebuild_lock
+            .lock()
+            .map_err(|_| anyhow!("locking versions summary rebuild"))?;
+        operation()
+    }
+
     pub(crate) fn cached_versions_summary_recipe_fingerprint(
         &self,
         cache_key: &str,
         resolve: impl FnOnce() -> Result<String>,
     ) -> Result<String> {
-        // Resolution can inspect/build the bound driver image and fetch immutable release
-        // inputs. Hold this small, process-local lock through resolution so concurrent page
-        // requests do that work once for a given source/report identity.
         let mut cached = self
             .versions_summary_recipe_cache
             .lock()
             .map_err(|_| anyhow!("locking versions summary recipe cache"))?;
-        if let Some((cached_key, fingerprint)) = cached.as_ref()
-            && cached_key == cache_key
+        if let Some(cached) = cached.as_ref()
+            && cached.loaded_at.elapsed() < VERSIONS_SUMMARY_RECIPE_CACHE_TTL
+            && cached.value.0 == cache_key
         {
-            return Ok(fingerprint.clone());
+            return Ok(cached.value.1.clone());
         }
+        // Resolution can inspect/build the bound driver image and fetch immutable release
+        // inputs. Serialize refreshes so an older concurrent result cannot overwrite a newer one.
+        // This mutex is deliberately independent of provenance mutation; the bounded TTL refreshes
+        // external runtime identity, while static recipe/card changes produce a different cache key.
         let fingerprint = resolve()?;
-        *cached = Some((cache_key.to_string(), fingerprint.clone()));
+        *cached = Some(TimedCache {
+            loaded_at: Instant::now(),
+            value: Arc::new((cache_key.to_string(), fingerprint.clone())),
+        });
         Ok(fingerprint)
     }
 
@@ -3141,36 +3171,46 @@ impl ArtifactStore {
         }
 
         let cache_started = Instant::now();
-        let mut cache = self
-            .provenance_cache
-            .lock()
-            .map_err(|_| anyhow!("locking provenance cache"))?;
-        if let Some(cached) = cache.as_ref()
-            && cached.loaded_at.elapsed() <= self.list_cache_ttl
         {
-            let shared = cached.value.clone();
-            let age_ms = cached.loaded_at.elapsed().as_millis();
-            info!(
-                "store.list_provenances cache_hit backend={} count={} age_ms={} elapsed_ms={}",
-                self.backend_label(),
-                shared.len(),
-                age_ms,
-                cache_started.elapsed().as_millis(),
-            );
-            return Ok(shared);
+            let cache = self
+                .provenance_cache
+                .lock()
+                .map_err(|_| anyhow!("locking provenance cache"))?;
+            if let Some(cached) = cache.as_ref()
+                && cached.loaded_at.elapsed() <= self.list_cache_ttl
+            {
+                let shared = cached.value.clone();
+                let age_ms = cached.loaded_at.elapsed().as_millis();
+                info!(
+                    "store.list_provenances cache_hit backend={} count={} age_ms={} elapsed_ms={}",
+                    self.backend_label(),
+                    shared.len(),
+                    age_ms,
+                    cache_started.elapsed().as_millis(),
+                );
+                return Ok(shared);
+            }
         }
 
+        let input_generation = self.versions_summary_input_generation();
         let started = Instant::now();
         let result = self.artifact_backend.list_provenances(&self.root);
         match result {
             Ok(provenances) => {
                 let count = provenances.len();
                 let shared = Arc::new(provenances);
-                *cache = Some(TimedCache {
-                    loaded_at: Instant::now(),
-                    value: shared.clone(),
-                });
-                drop(cache);
+                if self.versions_summary_input_generation() == input_generation {
+                    let mut cache = self
+                        .provenance_cache
+                        .lock()
+                        .map_err(|_| anyhow!("locking provenance cache after load"))?;
+                    if self.versions_summary_input_generation() == input_generation {
+                        *cache = Some(TimedCache {
+                            loaded_at: Instant::now(),
+                            value: shared.clone(),
+                        });
+                    }
+                }
                 info!(
                     "store.list_provenances cache_miss backend={} count={} elapsed_ms={}",
                     self.backend_label(),
@@ -3215,36 +3255,46 @@ impl ArtifactStore {
         }
 
         let cache_started = Instant::now();
-        let mut cache = self
-            .failed_records_cache
-            .lock()
-            .map_err(|_| anyhow!("locking failed records cache"))?;
-        if let Some(cached) = cache.as_ref()
-            && cached.loaded_at.elapsed() <= self.list_cache_ttl
         {
-            let shared = cached.value.clone();
-            let age_ms = cached.loaded_at.elapsed().as_millis();
-            info!(
-                "store.load_failed_action_records cache_hit backend={} count={} age_ms={} elapsed_ms={}",
-                self.backend_label(),
-                shared.len(),
-                age_ms,
-                cache_started.elapsed().as_millis(),
-            );
-            return Ok(shared);
+            let cache = self
+                .failed_records_cache
+                .lock()
+                .map_err(|_| anyhow!("locking failed records cache"))?;
+            if let Some(cached) = cache.as_ref()
+                && cached.loaded_at.elapsed() <= self.list_cache_ttl
+            {
+                let shared = cached.value.clone();
+                let age_ms = cached.loaded_at.elapsed().as_millis();
+                info!(
+                    "store.load_failed_action_records cache_hit backend={} count={} age_ms={} elapsed_ms={}",
+                    self.backend_label(),
+                    shared.len(),
+                    age_ms,
+                    cache_started.elapsed().as_millis(),
+                );
+                return Ok(shared);
+            }
         }
 
+        let input_generation = self.versions_summary_input_generation();
         let started = Instant::now();
         let result = self.artifact_backend.load_failed_action_records(&self.root);
         match result {
             Ok(records) => {
                 let count = records.len();
                 let shared = Arc::new(records);
-                *cache = Some(TimedCache {
-                    loaded_at: Instant::now(),
-                    value: shared.clone(),
-                });
-                drop(cache);
+                if self.versions_summary_input_generation() == input_generation {
+                    let mut cache = self
+                        .failed_records_cache
+                        .lock()
+                        .map_err(|_| anyhow!("locking failed records cache after load"))?;
+                    if self.versions_summary_input_generation() == input_generation {
+                        *cache = Some(TimedCache {
+                            loaded_at: Instant::now(),
+                            value: shared.clone(),
+                        });
+                    }
+                }
                 info!(
                     "store.load_failed_action_records cache_miss backend={} count={} elapsed_ms={}",
                     self.backend_label(),
@@ -3495,6 +3545,76 @@ mod tests {
             details: json!({"test": "sled-roundtrip"}),
             suggested_next_actions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn blocked_versions_recipe_resolution_does_not_block_provenance_writes() {
+        let root = make_test_root("xlsynth-bvc-versions-recipe-nonblocking");
+        let store = Arc::new(ArtifactStore::new(root.clone()));
+        store.ensure_layout().expect("store layout");
+        let (resolver_started_tx, resolver_started_rx) = mpsc::channel();
+        let (release_resolver_tx, release_resolver_rx) = mpsc::channel();
+        let resolver_store = store.clone();
+        let resolver_thread = std::thread::spawn(move || {
+            resolver_store.with_versions_summary_rebuild(|| {
+                resolver_store.cached_versions_summary_recipe_fingerprint("test-key", || {
+                    resolver_started_tx.send(()).expect("signal resolver start");
+                    release_resolver_rx.recv().expect("release resolver");
+                    Ok("a".repeat(64))
+                })
+            })
+        });
+        resolver_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("resolver should start");
+
+        let provenance = make_test_provenance(&"d".repeat(64), "payload/result.txt", 1);
+        let writer_store = store.clone();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        let writer_thread = std::thread::spawn(move || {
+            writer_tx
+                .send(writer_store.write_provenance(&provenance))
+                .expect("send writer result");
+        });
+        let writer_result = writer_rx.recv_timeout(Duration::from_secs(2));
+        release_resolver_tx.send(()).expect("release resolver");
+        resolver_thread
+            .join()
+            .expect("resolver thread")
+            .expect("resolver result");
+        writer_thread.join().expect("writer thread");
+        writer_result
+            .expect("provenance write must not wait for recipe resolution")
+            .expect("provenance write");
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup store");
+    }
+
+    #[test]
+    fn versions_recipe_cache_refreshes_runtime_identity_after_ttl() {
+        let root = make_test_root("xlsynth-bvc-versions-recipe-cache-ttl");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("store layout");
+
+        let image_a = store
+            .cached_versions_summary_recipe_fingerprint("same-recipe", || Ok("a".repeat(64)))
+            .expect("cache image A");
+        assert_eq!(image_a, "a".repeat(64));
+        {
+            let mut cached = store
+                .versions_summary_recipe_cache
+                .lock()
+                .expect("lock recipe cache");
+            cached.as_mut().expect("cached recipe").loaded_at =
+                Instant::now() - VERSIONS_SUMMARY_RECIPE_CACHE_TTL - Duration::from_secs(1);
+        }
+        let image_b = store
+            .cached_versions_summary_recipe_fingerprint("same-recipe", || Ok("b".repeat(64)))
+            .expect("refresh image B");
+        assert_eq!(image_b, "b".repeat(64));
+
+        fs::remove_dir_all(root).expect("cleanup store");
     }
 
     fn stage_test_sled_action(
