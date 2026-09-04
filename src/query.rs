@@ -18,7 +18,9 @@ use crate::executor::{
     extract_ir_ret_text_id,
 };
 use crate::model::*;
-use crate::proto::{decode_queue_canceled, decode_queue_running};
+use crate::proto::{
+    decode_queue_canceled, decode_queue_running, encode_provenance, encode_queue_failed,
+};
 #[cfg(test)]
 use crate::proto::{encode_queue_item, encode_queue_running};
 use crate::queue::*;
@@ -52,6 +54,7 @@ pub(crate) use corpus_structural::*;
 pub(crate) use public_projection::*;
 
 type ProvenanceLookup<'a> = BTreeMap<&'a str, &'a Provenance>;
+const VERSIONS_SUMMARY_INPUT_FINGERPRINT_DOMAIN: &[u8] = b"xlsynth-bvc/versions-summary-input/v1\0";
 
 fn build_provenance_lookup<'a>(provenances: &'a [Provenance]) -> ProvenanceLookup<'a> {
     provenances
@@ -1298,10 +1301,11 @@ pub(crate) struct MffcIrStructure {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct VersionsSummaryIndexFile {
-    schema_version: u32,
-    generated_utc: DateTime<Utc>,
-    report: VersionCardsReport,
+pub(crate) struct VersionsSummaryIndexFile {
+    pub(crate) schema_version: u32,
+    pub(crate) generated_utc: DateTime<Utc>,
+    pub(crate) input_fingerprint_sha256: String,
+    pub(crate) report: VersionCardsReport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6828,10 +6832,52 @@ fn versions_summary_matches_sources(
     Ok(index_file.report.repository_head_observation == source_observation)
 }
 
+pub(crate) fn versions_summary_input_fingerprint(
+    store: &ArtifactStore,
+    repo_root: &Path,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(VERSIONS_SUMMARY_INPUT_FINGERPRINT_DOMAIN);
+    for relpath in [
+        crate::VERSION_COMPAT_PATH,
+        crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
+    ] {
+        let bytes = fs::read(repo_root.join(relpath))
+            .with_context(|| format!("reading versions summary input {relpath}"))?;
+        hasher.update((relpath.len() as u64).to_be_bytes());
+        hasher.update(relpath.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut provenances = store.list_provenances_uncached()?;
+    provenances.sort_by(|a, b| a.action_id.cmp(&b.action_id));
+    for provenance in provenances {
+        let bytes = encode_provenance(&provenance)?;
+        hasher.update(b"provenance");
+        hasher.update((provenance.action_id.len() as u64).to_be_bytes());
+        hasher.update(provenance.action_id.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut failed_records = store.load_failed_action_records_uncached()?;
+    failed_records.sort_by(|a, b| a.action_id.cmp(&b.action_id));
+    for failed in failed_records {
+        let bytes = encode_queue_failed(&failed)?;
+        hasher.update(b"failed");
+        hasher.update((failed.action_id.len() as u64).to_be_bytes());
+        hasher.update(failed.action_id.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 pub(crate) fn load_versions_cards_index(
     store: &ArtifactStore,
     repo_root: &Path,
-) -> Result<Option<VersionCardsReport>> {
+) -> Result<Option<VersionsSummaryIndexFile>> {
     let key = WEB_VERSIONS_SUMMARY_INDEX_FILENAME;
     let location = store.web_index_location(key);
     let Some(bytes) = store
@@ -6851,6 +6897,14 @@ pub(crate) fn load_versions_cards_index(
     }
     public_projection::validate_versions_summary(&index_file)
         .with_context(|| format!("validating versions summary web index: {}", location))?;
+    let current_input_fingerprint = versions_summary_input_fingerprint(store, repo_root)?;
+    if index_file.input_fingerprint_sha256 != current_input_fingerprint {
+        info!(
+            "query versions summary web index input fingerprint mismatch location={}; rebuild required",
+            location
+        );
+        return Ok(None);
+    }
     if !versions_summary_matches_sources(&index_file, repo_root)? {
         info!(
             "query versions summary web index source mismatch location={}; rebuild required",
@@ -6865,12 +6919,13 @@ pub(crate) fn load_versions_cards_index(
         index_file.report.cards.len(),
         index_file.report.unattributed_actions.len()
     );
-    Ok(Some(index_file.report))
+    Ok(Some(index_file))
 }
 
 fn write_versions_cards_index(
     store: &ArtifactStore,
     report: &VersionCardsReport,
+    input_fingerprint_sha256: String,
 ) -> Result<(String, u64, DateTime<Utc>)> {
     let key = WEB_VERSIONS_SUMMARY_INDEX_FILENAME;
     let location = store.web_index_location(key);
@@ -6878,6 +6933,7 @@ fn write_versions_cards_index(
     let payload = VersionsSummaryIndexFile {
         schema_version: WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
         generated_utc,
+        input_fingerprint_sha256,
         report: report.clone(),
     };
     let bytes = serde_json::to_vec(&payload).context("serializing versions summary web index")?;
@@ -6899,8 +6955,20 @@ pub(crate) fn rebuild_versions_cards_index(
     repo_root: &Path,
 ) -> Result<VersionsSummaryIndexSummary> {
     let started = Instant::now();
-    let report = build_versions_cards(store, repo_root)?;
-    let (index_location, index_bytes, generated_utc) = write_versions_cards_index(store, &report)?;
+    let mut stable = None;
+    for _ in 0..3 {
+        let before = versions_summary_input_fingerprint(store, repo_root)?;
+        let report = build_versions_cards(store, repo_root)?;
+        let after = versions_summary_input_fingerprint(store, repo_root)?;
+        if before == after {
+            stable = Some((report, after));
+            break;
+        }
+    }
+    let (report, input_fingerprint_sha256) = stable
+        .ok_or_else(|| anyhow!("versions summary inputs changed repeatedly during rebuild"))?;
+    let (index_location, index_bytes, generated_utc) =
+        write_versions_cards_index(store, &report, input_fingerprint_sha256)?;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(VersionsSummaryIndexSummary {
         generated_utc,
@@ -6923,7 +6991,7 @@ pub(crate) fn build_versions_cards(
     let mut versions: BTreeMap<String, VersionAggregate> = BTreeMap::new();
     let mut unattributed_actions: Vec<UnattributedActionView> = Vec::new();
 
-    let provenances = store.list_provenances_shared()?;
+    let provenances = store.list_provenances_uncached()?;
     let provenance_by_action_id: BTreeMap<&str, &Provenance> = provenances
         .iter()
         .map(|provenance| (provenance.action_id.as_str(), provenance))
@@ -6958,7 +7026,7 @@ pub(crate) fn build_versions_cards(
         }
     }
 
-    for failed in load_failed_queue_records(store)? {
+    for failed in store.load_failed_action_records_uncached()? {
         let inferred = infer_crate_version_for_action_with_lookup(
             &failed.action,
             &compat_by_dso,
@@ -8659,6 +8727,7 @@ mod tests {
         let payload = json!({
             "schema_version": WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
             "generated_utc": "2026-09-03T22:34:04Z",
+            "input_fingerprint_sha256": "a".repeat(64),
             "report": {
                 "cards": [],
                 "unattributed_actions": [],
@@ -8758,6 +8827,57 @@ mod tests {
         assert!(
             load_versions_cards_index(&store, &test_repo_root)
                 .expect("check stale compatibility binding")
+                .is_none()
+        );
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn cached_versions_index_is_bound_to_provenance_and_failures() {
+        let (store, root) = make_test_store("versions-action-binding");
+        let repo_root = std::env::current_dir().expect("current repo root");
+        rebuild_versions_cards_index(&store, &repo_root).expect("build empty versions index");
+
+        let materialized_action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "a".repeat(64),
+            top_fn_name: Some("main".to_string()),
+        };
+        let materialized_action_id =
+            crate::executor::compute_action_id(&materialized_action).expect("action id");
+        store
+            .write_provenance(&synthetic_provenance(
+                &materialized_action_id,
+                materialized_action,
+                ArtifactType::IrPackageFile,
+            ))
+            .expect("write provenance");
+        assert!(
+            load_versions_cards_index(&store, &repo_root)
+                .expect("check provenance binding")
+                .is_none()
+        );
+
+        rebuild_versions_cards_index(&store, &repo_root).expect("rebuild after provenance change");
+        let failed_action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "b".repeat(64),
+            top_fn_name: Some("main".to_string()),
+        };
+        let failed_action_id =
+            crate::executor::compute_action_id(&failed_action).expect("failed action id");
+        store
+            .write_failed_action_record(&QueueFailed {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: failed_action_id,
+                enqueued_utc: Utc::now(),
+                failed_utc: Utc::now(),
+                failed_by: "test-worker".to_string(),
+                action: failed_action,
+                error: "test failure".to_string(),
+            })
+            .expect("write failed record");
+        assert!(
+            load_versions_cards_index(&store, &repo_root)
+                .expect("check failed-record binding")
                 .is_none()
         );
         fs::remove_dir_all(root).expect("cleanup temp store");

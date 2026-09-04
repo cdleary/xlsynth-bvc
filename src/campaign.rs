@@ -1108,7 +1108,9 @@ fn evaluate_completion(
             pb::RequiredOutputKind::VersionsSummaryDataset => {
                 let present = load_versions_cards_index(store, repo_root)?
                     .as_ref()
-                    .is_some_and(|report| versions_summary_contains_crate(report, crate_version));
+                    .is_some_and(|index| {
+                        versions_summary_contains_crate(&index.report, crate_version)
+                    });
                 add_missing_dataset_if(
                     pb::RequiredOutputKind::VersionsSummaryDataset,
                     WEB_VERSIONS_SUMMARY_INDEX_FILENAME,

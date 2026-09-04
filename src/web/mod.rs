@@ -242,7 +242,7 @@ pub(crate) fn serve_web_ui(
         thread::spawn(move || {
             let versions_started = Instant::now();
             match (|| -> Result<()> {
-                let report = if let Some(indexed) =
+                let index = if let Some(indexed) =
                     load_versions_cards_index(&prewarm_store, &prewarm_repo_root)?
                 {
                     indexed
@@ -264,7 +264,7 @@ pub(crate) fn serve_web_ui(
                 let unprocessed = build_unprocessed_version_rows(
                     &prewarm_store,
                     &prewarm_repo_root,
-                    &report.cards,
+                    &index.report.cards,
                 )?;
                 let live_status = QueueLiveStatusView {
                     updated_utc: Utc::now(),
@@ -290,16 +290,16 @@ pub(crate) fn serve_web_ui(
                 };
                 let db_size_bytes = prewarm_store.artifacts_db_size_bytes().ok();
                 let html = render_versions_html(
-                    &report.cards,
-                    &report.unattributed_actions,
-                    &report.releases,
-                    report.repository_head_observation.as_ref(),
+                    &index.report.cards,
+                    &index.report.unattributed_actions,
+                    &index.report.releases,
+                    index.report.repository_head_observation.as_ref(),
                     &unprocessed,
                     &live_status,
                     false,
                     !prewarm_store.is_snapshot_backend(),
                     db_size_bytes,
-                    Utc::now(),
+                    index.generated_utc,
                 );
                 prewarm_cache.put_page("page:/versions/".to_string(), html);
                 Ok(())

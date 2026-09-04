@@ -21,7 +21,7 @@ use crate::campaign::{
 };
 use crate::ops::run_workers;
 use crate::proto::v1 as pb;
-use crate::proto::{encode_provenance, timestamp_from_proto, timestamp_to_proto};
+use crate::proto::{timestamp_from_proto, timestamp_to_proto};
 use crate::publish::{publish_static_site_with_protected_roots, verify_published_site};
 use crate::query::rebuild_web_indices;
 use crate::service::{
@@ -39,7 +39,7 @@ use crate::store::ArtifactStore;
 use crate::versioning::normalize_tag_version;
 use crate::{
     DEFAULT_QUEUE_LEASE_SECONDS, DEFAULT_WEB_RUNNER_DRAIN_BATCH_SIZE,
-    DEFAULT_WEB_RUNNER_POLL_MILLIS, VERSION_COMPAT_PATH, XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
+    DEFAULT_WEB_RUNNER_POLL_MILLIS,
 };
 
 const COORDINATOR_RECORD_VERSION: u32 = 2;
@@ -380,35 +380,11 @@ fn stage_succeeded(state: &pb::CoordinatorState, stage: pb::CoordinatorStage) ->
 }
 
 fn indexed_source_fingerprint(store: &ArtifactStore, repo_root: &Path) -> Result<pb::Sha256Digest> {
-    let mut records = store
-        .list_provenances()?
-        .into_iter()
-        .map(|provenance| {
-            let action_id = provenance.action_id.clone();
-            Ok((action_id, encode_provenance(&provenance)?))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    records.sort_by(|a, b| a.0.cmp(&b.0));
-
     let mut hasher = Sha256::new();
     hasher.update(INDEXED_SOURCE_FINGERPRINT_DOMAIN);
-    for relpath in [
-        VERSION_COMPAT_PATH,
-        XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
-    ] {
-        let bytes = fs::read(repo_root.join(relpath))
-            .with_context(|| format!("reading indexed metadata source {relpath}"))?;
-        hasher.update((relpath.len() as u64).to_be_bytes());
-        hasher.update(relpath.as_bytes());
-        hasher.update((bytes.len() as u64).to_be_bytes());
-        hasher.update(bytes);
-    }
-    for (action_id, bytes) in records {
-        hasher.update((action_id.len() as u64).to_be_bytes());
-        hasher.update(action_id.as_bytes());
-        hasher.update((bytes.len() as u64).to_be_bytes());
-        hasher.update(bytes);
-    }
+    let versions_input = crate::query::versions_summary_input_fingerprint(store, repo_root)?;
+    hasher.update((versions_input.len() as u64).to_be_bytes());
+    hasher.update(versions_input.as_bytes());
     Ok(pb::Sha256Digest {
         value: hasher.finalize().to_vec(),
     })
@@ -1232,8 +1208,8 @@ mod tests {
         let source_root = std::env::current_dir().expect("current repo root");
         let repo_root = root.join("repo");
         for relpath in [
-            VERSION_COMPAT_PATH,
-            XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
+            crate::VERSION_COMPAT_PATH,
+            crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
         ] {
             let destination = repo_root.join(relpath);
             fs::create_dir_all(destination.parent().unwrap()).expect("create metadata parent");
@@ -1242,7 +1218,7 @@ mod tests {
 
         let before =
             indexed_source_fingerprint(&store, &repo_root).expect("initial source fingerprint");
-        let observation_path = repo_root.join(XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH);
+        let observation_path = repo_root.join(crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH);
         let mut observation = fs::read(&observation_path).expect("read observation");
         observation.push(b'\n');
         fs::write(observation_path, observation).expect("change observation bytes");

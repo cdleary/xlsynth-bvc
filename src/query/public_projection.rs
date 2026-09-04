@@ -185,6 +185,10 @@ pub(super) fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Res
     if index.schema_version != crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION {
         bail!("versions summary schema version mismatch");
     }
+    validate_hex_digest(
+        "versions_summary.input_fingerprint_sha256",
+        &index.input_fingerprint_sha256,
+    )?;
     validate_unique_strings(
         "versions_summary.cards.crate_version",
         index.report.cards.iter().map(|card| &card.crate_version),
@@ -1243,6 +1247,7 @@ mod tests {
         json!({
             "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
             "generated_utc": "2026-08-29T12:00:00Z",
+            "input_fingerprint_sha256": "a".repeat(64),
             "report": {
                 "cards": [],
                 "unattributed_actions": [],

@@ -326,6 +326,7 @@ struct ProgressionComparisonIndexFile {
 struct ProgressionVersionsIndexFile {
     schema_version: u32,
     generated_utc: chrono::DateTime<chrono::Utc>,
+    input_fingerprint_sha256: String,
     report: VersionCardsReport,
 }
 

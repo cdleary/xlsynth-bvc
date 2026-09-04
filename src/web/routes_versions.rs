@@ -105,7 +105,7 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
     match tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         let rss_mib_start = process_rss_mib().unwrap_or(0);
-        let report = if let Some(indexed) = load_versions_cards_index(&store, &repo_root)? {
+        let index = if let Some(indexed) = load_versions_cards_index(&store, &repo_root)? {
             indexed
         } else {
             let summary = rebuild_versions_cards_index(&store, &repo_root)?;
@@ -123,7 +123,8 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
             })?
         };
         let after_cards = Instant::now();
-        let unprocessed = build_unprocessed_version_rows(&store, &repo_root, &report.cards)?;
+        let unprocessed =
+            build_unprocessed_version_rows(&store, &repo_root, &index.report.cards)?;
         let after_unprocessed = Instant::now();
         let db_size_bytes = store.artifacts_db_size_bytes().ok();
         let live_status = if show_live_queue {
@@ -155,16 +156,16 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
         };
         let after_queue = Instant::now();
         let html = render_versions_html(
-            &report.cards,
-            &report.unattributed_actions,
-            &report.releases,
-            report.repository_head_observation.as_ref(),
+            &index.report.cards,
+            &index.report.unattributed_actions,
+            &index.report.releases,
+            index.report.repository_head_observation.as_ref(),
             &unprocessed,
             &live_status,
             show_live_queue,
             show_db_size_link,
             db_size_bytes,
-            Utc::now(),
+            index.generated_utc,
         );
         cache.put_page(cache_key, html.clone());
         let rss_mib_end = process_rss_mib().unwrap_or(0);
@@ -175,8 +176,8 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
             (after_queue - after_unprocessed).as_millis(),
             after_queue.elapsed().as_millis(),
             started.elapsed().as_millis(),
-            report.cards.len(),
-            report.unattributed_actions.len(),
+            index.report.cards.len(),
+            index.report.unattributed_actions.len(),
             unprocessed.len(),
             rss_mib_start,
             rss_mib_end,

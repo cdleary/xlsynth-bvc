@@ -3101,6 +3101,10 @@ impl ArtifactStore {
         Ok(self.list_provenances_shared()?.as_ref().clone())
     }
 
+    pub(crate) fn list_provenances_uncached(&self) -> Result<Vec<Provenance>> {
+        self.artifact_backend.list_provenances(&self.root)
+    }
+
     pub(crate) fn load_failed_action_records_shared(&self) -> Result<Arc<Vec<QueueFailed>>> {
         if self.list_cache_ttl.is_zero() {
             let started = Instant::now();
