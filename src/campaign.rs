@@ -25,8 +25,8 @@ use crate::query::{
     load_versions_cards_index, stdlib_enumeration_status_from_provenance,
 };
 use crate::queue::{
-    QueueState, action_dependency_action_ids, load_queue_canceled_record, queue_state_for_action,
-    resolve_queue_identity_alias,
+    QueueState, action_dependency_action_ids, load_queue_canceled_record,
+    project_action_identity_for_read, queue_state_for_action, resolve_queue_identity_alias,
 };
 use crate::runtime::{
     explicit_driver_runtime_for_crate_version, explicit_driver_runtime_recipe_for_crate_version,
@@ -990,7 +990,8 @@ fn evaluate_completion(
         }
         let provenance = store.load_provenance(&action_id)?;
         for suggestion in provenance.suggested_next_actions {
-            let suggested_action_id = resolve_queue_identity_alias(store, &suggestion.action_id)?;
+            let (suggested_action_id, _) =
+                project_action_identity_for_read(store, &suggestion.action_id, &suggestion.action)?;
             if discovered.insert(suggested_action_id.clone()) {
                 queue.push_back(suggested_action_id);
             }
@@ -1456,13 +1457,6 @@ mod tests {
             })
             .expect("write test provenance");
         action_id
-    }
-
-    fn write_test_identity_alias(store: &ArtifactStore, old: &str, new: &str) {
-        let path = store.queue_identity_alias_path(old);
-        fs::create_dir_all(path.parent().expect("identity alias parent"))
-            .expect("create identity alias parent");
-        fs::write(path, new).expect("write identity alias");
     }
 
     fn temp_path(label: &str) -> PathBuf {
@@ -2018,8 +2012,8 @@ mod tests {
     }
 
     #[test]
-    fn completion_resolves_migrated_suggested_action_identities() {
-        let root = temp_path("completion-identity-alias");
+    fn completion_projects_legacy_suggestion_without_identity_alias() {
+        let root = temp_path("completion-legacy-suggestion");
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("layout");
         let runtime = crate::model::DriverRuntimeSpec {
@@ -2053,7 +2047,7 @@ mod tests {
         let legacy_target_action_id = compute_model_action_id_v2(&legacy_target_action)
             .expect("legacy target action id")
             .to_hex();
-        write_test_identity_alias(&store, &legacy_target_action_id, &target_action_id);
+        assert_ne!(legacy_target_action_id, target_action_id);
         let root_action = ActionSpec::ImportIrPackageFile {
             source_sha256: "1".repeat(64),
             top_fn_name: Some("root".to_string()),
@@ -2090,7 +2084,7 @@ mod tests {
         };
 
         let completion = evaluate_completion(&store, Path::new("."), &manifest)
-            .expect("evaluate completion through identity alias");
+            .expect("evaluate completion through projected suggestion");
         assert_eq!(completion.status, pb::CampaignRunStatus::Complete as i32);
         assert_eq!(completion.completed_root_count, 1);
         assert_eq!(completion.pending_count, 0);

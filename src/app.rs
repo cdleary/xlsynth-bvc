@@ -1360,37 +1360,17 @@ pub(crate) fn drain_queue(
                             running,
                             output_artifact,
                             worker_id,
-                            || {
-                                if let Err(err) =
-                                    note_completed_action_for_previous_loss_k_cone_policy(
-                                        store,
-                                        running.action_id(),
-                                    )
-                                {
-                                    eprintln!(
-                                        "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
-                                        running.action_id(),
-                                        err
-                                    );
-                                }
-                                if crate::auto_suggested_enqueue_enabled()
-                                    && let Err(err) = enqueue_suggested_actions(
-                                        store,
-                                        repo_root,
-                                        running.action_id(),
-                                        false,
-                                        1,
-                                        running.priority(),
-                                    )
-                                {
-                                    eprintln!(
-                                        "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
-                                        running.action_id(),
-                                        err
-                                    );
-                                }
-                            },
                         )?;
+                        if let Err(err) = note_completed_action_for_previous_loss_k_cone_policy(
+                            store,
+                            running.action_id(),
+                        ) {
+                            eprintln!(
+                                "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
+                                running.action_id(),
+                                err
+                            );
+                        }
                     }
                 }
                 Ok(execution_result)
@@ -1432,6 +1412,7 @@ pub(crate) fn drain_queue(
                     continue;
                 };
                 if result.output_artifact.is_some() {
+                    enqueue_suggested_actions_after_lease_fence(store, repo_root, running);
                     drained += 1;
                 } else {
                     let error_text = result
@@ -1458,35 +1439,17 @@ pub(crate) fn drain_queue(
                         &running_batch[0],
                         output_artifact,
                         worker_id,
-                        || {
-                            if let Err(err) = note_completed_action_for_previous_loss_k_cone_policy(
-                                store,
-                                running_batch[0].action_id(),
-                            ) {
-                                eprintln!(
-                                    "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
-                                    running_batch[0].action_id(),
-                                    err
-                                );
-                            }
-                            if crate::auto_suggested_enqueue_enabled()
-                                && let Err(err) = enqueue_suggested_actions(
-                                    store,
-                                    repo_root,
-                                    running_batch[0].action_id(),
-                                    false,
-                                    1,
-                                    running_batch[0].priority(),
-                                )
-                            {
-                                eprintln!(
-                                    "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
-                                    running_batch[0].action_id(),
-                                    err
-                                );
-                            }
-                        },
                     )?;
+                    if let Err(err) = note_completed_action_for_previous_loss_k_cone_policy(
+                        store,
+                        running_batch[0].action_id(),
+                    ) {
+                        eprintln!(
+                            "queue action {} succeeded but failed to refresh k-bool loss cache: {:#}",
+                            running_batch[0].action_id(),
+                            err
+                        );
+                    }
                     Ok(Ok(()))
                 }
                 Err(error) => Ok(Err(error)),
@@ -1496,7 +1459,10 @@ pub(crate) fn drain_queue(
             continue;
         };
         match action_result {
-            Ok(()) => drained += 1,
+            Ok(()) => {
+                enqueue_suggested_actions_after_lease_fence(store, repo_root, &running_batch[0]);
+                drained += 1;
+            }
             Err(err) => {
                 let error_text = format!("{:#}", err);
                 if let Some(canceled_now) = record_queue_failure_and_cancel(
@@ -1526,43 +1492,50 @@ pub(crate) fn drain_queue(
     Ok(drained)
 }
 
+fn enqueue_suggested_actions_after_lease_fence(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    running: &QueueRunningWithPath,
+) {
+    // Enqueue acquires the global identity-migration lock. This helper must run only after the
+    // per-action lease fence has been released, preserving migration-lock -> action-lock order.
+    if crate::auto_suggested_enqueue_enabled()
+        && let Err(err) = enqueue_suggested_actions(
+            store,
+            repo_root,
+            running.action_id(),
+            false,
+            1,
+            running.priority(),
+        )
+    {
+        eprintln!(
+            "queue action {} succeeded but failed to enqueue suggested actions: {:#}",
+            running.action_id(),
+            err
+        );
+    }
+}
+
 #[cfg(test)]
-fn finalize_successful_queue_action<F>(
+fn finalize_successful_queue_action(
     store: &ArtifactStore,
     running: &QueueRunningWithPath,
     output_artifact: ArtifactRef,
     worker_id: &str,
-    before_mark_done: F,
-) -> Result<()>
-where
-    F: FnOnce(),
-{
+) -> Result<()> {
     with_current_running_lease(store, running, || {
-        finalize_successful_queue_action_locked(
-            store,
-            running,
-            output_artifact,
-            worker_id,
-            before_mark_done,
-        )
+        finalize_successful_queue_action_locked(store, running, output_artifact, worker_id)
     })?;
     Ok(())
 }
 
-fn finalize_successful_queue_action_locked<F>(
+fn finalize_successful_queue_action_locked(
     store: &ArtifactStore,
     running: &QueueRunningWithPath,
     output_artifact: ArtifactRef,
     worker_id: &str,
-    before_mark_done: F,
-) -> Result<()>
-where
-    F: FnOnce(),
-{
-    // Keep the running lease visible until post-success bookkeeping finishes so
-    // queue status does not briefly report the worker as idle while it is still
-    // expanding follow-up work.
-    before_mark_done();
+) -> Result<()> {
     store.delete_failed_action_record(running.action_id())?;
     remove_file_if_exists(&store.canceled_queue_path(running.action_id()))?;
     write_done_record(store, running, output_artifact, worker_id)?;
@@ -4014,7 +3987,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_successful_queue_action_keeps_running_visible_until_done_write() {
+    fn finalize_successful_queue_action_replaces_running_with_done() {
         let (store, root) = make_test_store("finalize-success-order");
         let runtime = test_runtime();
         let action = make_opt_action(&test_action_id("finalize-success-order-ir"), &runtime);
@@ -4067,7 +4040,8 @@ mod tests {
         )
         .expect("write stale cancellation");
 
-        let mut before_mark_done_called = false;
+        assert!(running.path.exists());
+        assert!(!store.done_queue_path(&action_id).exists());
         finalize_successful_queue_action(
             &store,
             &running,
@@ -4077,15 +4051,9 @@ mod tests {
                 "payload/finalized.ir",
             ),
             "worker-1",
-            || {
-                before_mark_done_called = true;
-                assert!(running.path.exists());
-                assert!(!store.done_queue_path(&action_id).exists());
-            },
         )
         .expect("finalize successful queue action");
 
-        assert!(before_mark_done_called);
         assert!(!running.path.exists());
         assert!(!store.failed_action_record_exists(&action_id));
         assert!(!store.canceled_queue_path(&action_id).exists());

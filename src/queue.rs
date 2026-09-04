@@ -160,7 +160,16 @@ fn write_queue_identity_alias(
     }
     if let Some(existing) = load_queue_identity_alias(store, old_action_id)? {
         if existing != new_action_id {
-            bail!("queue identity alias already points at a different action id");
+            let existing_resolved = resolve_queue_identity_alias(store, old_action_id)?;
+            let requested_resolved = resolve_queue_identity_alias(store, new_action_id)?;
+            if existing_resolved != requested_resolved {
+                bail!(
+                    "queue identity alias already resolves to a different action id: old={} existing={} requested={}",
+                    old_action_id,
+                    existing_resolved,
+                    requested_resolved
+                );
+            }
         }
         return Ok(());
     }
@@ -3106,6 +3115,35 @@ mod tests {
         .expect("retry follows dependency alias");
         assert_eq!(retry_id, expected_action_id);
         handle.join().expect("join lock contender");
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn queue_identity_alias_replay_accepts_equivalent_chain_target() {
+        let (store, root) = make_test_store();
+        let old_action_id = "a".repeat(64);
+        let intermediate_action_id = "b".repeat(64);
+        let canonical_action_id = "c".repeat(64);
+
+        write_queue_identity_alias(&store, &old_action_id, &intermediate_action_id)
+            .expect("write initial alias");
+        write_queue_identity_alias(&store, &intermediate_action_id, &canonical_action_id)
+            .expect("extend alias chain");
+        write_queue_identity_alias(&store, &old_action_id, &canonical_action_id)
+            .expect("replay alias directly to canonical target");
+
+        assert_eq!(
+            load_queue_identity_alias(&store, &old_action_id)
+                .expect("load direct alias")
+                .as_deref(),
+            Some(intermediate_action_id.as_str())
+        );
+        assert_eq!(
+            resolve_queue_identity_alias(&store, &old_action_id).expect("resolve alias chain"),
+            canonical_action_id
+        );
 
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
