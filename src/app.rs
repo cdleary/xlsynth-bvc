@@ -1577,7 +1577,8 @@ pub(crate) fn build_suggested_report(
     recursive: bool,
     max_depth: u32,
 ) -> Result<SuggestedReport> {
-    let _root = store.load_provenance(root_action_id).with_context(|| {
+    let root_action_id = resolve_queue_identity_alias(store, root_action_id)?;
+    let _root = store.load_provenance(&root_action_id).with_context(|| {
         format!(
             "cannot build suggested report; root action provenance missing: {}",
             root_action_id
@@ -1596,17 +1597,18 @@ pub(crate) fn build_suggested_report(
         let provenance = store.load_provenance(&action_id)?;
         let mut statuses = Vec::new();
         for suggested in &provenance.suggested_next_actions {
-            let completed = store.action_exists(&suggested.action_id);
-            let queue_state = queue_state_for_action(store, &suggested.action_id).as_label();
+            let suggested_action_id = resolve_queue_identity_alias(store, &suggested.action_id)?;
+            let completed = store.action_exists(&suggested_action_id);
+            let queue_state = queue_state_for_action(store, &suggested_action_id).as_label();
             statuses.push(SuggestedStatus {
                 reason: suggested.reason.clone(),
-                action_id: suggested.action_id.clone(),
+                action_id: suggested_action_id.clone(),
                 completed,
                 queue_state,
                 action: suggested.action.clone(),
             });
             if recursive && depth < max_depth && completed {
-                queue.push_back((suggested.action_id.clone(), depth + 1));
+                queue.push_back((suggested_action_id, depth + 1));
             }
         }
         nodes.push(SuggestedNode {
@@ -1617,7 +1619,7 @@ pub(crate) fn build_suggested_report(
     }
 
     Ok(SuggestedReport {
-        root_action_id: root_action_id.to_string(),
+        root_action_id,
         recursive,
         max_depth,
         nodes,
@@ -1637,7 +1639,8 @@ pub(crate) fn build_suggested_audit_report(
         total_sources += 1;
         for suggested in &provenance.suggested_next_actions {
             total_suggestions += 1;
-            let completed = store.action_exists(&suggested.action_id);
+            let suggested_action_id = resolve_queue_identity_alias(store, &suggested.action_id)?;
+            let completed = store.action_exists(&suggested_action_id);
             if completed {
                 completed_suggestions += 1;
             }
@@ -1645,9 +1648,9 @@ pub(crate) fn build_suggested_audit_report(
                 entries.push(SuggestedAuditEntry {
                     source_action_id: provenance.action_id.clone(),
                     reason: suggested.reason.clone(),
-                    action_id: suggested.action_id.clone(),
+                    action_id: suggested_action_id.clone(),
                     completed,
-                    queue_state: queue_state_for_action(store, &suggested.action_id).as_label(),
+                    queue_state: queue_state_for_action(store, &suggested_action_id).as_label(),
                     action: suggested.action.clone(),
                 });
             }
@@ -3685,6 +3688,13 @@ mod tests {
             .expect("reload written provenance")
     }
 
+    fn write_test_identity_alias(store: &ArtifactStore, old: &str, new: &str) {
+        let path = store.queue_identity_alias_path(old);
+        fs::create_dir_all(path.parent().expect("identity alias parent"))
+            .expect("create identity alias parent");
+        fs::write(path, new).expect("write identity alias");
+    }
+
     fn make_opt_action(ir_action_id: &str, runtime: &DriverRuntimeSpec) -> ActionSpec {
         ActionSpec::DriverIrToOpt {
             ir_action_id: ir_action_id.to_string(),
@@ -3692,6 +3702,94 @@ mod tests {
             version: "v0.39.0".to_string(),
             runtime: runtime.clone(),
         }
+    }
+
+    #[test]
+    fn suggested_reports_resolve_migrated_action_identities() {
+        let (store, root) = make_test_store("suggested-identity-alias");
+        let mut runtime = test_runtime();
+        runtime.driver_version = "0.25.0".to_string();
+        let target_action = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: "2".repeat(64),
+            top_fn_name: Some("target".to_string()),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version,
+            ),
+            version: "v0.25.0".to_string(),
+            runtime,
+        };
+        let target_action_id = compute_action_id(&target_action).expect("target action id");
+        write_provenance_record(
+            &store,
+            target_action.clone(),
+            make_artifact(
+                &target_action_id,
+                ArtifactType::IrPackageFile,
+                "payload/target.ir",
+            ),
+            json!({}),
+            Vec::new(),
+            vec![("payload/target.ir".to_string(), b"package target".to_vec())],
+        );
+        let mut legacy_target_action = target_action.clone();
+        let ActionSpec::DriverIrToG8rAig {
+            execution_recipe_revision,
+            ..
+        } = &mut legacy_target_action
+        else {
+            unreachable!("test target is G8r")
+        };
+        *execution_recipe_revision = 0;
+        let legacy_target_action_id =
+            crate::proto::compute_model_action_id_v2(&legacy_target_action)
+                .expect("legacy target action id")
+                .to_hex();
+        write_test_identity_alias(&store, &legacy_target_action_id, &target_action_id);
+        let root_action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "1".repeat(64),
+            top_fn_name: Some("root".to_string()),
+        };
+        let root_action_id = compute_action_id(&root_action).expect("root action id");
+        write_provenance_record(
+            &store,
+            root_action,
+            make_artifact(
+                &root_action_id,
+                ArtifactType::IrPackageFile,
+                "payload/root.ir",
+            ),
+            json!({}),
+            vec![SuggestedAction {
+                reason: "migrated target".to_string(),
+                action_id: legacy_target_action_id,
+                action: legacy_target_action,
+            }],
+            vec![("payload/root.ir".to_string(), b"package root".to_vec())],
+        );
+
+        let report = build_suggested_report(&store, &root_action_id, true, 1)
+            .expect("build recursive suggested report");
+        assert_eq!(report.nodes.len(), 2);
+        assert_eq!(report.nodes[0].suggestions.len(), 1);
+        assert_eq!(report.nodes[0].suggestions[0].action_id, target_action_id);
+        assert!(report.nodes[0].suggestions[0].completed);
+        assert_eq!(report.nodes[1].source_action_id, target_action_id);
+
+        let audit = build_suggested_audit_report(&store, true).expect("build suggested audit");
+        let entry = audit
+            .entries
+            .iter()
+            .find(|entry| entry.source_action_id == root_action_id)
+            .expect("root suggestion audit entry");
+        assert_eq!(entry.action_id, target_action_id);
+        assert!(entry.completed);
+        assert_eq!(audit.completed_suggestions, 1);
+        assert_eq!(audit.missing_suggestions, 0);
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup temp store");
     }
 
     fn make_k_bool_action(source_opt_action_id: &str, runtime: &DriverRuntimeSpec) -> ActionSpec {

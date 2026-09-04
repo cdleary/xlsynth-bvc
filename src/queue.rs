@@ -581,7 +581,19 @@ fn requeue_pending_action_with_canonical_identity(
                     .with_context(|| format!("reading pending queue record: {}", path.display()));
             }
         };
-        let (action_id, _, priority, action) = parse_queue_work_item(&bytes, &path)?;
+        let (action_id, _, priority, action) = match parse_queue_work_item(&bytes, &path) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                quarantine_corrupt_queue_file(
+                    &path,
+                    &format!(
+                        "parse error while migrating pending queue identities: {:#}",
+                        error
+                    ),
+                )?;
+                continue;
+            }
+        };
         pending_records.push((path, action_id, priority, action));
     }
 
@@ -2840,6 +2852,10 @@ mod tests {
             encode_queue_item(&legacy_item).expect("encode legacy pending"),
         )
         .expect("write legacy pending");
+        let corrupt_path = store.pending_queue_path(&"c".repeat(64));
+        fs::create_dir_all(corrupt_path.parent().expect("corrupt pending parent"))
+            .expect("create corrupt pending parent");
+        fs::write(&corrupt_path, b"not a queue record").expect("write corrupt pending record");
 
         let legacy_stats = ActionSpec::DriverAigToStats {
             aig_action_id: pre_upgrade_id.clone(),
@@ -2894,6 +2910,18 @@ mod tests {
                 .is_none()
         );
         assert!(!legacy_path.exists());
+        assert!(!corrupt_path.exists());
+        let quarantined_path = fs::read_dir(corrupt_path.parent().expect("corrupt pending parent"))
+            .expect("read corrupt pending shard")
+            .map(|entry| entry.expect("corrupt pending shard entry").path())
+            .find(|path| {
+                path.file_name()
+                    .expect("quarantined filename")
+                    .to_string_lossy()
+                    .contains(".corrupt-")
+            })
+            .expect("corrupt record was quarantined");
+        fs::remove_file(quarantined_path).expect("remove quarantined test record");
         assert!(!store.pending_queue_path(&legacy_stats_id).exists());
         assert!(!store.pending_queue_path(&legacy_equiv_id).exists());
         assert!(!store.pending_queue_path(&legacy_diff_id).exists());
