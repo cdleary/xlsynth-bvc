@@ -15,8 +15,8 @@ use crate::cli::{
     DriverCli, YosysCli,
 };
 use crate::corpus_scheduling::{
-    CorpusSchedulingPolicyRecord, prioritized_sample_count, priority_boost,
-    resolve as resolve_scheduling_policy,
+    CorpusSchedulingArtifact, CorpusSchedulingPolicyRecord, prioritized_sample_count,
+    priority_boost, resolve as resolve_scheduling_policy,
 };
 use crate::executor::{compute_action_id, execute_action};
 use crate::model::{
@@ -271,6 +271,54 @@ enum CorpusStatusQueryMode {
     QueueFilesOnly,
 }
 
+fn validate_scheduling_policy_reuse(
+    existing: Option<&CorpusSchedulingPolicyRecord>,
+    requested: Option<&CorpusSchedulingPolicyRecord>,
+) -> Result<()> {
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    let Some(requested) = requested else {
+        bail!(
+            "output workspace already records scheduling policy {:?} (config {}); rerun with the same --scheduling-policy",
+            existing.policy_name,
+            existing.config_sha256
+        );
+    };
+    if existing != requested {
+        bail!(
+            "requested scheduling policy {:?} (config {}) does not match the policy already recorded for this output workspace: {:?} (config {})",
+            requested.policy_name,
+            requested.config_sha256,
+            existing.policy_name,
+            existing.config_sha256
+        );
+    }
+    Ok(())
+}
+
+fn validate_existing_manifest_scheduling_policy(
+    manifest_path: &Path,
+    requested: Option<&CorpusSchedulingPolicyRecord>,
+) -> Result<()> {
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    let bytes = fs::read(manifest_path).with_context(|| {
+        format!(
+            "reading existing corpus manifest: {}",
+            manifest_path.display()
+        )
+    })?;
+    let existing: IrDirCorpusManifest = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parsing existing corpus manifest: {}",
+            manifest_path.display()
+        )
+    })?;
+    validate_scheduling_policy_reuse(existing.scheduling_policy.as_ref(), requested)
+}
+
 pub(crate) fn run_ir_dir_corpus(
     repo_root: &Path,
     input_dir: &Path,
@@ -329,14 +377,23 @@ pub(crate) fn run_ir_dir_corpus(
     if samples.is_empty() {
         bail!("no .ir files found under {}", input_dir.display());
     }
-    let source_relpaths = samples
+    let scheduling_artifacts = samples
         .iter()
-        .map(|sample| sample.source_relpath.clone())
+        .map(|sample| CorpusSchedulingArtifact {
+            source_relpath: sample.source_relpath.clone(),
+            source_sha256: sample.source_sha256.clone(),
+        })
         .collect::<Vec<_>>();
-    let scheduling_policy = resolve_scheduling_policy(scheduling_policy_preset, &source_relpaths)?;
+    let scheduling_policy =
+        resolve_scheduling_policy(scheduling_policy_preset, &scheduling_artifacts)?;
     let scheduling_policy_record = scheduling_policy
         .as_ref()
         .map(|policy| policy.record.clone());
+    let manifest_path = output_dir.join(IR_DIR_CORPUS_MANIFEST_FILENAME);
+    validate_existing_manifest_scheduling_policy(
+        &manifest_path,
+        scheduling_policy_record.as_ref(),
+    )?;
 
     let mut counters = ExecutionCounters::default();
     let mut run_errors: BTreeMap<String, String> = BTreeMap::new();
@@ -445,7 +502,6 @@ pub(crate) fn run_ir_dir_corpus(
         executed_actions: counters.executed_actions,
     };
 
-    let manifest_path = output_dir.join(IR_DIR_CORPUS_MANIFEST_FILENAME);
     let samples_path = output_dir.join(IR_DIR_CORPUS_SAMPLES_FILENAME);
     let summary_path = output_dir.join(IR_DIR_CORPUS_SUMMARY_FILENAME);
     let joined_dir = output_dir.join(IR_DIR_CORPUS_JOINED_DIR);
@@ -2595,6 +2651,46 @@ mod tests {
         assert_eq!(lhs, rhs);
         assert_ne!(lhs, other);
         assert!(lhs.starts_with("sample-"));
+    }
+
+    fn sample_scheduling_policy_record(config_sha256: &str) -> CorpusSchedulingPolicyRecord {
+        CorpusSchedulingPolicyRecord {
+            schema_version: 1,
+            policy_name: "release-progression-ir".to_string(),
+            semantic_version: 1,
+            config_sha256: config_sha256.to_string(),
+            expected_corpus_sample_count: 187,
+            expected_corpus_artifact_manifest_sha256: "b".repeat(64),
+            priority_tiers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn scheduling_policy_reuse_cannot_erase_or_replace_provenance() {
+        let existing = sample_scheduling_policy_record(&"a".repeat(64));
+        validate_scheduling_policy_reuse(None, None).expect("unconfigured workspace");
+        validate_scheduling_policy_reuse(None, Some(&existing))
+            .expect("unconfigured workspace may adopt a policy");
+        validate_scheduling_policy_reuse(Some(&existing), Some(&existing))
+            .expect("identical policy may be reused");
+
+        let erase_error = validate_scheduling_policy_reuse(Some(&existing), None)
+            .expect_err("recorded policy must not be erased");
+        assert!(
+            erase_error
+                .to_string()
+                .contains("rerun with the same --scheduling-policy")
+        );
+
+        let replacement = sample_scheduling_policy_record(&"c".repeat(64));
+        let replacement_error =
+            validate_scheduling_policy_reuse(Some(&existing), Some(&replacement))
+                .expect_err("recorded policy must not be replaced");
+        assert!(
+            replacement_error
+                .to_string()
+                .contains("does not match the policy already recorded")
+        );
     }
 
     #[test]

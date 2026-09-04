@@ -4,12 +4,20 @@ schema_version: 1
 policy_name: "release-progression-ir"
 semantic_version: 1
 expected_corpus_sample_count: 187
-expected_corpus_hash_manifest_sha256: "bd6a384406f764baebe95089b792fe483ef84f0a8eda3ee8ea8047767a77ce38"
+expected_corpus_artifact_manifest_sha256 {
+  value: "\xd5\xb7\x56\x0b\x8a\x90\xc7\x09\x3e\x3c\x40\x6f\x5c\xe2\xa3\x58\x9f\xf6\x34\x08\x4f\x23\xb0\x16\x86\x6c\x9f\x34\x06\x11\x52\x60"
+}
 priority_tiers {
   tier_name: "abc-critical-path"
   queue_priority_boost: 100
-  structural_hashes: "71f27af55124e28aae72fe9121b0731d5a356b468dc0f214cfac54f37a01f5af"
-  structural_hashes: "b9d9c8026eb8a756e29645afea9a1f19918bec50f3629cf92a7f1c9afe7c32a7"
-  structural_hashes: "c8d78323bfef010613b71cae233b0ab7835ffb4132794e9a0036254891b6a814"
+  structural_hashes {
+    value: "\x71\xf2\x7a\xf5\x51\x24\xe2\x8a\xae\x72\xfe\x91\x21\xb0\x73\x1d\x5a\x35\x6b\x46\x8d\xc0\xf2\x14\xcf\xac\x54\xf3\x7a\x01\xf5\xaf"
+  }
+  structural_hashes {
+    value: "\xb9\xd9\xc8\x02\x6e\xb8\xa7\x56\xe2\x96\x45\xaf\xea\x9a\x1f\x19\x91\x8b\xec\x50\xf3\x62\x9c\xf9\x2a\x7f\x1c\x9a\xfe\x7c\x32\xa7"
+  }
+  structural_hashes {
+    value: "\xc8\xd7\x83\x23\xbf\xef\x01\x06\x13\xb7\x1c\xae\x23\x3b\x0a\xb7\x83\x5f\xfb\x41\x32\x79\x4e\x9a\x00\x36\x25\x48\x91\xb6\xa8\x14"
+  }
   reason: "Repeated Yosys/ABC makespan stragglers in xlsynth crate releases 0.27.0 through 0.29.0"
 }

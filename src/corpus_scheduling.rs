@@ -26,8 +26,14 @@ pub(crate) struct CorpusSchedulingPolicyRecord {
     pub(crate) semantic_version: u32,
     pub(crate) config_sha256: String,
     pub(crate) expected_corpus_sample_count: u64,
-    pub(crate) expected_corpus_hash_manifest_sha256: String,
+    pub(crate) expected_corpus_artifact_manifest_sha256: String,
     pub(crate) priority_tiers: Vec<CorpusPriorityTierRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CorpusSchedulingArtifact {
+    pub(crate) source_relpath: String,
+    pub(crate) source_sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +54,14 @@ fn is_lower_hex_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn digest_to_hex(digest: Option<&pb::Sha256Digest>, field: &str) -> Result<String> {
+    let digest = digest.with_context(|| format!("{field} must be present"))?;
+    if digest.value.len() != 32 {
+        bail!("{field} must contain exactly 32 bytes");
+    }
+    Ok(hex::encode(&digest.value))
 }
 
 fn structural_hash_from_source_relpath(source_relpath: &str) -> Result<&str> {
@@ -74,7 +88,7 @@ fn structural_hash_from_source_relpath(source_relpath: &str) -> Result<&str> {
 
 pub(crate) fn resolve(
     preset: Option<CorpusSchedulingPolicyPreset>,
-    source_relpaths: &[String],
+    source_artifacts: &[CorpusSchedulingArtifact],
 ) -> Result<Option<ResolvedCorpusSchedulingPolicy>> {
     let Some(preset) = preset else {
         return Ok(None);
@@ -106,45 +120,65 @@ pub(crate) fn resolve(
     if policy.expected_corpus_sample_count == 0 {
         bail!("scheduling_policy.expected_corpus_sample_count must be nonzero");
     }
-    if !is_lower_hex_sha256(&policy.expected_corpus_hash_manifest_sha256) {
-        bail!("scheduling_policy.expected_corpus_hash_manifest_sha256 must be a lowercase SHA-256");
-    }
-    if source_relpaths.len() as u64 != policy.expected_corpus_sample_count {
+    let expected_corpus_artifact_manifest_sha256 = digest_to_hex(
+        policy.expected_corpus_artifact_manifest_sha256.as_ref(),
+        "scheduling_policy.expected_corpus_artifact_manifest_sha256",
+    )?;
+    if source_artifacts.len() as u64 != policy.expected_corpus_sample_count {
         bail!(
             "scheduling policy {:?} expects {} corpus samples, got {}",
             policy.policy_name,
             policy.expected_corpus_sample_count,
-            source_relpaths.len()
+            source_artifacts.len()
         );
     }
 
-    let mut corpus_hashes = Vec::with_capacity(source_relpaths.len());
-    for source_relpath in source_relpaths {
-        corpus_hashes.push(structural_hash_from_source_relpath(source_relpath)?.to_string());
+    let mut corpus_artifacts = Vec::with_capacity(source_artifacts.len());
+    for artifact in source_artifacts {
+        let structural_hash = structural_hash_from_source_relpath(&artifact.source_relpath)?;
+        if !is_lower_hex_sha256(&artifact.source_sha256) {
+            bail!(
+                "scheduling policy requires lowercase SHA-256 source digests; got {:?} for {:?}",
+                artifact.source_sha256,
+                artifact.source_relpath
+            );
+        }
+        corpus_artifacts.push((structural_hash.to_string(), artifact.source_sha256.clone()));
     }
-    corpus_hashes.sort();
-    if corpus_hashes.windows(2).any(|pair| pair[0] == pair[1]) {
+    corpus_artifacts.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+    if corpus_artifacts
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0)
+    {
         bail!("scheduling-policy corpus contains duplicate structural hashes");
     }
-    let corpus_hash_manifest = corpus_hashes
-        .iter()
-        .map(|hash| format!("{hash}\n"))
-        .collect::<String>();
-    let actual_corpus_hash_manifest_sha256 =
-        hex::encode(Sha256::digest(corpus_hash_manifest.as_bytes()));
-    if actual_corpus_hash_manifest_sha256 != policy.expected_corpus_hash_manifest_sha256 {
+    let mut corpus_artifact_manifest_hasher = Sha256::new();
+    corpus_artifact_manifest_hasher.update(b"xlsynth-bvc/ir-dir-corpus-artifact-manifest/v1\0");
+    for (structural_hash, source_sha256) in &corpus_artifacts {
+        corpus_artifact_manifest_hasher.update(
+            hex::decode(structural_hash).expect("validated structural SHA-256 hexadecimal"),
+        );
+        corpus_artifact_manifest_hasher
+            .update(hex::decode(source_sha256).expect("validated source SHA-256 hexadecimal"));
+    }
+    let actual_corpus_artifact_manifest_sha256 =
+        hex::encode(corpus_artifact_manifest_hasher.finalize());
+    if actual_corpus_artifact_manifest_sha256 != expected_corpus_artifact_manifest_sha256 {
         bail!(
-            "scheduling policy {:?} corpus hash manifest mismatch: expected {}, got {}",
+            "scheduling policy {:?} corpus artifact manifest mismatch: expected {}, got {}",
             policy.policy_name,
-            policy.expected_corpus_hash_manifest_sha256,
-            actual_corpus_hash_manifest_sha256
+            expected_corpus_artifact_manifest_sha256,
+            actual_corpus_artifact_manifest_sha256
         );
     }
 
     if policy.priority_tiers.is_empty() {
         bail!("scheduling_policy.priority_tiers must not be empty");
     }
-    let corpus_hash_set: BTreeSet<_> = corpus_hashes.into_iter().collect();
+    let corpus_hash_set: BTreeSet<_> = corpus_artifacts
+        .into_iter()
+        .map(|(structural_hash, _)| structural_hash)
+        .collect();
     let mut tier_names = BTreeSet::new();
     let mut priority_boost_by_structural_hash = BTreeMap::new();
     let mut priority_tiers = Vec::with_capacity(policy.priority_tiers.len());
@@ -170,23 +204,24 @@ pub(crate) fn resolve(
             );
         }
 
-        let mut previous_hash: Option<&str> = None;
-        for structural_hash in &tier.structural_hashes {
-            if !is_lower_hex_sha256(structural_hash) {
-                bail!(
-                    "scheduling policy priority tier {:?} contains invalid structural hash {:?}",
-                    tier.tier_name,
-                    structural_hash
-                );
-            }
-            if previous_hash.is_some_and(|previous| previous >= structural_hash.as_str()) {
+        let mut previous_hash: Option<String> = None;
+        let mut structural_hashes = Vec::with_capacity(tier.structural_hashes.len());
+        for structural_hash_digest in &tier.structural_hashes {
+            let structural_hash = digest_to_hex(
+                Some(structural_hash_digest),
+                "scheduling_policy.priority_tier.structural_hash",
+            )?;
+            if previous_hash
+                .as_deref()
+                .is_some_and(|previous| previous >= structural_hash.as_str())
+            {
                 bail!(
                     "scheduling policy priority tier {:?} structural hashes must be sorted and unique",
                     tier.tier_name
                 );
             }
-            previous_hash = Some(structural_hash);
-            if !corpus_hash_set.contains(structural_hash) {
+            previous_hash = Some(structural_hash.clone());
+            if !corpus_hash_set.contains(&structural_hash) {
                 bail!(
                     "scheduling policy priority tier {:?} hash {} is not in the corpus",
                     tier.tier_name,
@@ -202,11 +237,12 @@ pub(crate) fn resolve(
                     structural_hash
                 );
             }
+            structural_hashes.push(structural_hash);
         }
         priority_tiers.push(CorpusPriorityTierRecord {
             tier_name: tier.tier_name,
             queue_priority_boost: tier.queue_priority_boost,
-            structural_hashes: tier.structural_hashes,
+            structural_hashes,
             reason: tier.reason,
         });
     }
@@ -219,7 +255,7 @@ pub(crate) fn resolve(
             semantic_version: policy.semantic_version,
             config_sha256,
             expected_corpus_sample_count: policy.expected_corpus_sample_count,
-            expected_corpus_hash_manifest_sha256: policy.expected_corpus_hash_manifest_sha256,
+            expected_corpus_artifact_manifest_sha256,
             priority_tiers,
         },
         priority_boost_by_structural_hash,
@@ -257,18 +293,37 @@ pub(crate) fn prioritized_sample_count(policy: Option<&CorpusSchedulingPolicyRec
 mod tests {
     use super::*;
 
-    fn canonical_source_relpaths() -> Vec<String> {
-        include_str!("site_assets/release_progression_ir_hashes.txt")
+    fn canonical_source_artifacts() -> Vec<CorpusSchedulingArtifact> {
+        include_str!("site_assets/release_progression_ir_artifacts.tsv")
             .lines()
-            .map(|hash| format!("{hash}.ir"))
+            .map(|line| {
+                let (structural_hash, source_sha256) = line
+                    .split_once('\t')
+                    .expect("artifact manifest line must be tab-separated");
+                CorpusSchedulingArtifact {
+                    source_relpath: format!("{structural_hash}.ir"),
+                    source_sha256: source_sha256.to_string(),
+                }
+            })
             .collect()
     }
 
     #[test]
     fn release_progression_policy_matches_pinned_corpus() {
+        let source_artifacts = canonical_source_artifacts();
+        let structural_hashes = source_artifacts
+            .iter()
+            .map(|artifact| artifact.source_relpath.trim_end_matches(".ir"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            structural_hashes,
+            include_str!("site_assets/release_progression_ir_hashes.txt")
+                .lines()
+                .collect::<Vec<_>>()
+        );
         let policy = resolve(
             Some(CorpusSchedulingPolicyPreset::ReleaseProgressionIrV1),
-            &canonical_source_relpaths(),
+            &source_artifacts,
         )
         .expect("resolve policy")
         .expect("selected policy");
@@ -297,10 +352,31 @@ mod tests {
     fn release_progression_policy_rejects_a_different_corpus() {
         let error = resolve(
             Some(CorpusSchedulingPolicyPreset::ReleaseProgressionIrV1),
-            &["0".repeat(64) + ".ir"],
+            &[CorpusSchedulingArtifact {
+                source_relpath: "0".repeat(64) + ".ir",
+                source_sha256: "0".repeat(64),
+            }],
         )
         .expect_err("different corpus must be rejected");
 
         assert!(error.to_string().contains("expects 187 corpus samples"));
+    }
+
+    #[test]
+    fn release_progression_policy_rejects_changed_ir_bytes() {
+        let mut source_artifacts = canonical_source_artifacts();
+        source_artifacts[0].source_sha256 = "0".repeat(64);
+
+        let error = resolve(
+            Some(CorpusSchedulingPolicyPreset::ReleaseProgressionIrV1),
+            &source_artifacts,
+        )
+        .expect_err("changed IR bytes must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("corpus artifact manifest mismatch")
+        );
     }
 }

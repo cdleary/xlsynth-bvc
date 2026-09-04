@@ -4,6 +4,12 @@
 
 The release-progression chart deliberately uses a pinned benchmark cohort, not the functions enumerated by each xlsynth release. Its canonical manifest is `src/site_assets/release_progression_ir_hashes.txt`: 187 sorted, unique whole-function structural hashes. `src/site.rs` pins both the count and the domain-separated manifest digest, so changing the cohort is an explicit versioned decision.
 
+`src/site_assets/release_progression_ir_artifacts.tsv` additionally binds each structural hash to
+the SHA-256 of the canonical IR file bytes. The scheduling policy validates a domain-separated
+digest of these 187 pairs: the prefix `xlsynth-bvc/ir-dir-corpus-artifact-manifest/v1\0`,
+followed by each sorted pair as raw 32-byte structural and content digests. A renamed, truncated, or
+replaced IR file is rejected before enqueue.
+
 ## Scheduling policy
 
 The cohort identity stays separate from operational scheduling. The checked-in
@@ -16,7 +22,7 @@ Select it explicitly when enqueueing a historical run:
 ```
 
 The runner only accepts the policy with `--execution-mode enqueue`, validates it against the exact
-187-hash manifest digest before enqueueing, and records the policy name, semantic version,
+187-artifact content manifest before enqueueing, and records the policy name, semantic version,
 compiled-config digest, tiers, and reasons in the run's `manifest.json`. Queue priority is
 operational metadata rather than action identity, so the policy does not change cache keys or QoR
 results.
