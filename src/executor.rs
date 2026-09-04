@@ -38,6 +38,12 @@ static DRIVER_SUBCOMMAND_HELP_TOKEN_CACHE: OnceLock<
     Mutex<BTreeMap<DriverSubcommandHelpTokenCacheKey, bool>>,
 > = OnceLock::new();
 const DRIVER_IR_EQUIV_TIMEOUT_SECONDS: u64 = 30;
+const MODERN_IR2G8R_CLI_MIN_DRIVER_VERSION: &str = "0.27.0";
+
+fn uses_legacy_ir2g8r_cli(driver_version: &str) -> bool {
+    cmp_dotted_numeric_version(driver_version, MODERN_IR2G8R_CLI_MIN_DRIVER_VERSION)
+        == std::cmp::Ordering::Less
+}
 
 pub(crate) fn execute_action(
     store: &ArtifactStore,
@@ -2567,8 +2573,7 @@ fn prepare_driver_ir_to_g8r_batch_action(
         relpath: "payload/result.aig".to_string(),
     };
 
-    let use_legacy_ir2g8r_cli =
-        cmp_dotted_numeric_version(&runtime.driver_version, "0.24.0") == std::cmp::Ordering::Less;
+    let use_legacy_ir2g8r_cli = uses_legacy_ir2g8r_cli(&runtime.driver_version);
     let prepared_ir_relpath = "prep_for_gatify.ir";
     let mut suggested_next_actions = Vec::new();
     let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
@@ -3013,8 +3018,7 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
         relpath: "payload/result.aig".to_string(),
     };
 
-    let use_legacy_ir2g8r_cli =
-        cmp_dotted_numeric_version(&runtime.driver_version, "0.24.0") == std::cmp::Ordering::Less;
+    let use_legacy_ir2g8r_cli = uses_legacy_ir2g8r_cli(&runtime.driver_version);
     let prepared_ir_relpath = "prep_for_gatify.ir";
     let mut suggested_next_actions = Vec::new();
     let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
@@ -5534,6 +5538,15 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn ir2g8r_cli_before_v0_27_uses_legacy_arguments() {
+        assert!(uses_legacy_ir2g8r_cli("0.24.0"));
+        assert!(uses_legacy_ir2g8r_cli("0.25.0"));
+        assert!(uses_legacy_ir2g8r_cli("0.26.0"));
+        assert!(!uses_legacy_ir2g8r_cli("0.27.0"));
+        assert!(!uses_legacy_ir2g8r_cli("0.68.0"));
+    }
 
     #[test]
     fn compute_action_id_matches_golden_for_aig_stat_diff() {
