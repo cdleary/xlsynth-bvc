@@ -162,10 +162,15 @@ same action at a higher priority promotes a pending queue record without changin
 so enabling a policy is safe for an existing output workspace. Running actions are not interrupted
 or reprioritized.
 
+Before any queue mutation, policy adoption is atomically recorded in
+`.bvc/bvc-artifacts/corpus/corpus-scheduling-policy.pb`. The public manifest carries the same
+identity after a successful enqueue pass, while the durable workspace marker protects interrupted
+or failed passes.
+
 An existing unconfigured workspace may adopt a policy and promote its pending records. Once a
 workspace records a policy, every later refresh or enqueue must specify the identical compiled
-policy; omitting or changing it is rejected so the manifest cannot erase a priority effect that
-still exists in the queue.
+policy; omitting or changing it is rejected so provenance cannot erase a priority effect that still
+exists in the queue.
 
 ## Queue-Backed Workflow
 

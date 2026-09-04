@@ -10,6 +10,7 @@ use crate::cli::CorpusSchedulingPolicyPreset;
 use crate::proto::{RELEASE_PROGRESSION_IR_SCHEDULING_POLICY, v1 as pb};
 
 const SCHEDULING_POLICY_SCHEMA_VERSION: u32 = 1;
+const SCHEDULING_POLICY_MARKER_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CorpusPriorityTierRecord {
@@ -28,6 +29,14 @@ pub(crate) struct CorpusSchedulingPolicyRecord {
     pub(crate) expected_corpus_sample_count: u64,
     pub(crate) expected_corpus_artifact_manifest_sha256: String,
     pub(crate) priority_tiers: Vec<CorpusPriorityTierRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CorpusSchedulingPolicyIdentity {
+    pub(crate) schema_version: u32,
+    pub(crate) policy_name: String,
+    pub(crate) semantic_version: u32,
+    pub(crate) config_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +271,71 @@ pub(crate) fn resolve(
     }))
 }
 
+pub(crate) fn scheduling_policy_identity(
+    record: &CorpusSchedulingPolicyRecord,
+) -> CorpusSchedulingPolicyIdentity {
+    CorpusSchedulingPolicyIdentity {
+        schema_version: record.schema_version,
+        policy_name: record.policy_name.clone(),
+        semantic_version: record.semantic_version,
+        config_sha256: record.config_sha256.clone(),
+    }
+}
+
+pub(crate) fn encode_scheduling_policy_marker(
+    record: &CorpusSchedulingPolicyRecord,
+) -> Result<Vec<u8>> {
+    if !is_lower_hex_sha256(&record.config_sha256) {
+        bail!("scheduling policy record config_sha256 must be a lowercase SHA-256");
+    }
+    Ok(pb::IrDirCorpusSchedulingPolicyMarker {
+        marker_schema_version: SCHEDULING_POLICY_MARKER_SCHEMA_VERSION,
+        policy_schema_version: record.schema_version,
+        policy_name: record.policy_name.clone(),
+        policy_semantic_version: record.semantic_version,
+        policy_config_sha256: Some(pb::Sha256Digest {
+            value: hex::decode(&record.config_sha256)
+                .expect("validated scheduling policy config SHA-256 hexadecimal"),
+        }),
+    }
+    .encode_to_vec())
+}
+
+pub(crate) fn decode_scheduling_policy_marker(
+    bytes: &[u8],
+) -> Result<CorpusSchedulingPolicyIdentity> {
+    let marker = pb::IrDirCorpusSchedulingPolicyMarker::decode(bytes)
+        .context("decoding corpus scheduling policy marker")?;
+    if marker.marker_schema_version != SCHEDULING_POLICY_MARKER_SCHEMA_VERSION {
+        bail!(
+            "unsupported corpus scheduling policy marker schema version {}; expected {}",
+            marker.marker_schema_version,
+            SCHEDULING_POLICY_MARKER_SCHEMA_VERSION
+        );
+    }
+    if marker.policy_schema_version != SCHEDULING_POLICY_SCHEMA_VERSION {
+        bail!(
+            "unsupported marked corpus scheduling policy schema version {}; expected {}",
+            marker.policy_schema_version,
+            SCHEDULING_POLICY_SCHEMA_VERSION
+        );
+    }
+    validate_text(&marker.policy_name, "scheduling_policy_marker.policy_name")?;
+    if marker.policy_semantic_version == 0 {
+        bail!("scheduling_policy_marker.policy_semantic_version must be nonzero");
+    }
+    let config_sha256 = digest_to_hex(
+        marker.policy_config_sha256.as_ref(),
+        "scheduling_policy_marker.policy_config_sha256",
+    )?;
+    Ok(CorpusSchedulingPolicyIdentity {
+        schema_version: marker.policy_schema_version,
+        policy_name: marker.policy_name,
+        semantic_version: marker.policy_semantic_version,
+        config_sha256,
+    })
+}
+
 pub(crate) fn priority_boost(
     policy: Option<&ResolvedCorpusSchedulingPolicy>,
     source_relpath: &str,
@@ -378,5 +452,20 @@ mod tests {
                 .to_string()
                 .contains("corpus artifact manifest mismatch")
         );
+    }
+
+    #[test]
+    fn scheduling_policy_marker_round_trips_validated_identity() {
+        let policy = resolve(
+            Some(CorpusSchedulingPolicyPreset::ReleaseProgressionIrV1),
+            &canonical_source_artifacts(),
+        )
+        .expect("resolve policy")
+        .expect("selected policy");
+        let encoded =
+            encode_scheduling_policy_marker(&policy.record).expect("encode policy marker");
+        let decoded = decode_scheduling_policy_marker(&encoded).expect("decode policy marker");
+
+        assert_eq!(decoded, scheduling_policy_identity(&policy.record));
     }
 }

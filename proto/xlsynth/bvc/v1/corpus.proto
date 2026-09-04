@@ -21,3 +21,11 @@ message IrDirCorpusSchedulingPolicy {
   Sha256Digest expected_corpus_artifact_manifest_sha256 = 5;
   repeated IrDirCorpusPriorityTier priority_tiers = 6;
 }
+
+message IrDirCorpusSchedulingPolicyMarker {
+  uint32 marker_schema_version = 1;
+  uint32 policy_schema_version = 2;
+  string policy_name = 3;
+  uint32 policy_semantic_version = 4;
+  Sha256Digest policy_config_sha256 = 5;
+}

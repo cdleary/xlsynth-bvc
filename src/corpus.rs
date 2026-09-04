@@ -15,8 +15,9 @@ use crate::cli::{
     DriverCli, YosysCli,
 };
 use crate::corpus_scheduling::{
-    CorpusSchedulingArtifact, CorpusSchedulingPolicyRecord, prioritized_sample_count,
-    priority_boost, resolve as resolve_scheduling_policy,
+    CorpusSchedulingArtifact, CorpusSchedulingPolicyIdentity, CorpusSchedulingPolicyRecord,
+    decode_scheduling_policy_marker, encode_scheduling_policy_marker, prioritized_sample_count,
+    priority_boost, resolve as resolve_scheduling_policy, scheduling_policy_identity,
 };
 use crate::executor::{compute_action_id, execute_action};
 use crate::model::{
@@ -42,6 +43,7 @@ const IR_DIR_CORPUS_EXPORTED_ARTIFACTS_DIR: &str = "artifacts";
 const IR_DIR_CORPUS_INTERNAL_DIR: &str = ".bvc";
 const IR_DIR_CORPUS_INTERNAL_STORE_DIR: &str = "bvc-artifacts";
 const IR_DIR_CORPUS_INTERNAL_SLED_FILENAME: &str = "artifacts.sled";
+const IR_DIR_CORPUS_SCHEDULING_POLICY_MARKER_FILENAME: &str = "corpus-scheduling-policy.pb";
 const IMPORTED_IR_RELPATH: &str = "payload/input.ir";
 const G8R_AIG_RELPATH: &str = "payload/result.aig";
 const G8R_STATS_RELPATH: &str = "payload/stats.json";
@@ -297,12 +299,11 @@ fn validate_scheduling_policy_reuse(
     Ok(())
 }
 
-fn validate_existing_manifest_scheduling_policy(
+fn read_manifest_scheduling_policy(
     manifest_path: &Path,
-    requested: Option<&CorpusSchedulingPolicyRecord>,
-) -> Result<()> {
+) -> Result<Option<CorpusSchedulingPolicyRecord>> {
     if !manifest_path.exists() {
-        return Ok(());
+        return Ok(None);
     }
     let bytes = fs::read(manifest_path).with_context(|| {
         format!(
@@ -316,7 +317,87 @@ fn validate_existing_manifest_scheduling_policy(
             manifest_path.display()
         )
     })?;
-    validate_scheduling_policy_reuse(existing.scheduling_policy.as_ref(), requested)
+    Ok(existing.scheduling_policy)
+}
+
+fn read_scheduling_policy_marker(
+    marker_path: &Path,
+) -> Result<Option<CorpusSchedulingPolicyIdentity>> {
+    if !marker_path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(marker_path).with_context(|| {
+        format!(
+            "reading corpus scheduling policy marker: {}",
+            marker_path.display()
+        )
+    })?;
+    decode_scheduling_policy_marker(&bytes)
+        .with_context(|| {
+            format!(
+                "validating corpus scheduling policy marker: {}",
+                marker_path.display()
+            )
+        })
+        .map(Some)
+}
+
+fn validate_existing_scheduling_policy(
+    manifest_path: &Path,
+    marker_path: &Path,
+    requested: Option<&CorpusSchedulingPolicyRecord>,
+) -> Result<()> {
+    let manifest_policy = read_manifest_scheduling_policy(manifest_path)?;
+    let marker_policy = read_scheduling_policy_marker(marker_path)?;
+    if let Some(marker_policy) = &marker_policy {
+        if let Some(manifest_policy) = &manifest_policy {
+            if scheduling_policy_identity(manifest_policy) != *marker_policy {
+                bail!(
+                    "corpus manifest scheduling policy does not match durable workspace marker {}",
+                    marker_path.display()
+                );
+            }
+        }
+        let Some(requested) = requested else {
+            bail!(
+                "output workspace already records scheduling policy {:?} (config {}); rerun with the same --scheduling-policy",
+                marker_policy.policy_name,
+                marker_policy.config_sha256
+            );
+        };
+        let requested_identity = scheduling_policy_identity(requested);
+        if requested_identity != *marker_policy {
+            bail!(
+                "requested scheduling policy {:?} (config {}) does not match the policy already recorded for this output workspace: {:?} (config {})",
+                requested.policy_name,
+                requested.config_sha256,
+                marker_policy.policy_name,
+                marker_policy.config_sha256
+            );
+        }
+        return Ok(());
+    }
+    validate_scheduling_policy_reuse(manifest_policy.as_ref(), requested)
+}
+
+fn persist_scheduling_policy_marker(
+    store: &ArtifactStore,
+    marker_path: &Path,
+    policy: Option<&CorpusSchedulingPolicyRecord>,
+) -> Result<()> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    let bytes = encode_scheduling_policy_marker(policy)
+        .context("encoding corpus scheduling policy marker")?;
+    store
+        .write_record_atomic("corpus-policy", marker_path, &bytes)
+        .with_context(|| {
+            format!(
+                "persisting corpus scheduling policy marker: {}",
+                marker_path.display()
+            )
+        })
 }
 
 pub(crate) fn run_ir_dir_corpus(
@@ -390,8 +471,12 @@ pub(crate) fn run_ir_dir_corpus(
         .as_ref()
         .map(|policy| policy.record.clone());
     let manifest_path = output_dir.join(IR_DIR_CORPUS_MANIFEST_FILENAME);
-    validate_existing_manifest_scheduling_policy(
+    let scheduling_policy_marker_path = workspace_store_dir
+        .join("corpus")
+        .join(IR_DIR_CORPUS_SCHEDULING_POLICY_MARKER_FILENAME);
+    validate_existing_scheduling_policy(
         &manifest_path,
+        &scheduling_policy_marker_path,
         scheduling_policy_record.as_ref(),
     )?;
 
@@ -400,19 +485,25 @@ pub(crate) fn run_ir_dir_corpus(
     let mut sample_records = Vec::with_capacity(samples.len());
     let now = Utc::now();
 
-    for sample in &samples {
-        let plan = build_action_plan(
-            sample,
-            fraig,
-            version,
-            &driver_runtime,
-            &stats_runtime,
-            &yosys_runtime,
-            &yosys_script_ref,
-        )?;
-        ensure_imported_ir_action(&store, sample, &plan.import_action)?;
-        match execution_mode {
-            CorpusExecutionMode::Enqueue => {
+    let plans = samples
+        .iter()
+        .map(|sample| {
+            build_action_plan(
+                sample,
+                fraig,
+                version,
+                &driver_runtime,
+                &stats_runtime,
+                &yosys_runtime,
+                &yosys_script_ref,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let enqueue_priorities = if matches!(execution_mode, CorpusExecutionMode::Enqueue) {
+        samples
+            .iter()
+            .zip(&plans)
+            .map(|(sample, plan)| {
                 let sample_priority_boost =
                     priority_boost(scheduling_policy.as_ref(), &sample.source_relpath)?;
                 let sample_priority =
@@ -424,10 +515,27 @@ pub(crate) fn run_ir_dir_corpus(
                                 sample.source_relpath
                             )
                         })?;
-                counters.enqueued_actions += enqueue_plan(&store, &plan, sample_priority)?;
+                checked_enqueue_plan_priorities(plan, sample_priority)
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    persist_scheduling_policy_marker(
+        &store,
+        &scheduling_policy_marker_path,
+        scheduling_policy_record.as_ref(),
+    )?;
+
+    for (index, (sample, plan)) in samples.iter().zip(&plans).enumerate() {
+        ensure_imported_ir_action(&store, sample, &plan.import_action)?;
+        match execution_mode {
+            CorpusExecutionMode::Enqueue => {
+                counters.enqueued_actions +=
+                    enqueue_plan(&store, plan, &enqueue_priorities[index])?;
             }
             CorpusExecutionMode::Run => {
-                execute_plan(&store, &plan, &mut counters)
+                execute_plan(&store, plan, &mut counters)
                     .map_err(|err| {
                         run_errors.insert(sample.sample_id.clone(), format!("{:#}", err));
                         err
@@ -438,7 +546,7 @@ pub(crate) fn run_ir_dir_corpus(
         sample_records.push(build_sample_record(
             &store,
             sample,
-            &plan,
+            plan,
             &run_errors,
             recipe_preset_name,
             top_fn_policy,
@@ -1404,10 +1512,38 @@ fn ensure_imported_ir_action(
     Ok(())
 }
 
+fn checked_enqueue_plan_priorities(
+    plan: &CorpusActionPlan,
+    base_priority: i32,
+) -> Result<Vec<i32>> {
+    let actions = [
+        &plan.g8r_aig_action,
+        &plan.g8r_stats_action,
+        &plan.combo_verilog_action,
+        &plan.yosys_abc_aig_action,
+        &plan.yosys_abc_stats_action,
+        &plan.aig_stat_diff_action,
+    ];
+    actions
+        .iter()
+        .map(|action| {
+            let stage_priority_offset = suggested_action_queue_priority(0, action);
+            base_priority
+                .checked_add(stage_priority_offset)
+                .with_context(|| {
+                    format!(
+                        "queue priority overflow after adding stage offset {}",
+                        stage_priority_offset
+                    )
+                })
+        })
+        .collect()
+}
+
 fn enqueue_plan(
     store: &ArtifactStore,
     plan: &CorpusActionPlan,
-    base_priority: i32,
+    priorities: &[i32],
 ) -> Result<usize> {
     let actions = [
         &plan.g8r_aig_action,
@@ -1417,23 +1553,17 @@ fn enqueue_plan(
         &plan.yosys_abc_stats_action,
         &plan.aig_stat_diff_action,
     ];
+    if priorities.len() != actions.len() {
+        bail!("corpus enqueue plan priority count does not match action count");
+    }
     let mut enqueued = 0_usize;
-    for action in actions {
+    for (action, action_priority) in actions.into_iter().zip(priorities.iter().copied()) {
         let action_id = compute_action_id(action)?;
         let was_known = store.action_exists(&action_id)
             || !matches!(
                 queue_state_for_action(store, &action_id),
                 crate::queue::QueueState::None
             );
-        let stage_priority_offset = suggested_action_queue_priority(0, action);
-        let action_priority = base_priority
-            .checked_add(stage_priority_offset)
-            .with_context(|| {
-                format!(
-                    "queue priority overflow after adding stage offset {} for action {}",
-                    stage_priority_offset, action_id
-                )
-            })?;
         enqueue_action_with_priority(store, action.clone(), action_priority)?;
         if !was_known && !store.action_exists(&action_id) {
             enqueued += 1;
@@ -2694,6 +2824,35 @@ mod tests {
     }
 
     #[test]
+    fn durable_scheduling_policy_marker_prevents_unconfigured_retry() {
+        let root = make_temp_dir("durable-scheduling-policy-marker");
+        let store_root = root.join("store");
+        let store = ArtifactStore::new_with_sled(store_root.clone(), root.join("artifacts.sled"));
+        store.ensure_layout().expect("ensure store layout");
+        let marker_path = store_root
+            .join("corpus")
+            .join(IR_DIR_CORPUS_SCHEDULING_POLICY_MARKER_FILENAME);
+        let record = sample_scheduling_policy_record(&"a".repeat(64));
+
+        persist_scheduling_policy_marker(&store, &marker_path, Some(&record))
+            .expect("persist policy marker");
+        validate_existing_scheduling_policy(
+            &root.join("missing-manifest.json"),
+            &marker_path,
+            None,
+        )
+        .expect_err("durable marker must reject unconfigured retry");
+        validate_existing_scheduling_policy(
+            &root.join("missing-manifest.json"),
+            &marker_path,
+            Some(&record),
+        )
+        .expect("durable marker accepts matching retry");
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn run_ir_dir_corpus_rejects_scheduling_policy_in_run_mode() {
         let root = make_temp_dir("run-mode-scheduling-policy");
         let input_dir = root.join("input");
@@ -2750,10 +2909,24 @@ mod tests {
         )
         .expect("build action plan");
 
-        let error = enqueue_plan(&store, &plan, i32::MAX)
+        let error = checked_enqueue_plan_priorities(&plan, i32::MAX - 10)
             .expect_err("stage priority adjustment must reject overflow");
 
         assert!(format!("{error:#}").contains("queue priority overflow after adding stage offset"));
+        for action in [
+            &plan.g8r_aig_action,
+            &plan.g8r_stats_action,
+            &plan.combo_verilog_action,
+            &plan.yosys_abc_aig_action,
+            &plan.yosys_abc_stats_action,
+            &plan.aig_stat_diff_action,
+        ] {
+            let action_id = compute_action_id(action).expect("compute action id");
+            assert!(matches!(
+                queue_state_for_action(&store, &action_id),
+                crate::queue::QueueState::None
+            ));
+        }
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
