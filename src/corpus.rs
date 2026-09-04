@@ -380,6 +380,28 @@ fn validate_existing_scheduling_policy(
     validate_scheduling_policy_reuse(manifest_policy.as_ref(), requested)
 }
 
+fn validate_refresh_scheduling_policy_provenance(
+    manifest_policy: Option<&CorpusSchedulingPolicyRecord>,
+    marker_path: &Path,
+) -> Result<()> {
+    let Some(marker_policy) = read_scheduling_policy_marker(marker_path)? else {
+        return Ok(());
+    };
+    let Some(manifest_policy) = manifest_policy else {
+        bail!(
+            "corpus manifest does not reflect durable scheduling policy marker {}; complete run-ir-dir-corpus with the matching --scheduling-policy before refreshing public outputs",
+            marker_path.display()
+        );
+    };
+    if scheduling_policy_identity(manifest_policy) != marker_policy {
+        bail!(
+            "corpus manifest scheduling policy does not match durable workspace marker {}; complete run-ir-dir-corpus with the matching --scheduling-policy before refreshing public outputs",
+            marker_path.display()
+        );
+    }
+    Ok(())
+}
+
 fn persist_scheduling_policy_marker(
     store: &ArtifactStore,
     marker_path: &Path,
@@ -706,6 +728,15 @@ fn build_ir_dir_corpus_status_report(
 
     let (workspace_dir, workspace_store_dir, workspace_artifacts_via_sled) =
         corpus_workspace_paths(output_dir);
+    if refresh_public_outputs {
+        let scheduling_policy_marker_path = workspace_store_dir
+            .join("corpus")
+            .join(IR_DIR_CORPUS_SCHEDULING_POLICY_MARKER_FILENAME);
+        validate_refresh_scheduling_policy_provenance(
+            manifest.scheduling_policy.as_ref(),
+            &scheduling_policy_marker_path,
+        )?;
+    }
     if !workspace_artifacts_via_sled.exists() {
         bail!(
             "corpus workspace sled db does not exist: {}",
@@ -3416,6 +3447,37 @@ mod tests {
             Some("synthetic run failure")
         );
 
+        fs::remove_dir_all(root).expect("cleanup fixture");
+    }
+
+    #[test]
+    fn refresh_rejects_policy_marker_missing_from_manifest() {
+        let fixture = make_status_fixture();
+        let output_dir = fixture.output_dir.clone();
+        let root = fixture.root.clone();
+        let marker_path = output_dir
+            .join(IR_DIR_CORPUS_INTERNAL_DIR)
+            .join(IR_DIR_CORPUS_INTERNAL_STORE_DIR)
+            .join("corpus")
+            .join(IR_DIR_CORPUS_SCHEDULING_POLICY_MARKER_FILENAME);
+        let policy = sample_scheduling_policy_record(&"a".repeat(64));
+        persist_scheduling_policy_marker(&fixture.store, &marker_path, Some(&policy))
+            .expect("persist policy marker");
+        let manifest_path = output_dir.join(IR_DIR_CORPUS_MANIFEST_FILENAME);
+        let manifest_before = fs::read(&manifest_path).expect("read manifest before refresh");
+        drop(fixture.store);
+
+        let error = refresh_ir_dir_corpus_status(&output_dir, 1800, 10)
+            .expect_err("refresh must reject a policy marker absent from the manifest");
+
+        assert!(
+            format!("{error:#}")
+                .contains("complete run-ir-dir-corpus with the matching --scheduling-policy")
+        );
+        assert_eq!(
+            fs::read(&manifest_path).expect("read manifest after rejected refresh"),
+            manifest_before
+        );
         fs::remove_dir_all(root).expect("cleanup fixture");
     }
 

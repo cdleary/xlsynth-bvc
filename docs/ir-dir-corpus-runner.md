@@ -165,7 +165,9 @@ or reprioritized.
 Before any queue mutation, policy adoption is atomically recorded in
 `.bvc/bvc-artifacts/corpus/corpus-scheduling-policy.pb`. The public manifest carries the same
 identity after a successful enqueue pass, while the durable workspace marker protects interrupted
-or failed passes.
+or failed passes. If an interrupted pass leaves the marker ahead of the public manifest,
+`refresh-corpus-status` refuses to rewrite public outputs until the matching policy-enabled
+corpus command completes.
 
 An existing unconfigured workspace may adopt a policy and promote its pending records. Once a
 workspace records a policy, every later refresh or enqueue must specify the identical compiled
