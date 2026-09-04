@@ -277,6 +277,11 @@ fn site_build_and_verify_supports_subdirectory_base() {
     assert_eq!(summary.dataset_count, 1);
     let verified = verify_static_site(&site_dir).expect("verify site");
     assert_eq!(verified.base_url, "/xlsynth-bvc/");
+    let catalog: BrowserCatalog = serde_json::from_slice(
+        &fs::read(site_dir.join("catalog.json")).expect("read browser catalog"),
+    )
+    .expect("decode browser catalog");
+    assert_eq!(catalog.schema_version, 4);
     let index_html = fs::read_to_string(site_dir.join("index.html")).expect("read homepage HTML");
     assert!(index_html.contains("Boolean synthesis comparison"));
     assert!(index_html.contains("id=\"home-overview\""));
