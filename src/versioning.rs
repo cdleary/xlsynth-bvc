@@ -57,9 +57,18 @@ pub(crate) struct DriverIr2g8rCliCapabilities {
 
 pub(crate) fn driver_ir2g8r_cli_capabilities(driver_version: &str) -> DriverIr2g8rCliCapabilities {
     DriverIr2g8rCliCapabilities {
-        aiger_out: cmp_dotted_numeric_version(driver_version, "0.24.0") != std::cmp::Ordering::Less,
-        top: cmp_dotted_numeric_version(driver_version, "0.27.0") != std::cmp::Ordering::Less,
+        aiger_out: cmp_dotted_numeric_version(normalize_tag_version(driver_version), "0.24.0")
+            != std::cmp::Ordering::Less,
+        top: cmp_dotted_numeric_version(normalize_tag_version(driver_version), "0.27.0")
+            != std::cmp::Ordering::Less,
     }
+}
+
+pub(crate) fn driver_ir2g8r_execution_recipe_revision(driver_version: &str) -> u32 {
+    u32::from(
+        cmp_dotted_numeric_version(normalize_tag_version(driver_version), "0.27.0")
+            == std::cmp::Ordering::Less,
+    )
 }
 
 fn timezone_abbrev_utc_offset_seconds(abbrev: &str) -> Option<i32> {

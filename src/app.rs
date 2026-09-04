@@ -1113,14 +1113,21 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
             fraig,
             version,
             driver,
-        } => Ok(ActionSpec::DriverIrToG8rAig {
-            ir_action_id,
-            top_fn_name,
-            fraig,
-            lowering_mode: crate::model::G8rLoweringMode::Default,
-            runtime: driver.into_runtime(repo_root, &version)?,
-            version,
-        }),
+        } => {
+            let runtime = driver.into_runtime(repo_root, &version)?;
+            Ok(ActionSpec::DriverIrToG8rAig {
+                ir_action_id,
+                top_fn_name,
+                fraig,
+                lowering_mode: crate::model::G8rLoweringMode::Default,
+                execution_recipe_revision:
+                    crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                        &runtime.driver_version,
+                    ),
+                runtime,
+                version,
+            })
+        }
         RunAction::IrToComboVerilog {
             ir_action_id,
             top_fn_name,
@@ -2260,6 +2267,10 @@ fn canonicalize_k3_cone_suggested_action(
                 top_fn_name: top_fn_name.clone(),
                 fraig: *fraig,
                 lowering_mode: lowering_mode.clone(),
+                execution_recipe_revision:
+                    crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                        &runtime.driver_version,
+                    ),
                 version: version.clone(),
                 runtime: runtime.clone(),
             },
@@ -2500,6 +2511,10 @@ pub(crate) fn backfill_stdlib_opt_ir_aig_equiv_suggestions(
                     top_fn_name: None,
                     fraig: false,
                     lowering_mode: crate::model::G8rLoweringMode::Default,
+                    execution_recipe_revision:
+                        crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                            &runtime.driver_version,
+                        ),
                     version: version.clone(),
                     runtime: runtime.clone(),
                 };
@@ -2508,6 +2523,10 @@ pub(crate) fn backfill_stdlib_opt_ir_aig_equiv_suggestions(
                     top_fn_name: None,
                     fraig: true,
                     lowering_mode: crate::model::G8rLoweringMode::Default,
+                    execution_recipe_revision:
+                        crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                            &runtime.driver_version,
+                        ),
                     version: version.clone(),
                     runtime: runtime.clone(),
                 };
@@ -2703,6 +2722,9 @@ pub(crate) fn backfill_opt_ir_frontend_compare_suggestions(
             top_fn_name: None,
             fraig: false,
             lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+            execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version,
+            ),
             version: version.clone(),
             runtime: runtime.clone(),
         };
@@ -2882,12 +2904,12 @@ pub(crate) fn enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
     )?;
 
     let mut keys = BTreeSet::new();
-    for key @ (_, version) in state.g8r_by_entity.keys() {
+    for key @ (_, version, _) in state.g8r_by_entity.keys() {
         if version == &crate_version {
             keys.insert(key.clone());
         }
     }
-    for key @ (_, version) in state.yosys_by_entity.keys() {
+    for key @ (_, version, _) in state.yosys_by_entity.keys() {
         if version == &crate_version {
             keys.insert(key.clone());
         }
@@ -2949,6 +2971,10 @@ pub(crate) fn enqueue_ir_fn_g8r_abc_vs_codegen_yosys_abc_gaps(
                     top_fn_name: point.ir_top.clone(),
                     fraig: false,
                     lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+                    execution_recipe_revision:
+                        crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                            &runtime.driver_version,
+                        ),
                     version: format!("v{}", normalize_tag_version(&point.dso_version)),
                     runtime,
                 }

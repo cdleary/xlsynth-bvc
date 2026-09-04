@@ -1307,6 +1307,9 @@ pub(crate) fn enqueue_structural_opt_ir_g8r_actions(
             top_fn_name: None,
             fraig,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &target_runtime.driver_version,
+            ),
             version: dso_version.clone(),
             runtime: target_runtime.clone(),
         };

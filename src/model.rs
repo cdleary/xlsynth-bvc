@@ -40,6 +40,10 @@ fn is_default_g8r_lowering_mode(mode: &G8rLoweringMode) -> bool {
     matches!(mode, G8rLoweringMode::Default)
 }
 
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ArtifactType {
@@ -140,6 +144,8 @@ pub(crate) enum ActionSpec {
         fraig: bool,
         #[serde(default, skip_serializing_if = "is_default_g8r_lowering_mode")]
         lowering_mode: G8rLoweringMode,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        execution_recipe_revision: u32,
         version: String,
         runtime: DriverRuntimeSpec,
     },
@@ -202,6 +208,7 @@ pub(crate) enum ActionBatchKey {
         runtime: DriverRuntimeSpec,
         fraig: bool,
         lowering_mode: G8rLoweringMode,
+        execution_recipe_revision: u32,
     },
 }
 
@@ -212,12 +219,14 @@ pub(crate) fn action_batch_key(action: &ActionSpec) -> Option<ActionBatchKey> {
             runtime,
             fraig,
             lowering_mode,
+            execution_recipe_revision,
             ..
         } => Some(ActionBatchKey::DriverIrToG8rAig {
             version: version.clone(),
             runtime: runtime.clone(),
             fraig: *fraig,
             lowering_mode: lowering_mode.clone(),
+            execution_recipe_revision: *execution_recipe_revision,
         }),
         ActionSpec::ImportIrPackageFile { .. }
         | ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. }
@@ -958,6 +967,7 @@ mod tests {
                     top_fn_name: Some("__foo".to_string()),
                     fraig: false,
                     lowering_mode: G8rLoweringMode::Default,
+                    execution_recipe_revision: 0,
                     version: "v0.35.0".to_string(),
                     runtime: sample_runtime(),
                 },

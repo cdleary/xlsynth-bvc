@@ -1172,6 +1172,9 @@ fn build_action_plan(
         top_fn_name: Some(sample.top_fn_name.clone()),
         fraig,
         lowering_mode: crate::model::G8rLoweringMode::Default,
+        execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+            &driver_runtime.driver_version,
+        ),
         version: version.to_string(),
         runtime: driver_runtime.clone(),
     };

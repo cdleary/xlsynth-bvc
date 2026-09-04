@@ -1374,9 +1374,11 @@ struct StdlibFnTimelineIndexFile {
 #[derive(Debug, Clone)]
 pub(crate) struct IrFnCorpusG8rVsYosysIndexState {
     pub(crate) dataset: StdlibG8rVsYosysDataset,
-    pub(crate) g8r_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint>,
-    pub(crate) yosys_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint>,
+    pub(crate) g8r_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    pub(crate) yosys_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 }
+
+type IrFnCorpusEntityKey = (String, String, String);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1402,17 +1404,20 @@ fn ir_fn_corpus_incremental_delta_key(
     source_kind: IrFnCorpusStatsSourceKind,
     structural_hash: &str,
     crate_version: &str,
+    dso_version: &str,
 ) -> String {
     let source = match source_kind {
         IrFnCorpusStatsSourceKind::G8r => "g8r",
         IrFnCorpusStatsSourceKind::YosysAbc => "yosys_abc",
     };
     let crate_component = crate_version.replace('/', "_");
+    let dso_component = dso_version.replace('/', "_");
     format!(
-        "{}/{}:{}:{}",
+        "{}/{}:{}:{}:{}",
         ir_fn_corpus_incremental_delta_prefix(index_key),
         source,
         crate_component,
+        dso_component,
         structural_hash
     )
 }
@@ -1440,11 +1445,11 @@ fn short_structural_hash(hash: &str) -> &str {
 }
 
 fn entity_map_to_points(
-    map: &BTreeMap<(String, String), StdlibAigStatsPoint>,
+    map: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 ) -> Vec<IrFnCorpusEntityPoint> {
     map.iter()
         .map(
-            |((structural_hash, crate_version), point)| IrFnCorpusEntityPoint {
+            |((structural_hash, crate_version, _dso_version), point)| IrFnCorpusEntityPoint {
                 structural_hash: structural_hash.clone(),
                 crate_version: crate_version.clone(),
                 point: point.clone(),
@@ -1456,10 +1461,14 @@ fn entity_map_to_points(
 #[allow(dead_code)]
 fn entity_points_to_map(
     points: &[IrFnCorpusEntityPoint],
-) -> BTreeMap<(String, String), StdlibAigStatsPoint> {
+) -> BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> {
     let mut map = BTreeMap::new();
     for row in points {
-        let key = (row.structural_hash.clone(), row.crate_version.clone());
+        let key = (
+            row.structural_hash.clone(),
+            row.crate_version.clone(),
+            row.point.dso_version.clone(),
+        );
         upsert_aig_stats_point_by_key(&mut map, key, row.point.clone());
     }
     map
@@ -1469,8 +1478,8 @@ fn entity_points_to_map(
 fn paired_entity_maps_from_dataset(
     dataset: &StdlibG8rVsYosysDataset,
 ) -> (
-    BTreeMap<(String, String), StdlibAigStatsPoint>,
-    BTreeMap<(String, String), StdlibAigStatsPoint>,
+    BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 ) {
     let mut g8r_by_entity = BTreeMap::new();
     let mut yosys_by_entity = BTreeMap::new();
@@ -1482,7 +1491,11 @@ fn paired_entity_maps_from_dataset(
         else {
             continue;
         };
-        let key = (structural_hash, sample.crate_version.clone());
+        let key = (
+            structural_hash,
+            sample.crate_version.clone(),
+            sample.dso_version.clone(),
+        );
         let g8r = StdlibAigStatsPoint {
             fn_key: sample.fn_key.clone(),
             ir_action_id: sample.ir_action_id.clone(),
@@ -1566,8 +1579,8 @@ fn structural_hash_from_generated_ir_top_prefix(
 
 fn build_ir_fn_corpus_dataset_from_entity_maps(
     store: &ArtifactStore,
-    g8r_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
-    yosys_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
+    g8r_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    yosys_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
     ir_node_count_by_structural_hash: Option<&BTreeMap<String, u64>>,
     ir_node_count_by_source_ir_action_and_top: Option<&BTreeMap<String, BTreeMap<String, u64>>>,
     unique_ir_node_count_by_source_ir_action: Option<&BTreeMap<String, u64>>,
@@ -1636,11 +1649,7 @@ fn build_ir_fn_corpus_dataset_from_entity_maps(
         samples.push(StdlibG8rVsYosysSample {
             fn_key: g8r.fn_key.clone(),
             crate_version: g8r.crate_version.clone(),
-            dso_version: if g8r.dso_version.is_empty() {
-                yosys.dso_version.clone()
-            } else {
-                g8r.dso_version.clone()
-            },
+            dso_version: entity_key.2.clone(),
             stdlib_root_action_id: None,
             ir_action_id: g8r.ir_action_id.clone(),
             ir_top: g8r.ir_top.clone().or_else(|| yosys.ir_top.clone()),
@@ -1661,6 +1670,7 @@ fn build_ir_fn_corpus_dataset_from_entity_maps(
 
     samples.sort_by(|a, b| {
         cmp_dotted_numeric_version(&a.crate_version, &b.crate_version)
+            .then(cmp_dotted_numeric_version(&a.dso_version, &b.dso_version))
             .then(a.fn_key.cmp(&b.fn_key))
             .then(a.ir_action_id.cmp(&b.ir_action_id))
     });
@@ -1712,12 +1722,13 @@ fn build_ir_fn_corpus_state_from_incremental_deltas(
     if deltas.is_empty() {
         return None;
     }
-    let mut g8r_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
-    let mut yosys_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
+    let mut g8r_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> = BTreeMap::new();
+    let mut yosys_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> = BTreeMap::new();
     for delta in deltas {
         let key = (
             delta.row.structural_hash.clone(),
             delta.row.crate_version.clone(),
+            delta.row.point.dso_version.clone(),
         );
         match delta.source_kind {
             IrFnCorpusStatsSourceKind::G8r => {
@@ -1762,6 +1773,7 @@ fn write_ir_fn_corpus_incremental_delta_row(
         point.source_kind,
         &point.structural_hash,
         &point.crate_version,
+        &point.point.dso_version,
     );
     let row = IrFnCorpusIncrementalDeltaRow {
         source_kind: point.source_kind,
@@ -1933,6 +1945,7 @@ fn load_ir_fn_corpus_index_state(
             let key = (
                 delta.row.structural_hash.clone(),
                 delta.row.crate_version.clone(),
+                delta.row.point.dso_version.clone(),
             );
             match delta.source_kind {
                 IrFnCorpusStatsSourceKind::G8r => upsert_aig_stats_point_by_key(
@@ -2012,8 +2025,8 @@ fn write_ir_fn_corpus_index_state(
     index_key: &str,
     schema_version: u32,
     dataset: &StdlibG8rVsYosysDataset,
-    g8r_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
-    yosys_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
+    g8r_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    yosys_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 ) -> Result<(String, u64, DateTime<Utc>)> {
     let location = store.web_index_location(index_key);
     let (bytes, generated_utc) = serialize_ir_fn_corpus_index_state(
@@ -2048,8 +2061,8 @@ fn write_ir_fn_corpus_index_state(
 fn serialize_ir_fn_corpus_index_state(
     schema_version: u32,
     dataset: &StdlibG8rVsYosysDataset,
-    g8r_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
-    yosys_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
+    g8r_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    yosys_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 ) -> Result<(Vec<u8>, DateTime<Utc>)> {
     let generated_utc = Utc::now();
     let payload = IrFnCorpusG8rVsYosysIndexFile {
@@ -2066,8 +2079,8 @@ fn serialize_ir_fn_corpus_index_state(
 fn write_ir_fn_corpus_g8r_vs_yosys_index_state(
     store: &ArtifactStore,
     dataset: &StdlibG8rVsYosysDataset,
-    g8r_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
-    yosys_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
+    g8r_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    yosys_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 ) -> Result<(String, u64, DateTime<Utc>)> {
     write_ir_fn_corpus_index_state(
         store,
@@ -2082,8 +2095,8 @@ fn write_ir_fn_corpus_g8r_vs_yosys_index_state(
 fn write_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_index_state(
     store: &ArtifactStore,
     dataset: &StdlibG8rVsYosysDataset,
-    g8r_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
-    yosys_by_entity: &BTreeMap<(String, String), StdlibAigStatsPoint>,
+    g8r_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
+    yosys_by_entity: &BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint>,
 ) -> Result<(String, u64, DateTime<Utc>)> {
     write_ir_fn_corpus_index_state(
         store,
@@ -2370,7 +2383,11 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
             if row.crate_version != row.point.crate_version {
                 bail!("paired corpus G8r point has conflicting crate-version identity");
             }
-            let key = (structural_hash, row.crate_version);
+            let key = (
+                structural_hash,
+                row.crate_version,
+                row.point.dso_version.clone(),
+            );
             if g8r_by_entity.insert(key, row.point).is_some() {
                 bail!("paired corpus index has duplicate G8r entity points");
             }
@@ -2382,7 +2399,11 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
             if row.crate_version != row.point.crate_version {
                 bail!("paired corpus Yosys/ABC point has conflicting crate-version identity");
             }
-            let key = (structural_hash, row.crate_version);
+            let key = (
+                structural_hash,
+                row.crate_version,
+                row.point.dso_version.clone(),
+            );
             if yosys_by_entity.insert(key, row.point).is_some() {
                 bail!("paired corpus index has duplicate Yosys/ABC entity points");
             }
@@ -2398,7 +2419,11 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                 .as_deref()
                 .and_then(normalize_structural_hash_hex)
                 .context("paired corpus sample has no valid canonical structural hash")?;
-            let entity_key = (structural_hash.clone(), sample.crate_version.clone());
+            let entity_key = (
+                structural_hash.clone(),
+                sample.crate_version.clone(),
+                sample.dso_version.clone(),
+            );
             let g8r = g8r_by_entity
                 .get(&entity_key)
                 .context("paired corpus sample is missing its G8r entity point")?;
@@ -3152,8 +3177,8 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
         load_generated_ir_node_count_maps(store, provenances.as_ref());
     ir_node_count_by_structural_hash.extend(generated_ir_node_count_by_structural_hash);
 
-    let mut g8r_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
-    let mut yosys_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
+    let mut g8r_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> = BTreeMap::new();
+    let mut yosys_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> = BTreeMap::new();
     let total_provenances = provenances.len();
     let mut stats_actions_seen = 0_usize;
     let mut last_progress_log_at = Instant::now();
@@ -3241,7 +3266,7 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
             };
             upsert_aig_stats_point_by_key(
                 &mut g8r_by_entity,
-                (structural_hash, crate_version),
+                (structural_hash, crate_version, point.dso_version.clone()),
                 point,
             );
             continue;
@@ -3284,7 +3309,7 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
             };
             upsert_aig_stats_point_by_key(
                 &mut yosys_by_entity,
-                (structural_hash, crate_version),
+                (structural_hash, crate_version, point.dso_version.clone()),
                 point,
             );
         }
@@ -3449,8 +3474,8 @@ pub(crate) fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_s
             .extend(by_top);
     }
 
-    let mut g8r_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
-    let mut yosys_by_entity: BTreeMap<(String, String), StdlibAigStatsPoint> = BTreeMap::new();
+    let mut g8r_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> = BTreeMap::new();
+    let mut yosys_by_entity: BTreeMap<IrFnCorpusEntityKey, StdlibAigStatsPoint> = BTreeMap::new();
     let total_provenances = provenances.len();
     let mut stats_actions_seen = 0_usize;
     let mut last_progress_log_at = Instant::now();
@@ -3552,7 +3577,11 @@ pub(crate) fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_s
             IrFnCorpusStatsSourceKind::G8r => &mut g8r_by_entity,
             IrFnCorpusStatsSourceKind::YosysAbc => &mut yosys_by_entity,
         };
-        upsert_aig_stats_point_by_key(target, (structural_hash, crate_version), point);
+        upsert_aig_stats_point_by_key(
+            target,
+            (structural_hash, crate_version, point.dso_version.clone()),
+            point,
+        );
     }
     maybe_log_web_index_rebuild_progress(
         "ir-fn-g8r-abc-vs-codegen-yosys-abc",
@@ -3767,6 +3796,7 @@ pub(crate) fn maybe_upsert_ir_fn_corpus_g8r_vs_yosys_index_for_completed_action(
         upsert_point.source_kind,
         &upsert_point.structural_hash,
         &upsert_point.crate_version,
+        &upsert_point.point.dso_version,
     );
     if let Some(existing_bytes) = store.load_web_index_bytes(&delta_key)? {
         if let Ok(existing_row) =
@@ -3981,6 +4011,7 @@ pub(crate) fn maybe_upsert_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_index_for_c
         upsert_point.source_kind,
         &upsert_point.structural_hash,
         &upsert_point.crate_version,
+        &upsert_point.point.dso_version,
     );
     if let Some(existing_bytes) = store.load_web_index_bytes(&delta_key)? {
         if let Ok(existing_row) =
@@ -9923,6 +9954,7 @@ mod tests {
                 top_fn_name: Some("__float32__add".to_string()),
                 fraig: false,
                 lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: 0,
                 version: "0.35.0".to_string(),
                 runtime: runtime.clone(),
             },
@@ -10513,6 +10545,7 @@ mod tests {
                 top_fn_name: Some("__float32__add".to_string()),
                 fraig: false,
                 lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: 0,
                 version: "0.35.0".to_string(),
                 runtime: runtime.clone(),
             },
@@ -10541,6 +10574,7 @@ mod tests {
                 top_fn_name: Some("__k3_cone_deadbeef".to_string()),
                 fraig: false,
                 lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: 0,
                 version: "0.35.0".to_string(),
                 runtime,
             },
@@ -10632,6 +10666,7 @@ mod tests {
             top_fn_name: Some(ir_top.to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: "0.35.0".to_string(),
             runtime: runtime.clone(),
         };
@@ -10719,6 +10754,7 @@ mod tests {
                 top_fn_name: Some(ir_top.to_string()),
                 fraig: false,
                 lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: 0,
                 version: "0.35.0".to_string(),
                 runtime: runtime.clone(),
             },
@@ -10752,6 +10788,7 @@ mod tests {
                 top_fn_name: Some(ir_top.to_string()),
                 fraig: true,
                 lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: 0,
                 version: "0.35.0".to_string(),
                 runtime: runtime.clone(),
             },
@@ -11085,7 +11122,11 @@ mod tests {
         let ir_top = Some("__foo".to_string());
 
         let g8r_by_entity = BTreeMap::from([(
-            (structural_hash.clone(), crate_version.clone()),
+            (
+                structural_hash.clone(),
+                crate_version.clone(),
+                "0.35.0".to_string(),
+            ),
             StdlibAigStatsPoint {
                 fn_key: "foo".to_string(),
                 ir_action_id: g8r_ir_action_id.clone(),
@@ -11099,7 +11140,7 @@ mod tests {
             },
         )]);
         let yosys_by_entity = BTreeMap::from([(
-            (structural_hash, crate_version.clone()),
+            (structural_hash, crate_version.clone(), "0.35.0".to_string()),
             StdlibAigStatsPoint {
                 fn_key: "foo".to_string(),
                 ir_action_id: yosys_ir_action_id.clone(),
@@ -11137,6 +11178,92 @@ mod tests {
         assert_eq!(dataset.samples.len(), 1);
         assert_eq!(dataset.samples[0].crate_version, crate_version);
         assert_eq!(dataset.samples[0].ir_node_count, 123);
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn build_ir_fn_corpus_dataset_never_pairs_different_dso_versions() {
+        let (store, root) = make_test_store("ir-fn-corpus-dso-pairing");
+        let structural_hash = "a".repeat(64);
+        let crate_version = "0.34.0".to_string();
+        let g8r = StdlibAigStatsPoint {
+            fn_key: "foo".to_string(),
+            ir_action_id: "1".repeat(64),
+            ir_top: Some("__foo".to_string()),
+            crate_version: crate_version.clone(),
+            dso_version: "0.35.0".to_string(),
+            and_nodes: 10.0,
+            depth: 2.0,
+            created_utc: DateTime::<Utc>::UNIX_EPOCH,
+            stats_action_id: "3".repeat(64),
+        };
+        let old_yosys = StdlibAigStatsPoint {
+            fn_key: "foo".to_string(),
+            ir_action_id: "2".repeat(64),
+            ir_top: Some("__foo".to_string()),
+            crate_version: crate_version.clone(),
+            dso_version: "0.34.0".to_string(),
+            and_nodes: 8.0,
+            depth: 2.0,
+            created_utc: DateTime::<Utc>::UNIX_EPOCH,
+            stats_action_id: "4".repeat(64),
+        };
+        let g8r_by_entity = BTreeMap::from([(
+            (
+                structural_hash.clone(),
+                crate_version.clone(),
+                g8r.dso_version.clone(),
+            ),
+            g8r,
+        )]);
+        let mut yosys_by_entity = BTreeMap::from([(
+            (
+                structural_hash.clone(),
+                crate_version.clone(),
+                old_yosys.dso_version.clone(),
+            ),
+            old_yosys.clone(),
+        )]);
+
+        let mismatched = build_ir_fn_corpus_dataset_from_entity_maps(
+            &store,
+            &g8r_by_entity,
+            &yosys_by_entity,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(mismatched.samples.is_empty());
+        assert_eq!(mismatched.g8r_only_count, 1);
+        assert_eq!(mismatched.yosys_only_count, 1);
+
+        let mut matching_yosys = old_yosys;
+        matching_yosys.dso_version = "0.35.0".to_string();
+        yosys_by_entity.insert(
+            (
+                structural_hash,
+                crate_version,
+                matching_yosys.dso_version.clone(),
+            ),
+            matching_yosys,
+        );
+        let exact = build_ir_fn_corpus_dataset_from_entity_maps(
+            &store,
+            &g8r_by_entity,
+            &yosys_by_entity,
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(exact.samples.len(), 1);
+        assert_eq!(exact.samples[0].dso_version, "0.35.0");
+        assert_eq!(exact.g8r_only_count, 0);
+        assert_eq!(exact.yosys_only_count, 1);
 
         fs::remove_dir_all(root).expect("cleanup temp store");
     }

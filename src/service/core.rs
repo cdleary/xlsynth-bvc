@@ -519,6 +519,7 @@ pub(crate) fn build_aig_stat_diff_suggestion_for_stats_action(
             lowering_mode,
             version,
             runtime,
+            ..
         } => {
             if fraig || lowering_mode != G8rLoweringMode::Default {
                 return Ok(None);
@@ -581,6 +582,10 @@ pub(crate) fn build_aig_stat_diff_suggestion_for_stats_action(
                 top_fn_name: ctx.top_fn_name.clone(),
                 fraig: false,
                 lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision:
+                    crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                        &ctx.runtime.driver_version,
+                    ),
                 version: ctx.version.clone(),
                 runtime: ctx.runtime.clone(),
             };

@@ -2080,6 +2080,7 @@ mod tests {
             top_fn_name: Some("__cone_a".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: "v0.39.0".to_string(),
             runtime: sample_runtime(),
         };
@@ -2088,6 +2089,7 @@ mod tests {
             top_fn_name: Some("__cone_b".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: "v0.39.0".to_string(),
             runtime: sample_runtime(),
         };
@@ -2096,6 +2098,7 @@ mod tests {
             top_fn_name: Some("__cone_c".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+            execution_recipe_revision: 0,
             version: "v0.39.0".to_string(),
             runtime: sample_runtime(),
         };
@@ -2104,6 +2107,7 @@ mod tests {
             top_fn_name: Some("__cone_d".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: "v0.39.0".to_string(),
             runtime: sample_runtime(),
         };
@@ -2408,6 +2412,7 @@ mod tests {
             top_fn_name: Some("__top".to_string()),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
             version: "v0.35.0".to_string(),
             runtime: runtime.clone(),
         };

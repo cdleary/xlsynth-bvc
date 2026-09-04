@@ -198,6 +198,7 @@ pub(crate) fn execute_action(
             top_fn_name,
             fraig,
             lowering_mode,
+            execution_recipe_revision,
             version,
             runtime,
         } => run_driver_ir_to_g8r_aig_action(
@@ -208,6 +209,7 @@ pub(crate) fn execute_action(
             top_fn_name.as_deref(),
             *fraig,
             lowering_mode,
+            *execution_recipe_revision,
             version,
             runtime,
             &payload_dir,
@@ -445,6 +447,7 @@ pub(crate) fn execute_action_batch(
             runtime,
             fraig,
             lowering_mode,
+            ..
         } => execute_driver_ir_to_g8r_aig_batch(
             store,
             actions,
@@ -657,8 +660,18 @@ pub(crate) fn compute_action_id(action: &ActionSpec) -> Result<String> {
 fn canonicalize_action_for_execution(action: ActionSpec) -> Result<ActionSpec> {
     let proto = crate::proto::action_spec_to_proto(&action)
         .context("canonicalizing action before execution")?;
-    crate::proto::action_spec_from_proto(&proto)
-        .context("round-tripping canonical action before execution")
+    let mut canonical = crate::proto::action_spec_from_proto(&proto)
+        .context("round-tripping canonical action before execution")?;
+    if let ActionSpec::DriverIrToG8rAig {
+        execution_recipe_revision,
+        runtime,
+        ..
+    } = &mut canonical
+    {
+        *execution_recipe_revision =
+            crate::versioning::driver_ir2g8r_execution_recipe_revision(&runtime.driver_version);
+    }
+    Ok(canonical)
 }
 
 pub(crate) fn make_staging_dir(store: &ArtifactStore, action_id: &str) -> Result<PathBuf> {
@@ -1522,6 +1535,9 @@ pub(crate) fn run_driver_ir_to_opt_action(
             top_fn_name: None,
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version,
+            ),
             version: version.to_string(),
             runtime: runtime.clone(),
         },
@@ -1533,6 +1549,9 @@ pub(crate) fn run_driver_ir_to_opt_action(
             top_fn_name: None,
             fraig: true,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version,
+            ),
             version: version.to_string(),
             runtime: runtime.clone(),
         },
@@ -1544,6 +1563,9 @@ pub(crate) fn run_driver_ir_to_opt_action(
             top_fn_name: None,
             fraig: false,
             lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+            execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version,
+            ),
             version: version.to_string(),
             runtime: runtime.clone(),
         },
@@ -2561,6 +2583,7 @@ fn prepare_driver_ir_to_g8r_batch_action(
     let ActionSpec::DriverIrToG8rAig {
         ir_action_id,
         top_fn_name,
+        execution_recipe_revision,
         ..
     } = &action
     else {
@@ -2633,6 +2656,10 @@ fn prepare_driver_ir_to_g8r_batch_action(
     details.insert(
         "g8r_lowering_mode_flags".to_string(),
         json!(g8r_lowering_mode_extra_flags(lowering_mode)),
+    );
+    details.insert(
+        "driver_ir2g8r_execution_recipe_revision".to_string(),
+        json!(execution_recipe_revision),
     );
     details.insert("driver_subcommand".to_string(), json!("ir2g8r"));
     let mut capture_prepared_ir = false;
@@ -2755,11 +2782,13 @@ fn prepare_driver_ir_to_g8r_batch_action(
                     ActionSpec::DriverIrToG8rAig {
                         fraig: candidate_fraig,
                         lowering_mode: candidate_lowering_mode,
+                        execution_recipe_revision: candidate_execution_recipe_revision,
                         version: candidate_version,
                         runtime: candidate_runtime,
                         ..
                     } if *candidate_fraig == fraig
                         && candidate_lowering_mode == lowering_mode
+                        && candidate_execution_recipe_revision == execution_recipe_revision
                         && candidate_version == version
                         && same_driver_runtime(candidate_runtime, runtime)
                 );
@@ -3027,6 +3056,7 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
     top_fn_name: Option<&str>,
     fraig: bool,
     lowering_mode: &G8rLoweringMode,
+    execution_recipe_revision: u32,
     version: &str,
     runtime: &DriverRuntimeSpec,
     payload_dir: &Path,
@@ -3099,6 +3129,10 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
     details.insert(
         "g8r_lowering_mode_flags".to_string(),
         json!(g8r_lowering_mode_extra_flags(lowering_mode)),
+    );
+    details.insert(
+        "driver_ir2g8r_execution_recipe_revision".to_string(),
+        json!(execution_recipe_revision),
     );
     details.insert("driver_subcommand".to_string(), json!("ir2g8r"));
     let mut capture_prepared_ir = false;
@@ -3214,11 +3248,13 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
                 ActionSpec::DriverIrToG8rAig {
                     fraig: candidate_fraig,
                     lowering_mode: candidate_lowering_mode,
+                    execution_recipe_revision: candidate_execution_recipe_revision,
                     version: candidate_version,
                     runtime: candidate_runtime,
                     ..
                 } if *candidate_fraig == fraig
                     && candidate_lowering_mode == lowering_mode
+                    && *candidate_execution_recipe_revision == execution_recipe_revision
                     && candidate_version == version
                     && same_driver_runtime(candidate_runtime, runtime)
             );
@@ -4762,6 +4798,9 @@ pub(crate) fn build_k_bool_cone_corpus_suggested_actions_for_entries(
             top_fn_name: top.clone(),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version,
+            ),
             version: version.to_string(),
             runtime: runtime.clone(),
         };
@@ -4777,6 +4816,9 @@ pub(crate) fn build_k_bool_cone_corpus_suggested_actions_for_entries(
             top_fn_name: top.clone(),
             fraig: false,
             lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+            execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version,
+            ),
             version: version.to_string(),
             runtime: runtime.clone(),
         };
@@ -4988,6 +5030,9 @@ pub(crate) fn build_mffc_corpus_suggested_actions(
             top_fn_name: top.clone(),
             fraig: false,
             lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version,
+            ),
             version: version.to_string(),
             runtime: runtime.clone(),
         };
@@ -5003,6 +5048,9 @@ pub(crate) fn build_mffc_corpus_suggested_actions(
             top_fn_name: top.clone(),
             fraig: false,
             lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+            execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version,
+            ),
             version: version.to_string(),
             runtime: runtime.clone(),
         };
@@ -5602,6 +5650,19 @@ mod tests {
             assert!(capabilities.aiger_out);
             assert!(capabilities.top);
         }
+
+        assert_eq!(
+            crate::versioning::driver_ir2g8r_execution_recipe_revision("0.26.0"),
+            1
+        );
+        assert_eq!(
+            crate::versioning::driver_ir2g8r_execution_recipe_revision("v0.26.0"),
+            1
+        );
+        assert_eq!(
+            crate::versioning::driver_ir2g8r_execution_recipe_revision("0.27.0"),
+            0
+        );
     }
 
     #[test]
@@ -5679,6 +5740,47 @@ mod tests {
         };
         assert_eq!(dslx_file, "pkg/a/b.x");
         assert_eq!(runtime.dockerfile, "docker/xlsynth-driver.Dockerfile");
+    }
+
+    #[test]
+    fn corrected_historical_ir2g8r_recipe_has_a_distinct_action_identity() {
+        let runtime = DriverRuntimeSpec {
+            driver_version: "0.25.0".to_string(),
+            release_platform: "ubuntu2004".to_string(),
+            docker_image: "xlsynth-bvc-driver:0.25.0".to_string(),
+            dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
+        };
+        let legacy = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: "1".repeat(64),
+            top_fn_name: Some("main".to_string()),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
+            version: "v0.29.0".to_string(),
+            runtime,
+        };
+        let mut corrected = legacy.clone();
+        let ActionSpec::DriverIrToG8rAig {
+            execution_recipe_revision,
+            ..
+        } = &mut corrected
+        else {
+            unreachable!();
+        };
+        *execution_recipe_revision = 1;
+
+        assert_ne!(
+            compute_action_id(&legacy).expect("legacy id"),
+            compute_action_id(&corrected).expect("corrected id")
+        );
+        let canonical = canonicalize_action_for_execution(legacy).expect("canonical action");
+        assert_eq!(
+            compute_action_id(&canonical).expect("canonical id"),
+            compute_action_id(&corrected).expect("corrected id")
+        );
     }
 
     #[test]
@@ -6175,6 +6277,7 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
                     ref top_fn_name,
                     fraig: false,
                     lowering_mode: G8rLoweringMode::Default,
+                    execution_recipe_revision: 0,
                     ..
                 } if top_fn_name.as_deref() == Some("__k3_cone_aaaaaaaaaaaaaaaa")
             )
@@ -6186,6 +6289,7 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
                     ref top_fn_name,
                     fraig: false,
                     lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+                    execution_recipe_revision: 0,
                     ..
                 } if top_fn_name.as_deref() == Some("__k3_cone_aaaaaaaaaaaaaaaa")
             )
@@ -6257,6 +6361,7 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
                     ref top_fn_name,
                     fraig: false,
                     lowering_mode: G8rLoweringMode::Default,
+                    execution_recipe_revision: 0,
                     ..
                 } if top_fn_name.as_deref() == Some("__mffc_aaaaaaaaaaaaaaaa")
             )
@@ -6268,6 +6373,7 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
                     ref top_fn_name,
                     fraig: false,
                     lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+                    execution_recipe_revision: 0,
                     ..
                 } if top_fn_name.as_deref() == Some("__mffc_aaaaaaaaaaaaaaaa")
             )
