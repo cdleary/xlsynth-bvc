@@ -2351,7 +2351,8 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
     store: &ArtifactStore,
     comparison_indices: &[(&str, &[u8], u32)],
 ) -> Result<IrFnCorpusIrIndexBuild> {
-    type SideIdentity = (String, String, String);
+    type ReleaseIdentity = (String, String, String);
+    type SideIdentity = (String, String, String, String);
     #[derive(Debug, PartialEq, Eq)]
     struct PairRequest {
         crate_version: String,
@@ -2362,7 +2363,7 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
         yosys_abc: SideIdentity,
     }
 
-    let mut wanted: BTreeMap<String, BTreeMap<String, (String, String, String)>> = BTreeMap::new();
+    let mut wanted: BTreeMap<String, BTreeMap<String, BTreeSet<ReleaseIdentity>>> = BTreeMap::new();
     let mut pair_requests_by_identity = BTreeMap::new();
     for (_, comparison_index_bytes, expected_schema_version) in comparison_indices {
         let comparison: IrFnCorpusG8rVsYosysIndexFile =
@@ -2449,22 +2450,17 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                     point.dso_version.clone(),
                     structural_hash.clone(),
                 );
-                if let Some(existing) = wanted
+                wanted
                     .entry(point.ir_action_id.clone())
                     .or_default()
-                    .insert(ir_top.to_string(), release_identity.clone())
-                    && existing != release_identity
-                {
-                    bail!(
-                        "paired corpus index has conflicting release identity for action {} top {}",
-                        point.ir_action_id,
-                        ir_top
-                    );
-                }
+                    .entry(ir_top.to_string())
+                    .or_default()
+                    .insert(release_identity);
                 identities.push((
                     point.ir_action_id.clone(),
                     ir_top.to_string(),
                     sample.crate_version.clone(),
+                    point.dso_version.clone(),
                 ));
             }
             let pair_identity = (
@@ -2499,6 +2495,14 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
             format!("loading MFFC corpus provenance while exporting IR: {ir_action_id}")
         })?;
         generated_utc = generated_utc.max(provenance.created_utc);
+        let requested_tops = requested_tops
+            .into_iter()
+            .flat_map(|(ir_top, releases)| {
+                releases
+                    .into_iter()
+                    .map(move |release| (ir_top.clone(), release))
+            })
+            .collect::<Vec<_>>();
         match &provenance.action {
             ActionSpec::IrFnToMffcCorpus {
                 ir_action_id: expected_source_ir_action_id,
@@ -2620,7 +2624,7 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                         source_ir_action_id: source_ir_action_id.clone(),
                         source_ir_top: source_ir_top.clone(),
                         source_structural_hash: source_structural_hash.clone(),
-                        dso_version,
+                        dso_version: dso_version.clone(),
                         root_ir_text_id,
                         mffc_structure: Some(MffcIrStructure {
                             rank: manifest_entry.rank,
@@ -2641,7 +2645,12 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                     if canonical_hash.is_empty() {
                         bail!("paired MFFC sample has an empty canonical structural hash");
                     }
-                    let identity = (ir_action_id.clone(), ir_top.clone(), crate_version);
+                    let identity = (
+                        ir_action_id.clone(),
+                        ir_top.clone(),
+                        crate_version,
+                        dso_version,
+                    );
                     if sides_by_identity.insert(identity, side).is_some() {
                         bail!(
                             "duplicate exported MFFC side for action {ir_action_id} top {ir_top}"
@@ -2773,12 +2782,17 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                         source_ir_action_id: source_ir_action_id.clone(),
                         source_ir_top: source_ir_top.clone(),
                         source_structural_hash: source_structural_hash.clone(),
-                        dso_version,
+                        dso_version: dso_version.clone(),
                         root_ir_text_id,
                         mffc_structure: None,
                         ir_text,
                     };
-                    let identity = (ir_action_id.clone(), ir_top.clone(), crate_version);
+                    let identity = (
+                        ir_action_id.clone(),
+                        ir_top.clone(),
+                        crate_version,
+                        dso_version,
+                    );
                     if sides_by_identity.insert(identity, side).is_some() {
                         bail!(
                             "duplicate exported k-bool-cone side for action {ir_action_id} top {ir_top}"
@@ -2839,12 +2853,17 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                         source_ir_action_id: ir_action_id.clone(),
                         source_ir_top: ir_top.clone(),
                         source_structural_hash: canonical_hash,
-                        dso_version,
+                        dso_version: dso_version.clone(),
                         root_ir_text_id,
                         mffc_structure: None,
                         ir_text,
                     };
-                    let identity = (ir_action_id.clone(), ir_top.clone(), crate_version);
+                    let identity = (
+                        ir_action_id.clone(),
+                        ir_top.clone(),
+                        crate_version,
+                        dso_version,
+                    );
                     if sides_by_identity.insert(identity, side).is_some() {
                         bail!("duplicate exported IR side for action {ir_action_id} top {ir_top}");
                     }
@@ -2873,12 +2892,17 @@ pub(crate) fn build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
                         source_ir_action_id: ir_action_id.clone(),
                         source_ir_top: ir_top.clone(),
                         source_structural_hash: canonical_hash,
-                        dso_version,
+                        dso_version: dso_version.clone(),
                         root_ir_text_id,
                         mffc_structure: None,
                         ir_text,
                     };
-                    let identity = (ir_action_id.clone(), ir_top.clone(), crate_version);
+                    let identity = (
+                        ir_action_id.clone(),
+                        ir_top.clone(),
+                        crate_version,
+                        dso_version,
+                    );
                     if sides_by_identity.insert(identity, side).is_some() {
                         bail!("duplicate exported IR side for action {ir_action_id} top {ir_top}");
                     }
@@ -3240,7 +3264,14 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
                 &unique_structural_hash_by_ir_action,
                 &source_ctx.ir_action_id,
                 source_ctx.ir_top.as_deref(),
-            ) else {
+            )
+            .or_else(|| {
+                ir_fn_corpus_structural_hash_hint_for_aig_source(
+                    &provenance_by_action_id,
+                    StdlibTrendKind::G8r,
+                    aig_action_id,
+                )
+            }) else {
                 continue;
             };
             let crate_version = source_ctx.crate_version.clone();
@@ -3283,7 +3314,14 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
                 &unique_structural_hash_by_ir_action,
                 &source_ctx.ir_action_id,
                 source_ctx.ir_top.as_deref(),
-            ) else {
+            )
+            .or_else(|| {
+                ir_fn_corpus_structural_hash_hint_for_aig_source(
+                    &provenance_by_action_id,
+                    StdlibTrendKind::YosysAbc,
+                    aig_action_id,
+                )
+            }) else {
                 continue;
             };
             let crate_version = source_ctx.crate_version.clone();
@@ -5763,6 +5801,30 @@ pub(crate) struct StdlibTrendSourceContext {
     pub(crate) ir_top: Option<String>,
     pub(crate) crate_version: String,
     pub(crate) dso_version: String,
+}
+
+fn ir_fn_corpus_structural_hash_hint_for_aig_source(
+    provenance_by_action_id: &ProvenanceLookup<'_>,
+    kind: StdlibTrendKind,
+    aig_action_id: &str,
+) -> Option<String> {
+    let producer = *provenance_by_action_id.get(aig_action_id)?;
+    match (kind, &producer.action) {
+        (StdlibTrendKind::G8r, ActionSpec::DriverIrToG8rAig { .. }) => {
+            structural_hash_from_details(&producer.details)
+        }
+        (
+            StdlibTrendKind::YosysAbc,
+            ActionSpec::ComboVerilogToYosysAbcAig {
+                verilog_action_id, ..
+            },
+        ) => {
+            let verilog_provenance = *provenance_by_action_id.get(verilog_action_id.as_str())?;
+            structural_hash_from_details(&verilog_provenance.details)
+                .or_else(|| structural_hash_from_details(&producer.details))
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn extract_stdlib_trend_source_context(
@@ -9501,6 +9563,173 @@ mod tests {
     }
 
     #[test]
+    fn canonical_ir_fn_corpus_rebuild_uses_import_producer_hash_hints() {
+        let (store, root) = make_test_store("fixed-import-canonical-rebuild");
+        let empty_manifest = IrFnCorpusStructuralManifest {
+            schema_version: crate::IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION,
+            generated_utc: Utc::now(),
+            recompute_missing_hashes: false,
+            total_actions_scanned: 0,
+            total_driver_ir_to_opt_actions: 0,
+            total_ir_fn_to_k_bool_cone_corpus_actions: 0,
+            indexed_actions: 0,
+            indexed_k_bool_cone_members: 0,
+            distinct_structural_hashes: 0,
+            hash_from_dependency_hint_count: 0,
+            hash_recomputed_count: 0,
+            hash_hint_conflict_count: 0,
+            skipped_missing_output_count: 0,
+            skipped_missing_ir_top_count: 0,
+            skipped_missing_hash_hint_count: 0,
+            skipped_hash_error_count: 0,
+            skipped_k_bool_cone_manifest_errors: 0,
+            skipped_k_bool_cone_empty_count: 0,
+            source_action_set_sha256: None,
+            groups: Vec::new(),
+        };
+        store
+            .write_web_index_bytes(
+                ir_fn_corpus_structural_manifest_index_key(),
+                &serde_json::to_vec(&empty_manifest).expect("serialize empty manifest"),
+            )
+            .expect("write empty structural manifest");
+
+        let runtime = test_runtime();
+        let dso_version = "0.35.0";
+        let ir_top = "main";
+        let structural_hash = "c".repeat(64);
+        let import_action_id = materialize_test_provenance(
+            &store,
+            "import",
+            ActionSpec::ImportIrPackageFile {
+                source_sha256: "d".repeat(64),
+                top_fn_name: Some(ir_top.to_string()),
+            },
+            ArtifactType::IrPackageFile,
+            "payload/input.ir",
+        );
+
+        let g8r_action_id = materialize_test_provenance(
+            &store,
+            "g8r",
+            ActionSpec::DriverIrToG8rAig {
+                ir_action_id: import_action_id.clone(),
+                top_fn_name: Some(ir_top.to_string()),
+                fraig: false,
+                lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: 0,
+                version: dso_version.to_string(),
+                runtime: runtime.clone(),
+            },
+            ArtifactType::AigFile,
+            "payload/g8r.aig",
+        );
+        let mut g8r_provenance = store
+            .load_provenance(&g8r_action_id)
+            .expect("load G8r provenance");
+        g8r_provenance.details = json!({
+            INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY: structural_hash.clone(),
+            "ir_top": ir_top,
+        });
+        store
+            .write_provenance(&g8r_provenance)
+            .expect("write G8r hash hint");
+        let g8r_stats_action_id = materialize_test_provenance(
+            &store,
+            "g8r-stats",
+            ActionSpec::DriverAigToStats {
+                aig_action_id: g8r_action_id,
+                version: dso_version.to_string(),
+                runtime: runtime.clone(),
+            },
+            ArtifactType::AigStatsFile,
+            "payload/stats.json",
+        );
+        overwrite_test_artifact(
+            &store,
+            &g8r_stats_action_id,
+            ArtifactType::AigStatsFile,
+            "payload/stats.json",
+            r#"{"and_nodes": 10, "depth": 3}"#,
+        );
+
+        let verilog_action_id = materialize_test_provenance(
+            &store,
+            "verilog",
+            ActionSpec::IrFnToCombinationalVerilog {
+                ir_action_id: import_action_id.clone(),
+                top_fn_name: Some(ir_top.to_string()),
+                use_system_verilog: false,
+                version: dso_version.to_string(),
+                runtime: runtime.clone(),
+            },
+            ArtifactType::VerilogFile,
+            "payload/module.v",
+        );
+        let mut verilog_provenance = store
+            .load_provenance(&verilog_action_id)
+            .expect("load Verilog provenance");
+        verilog_provenance.details = json!({
+            INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY: structural_hash.clone(),
+            "ir_top": ir_top,
+        });
+        store
+            .write_provenance(&verilog_provenance)
+            .expect("write Verilog hash hint");
+        let yosys_action_id = materialize_test_provenance(
+            &store,
+            "yosys",
+            ActionSpec::ComboVerilogToYosysAbcAig {
+                verilog_action_id,
+                verilog_top_module_name: Some(ir_top.to_string()),
+                frontend: YosysVerilogFrontend::Builtin,
+                yosys_script_ref: ScriptRef {
+                    path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
+                    sha256: "0".repeat(64),
+                },
+                runtime: crate::runtime::test_yosys_runtime(),
+            },
+            ArtifactType::AigFile,
+            "payload/yosys.aig",
+        );
+        let yosys_stats_action_id = materialize_test_provenance(
+            &store,
+            "yosys-stats",
+            ActionSpec::DriverAigToStats {
+                aig_action_id: yosys_action_id,
+                version: dso_version.to_string(),
+                runtime,
+            },
+            ArtifactType::AigStatsFile,
+            "payload/stats.json",
+        );
+        overwrite_test_artifact(
+            &store,
+            &yosys_stats_action_id,
+            ArtifactType::AigStatsFile,
+            "payload/stats.json",
+            r#"{"and_nodes": 8, "depth": 2}"#,
+        );
+
+        let state = build_ir_fn_corpus_g8r_vs_yosys_build_state(
+            &store,
+            &std::env::current_dir().expect("repo root"),
+        )
+        .expect("canonical rebuild");
+        assert_eq!(state.dataset.samples.len(), 1);
+        let sample = &state.dataset.samples[0];
+        assert_eq!(sample.ir_action_id, import_action_id);
+        assert_eq!(
+            sample.structural_hash.as_deref(),
+            Some(structural_hash.as_str())
+        );
+        assert_eq!(sample.g8r_nodes, 10.0);
+        assert_eq!(sample.yosys_abc_nodes, 8.0);
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
     fn ir_fn_corpus_ir_index_exports_only_paired_function_blocks() {
         let (store, root) = make_test_store("mffc-ir-index");
         let source_structural_hash = "d".repeat(64);
@@ -9880,6 +10109,140 @@ mod tests {
         .expect("public IR function corpus manifest validates");
         crate::query::canonicalize_public_web_index_json(&shard_key, shard_bytes)
             .expect("public IR function corpus shard validates");
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn ir_fn_corpus_ir_index_reuses_one_import_across_release_identities() {
+        let (store, root) = make_test_store("fixed-import-ir-index");
+        let ir_top = "main";
+        let structural_hash = "a".repeat(64);
+        let import_action_id = materialize_test_provenance(
+            &store,
+            "import",
+            ActionSpec::ImportIrPackageFile {
+                source_sha256: "b".repeat(64),
+                top_fn_name: Some(ir_top.to_string()),
+            },
+            ArtifactType::IrPackageFile,
+            "payload/input.ir",
+        );
+        overwrite_test_artifact(
+            &store,
+            &import_action_id,
+            ArtifactType::IrPackageFile,
+            "payload/input.ir",
+            "package p\n\ntop fn main(x: bits[1] id=1) -> bits[1] {\n  ret result: bits[1] = identity(x, id=2)\n}\n",
+        );
+
+        let mut samples = Vec::new();
+        let mut g8r_points = Vec::new();
+        let mut yosys_points = Vec::new();
+        for (index, (crate_version, dso_version)) in [
+            ("0.25.0", "0.29.0"),
+            ("0.25.0", "0.30.0"),
+            ("0.26.0", "0.30.0"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let g8r_stats_action_id = format!("{:064x}", index + 1);
+            let yosys_stats_action_id = format!("{:064x}", index + 11);
+            samples.push(StdlibG8rVsYosysSample {
+                fn_key: "main".to_string(),
+                crate_version: crate_version.to_string(),
+                dso_version: dso_version.to_string(),
+                stdlib_root_action_id: None,
+                ir_action_id: import_action_id.clone(),
+                ir_top: Some(ir_top.to_string()),
+                structural_hash: Some(structural_hash.clone()),
+                ir_node_count: 1,
+                g8r_nodes: 2.0,
+                g8r_levels: 2.0,
+                yosys_abc_nodes: 1.0,
+                yosys_abc_levels: 2.0,
+                g8r_product: 4.0,
+                yosys_abc_product: 2.0,
+                g8r_product_loss: 2.0,
+                g8r_stats_action_id: g8r_stats_action_id.clone(),
+                yosys_abc_stats_action_id: yosys_stats_action_id.clone(),
+            });
+            let point = |stats_action_id: String| IrFnCorpusEntityPoint {
+                structural_hash: structural_hash.clone(),
+                crate_version: crate_version.to_string(),
+                point: StdlibAigStatsPoint {
+                    fn_key: "main".to_string(),
+                    ir_action_id: import_action_id.clone(),
+                    ir_top: Some(ir_top.to_string()),
+                    crate_version: crate_version.to_string(),
+                    dso_version: dso_version.to_string(),
+                    and_nodes: 1.0,
+                    depth: 1.0,
+                    created_utc: Utc::now(),
+                    stats_action_id,
+                },
+            };
+            g8r_points.push(point(g8r_stats_action_id));
+            yosys_points.push(point(yosys_stats_action_id));
+        }
+        let comparison = IrFnCorpusG8rVsYosysIndexFile {
+            schema_version: WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+            generated_utc: Utc::now(),
+            dataset: StdlibG8rVsYosysDataset {
+                fraig: false,
+                samples,
+                min_ir_nodes: 1,
+                max_ir_nodes: 1,
+                g8r_only_count: 0,
+                yosys_only_count: 0,
+                available_crate_versions: vec!["0.25.0".to_string(), "0.26.0".to_string()],
+            },
+            g8r_points,
+            yosys_points,
+        };
+        let comparison_bytes = serde_json::to_vec(&comparison).expect("serialize comparison");
+        let build = build_ir_fn_corpus_ir_index_bytes_for_paired_indices(
+            &store,
+            &[(
+                WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+                comparison_bytes.as_slice(),
+                WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
+            )],
+        )
+        .expect("export reused import for both releases");
+        assert_eq!(build.entry_count, 3);
+        let shard_key = format!(
+            "{}/{}.json",
+            WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE,
+            &structural_hash[..2]
+        );
+        let shard: IrFnCorpusIrShardFile = serde_json::from_slice(
+            &build
+                .shard_files
+                .iter()
+                .find(|(key, _)| key == &shard_key)
+                .expect("find hash shard")
+                .1,
+        )
+        .expect("parse hash shard");
+        assert_eq!(shard.entries.len(), 3);
+        assert_eq!(
+            shard
+                .entries
+                .iter()
+                .filter(|entry| entry.crate_version == "0.25.0")
+                .count(),
+            2
+        );
+        assert_eq!(
+            shard
+                .entries
+                .iter()
+                .map(|entry| entry.g8r.dso_version.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["0.29.0", "0.30.0"])
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp store");
     }

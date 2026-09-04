@@ -408,15 +408,19 @@ fn is_progression_fixed_ir_sample(sample: &StdlibG8rVsYosysSample) -> bool {
         .is_some_and(|top| top.starts_with("__k3_cone_") || top.starts_with("__mffc_"))
 }
 
-fn empty_browser_progression_catalog() -> BrowserProgressionCatalog {
-    BrowserProgressionCatalog {
+fn empty_browser_progression_catalog() -> Result<BrowserProgressionCatalog> {
+    let cohort = release_progression_ir_hashes()?;
+    let cohort_ir_count =
+        u64::try_from(cohort.len()).context("fixed IR cohort size exceeds u64")?;
+    let cohort_ir_sha256 = Some(progression_ir_sha256(&cohort)?);
+    Ok(BrowserProgressionCatalog {
         dataset_key: crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME.to_string(),
-        cohort_ir_count: 0,
-        cohort_ir_sha256: None,
-        cohort_ir_hashes: Vec::new(),
+        cohort_ir_count,
+        cohort_ir_sha256,
+        cohort_ir_hashes: cohort,
         cohort_complete_generation_count: 0,
         generations: Vec::new(),
-    }
+    })
 }
 
 fn build_browser_progression_catalog(
@@ -428,7 +432,7 @@ fn build_browser_progression_catalog(
         .filter(|sample| is_progression_fixed_ir_sample(sample))
         .collect::<Vec<_>>();
     if fixed_samples.is_empty() {
-        return Ok(empty_browser_progression_catalog());
+        return empty_browser_progression_catalog();
     }
 
     let mut grouped = BTreeMap::<(String, String), BTreeSet<String>>::new();
@@ -529,7 +533,7 @@ fn build_browser_progression_catalog_from_site(
         .iter()
         .find(|dataset| dataset.logical_key == crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME)
     else {
-        return Ok(empty_browser_progression_catalog());
+        return empty_browser_progression_catalog();
     };
     let comparison_bytes = fs::read(site_dir.join(&comparison_entry.url)).with_context(|| {
         format!(

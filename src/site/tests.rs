@@ -705,7 +705,18 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
     });
     let unavailable = build_browser_progression_catalog(&generated_only)
         .expect("generated-only datasets keep the site publishable");
-    assert_eq!(unavailable.cohort_ir_count, 0);
+    assert_eq!(
+        unavailable.cohort_ir_count,
+        RELEASE_PROGRESSION_IR_COUNT as u64
+    );
+    assert_eq!(
+        unavailable.cohort_ir_hashes.len(),
+        RELEASE_PROGRESSION_IR_COUNT
+    );
+    assert_eq!(
+        unavailable.cohort_ir_sha256.as_deref(),
+        Some(RELEASE_PROGRESSION_IR_SHA256)
+    );
     assert_eq!(unavailable.cohort_complete_generation_count, 0);
     assert!(unavailable.generations.is_empty());
 }

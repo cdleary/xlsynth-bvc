@@ -268,6 +268,7 @@ pub(crate) fn enqueue_action_with_priority(
     action: ActionSpec,
     priority: i32,
 ) -> Result<String> {
+    let action = crate::executor::canonicalize_action_identity(action);
     let action_id = crate::executor::compute_action_id(&action)?;
     let _transition_lock = QueueTransitionLock::acquire(store, &action_id)?;
     enqueue_action_with_priority_locked(store, action, priority, action_id)
@@ -334,6 +335,7 @@ pub(crate) fn retry_action_with_priority(
     action: ActionSpec,
     priority: i32,
 ) -> Result<String> {
+    let action = crate::executor::canonicalize_action_identity(action);
     let action_id = crate::executor::compute_action_id(&action)?;
     let _transition_lock = QueueTransitionLock::acquire(store, &action_id)?;
     if !store.running_queue_path(&action_id).exists()
@@ -348,6 +350,32 @@ pub(crate) fn retry_action_with_priority(
 
 pub(crate) fn enqueue_action(store: &ArtifactStore, action: ActionSpec) -> Result<String> {
     enqueue_action_with_priority(store, action, crate::DEFAULT_QUEUE_PRIORITY)
+}
+
+fn requeue_pending_action_with_canonical_identity(
+    store: &ArtifactStore,
+    pending_path: &Path,
+    record_action_id: &str,
+    priority: i32,
+    action: ActionSpec,
+) -> Result<Option<ActionSpec>> {
+    let canonical = crate::executor::canonicalize_action_identity(action);
+    let canonical_id = crate::executor::compute_action_id(&canonical)?;
+    if canonical_id == record_action_id {
+        return Ok(Some(canonical));
+    }
+
+    let _transition_lock = QueueTransitionLock::acquire(store, record_action_id)?;
+    if !pending_path.exists() {
+        return Ok(None);
+    }
+    enqueue_action_with_priority(store, canonical, priority)?;
+    remove_file_if_exists(pending_path)?;
+    eprintln!(
+        "requeued pending action under canonical identity: old={} new={}",
+        record_action_id, canonical_id
+    );
+    Ok(None)
 }
 
 pub(crate) fn claim_next_pending_item(
@@ -417,6 +445,16 @@ pub(crate) fn claim_next_pending_item(
                     continue;
                 }
             };
+        let Some(action) = requeue_pending_action_with_canonical_identity(
+            store,
+            &pending_path,
+            &action_id,
+            priority,
+            action,
+        )?
+        else {
+            continue;
+        };
         match classify_action_readiness(store, &action)? {
             ActionReadiness::Ready => {
                 insert_ready_candidate(
@@ -534,6 +572,16 @@ pub(crate) fn claim_compatible_pending_items(
                     continue;
                 }
             };
+        let Some(action) = requeue_pending_action_with_canonical_identity(
+            store,
+            &pending_path,
+            &action_id,
+            priority,
+            action,
+        )?
+        else {
+            continue;
+        };
         if action_batch_key(&action).as_ref() != Some(batch_key) {
             continue;
         }
@@ -2487,6 +2535,78 @@ mod tests {
         assert!(!pending_path.exists());
 
         fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn legacy_ir2g8r_pending_identity_is_requeued_before_claim() {
+        let (store, root) = make_test_store();
+        let input_action_id = write_completed_provenance(&store, &"1".repeat(64));
+        let mut runtime = sample_runtime();
+        runtime.driver_version = "0.25.0".to_string();
+        let legacy = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: input_action_id,
+            top_fn_name: Some("main".to_string()),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
+            version: "v0.29.0".to_string(),
+            runtime,
+        };
+        let pre_upgrade_id = crate::proto::compute_model_action_id_v2(&legacy)
+            .expect("pre-upgrade id")
+            .to_hex();
+        let canonical_id = enqueue_action(&store, legacy.clone()).expect("canonical enqueue");
+        assert_ne!(pre_upgrade_id, canonical_id);
+        let pending = load_queue_pending_record(&store, &canonical_id)
+            .expect("load canonical pending")
+            .expect("canonical pending exists");
+        assert!(matches!(
+            pending.action,
+            ActionSpec::DriverIrToG8rAig {
+                execution_recipe_revision: 1,
+                ..
+            }
+        ));
+        remove_file_if_exists(&store.pending_queue_path(&canonical_id))
+            .expect("remove canonical setup record");
+
+        let legacy_item = QueueItem {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id: pre_upgrade_id.clone(),
+            enqueued_utc: Utc::now(),
+            priority: 7,
+            action: legacy,
+        };
+        let legacy_path = store.pending_queue_path(&pre_upgrade_id);
+        fs::create_dir_all(legacy_path.parent().expect("legacy pending parent"))
+            .expect("create legacy pending parent");
+        fs::write(
+            &legacy_path,
+            encode_queue_item(&legacy_item).expect("encode legacy pending"),
+        )
+        .expect("write legacy pending");
+
+        assert!(
+            claim_next_pending_item(&store, "worker-migrate", 60)
+                .expect("migrate legacy pending")
+                .is_none()
+        );
+        assert!(!legacy_path.exists());
+        assert!(store.pending_queue_path(&canonical_id).exists());
+        let running = claim_next_pending_item(&store, "worker-migrate", 60)
+            .expect("claim canonical pending")
+            .expect("canonical action should be claimable");
+        assert_eq!(running.action_id(), canonical_id);
+        assert!(matches!(
+            running.action(),
+            ActionSpec::DriverIrToG8rAig {
+                execution_recipe_revision: 1,
+                ..
+            }
+        ));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     fn terminal_test_action() -> ActionSpec {

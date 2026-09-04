@@ -653,25 +653,30 @@ pub(crate) fn promote_staging_action_dir(staging_dir: &Path, final_dir: &Path) -
     }
 }
 
-pub(crate) fn compute_action_id(action: &ActionSpec) -> Result<String> {
-    Ok(crate::proto::compute_model_action_id_v2(action)?.to_hex())
-}
-
-fn canonicalize_action_for_execution(action: ActionSpec) -> Result<ActionSpec> {
-    let proto = crate::proto::action_spec_to_proto(&action)
-        .context("canonicalizing action before execution")?;
-    let mut canonical = crate::proto::action_spec_from_proto(&proto)
-        .context("round-tripping canonical action before execution")?;
+pub(crate) fn canonicalize_action_identity(mut action: ActionSpec) -> ActionSpec {
     if let ActionSpec::DriverIrToG8rAig {
         execution_recipe_revision,
         runtime,
         ..
-    } = &mut canonical
+    } = &mut action
     {
         *execution_recipe_revision =
             crate::versioning::driver_ir2g8r_execution_recipe_revision(&runtime.driver_version);
     }
-    Ok(canonical)
+    action
+}
+
+pub(crate) fn compute_action_id(action: &ActionSpec) -> Result<String> {
+    let canonical = canonicalize_action_identity(action.clone());
+    Ok(crate::proto::compute_model_action_id_v2(&canonical)?.to_hex())
+}
+
+fn canonicalize_action_for_execution(action: ActionSpec) -> Result<ActionSpec> {
+    let action = canonicalize_action_identity(action);
+    let proto = crate::proto::action_spec_to_proto(&action)
+        .context("canonicalizing action before execution")?;
+    crate::proto::action_spec_from_proto(&proto)
+        .context("round-tripping canonical action before execution")
 }
 
 pub(crate) fn make_staging_dir(store: &ArtifactStore, action_id: &str) -> Result<PathBuf> {
@@ -5772,14 +5777,19 @@ mod tests {
         };
         *execution_recipe_revision = 1;
 
-        assert_ne!(
-            compute_action_id(&legacy).expect("legacy id"),
-            compute_action_id(&corrected).expect("corrected id")
+        let pre_upgrade_id = crate::proto::compute_model_action_id_v2(&legacy)
+            .expect("pre-upgrade id")
+            .to_hex();
+        let corrected_id = compute_action_id(&corrected).expect("corrected id");
+        assert_ne!(pre_upgrade_id, corrected_id);
+        assert_eq!(
+            compute_action_id(&legacy).expect("canonicalized legacy id"),
+            corrected_id
         );
         let canonical = canonicalize_action_for_execution(legacy).expect("canonical action");
         assert_eq!(
             compute_action_id(&canonical).expect("canonical id"),
-            compute_action_id(&corrected).expect("corrected id")
+            corrected_id
         );
     }
 
