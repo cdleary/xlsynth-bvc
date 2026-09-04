@@ -38,6 +38,23 @@ static DRIVER_SUBCOMMAND_HELP_TOKEN_CACHE: OnceLock<
     Mutex<BTreeMap<DriverSubcommandHelpTokenCacheKey, bool>>,
 > = OnceLock::new();
 const DRIVER_IR_EQUIV_TIMEOUT_SECONDS: u64 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DriverIr2g8rTopStrategy {
+    pass_top_flag: bool,
+    rewrite_input: bool,
+}
+
+fn driver_ir2g8r_top_strategy(
+    capabilities: DriverIr2g8rCliCapabilities,
+    has_explicit_top: bool,
+) -> DriverIr2g8rTopStrategy {
+    DriverIr2g8rTopStrategy {
+        pass_top_flag: capabilities.top && has_explicit_top,
+        rewrite_input: !capabilities.top && has_explicit_top,
+    }
+}
+
 pub(crate) fn execute_action(
     store: &ArtifactStore,
     action: ActionSpec,
@@ -476,7 +493,9 @@ struct DriverIrToG8rBatchRunnable {
     suggested_next_actions: Vec<SuggestedAction>,
     ir_input_path: PathBuf,
     explicit_ir_top: Option<String>,
-    standalone_ir_top: Option<String>,
+    input_rewrite_top: Option<String>,
+    isolate_input_top: bool,
+    top_strategy: DriverIr2g8rTopStrategy,
     ir2g8r_cli: DriverIr2g8rCliCapabilities,
     capture_prepared_ir: bool,
 }
@@ -2567,6 +2586,7 @@ fn prepare_driver_ir_to_g8r_batch_action(
     };
 
     let ir2g8r_cli = driver_ir2g8r_cli_capabilities(&runtime.driver_version);
+    let top_strategy = driver_ir2g8r_top_strategy(ir2g8r_cli, explicit_ir_top.is_some());
     let prepared_ir_relpath = "prep_for_gatify.ir";
     let mut suggested_next_actions = Vec::new();
     let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
@@ -2800,13 +2820,13 @@ fn prepare_driver_ir_to_g8r_batch_action(
             json!(LEGACY_G8R_STATS_RELPATH),
         );
     }
-    if ir2g8r_cli.top && explicit_ir_top.is_some() {
+    if top_strategy.pass_top_flag {
         details.insert("driver_ir2g8r_passed_top".to_string(), json!(true));
-    } else if !ir2g8r_cli.top && explicit_ir_top.is_some() {
+    } else if top_strategy.rewrite_input {
         details.insert("driver_ir2g8r_passed_top".to_string(), json!(false));
         details.insert(
             "driver_ir2g8r_top_ignored_reason".to_string(),
-            json!("top_flag_unsupported_before_v0_27"),
+            json!("top_flag_unsupported_input_rewritten"),
         );
     }
 
@@ -2822,10 +2842,16 @@ fn prepare_driver_ir_to_g8r_batch_action(
             details,
             suggested_next_actions,
             ir_input_path,
+            input_rewrite_top: if input_ir_is_generated_k_bool_cone {
+                inferred_ir_top.clone()
+            } else if top_strategy.rewrite_input {
+                explicit_ir_top.clone()
+            } else {
+                None
+            },
             explicit_ir_top,
-            standalone_ir_top: input_ir_is_generated_k_bool_cone
-                .then(|| inferred_ir_top.clone())
-                .flatten(),
+            isolate_input_top: input_ir_is_generated_k_bool_cone,
+            top_strategy,
             ir2g8r_cli,
             capture_prepared_ir,
         },
@@ -2863,13 +2889,14 @@ fn run_driver_ir_to_g8r_batch_runnable(
             write_driver_ir_input_for_top(
                 &member.ir_input_path,
                 &input_path,
-                member.standalone_ir_top.as_deref(),
+                member.input_rewrite_top.as_deref(),
+                member.isolate_input_top,
             )?;
             let output_dir = outputs_dir.join(index.to_string());
             fs::create_dir_all(&output_dir)
                 .with_context(|| format!("creating batch output dir: {}", output_dir.display()))?;
 
-            let ir2g8r_top_flag = if member.ir2g8r_cli.top {
+            let ir2g8r_top_flag = if member.top_strategy.pass_top_flag {
                 member
                     .explicit_ir_top
                     .as_ref()
@@ -2878,11 +2905,15 @@ fn run_driver_ir_to_g8r_batch_runnable(
             } else {
                 String::new()
             };
-            let ir2gates_top_flag = member
-                .explicit_ir_top
-                .as_ref()
-                .map(|top| format!(" --top {}", shell_single_quote(top)))
-                .unwrap_or_default();
+            let ir2gates_top_flag = if member.top_strategy.pass_top_flag {
+                member
+                    .explicit_ir_top
+                    .as_ref()
+                    .map(|top| format!(" --top {}", shell_single_quote(top)))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let input_ref = format!("/batch/inputs/{index}.ir");
             let output_ref = format!("/batch/outputs/{index}");
             script_body.push_str(&format!("mkdir -p {output_ref}\nif "));
@@ -3021,6 +3052,7 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
     };
 
     let ir2g8r_cli = driver_ir2g8r_cli_capabilities(&runtime.driver_version);
+    let top_strategy = driver_ir2g8r_top_strategy(ir2g8r_cli, explicit_ir_top.is_some());
     let prepared_ir_relpath = "prep_for_gatify.ir";
     let mut suggested_next_actions = Vec::new();
     let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
@@ -3249,12 +3281,12 @@ test -s /outputs/result.g8r_stats.json
 "#,
         )
     } else {
-        let ir2g8r_top_flag = if ir2g8r_cli.top && explicit_ir_top.is_some() {
+        let ir2g8r_top_flag = if top_strategy.pass_top_flag {
             r#" --top "${IR_TOP}""#
         } else {
             ""
         };
-        let ir2gates_top_flag = if explicit_ir_top.is_some() {
+        let ir2gates_top_flag = if top_strategy.pass_top_flag {
             r#" --top "${IR_TOP}""#
         } else {
             ""
@@ -3284,16 +3316,16 @@ test -s /outputs/result.g8r_stats.json
         "G8R_EXTRA_FLAGS".to_string(),
         g8r_lowering_mode_extra_flags(lowering_mode).to_string(),
     );
-    if ir2g8r_cli.top && explicit_ir_top.is_some() {
+    if top_strategy.pass_top_flag {
         details.insert("driver_ir2g8r_passed_top".to_string(), json!(true));
-    } else if !ir2g8r_cli.top && explicit_ir_top.is_some() {
+    } else if top_strategy.rewrite_input {
         details.insert("driver_ir2g8r_passed_top".to_string(), json!(false));
         details.insert(
             "driver_ir2g8r_top_ignored_reason".to_string(),
-            json!("top_flag_unsupported_before_v0_27"),
+            json!("top_flag_unsupported_input_rewritten"),
         );
     }
-    if (ir2g8r_cli.top || capture_prepared_ir)
+    if top_strategy.pass_top_flag
         && let Some(top) = &explicit_ir_top
     {
         env.insert("IR_TOP".to_string(), top.clone());
@@ -3301,10 +3333,22 @@ test -s /outputs/result.g8r_stats.json
 
     let mut docker_ir_input_path = ir_input_path.clone();
     let mut isolated_work_dir = None;
-    if input_ir_is_generated_k_bool_cone && let Some(top) = inferred_ir_top.as_deref() {
-        let work_dir = make_temp_work_dir("ir2g8r-cone")?;
+    let input_rewrite_top = if input_ir_is_generated_k_bool_cone {
+        inferred_ir_top.as_deref()
+    } else if top_strategy.rewrite_input {
+        explicit_ir_top.as_deref()
+    } else {
+        None
+    };
+    if let Some(top) = input_rewrite_top {
+        let work_dir = make_temp_work_dir("ir2g8r-top")?;
         let isolated_path = work_dir.join("input.ir");
-        write_driver_ir_input_for_top(&ir_input_path, &isolated_path, Some(top))?;
+        write_driver_ir_input_for_top(
+            &ir_input_path,
+            &isolated_path,
+            Some(top),
+            input_ir_is_generated_k_bool_cone,
+        )?;
         docker_ir_input_path = isolated_path;
         isolated_work_dir = Some(work_dir);
     }
@@ -3792,6 +3836,7 @@ fn write_driver_ir_input_for_top(
     source_path: &Path,
     destination_path: &Path,
     explicit_ir_top: Option<&str>,
+    isolate_top_function: bool,
 ) -> Result<bool> {
     let Some(ir_top) = explicit_ir_top else {
         fs::copy(source_path, destination_path).with_context(|| {
@@ -3805,12 +3850,17 @@ fn write_driver_ir_input_for_top(
     };
 
     let package_text = fs::read_to_string(source_path)
-        .with_context(|| format!("reading cone IR package: {}", source_path.display()))?;
-    let isolated = extract_standalone_ir_fn_package(&package_text, ir_top)
-        .with_context(|| format!("extracting standalone cone IR function `{ir_top}`"))?;
-    fs::write(destination_path, isolated).with_context(|| {
+        .with_context(|| format!("reading driver IR package: {}", source_path.display()))?;
+    let rewritten = if isolate_top_function {
+        extract_standalone_ir_fn_package(&package_text, ir_top)
+            .with_context(|| format!("extracting standalone driver IR function `{ir_top}`"))?
+    } else {
+        rewrite_ir_package_top_function(&package_text, ir_top)
+            .with_context(|| format!("marking requested driver IR top function `{ir_top}`"))?
+    };
+    fs::write(destination_path, rewritten).with_context(|| {
         format!(
-            "writing standalone cone IR input: {}",
+            "writing rewritten driver IR input: {}",
             destination_path.display()
         )
     })?;
@@ -5747,6 +5797,33 @@ fn __k3_cone_bbbb(y: bits[1] id=3) -> bits[1] {
         assert!(package.contains("ret y.4"));
         assert!(!package.contains("__k3_cone_aaaa"));
         assert_eq!(package.matches("top fn ").count(), 1);
+    }
+
+    #[test]
+    fn historical_ir2g8r_top_strategy_rewrites_selected_function() {
+        let historical = driver_ir2g8r_top_strategy(driver_ir2g8r_cli_capabilities("0.26.0"), true);
+        assert!(!historical.pass_top_flag);
+        assert!(historical.rewrite_input);
+
+        let input = r#"package multi
+
+top fn a(x: bits[1] id=1) -> bits[1] {
+  ret x.2: bits[1] = identity(x, id=2)
+}
+
+fn b(y: bits[1] id=3) -> bits[1] {
+  ret y.4: bits[1] = not(y, id=4)
+}"#;
+        let rewritten =
+            rewrite_ir_package_top_function(input, "b").expect("rewrite requested historical top");
+        assert!(rewritten.contains("top fn b("));
+        assert!(rewritten.contains("fn a("));
+        assert!(!rewritten.contains("top fn a("));
+        assert_eq!(rewritten.matches("top fn ").count(), 1);
+
+        let modern = driver_ir2g8r_top_strategy(driver_ir2g8r_cli_capabilities("0.27.0"), true);
+        assert!(modern.pass_top_flag);
+        assert!(!modern.rewrite_input);
     }
 
     #[test]
