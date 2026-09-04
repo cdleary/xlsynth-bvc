@@ -162,6 +162,7 @@ message DriverIrToG8rAigDetails {
   optional string output_kind = 15;
   optional string top_ignored_reason = 16;
   string lowering_mode_flags = 17;
+  optional uint32 execution_recipe_revision = 18;
 }
 
 message IrFnToCombinationalVerilogDetails {

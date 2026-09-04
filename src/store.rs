@@ -3079,6 +3079,10 @@ impl ArtifactStore {
         self.queue_root().join("transition-locks")
     }
 
+    pub(crate) fn queue_identity_aliases_dir(&self) -> PathBuf {
+        self.queue_root().join("identity-aliases")
+    }
+
     pub(crate) fn action_dir(&self, action_id: &str) -> PathBuf {
         self.artifact_backend.action_dir(&self.root, action_id)
     }
@@ -3131,6 +3135,11 @@ impl ArtifactStore {
     pub(crate) fn queue_transition_lock_path(&self, action_id: &str) -> PathBuf {
         self.shard_dir(self.queue_transition_locks_dir(), action_id)
             .join(format!("{action_id}.lock"))
+    }
+
+    pub(crate) fn queue_identity_alias_path(&self, action_id: &str) -> PathBuf {
+        self.shard_dir(self.queue_identity_aliases_dir(), action_id)
+            .join(format!("{action_id}.txt"))
     }
 
     pub(crate) fn load_provenance(&self, action_id: &str) -> Result<Provenance> {

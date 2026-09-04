@@ -31,6 +31,7 @@ pub(crate) struct ValidateStoreSummary {
     pub(crate) running_records: usize,
     pub(crate) done_records: usize,
     pub(crate) canceled_records: usize,
+    pub(crate) identity_alias_records: usize,
     pub(crate) campaign_run_records: usize,
     pub(crate) analysis_records: usize,
     pub(crate) coordinator_records: usize,
@@ -308,6 +309,37 @@ fn validate_coordinator_records(store: &ArtifactStore) -> Result<usize> {
     Ok(records)
 }
 
+fn validate_queue_identity_alias_records(store: &ArtifactStore) -> Result<usize> {
+    let root = store.queue_identity_aliases_dir();
+    let mut records = 0_usize;
+    for path in list_regular_files(&root)? {
+        if path.extension().and_then(|value| value.to_str()) != Some("txt") {
+            bail!(
+                "queue identity alias tree contains an unexpected file: {}",
+                path.display()
+            );
+        }
+        let action_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .context("queue identity alias filename is not UTF-8")?;
+        if action_id.len() != 64
+            || !action_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("queue identity alias filename is not an action id");
+        }
+        if path != store.queue_identity_alias_path(action_id) {
+            bail!("queue identity alias path does not match its source action id");
+        }
+        crate::queue::resolve_queue_identity_alias(store, action_id)
+            .with_context(|| format!("validating queue identity alias for {action_id}"))?;
+        records += 1;
+    }
+    Ok(records)
+}
+
 pub(crate) fn validate_store(
     store: &ArtifactStore,
     verify_payloads: bool,
@@ -361,6 +393,7 @@ pub(crate) fn validate_store(
             Ok(record.action_id.clone())
         },
     )?;
+    let identity_alias_records = validate_queue_identity_alias_records(store)?;
     let mut states_by_action: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (state, ids) in [
         ("pending", &pending_ids),
@@ -452,6 +485,7 @@ pub(crate) fn validate_store(
         running_records: running_ids.len(),
         done_records: done_ids.len(),
         canceled_records: canceled_ids.len(),
+        identity_alias_records,
         campaign_run_records,
         analysis_records,
         coordinator_records,
@@ -499,6 +533,7 @@ mod tests {
         let summary = validate_store(&store, true).expect("validate");
         assert_eq!(summary.provenance_records, 0);
         assert_eq!(summary.pending_records, 0);
+        assert_eq!(summary.identity_alias_records, 0);
         assert_eq!(summary.campaign_run_records, 0);
         assert_eq!(summary.analysis_records, 0);
         assert_eq!(summary.coordinator_records, 0);

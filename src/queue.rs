@@ -102,6 +102,95 @@ fn write_bytes_atomic(store: &ArtifactStore, path: &Path, contents: &[u8]) -> Re
     store.write_record_atomic("queue", path, contents)
 }
 
+fn is_action_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn load_queue_identity_alias(store: &ArtifactStore, action_id: &str) -> Result<Option<String>> {
+    if !is_action_id(action_id) {
+        bail!("queue identity alias lookup requires an action id");
+    }
+    let path = store.queue_identity_alias_path(action_id);
+    let value = match fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading queue identity alias: {}", path.display()));
+        }
+    };
+    let target = value.trim();
+    if !is_action_id(target) || target == action_id {
+        bail!(
+            "queue identity alias contains an invalid target: {}",
+            path.display()
+        );
+    }
+    Ok(Some(target.to_string()))
+}
+
+pub(crate) fn resolve_queue_identity_alias(
+    store: &ArtifactStore,
+    action_id: &str,
+) -> Result<String> {
+    let mut current = action_id.to_string();
+    let mut seen = HashSet::new();
+    while let Some(target) = load_queue_identity_alias(store, &current)? {
+        if !seen.insert(current) {
+            bail!("queue identity aliases contain a cycle");
+        }
+        current = target;
+    }
+    Ok(current)
+}
+
+fn write_queue_identity_alias(
+    store: &ArtifactStore,
+    old_action_id: &str,
+    new_action_id: &str,
+) -> Result<()> {
+    if !is_action_id(old_action_id)
+        || !is_action_id(new_action_id)
+        || old_action_id == new_action_id
+    {
+        bail!("queue identity alias requires two distinct action ids");
+    }
+    if let Some(existing) = load_queue_identity_alias(store, old_action_id)? {
+        if existing != new_action_id {
+            bail!("queue identity alias already points at a different action id");
+        }
+        return Ok(());
+    }
+    let path = store.queue_identity_alias_path(old_action_id);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("queue identity alias path missing parent"))?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "creating queue identity alias directory: {}",
+            parent.display()
+        )
+    })?;
+    write_bytes_atomic(store, &path, new_action_id.as_bytes())
+}
+
+fn replace_action_dependency_aliases(
+    store: &ArtifactStore,
+    action: &mut ActionSpec,
+) -> Result<bool> {
+    let mut replacements = BTreeMap::new();
+    for dependency in action_dependency_action_ids(action) {
+        let target = resolve_queue_identity_alias(store, dependency)?;
+        if target != dependency {
+            replacements.insert(dependency.to_string(), target);
+        }
+    }
+    Ok(replace_action_dependency_ids(action, &replacements))
+}
+
 pub(crate) fn quarantine_corrupt_queue_file(path: &Path, reason: &str) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -269,6 +358,23 @@ pub(crate) fn enqueue_action_with_priority(
     action: ActionSpec,
     priority: i32,
 ) -> Result<String> {
+    let _migration_lock = if action_dependency_action_ids(&action).is_empty() {
+        None
+    } else {
+        Some(QueueTransitionLock::acquire(
+            store,
+            QUEUE_IDENTITY_MIGRATION_LOCK_KEY,
+        )?)
+    };
+    enqueue_action_with_priority_under_migration_lock(store, action, priority)
+}
+
+fn enqueue_action_with_priority_under_migration_lock(
+    store: &ArtifactStore,
+    mut action: ActionSpec,
+    priority: i32,
+) -> Result<String> {
+    replace_action_dependency_aliases(store, &mut action)?;
     let action = crate::executor::canonicalize_action_identity(action);
     let action_id = crate::executor::compute_action_id(&action)?;
     let _transition_lock = QueueTransitionLock::acquire(store, &action_id)?;
@@ -333,9 +439,18 @@ fn enqueue_action_with_priority_locked(
 
 pub(crate) fn retry_action_with_priority(
     store: &ArtifactStore,
-    action: ActionSpec,
+    mut action: ActionSpec,
     priority: i32,
 ) -> Result<String> {
+    let _migration_lock = if action_dependency_action_ids(&action).is_empty() {
+        None
+    } else {
+        Some(QueueTransitionLock::acquire(
+            store,
+            QUEUE_IDENTITY_MIGRATION_LOCK_KEY,
+        )?)
+    };
+    replace_action_dependency_aliases(store, &mut action)?;
     let action = crate::executor::canonicalize_action_identity(action);
     let action_id = crate::executor::compute_action_id(&action)?;
     let _transition_lock = QueueTransitionLock::acquire(store, &action_id)?;
@@ -446,7 +561,8 @@ fn requeue_pending_action_with_canonical_identity(
     if !pending_path.exists() {
         return Ok(None);
     }
-    enqueue_action_with_priority(store, canonical, priority)?;
+    enqueue_action_with_priority_under_migration_lock(store, canonical, priority)?;
+    write_queue_identity_alias(store, record_action_id, &canonical_id)?;
 
     // Existing queue graphs were fingerprinted from the old producer identity. Rewrite every
     // pending transitive dependent before retiring that identity, otherwise the next readiness
@@ -474,7 +590,10 @@ fn requeue_pending_action_with_canonical_identity(
         let mut changed = false;
         for (path, action_id, priority, original_action) in &pending_records {
             let mut rewritten_action = original_action.clone();
-            if !replace_action_dependency_ids(&mut rewritten_action, &replacements) {
+            let aliases_changed = replace_action_dependency_aliases(store, &mut rewritten_action)?;
+            let replacements_changed =
+                replace_action_dependency_ids(&mut rewritten_action, &replacements);
+            if !aliases_changed && !replacements_changed {
                 continue;
             }
             rewritten_action = crate::executor::canonicalize_action_identity(rewritten_action);
@@ -493,8 +612,11 @@ fn requeue_pending_action_with_canonical_identity(
         }
     }
 
+    for (old_action_id, (_, _, _, new_action_id)) in &rewrites {
+        write_queue_identity_alias(store, old_action_id, new_action_id)?;
+    }
     for (_, priority, action, _) in rewrites.values() {
-        enqueue_action_with_priority(store, action.clone(), *priority)?;
+        enqueue_action_with_priority_under_migration_lock(store, action.clone(), *priority)?;
     }
     for (old_action_id, (old_path, _, _, _)) in &rewrites {
         let _dependent_lock = QueueTransitionLock::acquire(store, old_action_id)?;
@@ -2725,6 +2847,14 @@ mod tests {
             runtime: legacy_runtime.clone(),
         };
         let legacy_stats_id = enqueue_action(&store, legacy_stats.clone()).expect("enqueue stats");
+        let legacy_equiv = ActionSpec::DriverIrAigEquiv {
+            ir_action_id: pre_upgrade_id.clone(),
+            aig_action_id: legacy_stats_id.clone(),
+            top_fn_name: Some("main".to_string()),
+            version: "v0.29.0".to_string(),
+            runtime: legacy_runtime.clone(),
+        };
+        let legacy_equiv_id = enqueue_action(&store, legacy_equiv).expect("enqueue equivalence");
         let opt_ir_action_id = write_completed_provenance(&store, &"2".repeat(64));
         let yosys_stats_action_id = write_completed_provenance(&store, &"3".repeat(64));
         let legacy_diff = ActionSpec::AigStatDiff {
@@ -2737,10 +2867,19 @@ mod tests {
         let canonical_stats = ActionSpec::DriverAigToStats {
             aig_action_id: canonical_id.clone(),
             version: "v0.29.0".to_string(),
-            runtime: legacy_runtime,
+            runtime: legacy_runtime.clone(),
         };
         let canonical_stats_id =
             crate::executor::compute_action_id(&canonical_stats).expect("canonical stats id");
+        let canonical_equiv = ActionSpec::DriverIrAigEquiv {
+            ir_action_id: canonical_id.clone(),
+            aig_action_id: canonical_stats_id.clone(),
+            top_fn_name: Some("main".to_string()),
+            version: "v0.29.0".to_string(),
+            runtime: legacy_runtime,
+        };
+        let canonical_equiv_id =
+            crate::executor::compute_action_id(&canonical_equiv).expect("canonical equivalence id");
         let canonical_diff = ActionSpec::AigStatDiff {
             opt_ir_action_id,
             g8r_aig_stats_action_id: canonical_stats_id.clone(),
@@ -2756,8 +2895,26 @@ mod tests {
         );
         assert!(!legacy_path.exists());
         assert!(!store.pending_queue_path(&legacy_stats_id).exists());
+        assert!(!store.pending_queue_path(&legacy_equiv_id).exists());
         assert!(!store.pending_queue_path(&legacy_diff_id).exists());
         assert!(store.pending_queue_path(&canonical_id).exists());
+        assert_eq!(
+            resolve_queue_identity_alias(&store, &pre_upgrade_id).expect("resolve producer alias"),
+            canonical_id
+        );
+        assert_eq!(
+            resolve_queue_identity_alias(&store, &legacy_stats_id).expect("resolve stats alias"),
+            canonical_stats_id
+        );
+        assert_eq!(
+            resolve_queue_identity_alias(&store, &legacy_equiv_id)
+                .expect("resolve equivalence alias"),
+            canonical_equiv_id
+        );
+        assert_eq!(
+            resolve_queue_identity_alias(&store, &legacy_diff_id).expect("resolve diff alias"),
+            canonical_diff_id
+        );
         let rewritten_stats = load_queue_pending_record(&store, &canonical_stats_id)
             .expect("load rewritten stats")
             .expect("rewritten stats exists");
@@ -2765,6 +2922,14 @@ mod tests {
             rewritten_stats.action,
             ActionSpec::DriverAigToStats { aig_action_id, .. }
                 if aig_action_id == canonical_id
+        ));
+        let rewritten_equiv = load_queue_pending_record(&store, &canonical_equiv_id)
+            .expect("load rewritten equivalence")
+            .expect("rewritten equivalence exists");
+        assert!(matches!(
+            rewritten_equiv.action,
+            ActionSpec::DriverIrAigEquiv { ir_action_id, aig_action_id, .. }
+                if ir_action_id == canonical_id && aig_action_id == canonical_stats_id
         ));
         let rewritten_diff = load_queue_pending_record(&store, &canonical_diff_id)
             .expect("load rewritten diff")
@@ -2774,6 +2939,9 @@ mod tests {
             ActionSpec::AigStatDiff { g8r_aig_stats_action_id, .. }
                 if g8r_aig_stats_action_id == canonical_stats_id
         ));
+        let validation = crate::store_validation::validate_store(&store, false)
+            .expect("validate migrated queue and identity aliases");
+        assert_eq!(validation.identity_alias_records, 4);
         let running = claim_next_pending_item(&store, "worker-migrate", 60)
             .expect("claim canonical pending")
             .expect("canonical action should be claimable");
@@ -2791,30 +2959,71 @@ mod tests {
     }
 
     #[test]
-    fn identity_migration_lock_serializes_independent_store_handles() {
+    fn identity_migration_lock_blocks_concurrent_dependency_enqueue() {
         let (store, root) = make_test_store();
         let held = QueueTransitionLock::acquire(&store, QUEUE_IDENTITY_MIGRATION_LOCK_KEY)
-            .expect("acquire first migration lock");
+            .expect("acquire migration lock");
+        let old_dependency_id = "a".repeat(64);
+        let new_dependency_id = "b".repeat(64);
+        let action = ActionSpec::DriverAigToStats {
+            aig_action_id: old_dependency_id.clone(),
+            version: "v0.35.0".to_string(),
+            runtime: sample_runtime(),
+        };
+        let canonical_action = ActionSpec::DriverAigToStats {
+            aig_action_id: new_dependency_id.clone(),
+            version: "v0.35.0".to_string(),
+            runtime: sample_runtime(),
+        };
+        let expected_action_id =
+            crate::executor::compute_action_id(&canonical_action).expect("dependency action id");
+        let stale_action_id =
+            crate::executor::compute_action_id(&action).expect("stale dependency action id");
+        write_queue_identity_alias(&store, &old_dependency_id, &new_dependency_id)
+            .expect("publish dependency alias during migration");
         let (started_tx, started_rx) = mpsc::channel();
-        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (enqueued_tx, enqueued_rx) = mpsc::channel();
         let other_root = root.clone();
         let handle = thread::spawn(move || {
             let other_store = ArtifactStore::new(other_root);
-            started_tx.send(()).expect("signal lock attempt");
-            let _other_lock =
-                QueueTransitionLock::acquire(&other_store, QUEUE_IDENTITY_MIGRATION_LOCK_KEY)
-                    .expect("acquire serialized migration lock");
-            acquired_tx.send(()).expect("signal lock acquisition");
+            started_tx.send(()).expect("signal enqueue attempt");
+            let action_id = enqueue_action(&other_store, action).expect("enqueue dependency");
+            enqueued_tx
+                .send(action_id)
+                .expect("signal completed enqueue");
         });
 
         started_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("second store attempted lock");
-        assert!(acquired_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            .expect("second store attempted enqueue");
+        assert!(enqueued_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert!(!store.pending_queue_path(&expected_action_id).exists());
         drop(held);
-        acquired_rx
+        let action_id = enqueued_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("second store acquires lock after release");
+            .expect("dependency enqueue completes after migration");
+        assert_eq!(action_id, expected_action_id);
+        assert!(store.pending_queue_path(&expected_action_id).exists());
+        assert!(!store.pending_queue_path(&stale_action_id).exists());
+        let pending = load_queue_pending_record(&store, &expected_action_id)
+            .expect("load canonical dependency action")
+            .expect("canonical dependency action exists");
+        assert!(matches!(
+            pending.action,
+            ActionSpec::DriverAigToStats { aig_action_id, .. }
+                if aig_action_id == new_dependency_id
+        ));
+        let retry_id = retry_action_with_priority(
+            &store,
+            ActionSpec::DriverAigToStats {
+                aig_action_id: old_dependency_id,
+                version: "v0.35.0".to_string(),
+                runtime: sample_runtime(),
+            },
+            9,
+        )
+        .expect("retry follows dependency alias");
+        assert_eq!(retry_id, expected_action_id);
         handle.join().expect("join lock contender");
 
         drop(store);
