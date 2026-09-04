@@ -49,6 +49,19 @@ pub(crate) fn cmp_dotted_numeric_version(a: &str, b: &str) -> std::cmp::Ordering
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DriverIr2g8rCliCapabilities {
+    pub(crate) aiger_out: bool,
+    pub(crate) top: bool,
+}
+
+pub(crate) fn driver_ir2g8r_cli_capabilities(driver_version: &str) -> DriverIr2g8rCliCapabilities {
+    DriverIr2g8rCliCapabilities {
+        aiger_out: cmp_dotted_numeric_version(driver_version, "0.24.0") != std::cmp::Ordering::Less,
+        top: cmp_dotted_numeric_version(driver_version, "0.27.0") != std::cmp::Ordering::Less,
+    }
+}
+
 fn timezone_abbrev_utc_offset_seconds(abbrev: &str) -> Option<i32> {
     match abbrev {
         "UTC" | "GMT" => Some(0),

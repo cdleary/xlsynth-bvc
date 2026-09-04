@@ -38,13 +38,6 @@ static DRIVER_SUBCOMMAND_HELP_TOKEN_CACHE: OnceLock<
     Mutex<BTreeMap<DriverSubcommandHelpTokenCacheKey, bool>>,
 > = OnceLock::new();
 const DRIVER_IR_EQUIV_TIMEOUT_SECONDS: u64 = 30;
-const MODERN_IR2G8R_CLI_MIN_DRIVER_VERSION: &str = "0.27.0";
-
-fn uses_legacy_ir2g8r_cli(driver_version: &str) -> bool {
-    cmp_dotted_numeric_version(driver_version, MODERN_IR2G8R_CLI_MIN_DRIVER_VERSION)
-        == std::cmp::Ordering::Less
-}
-
 pub(crate) fn execute_action(
     store: &ArtifactStore,
     action: ActionSpec,
@@ -484,7 +477,7 @@ struct DriverIrToG8rBatchRunnable {
     ir_input_path: PathBuf,
     explicit_ir_top: Option<String>,
     standalone_ir_top: Option<String>,
-    use_legacy_ir2g8r_cli: bool,
+    ir2g8r_cli: DriverIr2g8rCliCapabilities,
     capture_prepared_ir: bool,
 }
 
@@ -2573,7 +2566,7 @@ fn prepare_driver_ir_to_g8r_batch_action(
         relpath: "payload/result.aig".to_string(),
     };
 
-    let use_legacy_ir2g8r_cli = uses_legacy_ir2g8r_cli(&runtime.driver_version);
+    let ir2g8r_cli = driver_ir2g8r_cli_capabilities(&runtime.driver_version);
     let prepared_ir_relpath = "prep_for_gatify.ir";
     let mut suggested_next_actions = Vec::new();
     let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
@@ -2623,7 +2616,7 @@ fn prepare_driver_ir_to_g8r_batch_action(
     );
     details.insert("driver_subcommand".to_string(), json!("ir2g8r"));
     let mut capture_prepared_ir = false;
-    if use_legacy_ir2g8r_cli {
+    if !ir2g8r_cli.aiger_out {
         details.insert(
             "driver_ir2g8r_prepared_ir_supported".to_string(),
             json!(false),
@@ -2791,13 +2784,13 @@ fn prepare_driver_ir_to_g8r_batch_action(
 
     details.insert(
         "driver_ir2g8r_cli_mode".to_string(),
-        json!(if use_legacy_ir2g8r_cli {
+        json!(if !ir2g8r_cli.aiger_out {
             "legacy_bin_out"
         } else {
             "modern_aiger_out"
         }),
     );
-    if use_legacy_ir2g8r_cli {
+    if !ir2g8r_cli.aiger_out {
         details.insert(
             "driver_ir2g8r_output_kind".to_string(),
             json!("g8rbin_with_stats_sidecar"),
@@ -2807,13 +2800,13 @@ fn prepare_driver_ir_to_g8r_batch_action(
             json!(LEGACY_G8R_STATS_RELPATH),
         );
     }
-    if !use_legacy_ir2g8r_cli && explicit_ir_top.is_some() {
+    if ir2g8r_cli.top && explicit_ir_top.is_some() {
         details.insert("driver_ir2g8r_passed_top".to_string(), json!(true));
-    } else if use_legacy_ir2g8r_cli && explicit_ir_top.is_some() {
+    } else if !ir2g8r_cli.top && explicit_ir_top.is_some() {
         details.insert("driver_ir2g8r_passed_top".to_string(), json!(false));
         details.insert(
             "driver_ir2g8r_top_ignored_reason".to_string(),
-            json!("legacy_cli_unsupported"),
+            json!("top_flag_unsupported_before_v0_27"),
         );
     }
 
@@ -2833,7 +2826,7 @@ fn prepare_driver_ir_to_g8r_batch_action(
             standalone_ir_top: input_ir_is_generated_k_bool_cone
                 .then(|| inferred_ir_top.clone())
                 .flatten(),
-            use_legacy_ir2g8r_cli,
+            ir2g8r_cli,
             capture_prepared_ir,
         },
     ))
@@ -2876,7 +2869,16 @@ fn run_driver_ir_to_g8r_batch_runnable(
             fs::create_dir_all(&output_dir)
                 .with_context(|| format!("creating batch output dir: {}", output_dir.display()))?;
 
-            let top_flag = member
+            let ir2g8r_top_flag = if member.ir2g8r_cli.top {
+                member
+                    .explicit_ir_top
+                    .as_ref()
+                    .map(|top| format!(" --top {}", shell_single_quote(top)))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let ir2gates_top_flag = member
                 .explicit_ir_top
                 .as_ref()
                 .map(|top| format!(" --top {}", shell_single_quote(top)))
@@ -2884,17 +2886,17 @@ fn run_driver_ir_to_g8r_batch_runnable(
             let input_ref = format!("/batch/inputs/{index}.ir");
             let output_ref = format!("/batch/outputs/{index}");
             script_body.push_str(&format!("mkdir -p {output_ref}\nif "));
-            if member.use_legacy_ir2g8r_cli {
+            if !member.ir2g8r_cli.aiger_out {
                 script_body.push_str(&format!(
                     "xlsynth-driver ir2g8r ${{G8R_EXTRA_FLAGS}} --fraig=\"${{FRAIG}}\" --bin-out {output_ref}/result.aig --stats-out {output_ref}/result.g8r_stats.json {input_ref} > /dev/null"
                 ));
             } else if member.capture_prepared_ir {
                 script_body.push_str(&format!(
-                    "xlsynth-driver ir2g8r ${{G8R_EXTRA_FLAGS}} {input_ref}{top_flag} --fraig=\"${{FRAIG}}\" --aiger-out {output_ref}/result.aig > /dev/null && xlsynth-driver ir2gates ${{G8R_EXTRA_FLAGS}} {input_ref}{top_flag} --fraig=\"${{FRAIG}}\" --prepared-ir-out {output_ref}/prep_for_gatify.ir > /dev/null && test -s {output_ref}/prep_for_gatify.ir"
+                    "xlsynth-driver ir2g8r ${{G8R_EXTRA_FLAGS}} {input_ref}{ir2g8r_top_flag} --fraig=\"${{FRAIG}}\" --aiger-out {output_ref}/result.aig > /dev/null && xlsynth-driver ir2gates ${{G8R_EXTRA_FLAGS}} {input_ref}{ir2gates_top_flag} --fraig=\"${{FRAIG}}\" --prepared-ir-out {output_ref}/prep_for_gatify.ir > /dev/null && test -s {output_ref}/prep_for_gatify.ir"
                 ));
             } else {
                 script_body.push_str(&format!(
-                    "xlsynth-driver ir2g8r ${{G8R_EXTRA_FLAGS}} {input_ref}{top_flag} --fraig=\"${{FRAIG}}\" --aiger-out {output_ref}/result.aig > /dev/null"
+                    "xlsynth-driver ir2g8r ${{G8R_EXTRA_FLAGS}} {input_ref}{ir2g8r_top_flag} --fraig=\"${{FRAIG}}\" --aiger-out {output_ref}/result.aig > /dev/null"
                 ));
             }
             script_body.push_str(&format!(
@@ -3018,7 +3020,7 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
         relpath: "payload/result.aig".to_string(),
     };
 
-    let use_legacy_ir2g8r_cli = uses_legacy_ir2g8r_cli(&runtime.driver_version);
+    let ir2g8r_cli = driver_ir2g8r_cli_capabilities(&runtime.driver_version);
     let prepared_ir_relpath = "prep_for_gatify.ir";
     let mut suggested_next_actions = Vec::new();
     let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
@@ -3068,7 +3070,7 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
     );
     details.insert("driver_subcommand".to_string(), json!("ir2g8r"));
     let mut capture_prepared_ir = false;
-    if use_legacy_ir2g8r_cli {
+    if !ir2g8r_cli.aiger_out {
         details.insert(
             "driver_ir2g8r_prepared_ir_supported".to_string(),
             json!(false),
@@ -3222,13 +3224,13 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
 
     details.insert(
         "driver_ir2g8r_cli_mode".to_string(),
-        json!(if use_legacy_ir2g8r_cli {
+        json!(if !ir2g8r_cli.aiger_out {
             "legacy_bin_out"
         } else {
             "modern_aiger_out"
         }),
     );
-    if use_legacy_ir2g8r_cli {
+    if !ir2g8r_cli.aiger_out {
         details.insert(
             "driver_ir2g8r_output_kind".to_string(),
             json!("g8rbin_with_stats_sidecar"),
@@ -3239,41 +3241,33 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
         );
     }
 
-    let script = if use_legacy_ir2g8r_cli {
+    let script = if !ir2g8r_cli.aiger_out {
         driver_script(
             r#"
 xlsynth-driver ir2g8r ${G8R_EXTRA_FLAGS} --fraig="${FRAIG}" --bin-out /outputs/result.aig --stats-out /outputs/result.g8r_stats.json /inputs/input.ir > /dev/null
 test -s /outputs/result.g8r_stats.json
 "#,
         )
-    } else if explicit_ir_top.is_some() && capture_prepared_ir {
-        driver_script(
-            r#"
-xlsynth-driver ir2g8r ${G8R_EXTRA_FLAGS} /inputs/input.ir --top "${IR_TOP}" --fraig="${FRAIG}" --aiger-out /outputs/result.aig > /dev/null
-xlsynth-driver ir2gates ${G8R_EXTRA_FLAGS} /inputs/input.ir --top "${IR_TOP}" --fraig="${FRAIG}" --prepared-ir-out /outputs/prep_for_gatify.ir > /dev/null
-test -s /outputs/prep_for_gatify.ir
-"#,
-        )
-    } else if explicit_ir_top.is_some() {
-        driver_script(
-            r#"
-xlsynth-driver ir2g8r ${G8R_EXTRA_FLAGS} /inputs/input.ir --top "${IR_TOP}" --fraig="${FRAIG}" --aiger-out /outputs/result.aig > /dev/null
-"#,
-        )
-    } else if capture_prepared_ir {
-        driver_script(
-            r#"
-xlsynth-driver ir2g8r ${G8R_EXTRA_FLAGS} /inputs/input.ir --fraig="${FRAIG}" --aiger-out /outputs/result.aig > /dev/null
-xlsynth-driver ir2gates ${G8R_EXTRA_FLAGS} /inputs/input.ir --fraig="${FRAIG}" --prepared-ir-out /outputs/prep_for_gatify.ir > /dev/null
-test -s /outputs/prep_for_gatify.ir
-"#,
-        )
     } else {
-        driver_script(
-            r#"
-xlsynth-driver ir2g8r ${G8R_EXTRA_FLAGS} /inputs/input.ir --fraig="${FRAIG}" --aiger-out /outputs/result.aig > /dev/null
-"#,
-        )
+        let ir2g8r_top_flag = if ir2g8r_cli.top && explicit_ir_top.is_some() {
+            r#" --top "${IR_TOP}""#
+        } else {
+            ""
+        };
+        let ir2gates_top_flag = if explicit_ir_top.is_some() {
+            r#" --top "${IR_TOP}""#
+        } else {
+            ""
+        };
+        let mut script_body = format!(
+            "\nxlsynth-driver ir2g8r ${{G8R_EXTRA_FLAGS}} /inputs/input.ir{ir2g8r_top_flag} --fraig=\"${{FRAIG}}\" --aiger-out /outputs/result.aig > /dev/null\n"
+        );
+        if capture_prepared_ir {
+            script_body.push_str(&format!(
+                "xlsynth-driver ir2gates ${{G8R_EXTRA_FLAGS}} /inputs/input.ir{ir2gates_top_flag} --fraig=\"${{FRAIG}}\" --prepared-ir-out /outputs/prep_for_gatify.ir > /dev/null\ntest -s /outputs/prep_for_gatify.ir\n"
+            ));
+        }
+        driver_script(&script_body)
     };
 
     let mut env = BTreeMap::new();
@@ -3290,16 +3284,18 @@ xlsynth-driver ir2g8r ${G8R_EXTRA_FLAGS} /inputs/input.ir --fraig="${FRAIG}" --a
         "G8R_EXTRA_FLAGS".to_string(),
         g8r_lowering_mode_extra_flags(lowering_mode).to_string(),
     );
-    if !use_legacy_ir2g8r_cli && explicit_ir_top.is_some() {
+    if ir2g8r_cli.top && explicit_ir_top.is_some() {
         details.insert("driver_ir2g8r_passed_top".to_string(), json!(true));
-    } else if use_legacy_ir2g8r_cli && explicit_ir_top.is_some() {
+    } else if !ir2g8r_cli.top && explicit_ir_top.is_some() {
         details.insert("driver_ir2g8r_passed_top".to_string(), json!(false));
         details.insert(
             "driver_ir2g8r_top_ignored_reason".to_string(),
-            json!("legacy_cli_unsupported"),
+            json!("top_flag_unsupported_before_v0_27"),
         );
     }
-    if !use_legacy_ir2g8r_cli && let Some(top) = &explicit_ir_top {
+    if (ir2g8r_cli.top || capture_prepared_ir)
+        && let Some(top) = &explicit_ir_top
+    {
         env.insert("IR_TOP".to_string(), top.clone());
     }
 
@@ -5540,12 +5536,22 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn ir2g8r_cli_before_v0_27_uses_legacy_arguments() {
-        assert!(uses_legacy_ir2g8r_cli("0.24.0"));
-        assert!(uses_legacy_ir2g8r_cli("0.25.0"));
-        assert!(uses_legacy_ir2g8r_cli("0.26.0"));
-        assert!(!uses_legacy_ir2g8r_cli("0.27.0"));
-        assert!(!uses_legacy_ir2g8r_cli("0.68.0"));
+    fn ir2g8r_cli_capabilities_have_independent_boundaries() {
+        let v0_23 = driver_ir2g8r_cli_capabilities("0.23.0");
+        assert!(!v0_23.aiger_out);
+        assert!(!v0_23.top);
+
+        for version in ["0.24.0", "0.25.0", "0.26.0"] {
+            let capabilities = driver_ir2g8r_cli_capabilities(version);
+            assert!(capabilities.aiger_out, "{version} must emit AIGER");
+            assert!(!capabilities.top, "{version} must omit --top");
+        }
+
+        for version in ["0.27.0", "0.68.0"] {
+            let capabilities = driver_ir2g8r_cli_capabilities(version);
+            assert!(capabilities.aiger_out);
+            assert!(capabilities.top);
+        }
     }
 
     #[test]
