@@ -10,8 +10,9 @@ use std::path::Path;
 use crate::model::*;
 use crate::query::*;
 use crate::queue::{
-    QueueState, action_dependency_role_action_ids, queue_state_display_label,
-    queue_state_for_action, queue_state_key,
+    QueueState, action_dependency_role_action_ids, project_action_identity_for_read,
+    queue_state_display_label, queue_state_for_action, queue_state_key,
+    resolve_queue_identity_alias,
 };
 use crate::service::{short_id, summarize_error};
 use crate::sled_space::{SledSpaceCategory, SledSpaceReport, SledSpaceRow, SledTreeSpaceReport};
@@ -2308,15 +2309,14 @@ pub(super) fn render_stdlib_g8r_vs_yosys_html(
     let zero_display_note = format!(
         "For the log/log levels and nodes plots, zero values are displayed as <code>1</code> so those samples remain visible ({lhs_label} vs {rhs_label})."
     );
-    let server_scoped_samples = scope == G8rVsYosysViewScope::IrFnCorpusG8rAbcVsCodegenYosysAbc
-        && selected_crate_version.is_some();
-    let scoped_samples: Vec<&crate::view::StdlibG8rVsYosysSample> = if server_scoped_samples {
-        let selected_crate_version =
-            selected_crate_version.expect("checked selected crate version");
-        dataset
-            .samples
-            .iter()
-            .filter(|sample| sample.crate_version == selected_crate_version)
+    let latest_dso_scope = scope == G8rVsYosysViewScope::IrFnCorpusG8rAbcVsCodegenYosysAbc;
+    let server_scoped_samples = latest_dso_scope && selected_crate_version.is_some();
+    let scoped_samples: Vec<&crate::view::StdlibG8rVsYosysSample> = if latest_dso_scope {
+        latest_dso_samples_by_crate(&dataset.samples)
+            .into_iter()
+            .filter(|sample| {
+                selected_crate_version.is_none_or(|selected| sample.crate_version == selected)
+            })
             .collect()
     } else {
         dataset.samples.iter().collect()
@@ -2326,11 +2326,27 @@ pub(super) fn render_stdlib_g8r_vs_yosys_html(
     let selected_crate_json =
         serde_json::to_string(&selected_crate_version).expect("serializing selected crate version");
     let scope_label = selected_crate_version
-        .map(|v| format!("crate:v{v}"))
+        .map(|v| {
+            if latest_dso_scope {
+                let dso_version = scoped_samples
+                    .first()
+                    .map(|sample| sample.dso_version.as_str())
+                    .unwrap_or("unknown");
+                format!("crate:v{v} · dso:v{dso_version}")
+            } else {
+                format!("crate:v{v}")
+            }
+        })
         .unwrap_or_else(|| {
+            let latest_dso_note = if latest_dso_scope {
+                ", latest DSO per crate"
+            } else {
+                ""
+            };
             format!(
-                "all crate versions ({})",
-                dataset.available_crate_versions.len()
+                "all crate versions{} ({})",
+                latest_dso_note,
+                dataset.available_crate_versions.len(),
             )
         });
 
@@ -2526,6 +2542,8 @@ pub(super) fn render_stdlib_g8r_vs_yosys_html(
     } else {
         "false"
     });
+    html.push_str(";\nconst latestDsoScope = ");
+    html.push_str(if latest_dso_scope { "true" } else { "false" });
     html.push_str(";\nlet lossesOnly = ");
     html.push_str(if losses_only { "true" } else { "false" });
     html.push_str(";\nconst viewScopePath = ");
@@ -3220,9 +3238,16 @@ function renderLossVsIrPlot(samples) {
 
 function currentScopeLabel() {
   if (selectedCrateVersion) {
-    return `crate:v${selectedCrateVersion}`;
+    const dsoVersions = [...new Set(
+      allSamples
+        .filter((sample) => sample.crate_version === selectedCrateVersion)
+        .map((sample) => sample.dso_version)
+        .filter(Boolean)
+    )];
+    const dsoLabel = dsoVersions.length === 1 ? ` · dso:v${dsoVersions[0]}` : '';
+    return `crate:v${selectedCrateVersion}${dsoLabel}`;
   }
-  return 'all crate versions';
+  return latestDsoScope ? 'all crate versions, latest DSO per crate' : 'all crate versions';
 }
 
 function isLossSample(sample) {
@@ -4528,6 +4553,8 @@ pub(super) fn render_action_detail_html(
 ) -> Result<Option<String>> {
     use std::fmt::Write;
 
+    let resolved_action_id = resolve_queue_identity_alias(store, action_id)?;
+    let action_id = resolved_action_id.as_str();
     let records = load_action_detail_records(store, action_id)?;
     if !action_detail_has_any_records(&records) {
         return Ok(None);
@@ -4918,10 +4945,15 @@ pub(super) fn render_action_detail_html(
                 "<details><summary>Suggested Next Actions</summary><table><thead><tr><th>Action ID</th><th>State</th><th>Kind</th><th>Subject</th><th>Reason</th></tr></thead><tbody>",
             );
             for suggested in &provenance.suggested_next_actions {
-                let suggestion_state = if store.action_exists(&suggested.action_id) {
+                let (suggested_action_id, suggested_action) = project_action_identity_for_read(
+                    store,
+                    &suggested.action_id,
+                    &suggested.action,
+                )?;
+                let suggestion_state = if store.action_exists(&suggested_action_id) {
                     QueueState::Done
                 } else {
-                    queue_state_for_action(store, &suggested.action_id)
+                    queue_state_for_action(store, &suggested_action_id)
                 };
                 let _ = write!(
                     html,
@@ -4932,12 +4964,12 @@ pub(super) fn render_action_detail_html(
 <td>{}</td>\
 <td>{}</td>\
 </tr>",
-                    html_escape(&suggested.action_id),
-                    html_escape(&suggested.action_id),
+                    html_escape(&suggested_action_id),
+                    html_escape(&suggested_action_id),
                     html_escape(queue_state_key(&suggestion_state)),
                     html_escape(queue_state_display_label(&suggestion_state)),
-                    html_escape(action_kind_label(&suggested.action)),
-                    html_escape(&action_subject(&suggested.action)),
+                    html_escape(action_kind_label(&suggested_action)),
+                    html_escape(&action_subject(&suggested_action)),
                     html_escape(&suggested.reason)
                 );
             }

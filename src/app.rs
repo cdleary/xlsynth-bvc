@@ -1597,7 +1597,8 @@ pub(crate) fn build_suggested_report(
         let provenance = store.load_provenance(&action_id)?;
         let mut statuses = Vec::new();
         for suggested in &provenance.suggested_next_actions {
-            let suggested_action_id = resolve_queue_identity_alias(store, &suggested.action_id)?;
+            let (suggested_action_id, suggested_action) =
+                project_action_identity_for_read(store, &suggested.action_id, &suggested.action)?;
             let completed = store.action_exists(&suggested_action_id);
             let queue_state = queue_state_for_action(store, &suggested_action_id).as_label();
             statuses.push(SuggestedStatus {
@@ -1605,7 +1606,7 @@ pub(crate) fn build_suggested_report(
                 action_id: suggested_action_id.clone(),
                 completed,
                 queue_state,
-                action: suggested.action.clone(),
+                action: suggested_action,
             });
             if recursive && depth < max_depth && completed {
                 queue.push_back((suggested_action_id, depth + 1));
@@ -1639,7 +1640,8 @@ pub(crate) fn build_suggested_audit_report(
         total_sources += 1;
         for suggested in &provenance.suggested_next_actions {
             total_suggestions += 1;
-            let suggested_action_id = resolve_queue_identity_alias(store, &suggested.action_id)?;
+            let (suggested_action_id, suggested_action) =
+                project_action_identity_for_read(store, &suggested.action_id, &suggested.action)?;
             let completed = store.action_exists(&suggested_action_id);
             if completed {
                 completed_suggestions += 1;
@@ -1651,7 +1653,7 @@ pub(crate) fn build_suggested_audit_report(
                     action_id: suggested_action_id.clone(),
                     completed,
                     queue_state: queue_state_for_action(store, &suggested_action_id).as_label(),
-                    action: suggested.action.clone(),
+                    action: suggested_action,
                 });
             }
         }
@@ -3774,6 +3776,11 @@ mod tests {
         assert_eq!(report.nodes.len(), 2);
         assert_eq!(report.nodes[0].suggestions.len(), 1);
         assert_eq!(report.nodes[0].suggestions[0].action_id, target_action_id);
+        assert_eq!(
+            compute_action_id(&report.nodes[0].suggestions[0].action)
+                .expect("projected report action id"),
+            target_action_id
+        );
         assert!(report.nodes[0].suggestions[0].completed);
         assert_eq!(report.nodes[1].source_action_id, target_action_id);
 
@@ -3784,6 +3791,10 @@ mod tests {
             .find(|entry| entry.source_action_id == root_action_id)
             .expect("root suggestion audit entry");
         assert_eq!(entry.action_id, target_action_id);
+        assert_eq!(
+            compute_action_id(&entry.action).expect("projected audit action id"),
+            target_action_id
+        );
         assert!(entry.completed);
         assert_eq!(audit.completed_suggestions, 1);
         assert_eq!(audit.missing_suggestions, 0);

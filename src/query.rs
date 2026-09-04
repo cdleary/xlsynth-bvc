@@ -700,6 +700,34 @@ pub(crate) fn build_stdlib_g8r_vs_yosys_dataset(
     Ok(dataset)
 }
 
+pub(crate) fn latest_dso_samples_by_crate(
+    samples: &[StdlibG8rVsYosysSample],
+) -> Vec<&StdlibG8rVsYosysSample> {
+    let mut latest_dso_by_crate: BTreeMap<String, String> = BTreeMap::new();
+    for sample in samples {
+        let crate_version = normalize_tag_version(&sample.crate_version).to_string();
+        let dso_version = normalize_tag_version(&sample.dso_version).to_string();
+        match latest_dso_by_crate.get_mut(&crate_version) {
+            Some(latest) if cmp_dotted_numeric_version(&dso_version, latest).is_gt() => {
+                *latest = dso_version;
+            }
+            None => {
+                latest_dso_by_crate.insert(crate_version, dso_version);
+            }
+            _ => {}
+        }
+    }
+    samples
+        .iter()
+        .filter(|sample| {
+            let crate_version = normalize_tag_version(&sample.crate_version);
+            latest_dso_by_crate
+                .get(crate_version)
+                .is_some_and(|latest| latest == normalize_tag_version(&sample.dso_version))
+        })
+        .collect()
+}
+
 pub(crate) fn filter_ir_fn_corpus_g8r_vs_yosys_samples(
     dataset: &StdlibG8rVsYosysDataset,
     crate_version: &str,
@@ -707,18 +735,10 @@ pub(crate) fn filter_ir_fn_corpus_g8r_vs_yosys_samples(
     ir_node_count_lt: u64,
 ) -> Vec<StdlibG8rVsYosysSample> {
     let target_crate_version = normalize_tag_version(crate_version).to_string();
-    let latest_dso_version = dataset
-        .samples
-        .iter()
-        .filter(|sample| normalize_tag_version(&sample.crate_version) == target_crate_version)
-        .map(|sample| normalize_tag_version(&sample.dso_version).to_string())
-        .max_by(|a, b| cmp_dotted_numeric_version(a, b));
-    dataset
-        .samples
-        .iter()
+    latest_dso_samples_by_crate(&dataset.samples)
+        .into_iter()
         .filter(|sample| {
             normalize_tag_version(&sample.crate_version) == target_crate_version
-                && latest_dso_version.as_deref() == Some(normalize_tag_version(&sample.dso_version))
                 && sample.yosys_abc_levels < yosys_levels_lt
                 && sample.ir_node_count < ir_node_count_lt
         })
@@ -4386,12 +4406,14 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
     for provenance in provenances.iter() {
         action_specs.insert(provenance.action_id.clone(), provenance.action.clone());
         for suggested in &provenance.suggested_next_actions {
+            let (suggested_action_id, suggested_action) =
+                project_action_identity_for_read(store, &suggested.action_id, &suggested.action)?;
             action_specs
-                .entry(suggested.action_id.clone())
-                .or_insert_with(|| suggested.action.clone());
+                .entry(suggested_action_id.clone())
+                .or_insert(suggested_action);
             suggested_edges.push(RawActionGraphEdge {
                 source: provenance.action_id.clone(),
-                target: suggested.action_id.clone(),
+                target: suggested_action_id,
                 edge_kind: "suggested".to_string(),
                 role: suggested.reason.clone(),
             });
@@ -4556,7 +4578,9 @@ pub(crate) fn build_stdlib_file_action_graph_dataset(
     available_crate_versions.sort_by(|a, b| cmp_dotted_numeric_version(a, b));
     let selected_action_id = requested_action_id
         .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .map(|action_id| resolve_queue_identity_alias(store, &action_id))
+        .transpose()?;
     let action_focus_found = selected_action_id
         .as_ref()
         .map(|v| action_specs.contains_key(v))
@@ -4929,6 +4953,7 @@ fn apply_runtime_action_specs_to_stdlib_file_action_graph_index_state(
     let compat_by_dso = load_compat_by_dso(repo_root);
     let runtime_action_specs = collect_runtime_action_specs_for_stdlib_file_action_graph(store)?;
     for (action_id, action) in runtime_action_specs {
+        let (action_id, action) = project_action_identity_for_read(store, &action_id, &action)?;
         if state.action_specs.contains_key(&action_id) {
             continue;
         }
@@ -5023,7 +5048,9 @@ fn build_stdlib_file_action_graph_dataset_from_index_state(
     available_crate_versions.sort_by(|a, b| cmp_dotted_numeric_version(a, b));
     let selected_action_id = requested_action_id
         .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .map(|action_id| resolve_queue_identity_alias(store, &action_id))
+        .transpose()?;
     let action_focus_found = selected_action_id
         .as_ref()
         .map(|v| state.action_specs.contains_key(v))
@@ -5314,12 +5341,14 @@ fn build_stdlib_file_action_graph_index_state(
         action_ids_with_provenance.insert(provenance.action_id.clone());
         action_specs.insert(provenance.action_id.clone(), provenance.action.clone());
         for suggested in &provenance.suggested_next_actions {
+            let (suggested_action_id, suggested_action) =
+                project_action_identity_for_read(store, &suggested.action_id, &suggested.action)?;
             action_specs
-                .entry(suggested.action_id.clone())
-                .or_insert_with(|| suggested.action.clone());
+                .entry(suggested_action_id.clone())
+                .or_insert(suggested_action);
             suggested_edges.push(RawActionGraphEdge {
                 source: provenance.action_id.clone(),
-                target: suggested.action_id.clone(),
+                target: suggested_action_id,
                 edge_kind: "suggested".to_string(),
                 role: suggested.reason.clone(),
             });
@@ -8250,9 +8279,11 @@ fn collect_known_action_specs_and_provenances(
     for provenance in provenances.iter() {
         action_specs.insert(provenance.action_id.clone(), provenance.action.clone());
         for suggested in &provenance.suggested_next_actions {
+            let (suggested_action_id, suggested_action) =
+                project_action_identity_for_read(store, &suggested.action_id, &suggested.action)?;
             action_specs
-                .entry(suggested.action_id.clone())
-                .or_insert_with(|| suggested.action.clone());
+                .entry(suggested_action_id)
+                .or_insert(suggested_action);
         }
         provenance_by_action_id.insert(provenance.action_id.clone(), provenance.clone());
     }
@@ -9054,6 +9085,13 @@ mod tests {
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("ensure test store layout");
         (store, root)
+    }
+
+    fn write_test_identity_alias(store: &ArtifactStore, old: &str, new: &str) {
+        let path = store.queue_identity_alias_path(old);
+        fs::create_dir_all(path.parent().expect("identity alias parent"))
+            .expect("create identity alias parent");
+        fs::write(path, new).expect("write identity alias");
     }
 
     #[test]
@@ -11021,6 +11059,106 @@ mod tests {
     }
 
     #[test]
+    fn stdlib_file_action_graph_projects_migrated_suggestion_identities() {
+        let (store, root) = make_test_store("file-graph-identity-alias");
+        let mut runtime = test_runtime();
+        runtime.driver_version = "0.25.0".to_string();
+        let ir_top = "__float32__add";
+        let root_action_id = materialize_test_provenance(
+            &store,
+            "root",
+            ActionSpec::DriverDslxFnToIr {
+                dslx_subtree_action_id: "f".repeat(64),
+                dslx_file: "xls/dslx/stdlib/float32.x".to_string(),
+                dslx_fn_name: "add".to_string(),
+                version: "0.25.0".to_string(),
+                runtime: runtime.clone(),
+            },
+            ArtifactType::IrPackageFile,
+            "payload/root.ir",
+        );
+        let canonical_target = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: root_action_id.clone(),
+            top_fn_name: Some(ir_top.to_string()),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: driver_ir2g8r_execution_recipe_revision(
+                &runtime.driver_version,
+            ),
+            version: "0.29.0".to_string(),
+            runtime,
+        };
+        let canonical_target_id =
+            compute_action_id(&canonical_target).expect("canonical target action id");
+        let mut legacy_target = canonical_target.clone();
+        let ActionSpec::DriverIrToG8rAig {
+            execution_recipe_revision,
+            ..
+        } = &mut legacy_target
+        else {
+            unreachable!("test target is G8r")
+        };
+        *execution_recipe_revision = 0;
+        let legacy_target_id = crate::proto::compute_model_action_id_v2(&legacy_target)
+            .expect("legacy target action id")
+            .to_hex();
+        assert_ne!(legacy_target_id, canonical_target_id);
+        write_test_identity_alias(&store, &legacy_target_id, &canonical_target_id);
+
+        let mut root_provenance = store
+            .load_provenance(&root_action_id)
+            .expect("load root provenance");
+        root_provenance.suggested_next_actions = vec![SuggestedAction {
+            reason: "migrated target".to_string(),
+            action_id: legacy_target_id.clone(),
+            action: legacy_target,
+        }];
+        store
+            .write_provenance(&root_provenance)
+            .expect("write legacy suggestion");
+
+        let repo_root = std::env::current_dir().expect("repo root");
+        let index_state = build_stdlib_file_action_graph_index_state(&store, &repo_root)
+            .expect("build graph index state");
+        assert!(index_state.action_specs.contains_key(&canonical_target_id));
+        assert!(!index_state.action_specs.contains_key(&legacy_target_id));
+        assert_eq!(
+            index_state
+                .suggested_edges_by_source
+                .get(&root_action_id)
+                .expect("root suggestion edges")[0]
+                .target,
+            canonical_target_id
+        );
+
+        let dataset = build_stdlib_file_action_graph_dataset_from_index_state(
+            &store,
+            &repo_root,
+            &index_state,
+            None,
+            None,
+            None,
+            Some(&legacy_target_id),
+            false,
+        )
+        .expect("focus graph via legacy identity");
+        let node_ids: BTreeSet<&str> = dataset
+            .nodes
+            .iter()
+            .map(|node| node.action_id.as_str())
+            .collect();
+        assert!(dataset.action_focus_found);
+        assert_eq!(
+            dataset.selected_action_id.as_deref(),
+            Some(canonical_target_id.as_str())
+        );
+        assert!(node_ids.contains(canonical_target_id.as_str()));
+        assert!(!node_ids.contains(legacy_target_id.as_str()));
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
     fn stdlib_file_action_graph_index_overlay_includes_runtime_queue_actions() {
         let (store, root) = make_test_store("file-graph-index-overlay");
         let runtime = test_runtime();
@@ -11515,6 +11653,27 @@ mod tests {
         let filtered = filter_ir_fn_corpus_g8r_vs_yosys_samples(&dataset, "v0.33.0", 6.0, 50);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].fn_key, "f::a");
+    }
+
+    #[test]
+    fn latest_dso_samples_by_crate_selects_one_generation_per_crate() {
+        let mut crate_a_old =
+            make_ir_fn_corpus_sample(&"a".repeat(64), "0.33.0", "a_old", "a::old", 8, 1.0);
+        crate_a_old.dso_version = "0.34.0".to_string();
+        let mut crate_a_new =
+            make_ir_fn_corpus_sample(&"b".repeat(64), "0.33.0", "a_new", "a::new", 8, 2.0);
+        crate_a_new.dso_version = "0.35.0".to_string();
+        let mut crate_b =
+            make_ir_fn_corpus_sample(&"c".repeat(64), "0.32.0", "b", "b::only", 8, 3.0);
+        crate_b.dso_version = "0.33.0".to_string();
+        let samples = vec![crate_a_old, crate_a_new, crate_b];
+
+        let selected = latest_dso_samples_by_crate(&samples);
+        let selected_keys: BTreeSet<&str> = selected
+            .iter()
+            .map(|sample| sample.fn_key.as_str())
+            .collect();
+        assert_eq!(selected_keys, BTreeSet::from(["a::new", "b::only"]));
     }
 
     #[test]

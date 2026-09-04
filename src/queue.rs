@@ -191,6 +191,33 @@ fn replace_action_dependency_aliases(
     Ok(replace_action_dependency_ids(action, &replacements))
 }
 
+fn canonicalize_action_with_queue_aliases(
+    store: &ArtifactStore,
+    mut action: ActionSpec,
+) -> Result<ActionSpec> {
+    replace_action_dependency_aliases(store, &mut action)?;
+    Ok(crate::executor::canonicalize_action_identity(action))
+}
+
+pub(crate) fn project_action_identity_for_read(
+    store: &ArtifactStore,
+    action_id: &str,
+    action: &ActionSpec,
+) -> Result<(String, ActionSpec)> {
+    let resolved_action_id = resolve_queue_identity_alias(store, action_id)?;
+    let projected_action = canonicalize_action_with_queue_aliases(store, action.clone())?;
+    let projected_action_id = crate::executor::compute_action_id(&projected_action)?;
+    if resolved_action_id != action_id && resolved_action_id != projected_action_id {
+        bail!(
+            "queue identity alias target disagrees with projected action identity: old={} alias={} projected={}",
+            action_id,
+            resolved_action_id,
+            projected_action_id
+        );
+    }
+    Ok((projected_action_id, projected_action))
+}
+
 pub(crate) fn quarantine_corrupt_queue_file(path: &Path, reason: &str) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -548,7 +575,7 @@ fn requeue_pending_action_with_canonical_identity(
     priority: i32,
     action: ActionSpec,
 ) -> Result<Option<ActionSpec>> {
-    let canonical = crate::executor::canonicalize_action_identity(action);
+    let canonical = canonicalize_action_with_queue_aliases(store, action)?;
     let canonical_id = crate::executor::compute_action_id(&canonical)?;
     if canonical_id == record_action_id {
         return Ok(Some(canonical));
@@ -2970,9 +2997,35 @@ mod tests {
         let validation = crate::store_validation::validate_store(&store, false)
             .expect("validate migrated queue and identity aliases");
         assert_eq!(validation.identity_alias_records, 4);
+
+        // Model a rolling old worker that writes a dependent record after the
+        // producer migration has already published its identity alias.
+        let late_legacy_stats_item = QueueItem {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id: legacy_stats_id.clone(),
+            enqueued_utc: Utc::now(),
+            priority: 7,
+            action: legacy_stats,
+        };
+        let late_legacy_stats_path = store.pending_queue_path(&legacy_stats_id);
+        fs::create_dir_all(
+            late_legacy_stats_path
+                .parent()
+                .expect("late legacy stats pending parent"),
+        )
+        .expect("create late legacy stats pending parent");
+        fs::write(
+            &late_legacy_stats_path,
+            encode_queue_item(&late_legacy_stats_item).expect("encode late legacy stats pending"),
+        )
+        .expect("write late legacy stats pending");
+
         let running = claim_next_pending_item(&store, "worker-migrate", 60)
             .expect("claim canonical pending")
             .expect("canonical action should be claimable");
+        assert!(!late_legacy_stats_path.exists());
+        assert!(!store.canceled_queue_path(&legacy_stats_id).exists());
+        assert!(store.pending_queue_path(&canonical_stats_id).exists());
         assert_eq!(running.action_id(), canonical_id);
         assert!(matches!(
             running.action(),
