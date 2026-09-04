@@ -980,12 +980,13 @@ pub(crate) fn run() -> Result<()> {
             );
         }
         TopCommand::Rematerialize { action_id } => {
-            let provenance = store.load_provenance(&action_id)?;
-            let (computed, artifact_ref) = execute_action(&store, provenance.action.clone())?;
-            if computed != action_id {
+            let (expected_action_id, action) =
+                prepare_action_for_rematerialization(&store, &action_id)?;
+            let (computed, artifact_ref) = execute_action(&store, action)?;
+            if computed != expected_action_id {
                 bail!(
                     "action id mismatch when rematerializing; stored={} computed={}",
-                    action_id,
+                    expected_action_id,
                     computed
                 );
             }
@@ -1019,6 +1020,25 @@ pub(crate) fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn prepare_action_for_rematerialization(
+    store: &ArtifactStore,
+    requested_action_id: &str,
+) -> Result<(String, ActionSpec)> {
+    let resolved_action_id = resolve_queue_identity_alias(store, requested_action_id)?;
+    let provenance = store.load_provenance(&resolved_action_id)?;
+    let (projected_action_id, projected_action) =
+        project_action_identity_for_read(store, &provenance.action_id, &provenance.action)?;
+    if projected_action_id != provenance.action_id {
+        bail!(
+            "action identity changed since it was stored; requested={} stored={} canonical={}; refusing to rematerialize before execution",
+            requested_action_id,
+            provenance.action_id,
+            projected_action_id
+        );
+    }
+    Ok((projected_action_id, projected_action))
 }
 
 pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<ActionSpec> {
@@ -3771,6 +3791,71 @@ mod tests {
         assert!(entry.completed);
         assert_eq!(audit.completed_suggestions, 1);
         assert_eq!(audit.missing_suggestions, 0);
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn rematerialize_rejects_legacy_identity_before_execution() {
+        let (store, root) = make_test_store("rematerialize-legacy-identity");
+        let mut runtime = test_runtime();
+        runtime.driver_version = "0.25.0".to_string();
+        let legacy_action = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: "2".repeat(64),
+            top_fn_name: Some("target".to_string()),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
+            version: "v0.25.0".to_string(),
+            runtime,
+        };
+        let legacy_action_id = crate::proto::compute_model_action_id_v2(&legacy_action)
+            .expect("legacy action id")
+            .to_hex();
+        let canonical_action_id = compute_action_id(&legacy_action).expect("canonical action id");
+        assert_ne!(legacy_action_id, canonical_action_id);
+        let output_relpath = "payload/legacy.aig";
+        let output_bytes = b"legacy artifact";
+        let provenance = Provenance {
+            schema_version: crate::ACTION_SCHEMA_VERSION,
+            action_id: legacy_action_id.clone(),
+            created_utc: Utc::now(),
+            action: legacy_action,
+            dependencies: Vec::new(),
+            output_artifact: make_artifact(
+                &legacy_action_id,
+                ArtifactType::AigFile,
+                output_relpath,
+            ),
+            output_files: vec![OutputFile {
+                path: output_relpath.to_string(),
+                bytes: output_bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(output_bytes)),
+            }],
+            commands: Vec::new(),
+            details: json!({}),
+            suggested_next_actions: Vec::new(),
+        };
+        let staging_dir = store.staging_dir().join("legacy-rematerialize-staged");
+        fs::create_dir_all(staging_dir.join("payload")).expect("create legacy staging payload");
+        fs::write(staging_dir.join(output_relpath), output_bytes)
+            .expect("write legacy staged artifact");
+        fs::write(
+            staging_dir.join("provenance.pb"),
+            crate::proto::encode_provenance(&provenance).expect("encode legacy provenance"),
+        )
+        .expect("write legacy staged provenance");
+        store
+            .promote_staging_action_dir(&legacy_action_id, &staging_dir)
+            .expect("promote legacy action");
+
+        let error = prepare_action_for_rematerialization(&store, &legacy_action_id)
+            .expect_err("legacy identity must be rejected before execution");
+        let error = format!("{error:#}");
+        assert!(error.contains(&legacy_action_id));
+        assert!(error.contains(&canonical_action_id));
+        assert!(!store.action_exists(&canonical_action_id));
 
         drop(store);
         fs::remove_dir_all(root).expect("cleanup temp store");

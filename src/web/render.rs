@@ -2309,7 +2309,10 @@ pub(super) fn render_stdlib_g8r_vs_yosys_html(
     let zero_display_note = format!(
         "For the log/log levels and nodes plots, zero values are displayed as <code>1</code> so those samples remain visible ({lhs_label} vs {rhs_label})."
     );
-    let latest_dso_scope = scope == G8rVsYosysViewScope::IrFnCorpusG8rAbcVsCodegenYosysAbc;
+    let latest_dso_scope = matches!(
+        scope,
+        G8rVsYosysViewScope::IrFnCorpus | G8rVsYosysViewScope::IrFnCorpusG8rAbcVsCodegenYosysAbc
+    );
     let server_scoped_samples = latest_dso_scope && selected_crate_version.is_some();
     let scoped_samples: Vec<&crate::view::StdlibG8rVsYosysSample> = if latest_dso_scope {
         latest_dso_samples_by_crate(&dataset.samples)
@@ -3356,6 +3359,62 @@ restoreSelectedSampleFromQuery();
     html.push_str("</script>");
     html.push_str("</main></body></html>");
     html
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn comparison_sample(fn_key: &str, dso_version: &str) -> StdlibG8rVsYosysSample {
+        StdlibG8rVsYosysSample {
+            fn_key: fn_key.to_string(),
+            crate_version: "0.40.0".to_string(),
+            dso_version: dso_version.to_string(),
+            stdlib_root_action_id: None,
+            ir_action_id: format!("ir-{fn_key}"),
+            ir_top: Some("main".to_string()),
+            structural_hash: Some(format!("hash-{fn_key}")),
+            ir_node_count: 12,
+            g8r_nodes: 10.0,
+            g8r_levels: 3.0,
+            yosys_abc_nodes: 12.0,
+            yosys_abc_levels: 4.0,
+            g8r_product: 30.0,
+            yosys_abc_product: 48.0,
+            g8r_product_loss: -18.0,
+            g8r_stats_action_id: format!("g8r-{fn_key}"),
+            yosys_abc_stats_action_id: format!("yosys-{fn_key}"),
+        }
+    }
+
+    #[test]
+    fn direct_ir_corpus_renderer_uses_latest_dso_for_selected_crate() {
+        let dataset = StdlibG8rVsYosysDataset {
+            fraig: false,
+            samples: vec![
+                comparison_sample("stale-dso-only", "0.41.0"),
+                comparison_sample("latest-dso-only", "0.42.0"),
+            ],
+            min_ir_nodes: 12,
+            max_ir_nodes: 12,
+            g8r_only_count: 0,
+            yosys_only_count: 0,
+            available_crate_versions: vec!["0.40.0".to_string()],
+        };
+
+        let html = render_stdlib_g8r_vs_yosys_html(
+            &dataset,
+            12,
+            Some("0.40.0"),
+            false,
+            Utc::now(),
+            G8rVsYosysViewScope::IrFnCorpus,
+        );
+
+        assert!(html.contains("\"fn_key\":\"latest-dso-only\""));
+        assert!(!html.contains("\"fn_key\":\"stale-dso-only\""));
+        assert!(html.contains("crate:v0.40.0 · dso:v0.42.0"));
+    }
 }
 
 pub(super) fn render_stdlib_file_action_graph_html(
