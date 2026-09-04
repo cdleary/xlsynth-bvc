@@ -724,8 +724,20 @@ mod tests {
         ))
     }
 
-    fn empty_versions_index_bytes() -> &'static [u8] {
-        br#"{"schema_version":5,"generated_utc":"2026-08-29T12:00:00Z","report":{"cards":[],"unattributed_actions":[],"releases":[],"repository_head_observation":null}}"#
+    fn empty_versions_index_bytes() -> Vec<u8> {
+        let root = temp_path("versions-fixture-store");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("versions fixture layout");
+        let repo_root = std::env::current_dir().expect("current directory");
+        crate::query::rebuild_versions_cards_index(&store, &repo_root)
+            .expect("build versions fixture");
+        let bytes = store
+            .load_web_index_bytes(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .expect("load versions fixture")
+            .expect("versions fixture exists");
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup versions fixture");
+        bytes
     }
 
     #[test]
@@ -848,7 +860,7 @@ for (const [locationValue, expected] of cases) {
         store
             .write_web_index_bytes(
                 crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
-                empty_versions_index_bytes(),
+                &empty_versions_index_bytes(),
             )
             .expect("write index");
         let snapshot_dir = root.join("snapshot");

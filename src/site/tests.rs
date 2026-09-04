@@ -9,9 +9,7 @@ use crate::snapshot::{
     BuildStaticSnapshotOptions, STATIC_SNAPSHOT_MANIFEST_FILENAME, build_static_snapshot,
 };
 use crate::store::ArtifactStore;
-use crate::versioning::{
-    load_version_compat_map, normalize_tag_version, resolve_xlsynth_version_for_driver,
-};
+use crate::versioning::{load_version_compat_map, resolve_xlsynth_version_for_driver};
 use chrono::Utc;
 use serde_json::json;
 use std::io::Write as _;
@@ -29,17 +27,17 @@ fn test_repo_root() -> PathBuf {
 }
 
 fn empty_versions_index_bytes() -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
-        "generated_utc": "2026-08-29T12:00:00Z",
-        "report": {
-            "cards": [],
-            "unattributed_actions": [],
-            "releases": [],
-            "repository_head_observation": null
-        }
-    }))
-    .expect("serialize empty versions index")
+    let root = temp_root().join("versions-fixture-store");
+    let store = ArtifactStore::new(root.clone());
+    store.ensure_layout().expect("versions fixture layout");
+    rebuild_versions_cards_index(&store, &test_repo_root()).expect("build versions fixture");
+    let bytes = store
+        .load_web_index_bytes(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+        .expect("load versions fixture")
+        .expect("versions fixture exists");
+    drop(store);
+    fs::remove_dir_all(root).expect("cleanup versions fixture");
+    bytes
 }
 
 fn refresh_site_manifest_entry(site_dir: &Path, relpath: &str) {
@@ -275,7 +273,8 @@ fn site_build_and_verify_supports_subdirectory_base() {
     let releases_html =
         fs::read_to_string(site_dir.join("releases.html")).expect("read releases HTML");
     assert!(releases_html.contains("Crate release processing"));
-    assert!(releases_html.contains("No crate release inventory was published."));
+    assert!(releases_html.contains("Release ledger"));
+    assert!(releases_html.contains("not processed"));
     assert!(index_html.contains("Processing status"));
     assert!(APP_JS.contains("Release progression data is not available in this snapshot."));
     assert!(APP_JS.contains("At least two cohort-complete releases are needed"));
@@ -1724,14 +1723,8 @@ fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() 
     let repo_root = std::env::current_dir().expect("current dir");
     let compat = load_version_compat_map(&repo_root).expect("compat map");
     let crate_version = compat.keys().next().expect("known crate version").clone();
-    let crate_release_datetime = compat
-        .get(&crate_version)
-        .expect("compat entry")
-        .crate_release_datetime
-        .clone();
     let dso_version =
         resolve_xlsynth_version_for_driver(&repo_root, &crate_version).expect("dso version");
-    let release_dso_version = normalize_tag_version(&dso_version).to_string();
     for action in canonical_root_actions_for_crate_version(&repo_root, &crate_version, &dso_version)
         .expect("root actions")
     {
@@ -1765,44 +1758,7 @@ fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() 
             .expect("write root provenance");
     }
     let generated_utc = Utc::now();
-    let versions_json = serde_json::to_vec(&json!({
-        "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
-        "generated_utc": generated_utc,
-        "report": {
-            "cards": [{
-                "crate_version": crate_version,
-                "crate_release_datetime": crate_release_datetime,
-                "total_materialized": 1,
-                "failed_total": 0,
-                "dso_versions": [dso_version],
-                "stdlib_enumeration": {
-                    "state": "ok",
-                    "reason": "discovery_counts",
-                    "scanned_files": 1,
-                    "failed_files": 0,
-                    "concrete_functions": 1,
-                    "suggested_actions": 1
-                },
-                "failed_by_kind": [],
-                "failures": []
-            }],
-            "unattributed_actions": [],
-            "releases": [{
-                "crate_version": crate_version,
-                "crate_release_datetime": crate_release_datetime,
-                "dso_version": release_dso_version,
-                "processed": true,
-                "materialized_actions": 1,
-                "failed_actions": 0,
-                "stdlib_enumeration_state": "ok"
-            }],
-            "repository_head_observation": null
-        }
-    }))
-    .expect("serialize versions dataset");
-    store
-        .write_web_index_bytes(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME, &versions_json)
-        .expect("versions dataset");
+    rebuild_versions_cards_index(&store, &repo_root).expect("versions dataset");
     let comparison_json = serde_json::to_vec(&json!({
         "schema_version": crate::WEB_STDLIB_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
         "generated_utc": generated_utc,

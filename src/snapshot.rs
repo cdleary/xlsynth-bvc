@@ -15,7 +15,7 @@ use crate::campaign::{campaign_analysis_path, list_finalized_campaign_runs};
 use crate::query::{
     build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_bytes,
     build_ir_fn_corpus_g8r_vs_yosys_dataset_index_bytes,
-    build_ir_fn_corpus_ir_index_bytes_for_paired_indices,
+    build_ir_fn_corpus_ir_index_bytes_for_paired_indices, load_versions_cards_index,
     rebuild_stdlib_fn_version_timeline_dataset_index, rebuild_stdlib_fns_trend_dataset_index,
     rebuild_stdlib_g8r_vs_yosys_dataset_index, rebuild_versions_cards_index,
 };
@@ -1065,6 +1065,15 @@ pub(crate) fn build_static_snapshot(
     options: &BuildStaticSnapshotOptions,
 ) -> Result<BuildStaticSnapshotSummary> {
     reject_snapshot_output_overlap(&options.out_dir, store, repo_root)?;
+    if options.skip_rebuild_web_indices
+        && load_versions_cards_index(store, repo_root)
+            .context("validating cached versions summary before static snapshot")?
+            .is_none()
+    {
+        bail!(
+            "cached versions summary is missing or stale; rebuild web indices before using --skip-rebuild-web-indices"
+        );
+    }
     ensure_empty_output_dir(&options.out_dir, options.overwrite)?;
     fs::create_dir_all(options.out_dir.join(STATIC_SNAPSHOT_WEB_INDEX_DIR)).with_context(|| {
         format!(
@@ -1458,17 +1467,17 @@ mod tests {
     }
 
     fn empty_versions_index_bytes() -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
-            "generated_utc": Utc::now(),
-            "report": {
-                "cards": [],
-                "unattributed_actions": [],
-                "releases": [],
-                "repository_head_observation": null
-            }
-        }))
-        .expect("serialize empty versions index")
+        let root = make_temp_dir("versions-fixture-store");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("versions fixture layout");
+        rebuild_versions_cards_index(&store, &test_repo_root()).expect("build versions fixture");
+        let bytes = store
+            .load_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .expect("load versions fixture")
+            .expect("versions fixture exists");
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup versions fixture");
+        bytes
     }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
@@ -1656,6 +1665,45 @@ mod tests {
             first_manifest,
             fs::read(out_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME)).expect("second manifest")
         );
+    }
+
+    #[test]
+    fn skipped_snapshot_rejects_source_incomplete_release_ledger() {
+        let root = make_temp_dir("skip-incomplete-releases");
+        let store = ArtifactStore::new(root.join("store"));
+        store.ensure_layout().expect("ensure layout");
+        let repo_root = test_repo_root();
+        let input_fingerprint_sha256 =
+            crate::query::versions_summary_input_fingerprint(&store, &repo_root)
+                .expect("versions input fingerprint");
+        let incomplete = crate::query::VersionsSummaryIndexFile {
+            schema_version: crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
+            generated_utc: Utc::now(),
+            input_fingerprint_sha256,
+            report: crate::view::VersionCardsReport::default(),
+        };
+        store
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &serde_json::to_vec(&incomplete).expect("serialize incomplete versions index"),
+            )
+            .expect("write incomplete versions index");
+
+        let error = build_static_snapshot(
+            &store,
+            &repo_root,
+            &BuildStaticSnapshotOptions {
+                out_dir: root.join("snapshot-out"),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect_err("skip mode must reject a source-incomplete release ledger");
+        assert!(
+            format!("{error:#}").contains("missing or stale"),
+            "unexpected error: {error:#}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -2150,6 +2198,8 @@ mod tests {
                 &serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
             )
             .expect("write structural manifest");
+        rebuild_versions_cards_index(&store, &test_repo_root())
+            .expect("build source-complete versions index");
 
         let error = build_static_snapshot(
             &store,
