@@ -48,7 +48,7 @@ const RELEASE_PROGRESSION_IR_HASHES: &str =
 const RELEASE_PROGRESSION_IR_COUNT: usize = 187;
 const RELEASE_PROGRESSION_IR_SHA256: &str =
     "a70a2e38b978d07b8bfc642f7a7cd6806a35bfa4de52f8c9919cd880057e2f77";
-const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 4;
+const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 5;
 const STATIC_COMPARISON_SHARD_SCHEMA_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_PREFIX_HEX_CHARS: u8 = 1;
 const STATIC_STRUCTURAL_SHARD_SCHEMA_VERSION: u32 = 1;
@@ -282,6 +282,7 @@ struct BrowserProgressionCatalog {
     dataset_key: String,
     cohort_ir_count: u64,
     cohort_ir_sha256: Option<String>,
+    cohort_ir_hashes: Vec<String>,
     cohort_complete_generation_count: u64,
     generations: Vec<BrowserProgressionGeneration>,
 }
@@ -412,6 +413,7 @@ fn empty_browser_progression_catalog() -> BrowserProgressionCatalog {
         dataset_key: crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME.to_string(),
         cohort_ir_count: 0,
         cohort_ir_sha256: None,
+        cohort_ir_hashes: Vec::new(),
         cohort_complete_generation_count: 0,
         generations: Vec::new(),
     }
@@ -477,14 +479,14 @@ fn build_browser_progression_catalog(
             .context("missing fixed IR count exceeds u64")?;
         let extra_ir_count = u64::try_from(ir_set.difference(&cohort_set).count())
             .context("extra fixed IR count exceeds u64")?;
-        let coverage = if ir_set == cohort_set {
+        let coverage = if missing_cohort_ir_count == 0 {
             BrowserProgressionCoverage::CohortComplete
         } else if extra_ir_count == 0 {
             BrowserProgressionCoverage::Partial
         } else {
             BrowserProgressionCoverage::Incompatible
         };
-        let observed_ir_count = u64::try_from(source.structural_hashes.len())
+        let observed_ir_count = u64::try_from(ir_set.intersection(&cohort_set).count())
             .context("observed fixed IR count exceeds u64")?;
         generations.push(BrowserProgressionGeneration {
             generation_id: progression_generation_id(&source.crate_version, &source.dso_version),
@@ -512,6 +514,7 @@ fn build_browser_progression_catalog(
         dataset_key: crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME.to_string(),
         cohort_ir_count,
         cohort_ir_sha256,
+        cohort_ir_hashes: cohort,
         cohort_complete_generation_count,
         generations,
     })

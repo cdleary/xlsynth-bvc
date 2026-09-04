@@ -281,7 +281,7 @@ fn site_build_and_verify_supports_subdirectory_base() {
         &fs::read(site_dir.join("catalog.json")).expect("read browser catalog"),
     )
     .expect("decode browser catalog");
-    assert_eq!(catalog.schema_version, 4);
+    assert_eq!(catalog.schema_version, 5);
     let index_html = fs::read_to_string(site_dir.join("index.html")).expect("read homepage HTML");
     assert!(index_html.contains("Boolean synthesis comparison"));
     assert!(index_html.contains("id=\"home-overview\""));
@@ -575,6 +575,7 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
         samples.push(sample("0.3.0", hash, &format!("partial-{index}")));
         samples.push(sample("0.4.0", hash, &format!("changed-{index}")));
     }
+    samples.push(sample("0.2.0", &extra_hash, "unrelated-complete-extra"));
     samples.push(sample("0.4.0", &extra_hash, "extra"));
     let mut generated = sample("0.4.0", &extra_hash, "generated");
     generated.ir_top = Some("__k3_cone_generated".to_string());
@@ -600,6 +601,7 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
         crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME
     );
     assert_eq!(catalog.cohort_ir_count, RELEASE_PROGRESSION_IR_COUNT as u64);
+    assert_eq!(&catalog.cohort_ir_hashes, &hashes);
     assert_eq!(
         catalog.cohort_ir_sha256.as_deref(),
         Some(
@@ -630,6 +632,7 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
         generation("0.2.0").observed_ir_count,
         RELEASE_PROGRESSION_IR_COUNT as u64
     );
+    assert_eq!(generation("0.2.0").extra_ir_count, 1);
 
     let partial = generation("0.3.0");
     assert_eq!(partial.coverage, BrowserProgressionCoverage::Partial);
@@ -643,7 +646,7 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
     );
     assert_eq!(
         incompatible.observed_ir_count,
-        RELEASE_PROGRESSION_IR_COUNT as u64
+        (RELEASE_PROGRESSION_IR_COUNT - 1) as u64
     );
     assert_eq!(incompatible.missing_cohort_ir_count, 1);
     assert_eq!(incompatible.extra_ir_count, 1);
@@ -761,10 +764,12 @@ const generation = (generation_id, dso_version) => ({
   extra_ir_count: 0,
 });
 const rolling = api.releaseGenerations(
-  {progression: {generations: [generation('new', '0.10.0'), generation('old', '0.9.0')]}},
+  {progression: {cohort_ir_count: 2, cohort_ir_hashes: [hash('a'), hash('b')], generations: [generation('new', '0.10.0'), generation('old', '0.9.0')]}},
   [
     {...sample('a', 'a', 0), crate_version: '1.0.0', dso_version: '0.9.0'},
     {...sample('a', 'a', 0), crate_version: '1.0.0', dso_version: '0.10.0'},
+    {...sample('unrelated-old', 'f', 999999), crate_version: '1.0.0', dso_version: '0.9.0'},
+    {...sample('unrelated-new', 'f', -999999), crate_version: '1.0.0', dso_version: '0.10.0'},
   ],
 );
 if (rolling.length !== 2 || rolling.some(value => value.samples.length !== 1)
