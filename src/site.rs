@@ -28,7 +28,7 @@ use crate::snapshot::{
 use crate::versioning::cmp_dotted_numeric_version;
 use crate::view::{
     CrateReleaseStatusView, RepositoryHeadObservationView, StdlibAigStatsPoint,
-    StdlibEnumerationState, StdlibG8rVsYosysDataset, StdlibG8rVsYosysSample, VersionCardsReport,
+    StdlibG8rVsYosysDataset, StdlibG8rVsYosysSample, VersionCardsReport,
 };
 
 pub(crate) const STATIC_SITE_RECORD_VERSION: u32 = 1;
@@ -43,6 +43,11 @@ const PLOTLY_NOTICE: &[u8] =
 
 const STYLE_CSS: &str = include_str!("site_assets/style.css");
 const APP_JS: &str = include_str!("site_assets/app.js");
+const RELEASE_PROGRESSION_IR_HASHES: &str =
+    include_str!("site_assets/release_progression_ir_hashes.txt");
+const RELEASE_PROGRESSION_IR_COUNT: usize = 187;
+const RELEASE_PROGRESSION_IR_SHA256: &str =
+    "a70a2e38b978d07b8bfc642f7a7cd6806a35bfa4de52f8c9919cd880057e2f77";
 const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 3;
 const STATIC_COMPARISON_SHARD_SCHEMA_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_PREFIX_HEX_CHARS: u8 = 1;
@@ -275,8 +280,8 @@ struct BrowserFinding {
 #[serde(deny_unknown_fields)]
 struct BrowserProgressionCatalog {
     dataset_key: String,
-    cohort_subject_count: u64,
-    cohort_subject_sha256: Option<String>,
+    cohort_ir_count: u64,
+    cohort_ir_sha256: Option<String>,
     cohort_complete_generation_count: u64,
     generations: Vec<BrowserProgressionGeneration>,
 }
@@ -291,49 +296,22 @@ enum BrowserProgressionCoverage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct BrowserProgressionRunRef {
-    run_id: String,
-    status: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 struct BrowserProgressionGeneration {
     generation_id: String,
     crate_version: String,
     dso_version: String,
-    stdlib_root_action_id: String,
     coverage: BrowserProgressionCoverage,
-    observed_subject_count: u64,
-    cohort_subject_count: u64,
-    missing_cohort_subject_count: u64,
-    extra_subject_count: u64,
-    enumeration_status: Option<String>,
-    enumerated_subject_count: Option<u64>,
-    unmeasured_enumerated_subject_count: Option<u64>,
-    campaign_runs: Vec<BrowserProgressionRunRef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProgressionComparisonIndexFile {
-    schema_version: u32,
-    generated_utc: chrono::DateTime<chrono::Utc>,
-    dataset: StdlibG8rVsYosysDataset,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-struct ProgressionSubject {
-    fn_key: String,
-    ir_top: Option<String>,
+    observed_ir_count: u64,
+    cohort_ir_count: u64,
+    missing_cohort_ir_count: u64,
+    extra_ir_count: u64,
 }
 
 #[derive(Debug)]
 struct ProgressionGenerationSource {
     crate_version: String,
     dso_version: String,
-    stdlib_root_action_id: String,
-    subjects: Vec<ProgressionSubject>,
+    structural_hashes: Vec<String>,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -362,44 +340,78 @@ fn decode_canonical_browser_catalog(bytes: &[u8]) -> Result<BrowserCatalog> {
     Ok(catalog)
 }
 
-fn progression_subjects_sha256(subjects: &[ProgressionSubject]) -> Result<String> {
+fn progression_ir_sha256(structural_hashes: &[String]) -> Result<String> {
     let mut hasher = Sha256::new();
-    hasher.update(b"xlsynth-bvc/release-progression-cohort/v1\0");
+    hasher.update(b"xlsynth-bvc/release-progression-fixed-ir-cohort/v2\0");
     hasher.update(
-        serde_json::to_vec(subjects).context("encoding release progression cohort identity")?,
+        serde_json::to_vec(structural_hashes)
+            .context("encoding fixed-IR release progression cohort identity")?,
     );
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn progression_generation_id(
-    crate_version: &str,
-    dso_version: &str,
-    stdlib_root_action_id: &str,
-) -> String {
+fn release_progression_ir_hashes() -> Result<Vec<String>> {
+    let hashes = RELEASE_PROGRESSION_IR_HASHES
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if hashes.len() != RELEASE_PROGRESSION_IR_COUNT {
+        bail!(
+            "fixed IR release-progression manifest has the wrong size: expected={} actual={}",
+            RELEASE_PROGRESSION_IR_COUNT,
+            hashes.len()
+        );
+    }
+    if hashes.iter().any(|hash| {
+        hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        bail!("fixed IR release-progression manifest contains a noncanonical SHA-256 digest");
+    }
+    if hashes.windows(2).any(|pair| pair[0] >= pair[1]) {
+        bail!("fixed IR release-progression manifest must be strictly sorted and unique");
+    }
+    let digest = progression_ir_sha256(&hashes)?;
+    if digest != RELEASE_PROGRESSION_IR_SHA256 {
+        bail!(
+            "fixed IR release-progression manifest identity changed: expected={} actual={}",
+            RELEASE_PROGRESSION_IR_SHA256,
+            digest
+        );
+    }
+    Ok(hashes)
+}
+
+fn progression_generation_id(crate_version: &str, dso_version: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"xlsynth-bvc/release-progression-generation/v1\0");
-    for value in [crate_version, dso_version, stdlib_root_action_id] {
+    hasher.update(b"xlsynth-bvc/release-progression-fixed-ir-generation/v2\0");
+    for value in [crate_version, dso_version] {
         hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value.as_bytes());
     }
     hex::encode(hasher.finalize())
 }
 
-fn enumeration_state_label(state: StdlibEnumerationState) -> &'static str {
-    match state {
-        StdlibEnumerationState::Unknown => "unknown",
-        StdlibEnumerationState::Missing => "missing",
-        StdlibEnumerationState::Failed => "failed",
-        StdlibEnumerationState::Partial => "partial",
-        StdlibEnumerationState::Ok => "ok",
-    }
+fn normalized_progression_ir_hash(sample: &StdlibG8rVsYosysSample) -> Option<String> {
+    let value = sample.structural_hash.as_deref()?.trim();
+    (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| value.to_ascii_lowercase())
+}
+
+fn is_progression_fixed_ir_sample(sample: &StdlibG8rVsYosysSample) -> bool {
+    !sample
+        .ir_top
+        .as_deref()
+        .is_some_and(|top| top.starts_with("__k3_cone_") || top.starts_with("__mffc_"))
 }
 
 fn empty_browser_progression_catalog() -> BrowserProgressionCatalog {
     BrowserProgressionCatalog {
-        dataset_key: crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME.to_string(),
-        cohort_subject_count: 0,
-        cohort_subject_sha256: None,
+        dataset_key: crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME.to_string(),
+        cohort_ir_count: 0,
+        cohort_ir_sha256: None,
         cohort_complete_generation_count: 0,
         generations: Vec::new(),
     }
@@ -407,185 +419,87 @@ fn empty_browser_progression_catalog() -> BrowserProgressionCatalog {
 
 fn build_browser_progression_catalog(
     dataset: &StdlibG8rVsYosysDataset,
-    versions: Option<&VersionCardsReport>,
-    runs: &[BrowserRun],
 ) -> Result<BrowserProgressionCatalog> {
-    if dataset
+    let fixed_samples = dataset
         .samples
         .iter()
-        .any(|sample| sample.stdlib_root_action_id.is_none())
-    {
+        .filter(|sample| is_progression_fixed_ir_sample(sample))
+        .collect::<Vec<_>>();
+    if fixed_samples.is_empty() {
         return Ok(empty_browser_progression_catalog());
     }
-    let mut grouped = BTreeMap::<(String, String, String), Vec<_>>::new();
-    let mut cohort_populations = BTreeMap::<(String, String), BTreeSet<_>>::new();
-    for sample in &dataset.samples {
-        let root = sample
-            .stdlib_root_action_id
-            .as_ref()
-            .expect("lineage presence was checked above");
-        let subject = ProgressionSubject {
-            fn_key: sample.fn_key.clone(),
-            ir_top: sample.ir_top.clone(),
-        };
-        cohort_populations
-            .entry((sample.crate_version.clone(), root.clone()))
-            .or_default()
-            .insert(subject);
-        grouped
-            .entry((
-                sample.crate_version.clone(),
-                sample.dso_version.clone(),
-                root.clone(),
-            ))
-            .or_default()
-            .push(sample);
-    }
 
-    let mut sources = Vec::with_capacity(grouped.len());
-    let mut population_frequency = BTreeMap::<Vec<ProgressionSubject>, u64>::new();
-    for subjects in cohort_populations.into_values() {
-        *population_frequency
-            .entry(subjects.into_iter().collect())
-            .or_default() += 1;
-    }
-    for ((crate_version, dso_version, stdlib_root_action_id), samples) in grouped {
-        let mut subjects = BTreeSet::new();
-        for sample in samples {
-            let subject = ProgressionSubject {
-                fn_key: sample.fn_key.clone(),
-                ir_top: sample.ir_top.clone(),
-            };
-            if !subjects.insert(subject) {
-                bail!(
-                    "release progression generation contains a duplicate subject: crate={} root={}",
-                    crate_version,
-                    stdlib_root_action_id
-                );
-            }
+    let mut grouped = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    for sample in fixed_samples {
+        let structural_hash = normalized_progression_ir_hash(sample).with_context(|| {
+            format!(
+                "fixed-IR release progression sample {} in crate {} has no valid structural hash",
+                sample.fn_key, sample.crate_version
+            )
+        })?;
+        let generation = grouped
+            .entry((sample.crate_version.clone(), sample.dso_version.clone()))
+            .or_default();
+        if !generation.insert(structural_hash.clone()) {
+            bail!(
+                "fixed-IR release progression generation contains duplicate structural hash: crate={} dso={} hash={}",
+                sample.crate_version,
+                sample.dso_version,
+                structural_hash
+            );
         }
-        let subjects = subjects.into_iter().collect::<Vec<_>>();
-        sources.push(ProgressionGenerationSource {
-            crate_version,
-            dso_version,
-            stdlib_root_action_id,
-            subjects,
-        });
     }
 
-    let mut populations = population_frequency.into_iter().collect::<Vec<_>>();
-    populations.sort_by(
-        |(left_subjects, left_count), (right_subjects, right_count)| {
-            right_count
-                .cmp(left_count)
-                .then(right_subjects.len().cmp(&left_subjects.len()))
-                .then_with(|| {
-                    progression_subjects_sha256(left_subjects)
-                        .expect("cohort encoding is infallible")
-                        .cmp(
-                            &progression_subjects_sha256(right_subjects)
-                                .expect("cohort encoding is infallible"),
-                        )
-                })
-        },
-    );
-    let cohort = populations
-        .first()
-        .map(|(subjects, _)| subjects.clone())
-        .unwrap_or_default();
+    let sources = grouped
+        .into_iter()
+        .map(
+            |((crate_version, dso_version), structural_hashes)| ProgressionGenerationSource {
+                crate_version,
+                dso_version,
+                structural_hashes: structural_hashes.into_iter().collect(),
+            },
+        )
+        .collect::<Vec<_>>();
+    let cohort = release_progression_ir_hashes()?;
     let cohort_set = cohort.iter().cloned().collect::<BTreeSet<_>>();
-    let cohort_subject_sha256 = if cohort.is_empty() {
-        None
-    } else {
-        Some(progression_subjects_sha256(&cohort)?)
-    };
+    let cohort_ir_sha256 = Some(progression_ir_sha256(&cohort)?);
+    let cohort_ir_count =
+        u64::try_from(cohort.len()).context("fixed IR cohort size exceeds u64")?;
 
-    let mut enumeration_by_version = BTreeMap::new();
-    if let Some(versions) = versions {
-        for card in &versions.cards {
-            if enumeration_by_version
-                .insert(
-                    card.crate_version.clone(),
-                    (
-                        enumeration_state_label(card.stdlib_enumeration.state).to_string(),
-                        matches!(
-                            card.stdlib_enumeration.state,
-                            StdlibEnumerationState::Partial | StdlibEnumerationState::Ok
-                        )
-                        .then_some(card.stdlib_enumeration.concrete_functions),
-                    ),
-                )
-                .is_some()
-            {
-                bail!(
-                    "version summary contains duplicate cards for {}",
-                    card.crate_version
-                );
-            }
-        }
-    }
-
-    let cohort_subject_count = u64::try_from(cohort.len()).context("cohort size exceeds u64")?;
     let mut generations = Vec::with_capacity(sources.len());
     for source in sources {
-        let subject_set = source.subjects.iter().cloned().collect::<BTreeSet<_>>();
-        let missing_cohort_subject_count =
-            u64::try_from(cohort_set.difference(&subject_set).count())
-                .context("missing cohort subject count exceeds u64")?;
-        let extra_subject_count = u64::try_from(subject_set.difference(&cohort_set).count())
-            .context("extra subject count exceeds u64")?;
-        let coverage = if subject_set == cohort_set {
+        let ir_set = source
+            .structural_hashes
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let missing_cohort_ir_count = u64::try_from(cohort_set.difference(&ir_set).count())
+            .context("missing fixed IR count exceeds u64")?;
+        let extra_ir_count = u64::try_from(ir_set.difference(&cohort_set).count())
+            .context("extra fixed IR count exceeds u64")?;
+        let coverage = if ir_set == cohort_set {
             BrowserProgressionCoverage::CohortComplete
-        } else if extra_subject_count == 0 {
+        } else if extra_ir_count == 0 {
             BrowserProgressionCoverage::Partial
         } else {
             BrowserProgressionCoverage::Incompatible
         };
-        let observed_subject_count =
-            u64::try_from(source.subjects.len()).context("subject count exceeds u64")?;
-        let (enumeration_status, enumerated_subject_count) = enumeration_by_version
-            .get(&source.crate_version)
-            .map(|(status, count)| (Some(status.clone()), *count))
-            .unwrap_or((None, None));
-        let unmeasured_enumerated_subject_count =
-            enumerated_subject_count.map(|count| count.saturating_sub(observed_subject_count));
-        let mut campaign_runs = runs
-            .iter()
-            .filter(|run| {
-                run.crate_version == source.crate_version
-                    && run.dso_version == source.dso_version
-                    && run.root_action_ids.contains(&source.stdlib_root_action_id)
-            })
-            .map(|run| BrowserProgressionRunRef {
-                run_id: run.run_id.clone(),
-                status: run.status.clone(),
-            })
-            .collect::<Vec<_>>();
-        campaign_runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        let observed_ir_count = u64::try_from(source.structural_hashes.len())
+            .context("observed fixed IR count exceeds u64")?;
         generations.push(BrowserProgressionGeneration {
-            generation_id: progression_generation_id(
-                &source.crate_version,
-                &source.dso_version,
-                &source.stdlib_root_action_id,
-            ),
+            generation_id: progression_generation_id(&source.crate_version, &source.dso_version),
             crate_version: source.crate_version,
             dso_version: source.dso_version,
-            stdlib_root_action_id: source.stdlib_root_action_id,
             coverage,
-            observed_subject_count,
-            cohort_subject_count,
-            missing_cohort_subject_count,
-            extra_subject_count,
-            enumeration_status,
-            enumerated_subject_count,
-            unmeasured_enumerated_subject_count,
-            campaign_runs,
+            observed_ir_count,
+            cohort_ir_count,
+            missing_cohort_ir_count,
+            extra_ir_count,
         });
     }
     generations.sort_by(|left, right| {
         cmp_dotted_numeric_version(&left.crate_version, &right.crate_version)
             .then_with(|| cmp_dotted_numeric_version(&left.dso_version, &right.dso_version))
-            .then(left.stdlib_root_action_id.cmp(&right.stdlib_root_action_id))
     });
     let cohort_complete_generation_count = u64::try_from(
         generations
@@ -593,11 +507,11 @@ fn build_browser_progression_catalog(
             .filter(|generation| generation.coverage == BrowserProgressionCoverage::CohortComplete)
             .count(),
     )
-    .context("complete generation count exceeds u64")?;
+    .context("complete fixed-IR generation count exceeds u64")?;
     Ok(BrowserProgressionCatalog {
-        dataset_key: crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME.to_string(),
-        cohort_subject_count,
-        cohort_subject_sha256,
+        dataset_key: crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME.to_string(),
+        cohort_ir_count,
+        cohort_ir_sha256,
         cohort_complete_generation_count,
         generations,
     })
@@ -606,48 +520,71 @@ fn build_browser_progression_catalog(
 fn build_browser_progression_catalog_from_site(
     site_dir: &Path,
     datasets: &[BrowserDataset],
-    runs: &[BrowserRun],
+    _runs: &[BrowserRun],
 ) -> Result<BrowserProgressionCatalog> {
-    let Some(comparison_entry) = datasets.iter().find(|dataset| {
-        dataset.logical_key == crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME
-    }) else {
+    let Some(comparison_entry) = datasets
+        .iter()
+        .find(|dataset| dataset.logical_key == crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME)
+    else {
         return Ok(empty_browser_progression_catalog());
     };
     let comparison_bytes = fs::read(site_dir.join(&comparison_entry.url)).with_context(|| {
         format!(
-            "reading comparison dataset for release progression: {}",
+            "reading fixed-IR comparison dataset for release progression: {}",
             comparison_entry.url
         )
     })?;
-    let comparison: ProgressionComparisonIndexFile = serde_json::from_slice(&comparison_bytes)
-        .context("decoding typed release progression comparison dataset")?;
-    if comparison.schema_version != crate::WEB_STDLIB_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION
+    let mut comparison: StaticComparisonManifest = serde_json::from_slice(&comparison_bytes)
+        .context("decoding fixed-IR release progression comparison manifest")?;
+    if comparison.schema_version != STATIC_COMPARISON_SHARD_SCHEMA_VERSION
+        || comparison.source.schema_version
+            != crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION
         || comparison.dataset.fraig
     {
-        bail!("release progression comparison dataset has the wrong schema or fraig mode");
+        bail!("fixed-IR release progression comparison dataset has the wrong schema or fraig mode");
     }
-    let versions = datasets
-        .iter()
-        .find(|dataset| dataset.logical_key == crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
-        .map(|entry| {
-            let bytes = fs::read(site_dir.join(&entry.url)).with_context(|| {
+    let mut sample_rows = Vec::with_capacity(comparison.sample_count);
+    for summary in &comparison.sample_shards {
+        let shard_entry = datasets
+            .iter()
+            .find(|dataset| dataset.logical_key == summary.index_key)
+            .with_context(|| {
                 format!(
-                    "reading versions dataset for release progression: {}",
-                    entry.url
+                    "fixed-IR release progression sample shard is absent from browser catalog: {}",
+                    summary.index_key
                 )
             })?;
-            let versions: VersionsSummaryIndexFile = serde_json::from_slice(&bytes)
-                .context("decoding typed release progression versions dataset")?;
-            validate_complete_versions_summary(&versions)
-                .context("validating release progression versions dataset")?;
-            Ok::<VersionsSummaryIndexFile, anyhow::Error>(versions)
-        })
-        .transpose()?;
-    build_browser_progression_catalog(
-        &comparison.dataset,
-        versions.as_ref().map(|versions| &versions.report),
-        runs,
-    )
+        let shard_bytes = fs::read(site_dir.join(&shard_entry.url)).with_context(|| {
+            format!(
+                "reading fixed-IR release progression sample shard: {}",
+                shard_entry.url
+            )
+        })?;
+        let shard: StaticComparisonSampleShard = serde_json::from_slice(&shard_bytes)
+            .with_context(|| {
+                format!(
+                    "decoding fixed-IR release progression sample shard: {}",
+                    summary.index_key
+                )
+            })?;
+        if shard.rows.len() != summary.row_count {
+            bail!(
+                "fixed-IR release progression sample shard row count mismatch: {}",
+                summary.index_key
+            );
+        }
+        sample_rows.extend(shard.rows);
+    }
+    sample_rows.sort_by_key(|row| row.source_ordinal);
+    if sample_rows.len() != comparison.sample_count {
+        bail!(
+            "fixed-IR release progression sample count mismatch: expected={} actual={}",
+            comparison.sample_count,
+            sample_rows.len()
+        );
+    }
+    comparison.dataset.samples = sample_rows.into_iter().map(|row| row.sample).collect();
+    build_browser_progression_catalog(&comparison.dataset)
 }
 
 fn load_versions_report_from_site(
@@ -1024,8 +961,8 @@ fn actual_site_relpaths(site_dir: &Path) -> Result<BTreeSet<String>> {
 
 fn progression_body(root_site_url: &str) -> String {
     format!(
-        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Release progression</h1><p class=\"meta\">Signed G8r − Yosys/ABC nodes × levels product loss across the canonical measured stdlib cohort; negative means G8r is better</p><p id=\"error\" role=\"alert\"></p></header><main id=\"progression\" data-dataset-key=\"{}\"><div class=\"toolbar\"><label>Baseline <select id=\"baseline-version\" aria-label=\"Baseline crate release\"></select></label><label>Current <select id=\"current-version\" aria-label=\"Current crate release\"></select></label><label><input id=\"include-incomplete\" type=\"checkbox\"> Include incomplete generations</label></div><p id=\"progression-status\" class=\"meta\" aria-live=\"polite\">Loading release data…</p><section id=\"progression-summary\" class=\"grid\" aria-live=\"polite\"></section><h2>Distribution progression</h2><section id=\"progression-chart\" class=\"progression-chart\" aria-live=\"polite\"><p class=\"muted\">Loading release data…</p></section><h2>Generation coverage</h2><section id=\"progression-inventory\" aria-live=\"polite\"></section><section id=\"progression-table\" aria-live=\"polite\"></section></main>",
-        crate::WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
+        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Fixed-IR release progression</h1><p class=\"meta\">Aggregate quality and per-artifact distributions for the same structural IR corpus across crate releases; negative means G8r is better</p><p id=\"error\" role=\"alert\"></p></header><main id=\"progression\" data-dataset-key=\"{}\"><div class=\"toolbar\"><label>Baseline <select id=\"baseline-version\" aria-label=\"Baseline crate release\"></select></label><label>Current <select id=\"current-version\" aria-label=\"Current crate release\"></select></label><label><input id=\"include-incomplete\" type=\"checkbox\"> Include incomplete generations</label></div><p id=\"progression-status\" class=\"meta\" aria-live=\"polite\">Loading release data…</p><section id=\"progression-summary\" class=\"grid\" aria-live=\"polite\"></section><h2>Quality versus distribution</h2><section id=\"progression-chart\" class=\"progression-chart\" aria-live=\"polite\"><p class=\"muted\">Loading release data…</p></section><h2>Fixed-IR coverage</h2><section id=\"progression-inventory\" aria-live=\"polite\"></section><section id=\"progression-table\" aria-live=\"polite\"></section></main>",
+        crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
     )
 }
 
@@ -1163,7 +1100,7 @@ fn homepage_body(
         .get(..12)
         .unwrap_or(&snapshot.snapshot_id);
     format!(
-        r#"<header class="science-header"><div class="science-topline"><div><p class="science-label">xlsynth-bvc / static result corpus</p><h1>Boolean synthesis comparison</h1></div><nav class="science-nav" aria-label="Primary navigation"><a href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">QoR explorer</a><a href="{root_site_url}progression.html">Release history</a><a href="{root_site_url}releases.html">Processing status</a><a href="{root_site_url}runs.html">Runs</a><a href="{root_site_url}dataset.html">Data</a></nav></div><p class="science-abstract">Paired measurements of XLS IR through G8r+ABC and codegen+Yosys/ABC. Both paths share ABC downstream, so the overview isolates frontend structure; the full explorers provide sample-level links to immutable exported evidence.</p><dl class="science-meta"><div><dt>snapshot</dt><dd><code title="{}">{}</code></dd></div><div><dt>verified runs</dt><dd>{}</dd></div><div><dt>datasets</dt><dd>{}</dd></div><div><dt>generated</dt><dd>{}</dd></div></dl><p id="error" role="alert"></p></header><main class="science-main"><section id="home-overview" data-dataset-key="{}" data-lhs-label="G8r+ABC" data-rhs-label="codegen+Yosys/ABC" aria-labelledby="overview-title"><div class="overview-heading"><div><p class="science-label">latest crate release / G8r+ABC vs codegen+Yosys/ABC</p><h2 id="overview-title">Corpus overview</h2><p id="home-overview-status" class="meta" aria-live="polite">Loading paired synthesis measurements…</p></div><a id="home-full-explorer-link" class="text-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">Open the full interactive view →</a></div><p id="home-coverage-warning" class="coverage-warning" hidden role="status"></p><dl class="metric-row"><div><dt>crate release</dt><dd id="home-overview-release">—</dd></div><div><dt>paired IR samples</dt><dd id="home-sample-count">—</dd></div><div><dt>Q1 pure wins</dt><dd id="home-pure-win-count">—</dd></div><div><dt>Q3 strict losses</dt><dd id="home-strict-loss-count">—</dd></div><div><dt>median signed product Δ</dt><dd id="home-median-loss">—</dd></div></dl><div class="home-plot-grid"><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic levels</h3><span>log / log · y=x · zero→1 disclosed</span></div><div id="home-plot-levels" class="home-plot" aria-label="G8r plus ABC versus codegen plus Yosys ABC logic levels"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic nodes</h3><span>log / log · y=x · zero→1 disclosed</span></div><div id="home-plot-nodes" class="home-plot" aria-label="G8r plus ABC versus codegen plus Yosys ABC logic nodes"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Node / level delta quadrants</h3><span>positive = G8r+ABC better</span></div><div id="home-plot-deltas" class="home-plot" aria-label="Four quadrant node and level delta plot"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Strict product losses vs IR size</h3><span>Q3 positive only · click to inspect</span></div><div id="home-plot-loss" class="home-plot" aria-label="G8r plus ABC strict product loss versus IR size"></div></article></div></section><section class="analysis-index" aria-labelledby="analysis-title"><div class="analysis-index-header"><h2 id="analysis-title">Analysis views</h2><p>Focused views of the same exported corpus</p></div><nav class="analysis-list" aria-label="Analysis views"><a class="analysis-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/"><span>01</span><span><strong>G8r+ABC vs codegen+Yosys/ABC</strong><small>Frontend structure comparison with a shared downstream optimizer.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/"><span>02</span><span><strong>G8r vs Yosys/ABC</strong><small>Direct backend comparison across releases, filters, quadrants, and sample evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}mffc-discrepancies.html"><span>03</span><span><strong>MFFC discrepancies</strong><small>Local cone ranking with paired IR and synthesis evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}progression.html"><span>04</span><span><strong>Release progression</strong><small>Median and tail product-loss changes across verified runs.</small></span><span>→</span></a></nav></section><footer class="publication-bar"><span>Self-contained static publication · no live database at request time</span><nav aria-label="Publication details"><a href="{root_site_url}runs.html">Campaign runs</a><a href="{root_site_url}dataset.html">Raw datasets</a></nav></footer></main>"#,
+        r#"<header class="science-header"><div class="science-topline"><div><p class="science-label">xlsynth-bvc / static result corpus</p><h1>Boolean synthesis comparison</h1></div><nav class="science-nav" aria-label="Primary navigation"><a href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">QoR explorer</a><a href="{root_site_url}progression.html">Release history</a><a href="{root_site_url}releases.html">Processing status</a><a href="{root_site_url}runs.html">Runs</a><a href="{root_site_url}dataset.html">Data</a></nav></div><p class="science-abstract">Paired measurements of XLS IR through G8r+ABC and codegen+Yosys/ABC. Both paths share ABC downstream, so the overview isolates frontend structure; the full explorers provide sample-level links to immutable exported evidence.</p><dl class="science-meta"><div><dt>snapshot</dt><dd><code title="{}">{}</code></dd></div><div><dt>verified runs</dt><dd>{}</dd></div><div><dt>datasets</dt><dd>{}</dd></div><div><dt>generated</dt><dd>{}</dd></div></dl><p id="error" role="alert"></p></header><main class="science-main"><section id="home-overview" data-dataset-key="{}" data-lhs-label="G8r+ABC" data-rhs-label="codegen+Yosys/ABC" aria-labelledby="overview-title"><div class="overview-heading"><div><p class="science-label">latest crate release / G8r+ABC vs codegen+Yosys/ABC</p><h2 id="overview-title">Corpus overview</h2><p id="home-overview-status" class="meta" aria-live="polite">Loading paired synthesis measurements…</p></div><a id="home-full-explorer-link" class="text-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">Open the full interactive view →</a></div><p id="home-coverage-warning" class="coverage-warning" hidden role="status"></p><dl class="metric-row"><div><dt>crate release</dt><dd id="home-overview-release">—</dd></div><div><dt>paired IR samples</dt><dd id="home-sample-count">—</dd></div><div><dt>Q1 pure wins</dt><dd id="home-pure-win-count">—</dd></div><div><dt>Q3 strict losses</dt><dd id="home-strict-loss-count">—</dd></div><div><dt>median signed product Δ</dt><dd id="home-median-loss">—</dd></div></dl><div class="home-plot-grid"><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic levels</h3><span>log / log · y=x · zero→1 disclosed</span></div><div id="home-plot-levels" class="home-plot" aria-label="G8r plus ABC versus codegen plus Yosys ABC logic levels"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic nodes</h3><span>log / log · y=x · zero→1 disclosed</span></div><div id="home-plot-nodes" class="home-plot" aria-label="G8r plus ABC versus codegen plus Yosys ABC logic nodes"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Node / level delta quadrants</h3><span>positive = G8r+ABC better</span></div><div id="home-plot-deltas" class="home-plot" aria-label="Four quadrant node and level delta plot"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Strict product losses vs IR size</h3><span>Q3 positive only · click to inspect</span></div><div id="home-plot-loss" class="home-plot" aria-label="G8r plus ABC strict product loss versus IR size"></div></article></div></section><section class="analysis-index" aria-labelledby="analysis-title"><div class="analysis-index-header"><h2 id="analysis-title">Analysis views</h2><p>Focused views of the same exported corpus</p></div><nav class="analysis-list" aria-label="Analysis views"><a class="analysis-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/"><span>01</span><span><strong>G8r+ABC vs codegen+Yosys/ABC</strong><small>Frontend structure comparison with a shared downstream optimizer.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/"><span>02</span><span><strong>G8r vs Yosys/ABC</strong><small>Direct backend comparison across releases, filters, quadrants, and sample evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}mffc-discrepancies.html"><span>03</span><span><strong>MFFC discrepancies</strong><small>Local cone ranking with paired IR and synthesis evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}progression.html"><span>04</span><span><strong>Release progression</strong><small>Aggregate quality and per-artifact distributions on fixed IR.</small></span><span>→</span></a></nav></section><footer class="publication-bar"><span>Self-contained static publication · no live database at request time</span><nav aria-label="Publication details"><a href="{root_site_url}runs.html">Campaign runs</a><a href="{root_site_url}dataset.html">Raw datasets</a></nav></footer></main>"#,
         escape_html(&snapshot.snapshot_id),
         escape_html(snapshot_short),
         catalog.runs.len(),
