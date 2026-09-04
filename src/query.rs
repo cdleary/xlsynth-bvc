@@ -18,9 +18,7 @@ use crate::executor::{
     extract_ir_ret_text_id,
 };
 use crate::model::*;
-use crate::proto::{
-    decode_queue_canceled, decode_queue_running, encode_provenance, encode_queue_failed,
-};
+use crate::proto::{decode_queue_canceled, decode_queue_running};
 #[cfg(test)]
 use crate::proto::{encode_queue_item, encode_queue_running};
 use crate::queue::*;
@@ -6833,14 +6831,20 @@ fn versions_summary_matches_sources(
 }
 
 pub(crate) fn versions_summary_input_fingerprint(
-    store: &ArtifactStore,
+    _store: &ArtifactStore,
     repo_root: &Path,
 ) -> Result<String> {
+    // Provenance and failed-record writes proactively delete this index while holding the
+    // store's versions-summary write lock. Keep cache-hit validation bounded to the small static
+    // metadata and recipe inputs; the rebuild path holds the matching read lock while scanning
+    // mutable records and publishing the replacement index.
     let mut hasher = Sha256::new();
     hasher.update(VERSIONS_SUMMARY_INPUT_FINGERPRINT_DOMAIN);
     for relpath in [
         crate::VERSION_COMPAT_PATH,
         crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
+        crate::DEFAULT_DOCKERFILE,
+        crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
     ] {
         let bytes = fs::read(repo_root.join(relpath))
             .with_context(|| format!("reading versions summary input {relpath}"))?;
@@ -6849,25 +6853,22 @@ pub(crate) fn versions_summary_input_fingerprint(
         hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(bytes);
     }
-
-    let mut provenances = store.list_provenances_uncached()?;
-    provenances.sort_by(|a, b| a.action_id.cmp(&b.action_id));
-    for provenance in provenances {
-        let bytes = encode_provenance(&provenance)?;
-        hasher.update(b"provenance");
-        hasher.update((provenance.action_id.len() as u64).to_be_bytes());
-        hasher.update(provenance.action_id.as_bytes());
-        hasher.update((bytes.len() as u64).to_be_bytes());
-        hasher.update(bytes);
-    }
-
-    let mut failed_records = store.load_failed_action_records_uncached()?;
-    failed_records.sort_by(|a, b| a.action_id.cmp(&b.action_id));
-    for failed in failed_records {
-        let bytes = encode_queue_failed(&failed)?;
-        hasher.update(b"failed");
-        hasher.update((failed.action_id.len() as u64).to_be_bytes());
-        hasher.update(failed.action_id.as_bytes());
+    for (name, bytes) in [
+        (
+            "compiled-release-inputs",
+            crate::proto::DEFAULT_RELEASE_INPUTS,
+        ),
+        (
+            "release-platform",
+            crate::DEFAULT_RELEASE_PLATFORM.as_bytes(),
+        ),
+        (
+            "driver-image-prefix",
+            crate::DEFAULT_DOCKER_IMAGE_PREFIX.as_bytes(),
+        ),
+    ] {
+        hasher.update((name.len() as u64).to_be_bytes());
+        hasher.update(name.as_bytes());
         hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(bytes);
     }
@@ -6897,6 +6898,9 @@ pub(crate) fn load_versions_cards_index(
     }
     public_projection::validate_versions_summary(&index_file)
         .with_context(|| format!("validating versions summary web index: {}", location))?;
+    if store.is_snapshot_backend() {
+        return Ok(Some(index_file));
+    }
     let current_input_fingerprint = versions_summary_input_fingerprint(store, repo_root)?;
     if index_file.input_fingerprint_sha256 != current_input_fingerprint {
         info!(
@@ -6955,20 +6959,14 @@ pub(crate) fn rebuild_versions_cards_index(
     repo_root: &Path,
 ) -> Result<VersionsSummaryIndexSummary> {
     let started = Instant::now();
-    let mut stable = None;
-    for _ in 0..3 {
-        let before = versions_summary_input_fingerprint(store, repo_root)?;
-        let report = build_versions_cards(store, repo_root)?;
-        let after = versions_summary_input_fingerprint(store, repo_root)?;
-        if before == after {
-            stable = Some((report, after));
-            break;
-        }
-    }
-    let (report, input_fingerprint_sha256) = stable
-        .ok_or_else(|| anyhow!("versions summary inputs changed repeatedly during rebuild"))?;
-    let (index_location, index_bytes, generated_utc) =
-        write_versions_cards_index(store, &report, input_fingerprint_sha256)?;
+    let (report, index_location, index_bytes, generated_utc) = store
+        .with_versions_summary_input_snapshot(|| {
+            let input_fingerprint_sha256 = versions_summary_input_fingerprint(store, repo_root)?;
+            let report = build_versions_cards(store, repo_root)?;
+            let (index_location, index_bytes, generated_utc) =
+                write_versions_cards_index(store, &report, input_fingerprint_sha256)?;
+            Ok((report, index_location, index_bytes, generated_utc))
+        })?;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(VersionsSummaryIndexSummary {
         generated_utc,
@@ -7489,6 +7487,24 @@ pub(crate) fn build_unprocessed_version_rows(
         }
     });
     Ok(rows)
+}
+
+pub(crate) fn build_snapshot_unprocessed_version_rows(
+    releases: &[CrateReleaseStatusView],
+) -> Vec<UnprocessedVersionRowView> {
+    releases
+        .iter()
+        .filter(|release| !release.processed)
+        .map(|release| UnprocessedVersionRowView {
+            crate_version: release.crate_version.clone(),
+            crate_release_datetime: release.crate_release_datetime.clone(),
+            dso_version: release.dso_version.clone(),
+            materialized_actions: release.materialized_actions,
+            active_queue_actions: 0,
+            root_queue_state_key: "not_queued".to_string(),
+            root_queue_state_label: "Not queued".to_string(),
+        })
+        .collect()
 }
 
 pub(crate) fn build_queue_live_status(
@@ -8775,13 +8791,15 @@ mod tests {
     }
 
     #[test]
-    fn cached_versions_index_is_bound_to_release_metadata_sources() {
+    fn cached_versions_index_is_bound_to_release_metadata_and_recipe_sources() {
         let (store, root) = make_test_store("versions-source-binding");
         let source_root = std::env::current_dir().expect("current repo root");
         let test_repo_root = root.join("repo");
         for relpath in [
             crate::VERSION_COMPAT_PATH,
             crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
+            crate::DEFAULT_DOCKERFILE,
+            crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
         ] {
             let source = source_root.join(relpath);
             let destination = test_repo_root.join(relpath);
@@ -8814,6 +8832,18 @@ mod tests {
         );
 
         fs::write(&observation_path, original_observation).expect("restore observation source");
+        let dockerfile_path = test_repo_root.join(crate::DEFAULT_DOCKERFILE);
+        let original_dockerfile = fs::read(&dockerfile_path).expect("read Dockerfile source");
+        let mut dockerfile = original_dockerfile.clone();
+        dockerfile.extend_from_slice(b"\n# recipe change\n");
+        fs::write(&dockerfile_path, dockerfile).expect("change Dockerfile source");
+        assert!(
+            load_versions_cards_index(&store, &test_repo_root)
+                .expect("check stale runtime-recipe binding")
+                .is_none()
+        );
+        fs::write(&dockerfile_path, original_dockerfile).expect("restore Dockerfile source");
+
         let compat_path = test_repo_root.join(crate::VERSION_COMPAT_PATH);
         let mut compat: serde_json::Value =
             serde_json::from_slice(&fs::read(&compat_path).unwrap()).expect("parse compatibility");
@@ -8852,6 +8882,13 @@ mod tests {
             ))
             .expect("write provenance");
         assert!(
+            store
+                .load_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+                .expect("load invalidated versions index")
+                .is_none(),
+            "provenance writes should delete the cached versions index"
+        );
+        assert!(
             load_versions_cards_index(&store, &repo_root)
                 .expect("check provenance binding")
                 .is_none()
@@ -8876,9 +8913,58 @@ mod tests {
             })
             .expect("write failed record");
         assert!(
+            store
+                .load_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+                .expect("load invalidated versions index")
+                .is_none(),
+            "failed-record writes should delete the cached versions index"
+        );
+        assert!(
             load_versions_cards_index(&store, &repo_root)
                 .expect("check failed-record binding")
                 .is_none()
+        );
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
+    #[test]
+    fn cached_versions_index_loads_from_snapshot_backend_without_live_records() {
+        let (store, root) = make_test_store("versions-snapshot-load");
+        let repo_root = std::env::current_dir().expect("current repo root");
+        let action = ActionSpec::ImportIrPackageFile {
+            source_sha256: "c".repeat(64),
+            top_fn_name: Some("main".to_string()),
+        };
+        let action_id = crate::executor::compute_action_id(&action).expect("action id");
+        store
+            .write_provenance(&synthetic_provenance(
+                &action_id,
+                action,
+                ArtifactType::IrPackageFile,
+            ))
+            .expect("write live provenance");
+        rebuild_versions_cards_index(&store, &repo_root).expect("build populated live index");
+        let bytes = store
+            .load_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .expect("load live index")
+            .expect("live index exists");
+
+        let snapshot_dir = root.join("snapshot");
+        let snapshot_index = crate::snapshot::snapshot_web_index_path(
+            &snapshot_dir,
+            WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+        )
+        .expect("snapshot index path");
+        fs::create_dir_all(snapshot_index.parent().unwrap()).expect("create snapshot index parent");
+        fs::write(snapshot_index, bytes).expect("copy versions index into snapshot");
+        let snapshot_store =
+            ArtifactStore::new_with_snapshot(root.join("snapshot-store"), snapshot_dir);
+
+        assert!(
+            load_versions_cards_index(&snapshot_store, &repo_root)
+                .expect("load snapshot versions index")
+                .is_some(),
+            "a verified snapshot index must not depend on absent live provenance"
         );
         fs::remove_dir_all(root).expect("cleanup temp store");
     }

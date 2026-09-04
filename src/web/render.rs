@@ -5020,7 +5020,7 @@ pub(super) fn render_versions_html(
     show_live_queue: bool,
     show_db_size_link: bool,
     db_size_bytes: Option<u64>,
-    generated_utc: DateTime<Utc>,
+    generated_utc: Option<DateTime<Utc>>,
 ) -> String {
     use std::fmt::Write;
 
@@ -5273,9 +5273,12 @@ pub(super) fn render_versions_html(
     } else {
         String::new()
     };
+    let generated_fragment = generated_utc
+        .map(|value| format!("generated={} | ", value.to_rfc3339()))
+        .unwrap_or_default();
     let subtitle = format!(
-        "generated={} | crate_releases={} | processed={} | failed_actions={} | unprocessed={}{}",
-        generated_utc.to_rfc3339(),
+        "{}crate_releases={} | processed={} | failed_actions={} | unprocessed={}{}",
+        generated_fragment,
         total_versions,
         processed_versions,
         total_failed,

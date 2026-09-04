@@ -1071,7 +1071,14 @@ mod tests {
         let repo_root = std::env::current_dir().expect("current repo root");
         let source_before =
             indexed_source_fingerprint(&store, &repo_root).expect("empty source fingerprint");
-        let output_before = indexed_output_fingerprint(&store).expect("empty output fingerprint");
+        let versions_index_bytes = br#"{"cached":"versions"}"#;
+        store
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                versions_index_bytes,
+            )
+            .expect("seed cached versions index");
+        let output_before = indexed_output_fingerprint(&store).expect("initial output fingerprint");
         let previous_policy_output =
             indexed_output_fingerprint_for_policy(&store, PUBLICATION_POLICY_VERSION - 1)
                 .expect("previous-policy output fingerprint");
@@ -1127,18 +1134,29 @@ mod tests {
             .expect("write newly completed action");
         let source_after_action =
             indexed_source_fingerprint(&store, &repo_root).expect("updated source fingerprint");
-        assert_ne!(source_before, source_after_action);
+        assert_eq!(source_before, source_after_action);
+        let output_after_action =
+            indexed_output_fingerprint(&store).expect("invalidated output fingerprint");
+        assert_ne!(output_before, output_after_action);
         assert!(!indexed_checkpoint_matches(
             &state,
             &source_after_action,
-            &output_before
+            &output_after_action
         ));
 
-        state.indexed_source_fingerprint = Some(source_after_action.clone());
+        store
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                versions_index_bytes,
+            )
+            .expect("restore cached versions index");
+        let output_restored =
+            indexed_output_fingerprint(&store).expect("restored output fingerprint");
+        assert_eq!(output_before, output_restored);
         assert!(indexed_checkpoint_matches(
             &state,
             &source_after_action,
-            &output_before
+            &output_restored
         ));
         provenance.details["source_path"] = serde_json::json!("refreshed.ir");
         store
@@ -1146,20 +1164,24 @@ mod tests {
             .expect("refresh provenance contents");
         let source_after_refresh =
             indexed_source_fingerprint(&store, &repo_root).expect("refreshed source fingerprint");
-        assert_ne!(source_after_action, source_after_refresh);
+        assert_eq!(source_after_action, source_after_refresh);
+        let output_after_refresh =
+            indexed_output_fingerprint(&store).expect("re-invalidated output fingerprint");
+        assert_eq!(output_after_action, output_after_refresh);
         assert!(!indexed_checkpoint_matches(
             &state,
             &source_after_refresh,
-            &output_before
+            &output_after_refresh
         ));
 
         state.indexed_source_fingerprint = Some(source_after_refresh.clone());
+        state.indexed_output_fingerprint = Some(output_after_refresh.clone());
         store
             .write_web_index_bytes("checkpoint-test.v1.json", br#"{"value":1}"#)
             .expect("write index output");
         let output_after_write =
             indexed_output_fingerprint(&store).expect("written output fingerprint");
-        assert_ne!(output_before, output_after_write);
+        assert_ne!(output_after_refresh, output_after_write);
         assert!(!indexed_checkpoint_matches(
             &state,
             &source_after_refresh,
@@ -1189,7 +1211,7 @@ mod tests {
             .expect("delete index output");
         let output_after_delete =
             indexed_output_fingerprint(&store).expect("deleted output fingerprint");
-        assert_eq!(output_before, output_after_delete);
+        assert_eq!(output_after_refresh, output_after_delete);
         assert!(!indexed_checkpoint_matches(
             &state,
             &source_after_refresh,
@@ -1201,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_source_fingerprint_binds_release_metadata_files() {
+    fn indexed_source_fingerprint_binds_release_metadata_and_recipe_files() {
         let root = temp_path("indexed-release-metadata-fingerprint");
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("layout");
@@ -1210,6 +1232,8 @@ mod tests {
         for relpath in [
             crate::VERSION_COMPAT_PATH,
             crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
+            crate::DEFAULT_DOCKERFILE,
+            crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
         ] {
             let destination = repo_root.join(relpath);
             fs::create_dir_all(destination.parent().unwrap()).expect("create metadata parent");

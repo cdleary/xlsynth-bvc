@@ -299,7 +299,7 @@ pub(crate) fn serve_web_ui(
                     false,
                     !prewarm_store.is_snapshot_backend(),
                     db_size_bytes,
-                    index.generated_utc,
+                    Some(index.generated_utc),
                 );
                 prewarm_cache.put_page("page:/versions/".to_string(), html);
                 Ok(())

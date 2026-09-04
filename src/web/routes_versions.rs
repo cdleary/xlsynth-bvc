@@ -14,7 +14,8 @@ use std::time::Instant;
 
 use crate::DASHBOARD_FAVICON_SVG;
 use crate::query::{
-    build_queue_live_status, build_unprocessed_version_rows, enqueue_processing_for_crate_version,
+    build_queue_live_status, build_snapshot_unprocessed_version_rows,
+    build_unprocessed_version_rows, enqueue_processing_for_crate_version,
     load_versions_cards_index, rebuild_versions_cards_index,
 };
 use crate::view::QueueLiveStatusView;
@@ -100,7 +101,8 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
     let repo_root = state.repo_root.clone();
     let runner_owner_prefix = state.runner_owner_prefix.clone();
     let runner_control = state.runner_control.clone();
-    let show_db_size_link = state.snapshot_manifest.is_none();
+    let snapshot_mode = state.snapshot_manifest.is_some();
+    let show_db_size_link = !snapshot_mode;
     let show_live_queue = state.runner_enabled;
     match tokio::task::spawn_blocking(move || {
         let started = Instant::now();
@@ -123,8 +125,11 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
             })?
         };
         let after_cards = Instant::now();
-        let unprocessed =
-            build_unprocessed_version_rows(&store, &repo_root, &index.report.cards)?;
+        let unprocessed = if snapshot_mode {
+            build_snapshot_unprocessed_version_rows(&index.report.releases)
+        } else {
+            build_unprocessed_version_rows(&store, &repo_root, &index.report.cards)?
+        };
         let after_unprocessed = Instant::now();
         let db_size_bytes = store.artifacts_db_size_bytes().ok();
         let live_status = if show_live_queue {
@@ -165,7 +170,7 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
             show_live_queue,
             show_db_size_link,
             db_size_bytes,
-            index.generated_utc,
+            (!snapshot_mode).then_some(index.generated_utc),
         );
         cache.put_page(cache_key, html.clone());
         let rss_mib_end = process_rss_mib().unwrap_or(0);

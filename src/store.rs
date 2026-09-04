@@ -169,6 +169,7 @@ trait ArtifactBackend: std::fmt::Debug + Send + Sync {
         store_root: &Path,
         prefix: &str,
     ) -> Result<Vec<(String, Vec<u8>)>>;
+    fn delete_web_index_key_unflushed(&self, store_root: &Path, index_key: &str) -> Result<()>;
     fn delete_web_index_keys_with_prefix(&self, store_root: &Path, prefix: &str) -> Result<usize>;
     fn web_index_location(&self, store_root: &Path, index_key: &str) -> String;
     fn size_on_disk_bytes(&self, store_root: &Path) -> Result<u64>;
@@ -1273,6 +1274,15 @@ fn build_reverse_dependency_edges(
     Ok(reverse_edges)
 }
 
+fn delete_versions_summary_web_index(db: &sled::Db) -> Result<()> {
+    let tree = db
+        .open_tree(SledArtifactBackend::TREE_WEB_INDEX_BYTES)
+        .context("opening web_index_bytes tree for versions summary invalidation")?;
+    tree.remove(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME.as_bytes())
+        .context("invalidating versions summary web index")?;
+    Ok(())
+}
+
 pub(crate) fn prune_sled_actions_by_ids(
     store_root: &Path,
     db_path: &Path,
@@ -1435,6 +1445,9 @@ pub(crate) fn prune_sled_actions_by_ids(
     }
 
     if !dry_run {
+        if deleted_provenance_rows > 0 || deleted_failed_action_record_files > 0 {
+            delete_versions_summary_web_index(&db)?;
+        }
         db.flush()
             .context("flushing sled db after action-id prune")?;
     }
@@ -1697,6 +1710,9 @@ pub(crate) fn prune_sled_actions_by_relpath_size(
     }
 
     if !dry_run {
+        if deleted_provenance_rows > 0 || deleted_failed_action_record_files > 0 {
+            delete_versions_summary_web_index(&db)?;
+        }
         db.flush().context("flushing sled db after prune")?;
     }
 
@@ -2398,6 +2414,20 @@ impl ArtifactBackend for SledArtifactBackend {
         Ok(rows)
     }
 
+    fn delete_web_index_key_unflushed(&self, _store_root: &Path, index_key: &str) -> Result<()> {
+        let db = self.open_db()?;
+        if index_key == crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME {
+            delete_versions_summary_web_index(&db)?;
+        } else {
+            let tree = db
+                .open_tree(Self::TREE_WEB_INDEX_BYTES)
+                .context("opening sled tree web_index_bytes")?;
+            tree.remove(index_key.as_bytes())
+                .context("invalidating web index row")?;
+        }
+        Ok(())
+    }
+
     fn delete_web_index_keys_with_prefix(&self, _store_root: &Path, prefix: &str) -> Result<usize> {
         let db = self.open_db()?;
         let tree = db
@@ -2644,6 +2674,13 @@ impl ArtifactBackend for SnapshotArtifactBackend {
         Ok(entries)
     }
 
+    fn delete_web_index_key_unflushed(&self, _store_root: &Path, index_key: &str) -> Result<()> {
+        bail!(
+            "delete_web_index_key_unflushed is unavailable in snapshot read-only backend (index_key={})",
+            index_key
+        )
+    }
+
     fn delete_web_index_keys_with_prefix(&self, _store_root: &Path, prefix: &str) -> Result<usize> {
         bail!(
             "delete_web_index_keys_with_prefix is unavailable in snapshot read-only backend (prefix={})",
@@ -2685,6 +2722,7 @@ pub(crate) struct ArtifactStore {
     provenance_cache: Mutex<Option<TimedCache<Vec<Provenance>>>>,
     failed_records_cache: Mutex<Option<TimedCache<Vec<QueueFailed>>>>,
     db_size_cache: Mutex<Option<TimedCache<u64>>>,
+    versions_summary_input_lock: RwLock<()>,
 }
 
 impl ArtifactStore {
@@ -2725,6 +2763,7 @@ impl ArtifactStore {
             provenance_cache: Mutex::new(None),
             failed_records_cache: Mutex::new(None),
             db_size_cache: Mutex::new(None),
+            versions_summary_input_lock: RwLock::new(()),
         }
     }
 
@@ -2742,6 +2781,7 @@ impl ArtifactStore {
             provenance_cache: Mutex::new(None),
             failed_records_cache: Mutex::new(None),
             db_size_cache: Mutex::new(None),
+            versions_summary_input_lock: RwLock::new(()),
         }
     }
 
@@ -2802,6 +2842,35 @@ impl ArtifactStore {
         if let Ok(mut cached) = self.db_size_cache.lock() {
             *cached = None;
         }
+    }
+
+    fn mutate_versions_summary_input<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _guard = self
+            .versions_summary_input_lock
+            .write()
+            .map_err(|_| anyhow!("locking versions summary inputs for mutation"))?;
+        self.invalidate_list_caches();
+        // Delete before the mutation so every successfully flushed write also persists the
+        // invalidation. Reuse the mutation's durable flush rather than adding another flush per
+        // completed action.
+        self.artifact_backend.delete_web_index_key_unflushed(
+            &self.root,
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+        )?;
+        let result = operation();
+        self.invalidate_list_caches();
+        result
+    }
+
+    pub(crate) fn with_versions_summary_input_snapshot<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _guard = self
+            .versions_summary_input_lock
+            .read()
+            .map_err(|_| anyhow!("locking versions summary inputs for rebuild"))?;
+        operation()
     }
 
     #[cfg(test)]
@@ -2969,10 +3038,10 @@ impl ArtifactStore {
         action_id: &str,
         staging_dir: &Path,
     ) -> Result<()> {
-        self.artifact_backend
-            .promote_staging_action_dir(&self.root, action_id, staging_dir)?;
-        self.invalidate_list_caches();
-        Ok(())
+        self.mutate_versions_summary_input(|| {
+            self.artifact_backend
+                .promote_staging_action_dir(&self.root, action_id, staging_dir)
+        })
     }
 
     pub(crate) fn action_exists(&self, action_id: &str) -> bool {
@@ -3014,10 +3083,10 @@ impl ArtifactStore {
     }
 
     pub(crate) fn write_provenance(&self, provenance: &Provenance) -> Result<()> {
-        self.artifact_backend
-            .write_provenance(&self.root, provenance)?;
-        self.invalidate_list_caches();
-        Ok(())
+        self.mutate_versions_summary_input(|| {
+            self.artifact_backend
+                .write_provenance(&self.root, provenance)
+        })
     }
 
     pub(crate) fn for_each_provenance(
@@ -3260,20 +3329,17 @@ impl ArtifactStore {
     }
 
     pub(crate) fn write_failed_action_record(&self, failed: &QueueFailed) -> Result<()> {
-        self.artifact_backend
-            .write_failed_action_record(&self.root, failed)?;
-        self.invalidate_list_caches();
-        Ok(())
+        self.mutate_versions_summary_input(|| {
+            self.artifact_backend
+                .write_failed_action_record(&self.root, failed)
+        })
     }
 
     pub(crate) fn delete_failed_action_record(&self, action_id: &str) -> Result<bool> {
-        let deleted = self
-            .artifact_backend
-            .delete_failed_action_record(&self.root, action_id)?;
-        if deleted {
-            self.invalidate_list_caches();
-        }
-        Ok(deleted)
+        self.mutate_versions_summary_input(|| {
+            self.artifact_backend
+                .delete_failed_action_record(&self.root, action_id)
+        })
     }
 
     pub(crate) fn shard_dir(&self, base: PathBuf, key: &str) -> PathBuf {
@@ -4198,6 +4264,15 @@ mod tests {
         let file_tree = db
             .open_tree(SledArtifactBackend::TREE_ACTION_FILE_BYTES)
             .expect("open action_file_bytes tree");
+        let web_index_tree = db
+            .open_tree(SledArtifactBackend::TREE_WEB_INDEX_BYTES)
+            .expect("open web index tree");
+        web_index_tree
+            .insert(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                b"cached-versions",
+            )
+            .expect("seed versions index");
 
         let queue_child = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
@@ -4263,6 +4338,7 @@ mod tests {
             .expect("insert result.v bytes for action_c");
 
         db.flush().expect("flush seed db");
+        drop(web_index_tree);
         drop(file_tree);
         drop(provenance_tree);
         drop(db);
@@ -4326,6 +4402,17 @@ mod tests {
         let file_tree = db
             .open_tree(SledArtifactBackend::TREE_ACTION_FILE_BYTES)
             .expect("open action_file tree");
+        let web_index_tree = db
+            .open_tree(SledArtifactBackend::TREE_WEB_INDEX_BYTES)
+            .expect("open web index tree");
+
+        assert!(
+            web_index_tree
+                .get(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+                .expect("load versions index after prune")
+                .is_none(),
+            "pruning provenance should invalidate the cached versions index"
+        );
 
         assert!(
             provenance_tree
