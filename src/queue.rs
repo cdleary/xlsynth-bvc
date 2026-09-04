@@ -31,6 +31,7 @@ static QUEUE_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_READY_CANDIDATES_PER_CLAIM: usize = 32;
 const MAX_PENDING_SCAN_PER_CLAIM: usize = 128;
 const MAX_PENDING_SCAN_PER_COMPATIBLE_CLAIM: usize = 256;
+const QUEUE_IDENTITY_MIGRATION_LOCK_KEY: &str = "queue-identity-migration";
 
 struct QueueTransitionLock {
     file: File,
@@ -438,6 +439,9 @@ fn requeue_pending_action_with_canonical_identity(
         return Ok(Some(canonical));
     }
 
+    // A migration snapshots and rewrites the transitive pending graph. Serialize migrations for
+    // different roots so shared descendants cannot be published with only one root rewritten.
+    let _migration_lock = QueueTransitionLock::acquire(store, QUEUE_IDENTITY_MIGRATION_LOCK_KEY)?;
     let _transition_lock = QueueTransitionLock::acquire(store, record_action_id)?;
     if !pending_path.exists() {
         return Ok(None);
@@ -1904,9 +1908,9 @@ mod tests {
     use crate::model::{ArtifactType, G8rLoweringMode, OutputFile, Provenance};
     use serde_json::json;
     use sha2::{Digest, Sha256};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, mpsc};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn make_test_store() -> (ArtifactStore, PathBuf) {
         let nanos = SystemTime::now()
@@ -2781,6 +2785,37 @@ mod tests {
                 ..
             }
         ));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn identity_migration_lock_serializes_independent_store_handles() {
+        let (store, root) = make_test_store();
+        let held = QueueTransitionLock::acquire(&store, QUEUE_IDENTITY_MIGRATION_LOCK_KEY)
+            .expect("acquire first migration lock");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let other_root = root.clone();
+        let handle = thread::spawn(move || {
+            let other_store = ArtifactStore::new(other_root);
+            started_tx.send(()).expect("signal lock attempt");
+            let _other_lock =
+                QueueTransitionLock::acquire(&other_store, QUEUE_IDENTITY_MIGRATION_LOCK_KEY)
+                    .expect("acquire serialized migration lock");
+            acquired_tx.send(()).expect("signal lock acquisition");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second store attempted lock");
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(held);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second store acquires lock after release");
+        handle.join().expect("join lock contender");
 
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
