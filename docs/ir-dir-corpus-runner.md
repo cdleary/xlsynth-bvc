@@ -147,6 +147,33 @@ cargo run --bin xlsynth_bvc -- \
   --driver-version 0.34.0
 ```
 
+## Scheduling Policies
+
+`--scheduling-policy release-progression-ir-v1` selects the compiled policy described by
+`campaigns/release-progression-ir-v1.textproto`. It is intentionally opt-in and only accepts the
+exact fixed release-progression corpus named by that policy's sample count and artifact-manifest
+digest. The manifest binds each structural-hash filename to the SHA-256 of its IR bytes. Scheduling
+policies require `--execution-mode enqueue`. Selected structural hashes receive the configured
+boost on every action in their corpus recipe; the normal per-action stage priority is then added as
+usual.
+
+The applied policy and compiled policy digest are recorded in `manifest.json`. Re-enqueueing the
+same action at a higher priority promotes a pending queue record without changing the action ID,
+so enabling a policy is safe for an existing output workspace. Running actions are not interrupted
+or reprioritized.
+
+Before any queue mutation, policy adoption is atomically recorded in
+`.bvc/bvc-artifacts/corpus/corpus-scheduling-policy.pb`. The public manifest carries the same
+identity after a successful enqueue pass, while the durable workspace marker protects interrupted
+or failed passes. If an interrupted pass leaves the marker ahead of the public manifest,
+`refresh-corpus-status` refuses to rewrite public outputs until the matching policy-enabled
+corpus command completes.
+
+An existing unconfigured workspace may adopt a policy and promote its pending records. Once a
+workspace records a policy, every later refresh or enqueue must specify the identical compiled
+policy; omitting or changing it is rejected so provenance cannot erase a priority effect that still
+exists in the queue.
+
 ## Queue-Backed Workflow
 
 The enqueue workflow is deliberately explicit:

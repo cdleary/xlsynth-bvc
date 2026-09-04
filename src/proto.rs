@@ -24,6 +24,8 @@ pub(crate) const DEFAULT_RELEASE_CAMPAIGN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/release-qor-v1.pb"));
 pub(crate) const DEFAULT_RELEASE_INPUTS: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/release-inputs-v1.pb"));
+pub(crate) const RELEASE_PROGRESSION_IR_SCHEDULING_POLICY: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/release-progression-ir-v1.pb"));
 
 #[cfg(test)]
 mod tests {
