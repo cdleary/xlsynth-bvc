@@ -4,6 +4,22 @@
 
 The release-progression chart deliberately uses a pinned benchmark cohort, not the functions enumerated by each xlsynth release. Its canonical manifest is `src/site_assets/release_progression_ir_hashes.txt`: 187 sorted, unique whole-function structural hashes. `src/site.rs` pins both the count and the domain-separated manifest digest, so changing the cohort is an explicit versioned decision.
 
+## Scheduling policy
+
+The cohort identity stays separate from operational scheduling. The checked-in
+`campaigns/release-progression-ir-v1.textproto` policy identifies persistent Yosys/ABC
+critical-path samples by structural hash and assigns their action graphs a queue-priority boost.
+Select it explicitly when enqueueing a historical run:
+
+```text
+--scheduling-policy release-progression-ir-v1
+```
+
+The runner validates the policy against the exact 187-hash manifest digest before enqueueing and
+records the policy name, semantic version, compiled-config digest, tiers, and reasons in the run's
+`manifest.json`. Queue priority is operational metadata rather than action identity, so the policy
+does not change cache keys or QoR results.
+
 ## Origin
 
 The cohort was captured on 2026-09-03 from a production static-site snapshot whose `catalog.json` SHA-256 is `5a99a8efcc222687995a12ef0fe1a7f70dfd5ab87812b3c895df3c5943aaeeb2`. The snapshot's `ir-fn-corpus-ir.v1.json` descriptor SHA-256 is `d08e478594386e648347757ac9bef9d5d652d71a9752c479848b54ebc3bc0aba`; its paired `ir-fn-corpus-g8r-abc-vs-codegen-yosys-abc.v1.json` descriptor SHA-256 is `cd778dec73387f41ddf137616a3ad2fced7290f488fb86a215b93a3633e59246`.

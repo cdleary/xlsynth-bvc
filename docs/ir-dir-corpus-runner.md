@@ -147,6 +147,19 @@ cargo run --bin xlsynth_bvc -- \
   --driver-version 0.34.0
 ```
 
+## Scheduling Policies
+
+`--scheduling-policy release-progression-ir-v1` selects the compiled policy described by
+`campaigns/release-progression-ir-v1.textproto`. It is intentionally opt-in and only accepts the
+exact fixed release-progression corpus named by that policy's sample count and hash-manifest
+digest. Selected structural hashes receive the configured boost on every action in their corpus
+recipe; the normal per-action stage priority is then added as usual.
+
+The applied policy and compiled policy digest are recorded in `manifest.json`. Re-enqueueing the
+same action at a higher priority promotes a pending queue record without changing the action ID,
+so enabling a policy is safe for an existing output workspace. Running actions are not interrupted
+or reprioritized.
+
 ## Queue-Backed Workflow
 
 The enqueue workflow is deliberately explicit:

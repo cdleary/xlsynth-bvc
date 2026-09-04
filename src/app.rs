@@ -162,6 +162,7 @@ pub(crate) fn run() -> Result<()> {
         version,
         yosys_script,
         priority,
+        scheduling_policy,
         driver,
         yosys,
     } = command
@@ -178,6 +179,7 @@ pub(crate) fn run() -> Result<()> {
             &version,
             yosys_script.as_deref(),
             priority,
+            scheduling_policy,
             driver,
             yosys,
         )?;

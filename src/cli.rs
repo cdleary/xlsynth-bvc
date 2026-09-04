@@ -40,6 +40,8 @@ pub enum TopCommand {
         yosys_script: Option<String>,
         #[arg(long, default_value_t = crate::DEFAULT_QUEUE_PRIORITY)]
         priority: i32,
+        #[arg(long, value_enum)]
+        scheduling_policy: Option<CorpusSchedulingPolicyPreset>,
         #[command(flatten)]
         driver: DriverCli,
         #[command(flatten)]
@@ -456,6 +458,11 @@ pub enum CorpusTopFnPolicy {
     InferSinglePackage,
     Explicit,
     FromFilename,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CorpusSchedulingPolicyPreset {
+    ReleaseProgressionIrV1,
 }
 
 #[derive(Debug, Subcommand)]

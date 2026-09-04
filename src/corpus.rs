@@ -10,7 +10,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::cli::{CorpusExecutionMode, CorpusRecipePreset, CorpusTopFnPolicy, DriverCli, YosysCli};
+use crate::cli::{
+    CorpusExecutionMode, CorpusRecipePreset, CorpusSchedulingPolicyPreset, CorpusTopFnPolicy,
+    DriverCli, YosysCli,
+};
+use crate::corpus_scheduling::{
+    CorpusSchedulingPolicyRecord, prioritized_sample_count, priority_boost,
+    resolve as resolve_scheduling_policy,
+};
 use crate::executor::{compute_action_id, execute_action};
 use crate::model::{
     ActionSpec, ArtifactRef, ArtifactType, DriverRuntimeSpec, Provenance, YosysRuntimeSpec,
@@ -26,7 +33,7 @@ use crate::service::{
 };
 use crate::store::ArtifactStore;
 
-const IR_DIR_CORPUS_MANIFEST_SCHEMA_VERSION: u32 = 2;
+const IR_DIR_CORPUS_MANIFEST_SCHEMA_VERSION: u32 = 3;
 const IR_DIR_CORPUS_MANIFEST_FILENAME: &str = "manifest.json";
 const IR_DIR_CORPUS_SAMPLES_FILENAME: &str = "samples.jsonl";
 const IR_DIR_CORPUS_SUMMARY_FILENAME: &str = "summary.json";
@@ -72,6 +79,8 @@ pub(crate) struct RunIrDirCorpusSummary {
     pub(crate) enqueued_actions: usize,
     pub(crate) executed_actions: usize,
     pub(crate) status_counts: BTreeMap<String, usize>,
+    pub(crate) scheduling_policy: Option<String>,
+    pub(crate) prioritized_samples: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +105,8 @@ struct IrDirCorpusManifest {
     yosys_runtime: YosysRuntimeSpec,
     yosys_script: String,
     yosys_script_sha256: String,
+    #[serde(default)]
+    scheduling_policy: Option<CorpusSchedulingPolicyRecord>,
     samples: Vec<IrDirCorpusSampleRecord>,
 }
 
@@ -146,6 +157,8 @@ struct IrDirCorpusSummaryFile {
     total_samples: usize,
     completed_samples: usize,
     status_counts: BTreeMap<String, usize>,
+    scheduling_policy: Option<String>,
+    prioritized_samples: usize,
     enqueued_actions: usize,
     executed_actions: usize,
 }
@@ -270,6 +283,7 @@ pub(crate) fn run_ir_dir_corpus(
     version: &str,
     yosys_script: Option<&str>,
     priority: i32,
+    scheduling_policy_preset: Option<CorpusSchedulingPolicyPreset>,
     driver: DriverCli,
     yosys: YosysCli,
 ) -> Result<RunIrDirCorpusSummary> {
@@ -311,6 +325,14 @@ pub(crate) fn run_ir_dir_corpus(
     if samples.is_empty() {
         bail!("no .ir files found under {}", input_dir.display());
     }
+    let source_relpaths = samples
+        .iter()
+        .map(|sample| sample.source_relpath.clone())
+        .collect::<Vec<_>>();
+    let scheduling_policy = resolve_scheduling_policy(scheduling_policy_preset, &source_relpaths)?;
+    let scheduling_policy_record = scheduling_policy
+        .as_ref()
+        .map(|policy| policy.record.clone());
 
     let mut counters = ExecutionCounters::default();
     let mut run_errors: BTreeMap<String, String> = BTreeMap::new();
@@ -330,7 +352,18 @@ pub(crate) fn run_ir_dir_corpus(
         ensure_imported_ir_action(&store, sample, &plan.import_action)?;
         match execution_mode {
             CorpusExecutionMode::Enqueue => {
-                counters.enqueued_actions += enqueue_plan(&store, &plan, priority)?;
+                let sample_priority_boost =
+                    priority_boost(scheduling_policy.as_ref(), &sample.source_relpath)?;
+                let sample_priority =
+                    priority
+                        .checked_add(sample_priority_boost)
+                        .with_context(|| {
+                            format!(
+                                "queue priority overflow for corpus sample {:?}",
+                                sample.source_relpath
+                            )
+                        })?;
+                counters.enqueued_actions += enqueue_plan(&store, &plan, sample_priority)?;
             }
             CorpusExecutionMode::Run => {
                 execute_plan(&store, &plan, &mut counters)
@@ -380,6 +413,7 @@ pub(crate) fn run_ir_dir_corpus(
         yosys_runtime: yosys_runtime.clone(),
         yosys_script: yosys_script_ref.path.clone(),
         yosys_script_sha256: yosys_script_ref.sha256.clone(),
+        scheduling_policy: scheduling_policy_record.clone(),
         samples: sample_records.clone(),
     };
     let status_counts = count_statuses(&sample_records);
@@ -399,6 +433,10 @@ pub(crate) fn run_ir_dir_corpus(
             .filter(|sample| sample.status == "done")
             .count(),
         status_counts: status_counts.clone(),
+        scheduling_policy: scheduling_policy_record
+            .as_ref()
+            .map(|policy| policy.policy_name.clone()),
+        prioritized_samples: prioritized_sample_count(scheduling_policy_record.as_ref()),
         enqueued_actions: counters.enqueued_actions,
         executed_actions: counters.executed_actions,
     };
@@ -446,6 +484,10 @@ pub(crate) fn run_ir_dir_corpus(
         enqueued_actions: counters.enqueued_actions,
         executed_actions: counters.executed_actions,
         status_counts,
+        scheduling_policy: scheduling_policy_record
+            .as_ref()
+            .map(|policy| policy.policy_name.clone()),
+        prioritized_samples: prioritized_sample_count(scheduling_policy_record.as_ref()),
     })
 }
 
@@ -643,6 +685,7 @@ fn build_ir_dir_corpus_status_report(
             yosys_runtime: manifest.yosys_runtime.clone(),
             yosys_script: manifest.yosys_script.clone(),
             yosys_script_sha256: manifest.yosys_script_sha256.clone(),
+            scheduling_policy: manifest.scheduling_policy.clone(),
             samples: sample_records.clone(),
         };
         let refreshed_summary = IrDirCorpusSummaryFile {
@@ -658,6 +701,11 @@ fn build_ir_dir_corpus_status_report(
             total_samples: sample_records.len(),
             completed_samples: sample_counts.get("done").copied().unwrap_or(0),
             status_counts: count_statuses(&sample_records),
+            scheduling_policy: manifest
+                .scheduling_policy
+                .as_ref()
+                .map(|policy| policy.policy_name.clone()),
+            prioritized_samples: prioritized_sample_count(manifest.scheduling_policy.as_ref()),
             enqueued_actions: 0,
             executed_actions: 0,
         };
@@ -2152,6 +2200,7 @@ mod tests {
             "v0.39.0",
             yosys_script,
             crate::DEFAULT_QUEUE_PRIORITY,
+            None,
             sample_driver_cli(),
             sample_yosys_cli(),
         )
@@ -2341,6 +2390,7 @@ mod tests {
             yosys_runtime: yosys_runtime.clone(),
             yosys_script: yosys_script_ref.path.clone(),
             yosys_script_sha256: yosys_script_ref.sha256.clone(),
+            scheduling_policy: None,
             samples: samples
                 .iter()
                 .zip(plans.iter())
@@ -2704,6 +2754,7 @@ mod tests {
             "v0.39.0",
             Some("flows/yosys_to_aig.ys"),
             crate::DEFAULT_QUEUE_PRIORITY,
+            None,
             sample_driver_cli(),
             sample_yosys_cli(),
         )

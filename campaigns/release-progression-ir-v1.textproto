@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+policy_name: "release-progression-ir"
+semantic_version: 1
+expected_corpus_sample_count: 187
+expected_corpus_hash_manifest_sha256: "bd6a384406f764baebe95089b792fe483ef84f0a8eda3ee8ea8047767a77ce38"
+priority_tiers {
+  tier_name: "abc-critical-path"
+  queue_priority_boost: 100
+  structural_hashes: "71f27af55124e28aae72fe9121b0731d5a356b468dc0f214cfac54f37a01f5af"
+  structural_hashes: "b9d9c8026eb8a756e29645afea9a1f19918bec50f3629cf92a7f1c9afe7c32a7"
+  structural_hashes: "c8d78323bfef010613b71cae233b0ab7835ffb4132794e9a0036254891b6a814"
+  reason: "Repeated Yosys/ABC makespan stragglers in xlsynth crate releases 0.27.0 through 0.29.0"
+}

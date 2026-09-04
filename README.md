@@ -108,6 +108,10 @@ local IR corpora. It does not require global `--artifacts-via-sled`; instead it 
 self-contained workspace under `OUTPUT_DIR/.bvc/` and writes public manifests/exports directly into
 `OUTPUT_DIR/`.
 
+For the pinned release-progression cohort, pass
+`--scheduling-policy release-progression-ir-v1` to apply the checked-in critical-path priority
+policy without changing action identities or QoR results.
+
 Enqueue mode:
 
 ```bash

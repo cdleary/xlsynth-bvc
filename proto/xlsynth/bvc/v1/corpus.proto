@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package xlsynth.bvc.v1;
+
+message IrDirCorpusPriorityTier {
+  string tier_name = 1;
+  int32 queue_priority_boost = 2;
+  repeated string structural_hashes = 3;
+  string reason = 4;
+}
+
+message IrDirCorpusSchedulingPolicy {
+  uint32 schema_version = 1;
+  string policy_name = 2;
+  uint32 semantic_version = 3;
+  uint64 expected_corpus_sample_count = 4;
+  string expected_corpus_hash_manifest_sha256 = 5;
+  repeated IrDirCorpusPriorityTier priority_tiers = 6;
+}

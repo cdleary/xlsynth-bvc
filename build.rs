@@ -26,6 +26,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "proto/xlsynth/bvc/v1/analysis.proto",
             "proto/xlsynth/bvc/v1/deployment.proto",
             "proto/xlsynth/bvc/v1/release_inputs.proto",
+            "proto/xlsynth/bvc/v1/corpus.proto",
         ],
         &["proto"],
     )?;
@@ -80,6 +81,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     fs::write(out_dir.join("release-inputs-v1.pb"), output.stdout)?;
 
+    let corpus_scheduling_policy_text = fs::read("campaigns/release-progression-ir-v1.textproto")?;
+    let mut child = Command::new(&protoc)
+        .args([
+            "--proto_path=proto",
+            "--encode=xlsynth.bvc.v1.IrDirCorpusSchedulingPolicy",
+            "proto/xlsynth/bvc/v1/corpus.proto",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or("protoc corpus scheduling policy stdin unavailable")?
+        .write_all(&corpus_scheduling_policy_text)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "protoc failed to compile corpus scheduling policy textproto: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    fs::write(out_dir.join("release-progression-ir-v1.pb"), output.stdout)?;
+
     println!("cargo:rerun-if-changed=proto/xlsynth/bvc/v1/common.proto");
     println!("cargo:rerun-if-changed=proto/xlsynth/bvc/v1/action.proto");
     println!("cargo:rerun-if-changed=proto/xlsynth/bvc/v1/queue.proto");
@@ -90,7 +116,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=proto/xlsynth/bvc/v1/analysis.proto");
     println!("cargo:rerun-if-changed=proto/xlsynth/bvc/v1/deployment.proto");
     println!("cargo:rerun-if-changed=proto/xlsynth/bvc/v1/release_inputs.proto");
+    println!("cargo:rerun-if-changed=proto/xlsynth/bvc/v1/corpus.proto");
     println!("cargo:rerun-if-changed=campaigns/release-qor-v1.textproto");
+    println!("cargo:rerun-if-changed=campaigns/release-progression-ir-v1.textproto");
     println!("cargo:rerun-if-changed=release-inputs/v1.textproto");
     println!("cargo:rerun-if-changed=proto/README.md");
     Ok(())
