@@ -21,7 +21,7 @@ use crate::campaign::{
 };
 use crate::ops::run_workers;
 use crate::proto::v1 as pb;
-use crate::proto::{encode_provenance, timestamp_from_proto, timestamp_to_proto};
+use crate::proto::{timestamp_from_proto, timestamp_to_proto};
 use crate::publish::{publish_static_site_with_protected_roots, verify_published_site};
 use crate::query::rebuild_web_indices;
 use crate::service::{
@@ -379,25 +379,12 @@ fn stage_succeeded(state: &pb::CoordinatorState, stage: pb::CoordinatorStage) ->
     })
 }
 
-fn indexed_source_fingerprint(store: &ArtifactStore) -> Result<pb::Sha256Digest> {
-    let mut records = store
-        .list_provenances()?
-        .into_iter()
-        .map(|provenance| {
-            let action_id = provenance.action_id.clone();
-            Ok((action_id, encode_provenance(&provenance)?))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    records.sort_by(|a, b| a.0.cmp(&b.0));
-
+fn indexed_source_fingerprint(store: &ArtifactStore, repo_root: &Path) -> Result<pb::Sha256Digest> {
     let mut hasher = Sha256::new();
     hasher.update(INDEXED_SOURCE_FINGERPRINT_DOMAIN);
-    for (action_id, bytes) in records {
-        hasher.update((action_id.len() as u64).to_be_bytes());
-        hasher.update(action_id.as_bytes());
-        hasher.update((bytes.len() as u64).to_be_bytes());
-        hasher.update(bytes);
-    }
+    let versions_input = crate::query::versions_summary_input_fingerprint(store, repo_root)?;
+    hasher.update((versions_input.len() as u64).to_be_bytes());
+    hasher.update(versions_input.as_bytes());
     Ok(pb::Sha256Digest {
         value: hasher.finalize().to_vec(),
     })
@@ -438,6 +425,17 @@ fn indexed_checkpoint_matches(
     stage_succeeded(state, pb::CoordinatorStage::Indexed)
         && state.indexed_source_fingerprint.as_ref() == Some(source_fingerprint)
         && state.indexed_output_fingerprint.as_ref() == Some(output_fingerprint)
+}
+
+fn indexed_checkpoint_reusable(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    fingerprints_match: bool,
+) -> Result<bool> {
+    if !fingerprints_match {
+        return Ok(false);
+    }
+    Ok(crate::query::load_versions_cards_index(store, repo_root)?.is_some())
 }
 
 fn ensure_structural_index_current(
@@ -635,7 +633,7 @@ pub(crate) fn coordinate_release(
         },
     )?;
 
-    let current_indexed_source_fingerprint = indexed_source_fingerprint(&store)?;
+    let current_indexed_source_fingerprint = indexed_source_fingerprint(&store, repo_root)?;
     let current_indexed_source_fingerprint_hex = digest_hex(
         &current_indexed_source_fingerprint,
         "coordinator.indexed_source_fingerprint",
@@ -645,7 +643,7 @@ pub(crate) fn coordinate_release(
         &current_indexed_output_fingerprint,
         "coordinator.indexed_output_fingerprint",
     )?;
-    let indexed_already_succeeded = indexed_checkpoint_matches(
+    let indexed_checkpoint_fingerprints_match = indexed_checkpoint_matches(
         &state,
         &current_indexed_source_fingerprint,
         &current_indexed_output_fingerprint,
@@ -657,7 +655,11 @@ pub(crate) fn coordinate_release(
         pb::CoordinatorStage::Indexed,
         pb::CoordinatorStageStatus::FailedTransient,
         || {
-            if indexed_already_succeeded {
+            if indexed_checkpoint_reusable(
+                &store,
+                repo_root,
+                indexed_checkpoint_fingerprints_match,
+            )? {
                 Ok((
                     current_indexed_output_fingerprint.clone(),
                     format!(
@@ -704,7 +706,7 @@ pub(crate) fn coordinate_release(
         pb::CoordinatorStageStatus::FailedDeterministic,
         || {
             let current = load_campaign_run_by_id(&store, &plan.run_id)?;
-            let summary = finalize_stored_campaign_run(&store, &current)?;
+            let summary = finalize_stored_campaign_run(&store, repo_root, &current)?;
             if !matches!(summary.status.as_str(), "complete" | "degraded") {
                 bail!(
                     "campaign finalization refused publication: status={} missing_outputs={:?}",
@@ -1081,8 +1083,17 @@ mod tests {
         let root = temp_path("indexed-source-fingerprint");
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("layout");
-        let source_before = indexed_source_fingerprint(&store).expect("empty source fingerprint");
-        let output_before = indexed_output_fingerprint(&store).expect("empty output fingerprint");
+        let repo_root = std::env::current_dir().expect("current repo root");
+        let source_before =
+            indexed_source_fingerprint(&store, &repo_root).expect("empty source fingerprint");
+        let versions_index_bytes = br#"{"cached":"versions"}"#;
+        store
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                versions_index_bytes,
+            )
+            .expect("seed cached versions index");
+        let output_before = indexed_output_fingerprint(&store).expect("initial output fingerprint");
         let previous_policy_output =
             indexed_output_fingerprint_for_policy(&store, PUBLICATION_POLICY_VERSION - 1)
                 .expect("previous-policy output fingerprint");
@@ -1137,40 +1148,55 @@ mod tests {
             .write_provenance(&provenance)
             .expect("write newly completed action");
         let source_after_action =
-            indexed_source_fingerprint(&store).expect("updated source fingerprint");
-        assert_ne!(source_before, source_after_action);
+            indexed_source_fingerprint(&store, &repo_root).expect("updated source fingerprint");
+        assert_eq!(source_before, source_after_action);
+        let output_after_action =
+            indexed_output_fingerprint(&store).expect("invalidated output fingerprint");
+        assert_ne!(output_before, output_after_action);
         assert!(!indexed_checkpoint_matches(
             &state,
             &source_after_action,
-            &output_before
+            &output_after_action
         ));
 
-        state.indexed_source_fingerprint = Some(source_after_action.clone());
+        store
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                versions_index_bytes,
+            )
+            .expect("restore cached versions index");
+        let output_restored =
+            indexed_output_fingerprint(&store).expect("restored output fingerprint");
+        assert_eq!(output_before, output_restored);
         assert!(indexed_checkpoint_matches(
             &state,
             &source_after_action,
-            &output_before
+            &output_restored
         ));
         provenance.details["source_path"] = serde_json::json!("refreshed.ir");
         store
             .write_provenance(&provenance)
             .expect("refresh provenance contents");
         let source_after_refresh =
-            indexed_source_fingerprint(&store).expect("refreshed source fingerprint");
-        assert_ne!(source_after_action, source_after_refresh);
+            indexed_source_fingerprint(&store, &repo_root).expect("refreshed source fingerprint");
+        assert_eq!(source_after_action, source_after_refresh);
+        let output_after_refresh =
+            indexed_output_fingerprint(&store).expect("re-invalidated output fingerprint");
+        assert_eq!(output_after_action, output_after_refresh);
         assert!(!indexed_checkpoint_matches(
             &state,
             &source_after_refresh,
-            &output_before
+            &output_after_refresh
         ));
 
         state.indexed_source_fingerprint = Some(source_after_refresh.clone());
+        state.indexed_output_fingerprint = Some(output_after_refresh.clone());
         store
             .write_web_index_bytes("checkpoint-test.v1.json", br#"{"value":1}"#)
             .expect("write index output");
         let output_after_write =
             indexed_output_fingerprint(&store).expect("written output fingerprint");
-        assert_ne!(output_before, output_after_write);
+        assert_ne!(output_after_refresh, output_after_write);
         assert!(!indexed_checkpoint_matches(
             &state,
             &source_after_refresh,
@@ -1200,7 +1226,7 @@ mod tests {
             .expect("delete index output");
         let output_after_delete =
             indexed_output_fingerprint(&store).expect("deleted output fingerprint");
-        assert_eq!(output_before, output_after_delete);
+        assert_eq!(output_after_refresh, output_after_delete);
         assert!(!indexed_checkpoint_matches(
             &state,
             &source_after_refresh,
@@ -1208,6 +1234,95 @@ mod tests {
         ));
 
         drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn indexed_source_fingerprint_binds_release_metadata_and_recipe_files() {
+        let root = temp_path("indexed-release-metadata-fingerprint");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let source_root = std::env::current_dir().expect("current repo root");
+        let repo_root = root.join("repo");
+        for relpath in [
+            crate::VERSION_COMPAT_PATH,
+            crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
+            crate::DEFAULT_DOCKERFILE,
+            crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
+        ] {
+            let destination = repo_root.join(relpath);
+            fs::create_dir_all(destination.parent().unwrap()).expect("create metadata parent");
+            fs::copy(source_root.join(relpath), destination).expect("copy metadata source");
+        }
+
+        let before =
+            indexed_source_fingerprint(&store, &repo_root).expect("initial source fingerprint");
+        let observation_path = repo_root.join(crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH);
+        let mut observation = fs::read(&observation_path).expect("read observation");
+        observation.push(b'\n');
+        fs::write(observation_path, observation).expect("change observation bytes");
+        let after =
+            indexed_source_fingerprint(&store, &repo_root).expect("changed source fingerprint");
+
+        assert_ne!(before, after);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn indexed_checkpoint_rejects_stale_runtime_recipe_identity() {
+        let root = temp_path("indexed-runtime-recipe-fingerprint");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let repo_root = std::env::current_dir().expect("current repo root");
+        crate::query::rebuild_versions_cards_index(&store, &repo_root)
+            .expect("build current versions index");
+        let source = indexed_source_fingerprint(&store, &repo_root).expect("source fingerprint");
+        let output = indexed_output_fingerprint(&store).expect("output fingerprint");
+        let mut state = pb::CoordinatorState {
+            stage_results: vec![pb::CoordinatorStageResult {
+                stage: pb::CoordinatorStage::Indexed as i32,
+                status: pb::CoordinatorStageStatus::Succeeded as i32,
+                ..Default::default()
+            }],
+            indexed_source_fingerprint: Some(source.clone()),
+            indexed_output_fingerprint: Some(output.clone()),
+            ..Default::default()
+        };
+        assert!(
+            indexed_checkpoint_reusable(
+                &store,
+                &repo_root,
+                indexed_checkpoint_matches(&state, &source, &output),
+            )
+            .expect("validate current checkpoint")
+        );
+
+        let bytes = store
+            .load_web_index_bytes(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .expect("load versions index")
+            .expect("versions index exists");
+        let mut versions: crate::query::VersionsSummaryIndexFile =
+            serde_json::from_slice(&bytes).expect("decode versions index");
+        versions.resolved_recipe_fingerprint_sha256 = "f".repeat(64);
+        store
+            .write_web_index_bytes(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &serde_json::to_vec(&versions).expect("encode stale versions index"),
+            )
+            .expect("write stale versions index");
+        let stale_output = indexed_output_fingerprint(&store).expect("stale output fingerprint");
+        state.indexed_output_fingerprint = Some(stale_output.clone());
+        assert!(indexed_checkpoint_matches(&state, &source, &stale_output));
+        assert!(
+            !indexed_checkpoint_reusable(
+                &store,
+                &repo_root,
+                indexed_checkpoint_matches(&state, &source, &stale_output),
+            )
+            .expect("validate stale checkpoint"),
+            "checkpoint fingerprint matches must not bypass live runtime-recipe validation"
+        );
+
         fs::remove_dir_all(root).expect("cleanup");
     }
 

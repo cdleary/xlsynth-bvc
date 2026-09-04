@@ -38,6 +38,9 @@ jobs:
       - name: Check SPDX headers
         run: python3 scripts/check_spdx_headers.py
 
+      - name: Test version compatibility metadata
+        run: python3 scripts/version_compat_metadata_test.py
+
       - name: Typecheck
         run: cargo check --all-targets
 

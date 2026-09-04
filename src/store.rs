@@ -169,6 +169,7 @@ trait ArtifactBackend: std::fmt::Debug + Send + Sync {
         store_root: &Path,
         prefix: &str,
     ) -> Result<Vec<(String, Vec<u8>)>>;
+    fn delete_web_index_key_unflushed(&self, store_root: &Path, index_key: &str) -> Result<()>;
     fn delete_web_index_keys_with_prefix(&self, store_root: &Path, prefix: &str) -> Result<usize>;
     fn web_index_location(&self, store_root: &Path, index_key: &str) -> String;
     fn size_on_disk_bytes(&self, store_root: &Path) -> Result<u64>;
@@ -1273,6 +1274,15 @@ fn build_reverse_dependency_edges(
     Ok(reverse_edges)
 }
 
+fn delete_versions_summary_web_index(db: &sled::Db) -> Result<()> {
+    let tree = db
+        .open_tree(SledArtifactBackend::TREE_WEB_INDEX_BYTES)
+        .context("opening web_index_bytes tree for versions summary invalidation")?;
+    tree.remove(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME.as_bytes())
+        .context("invalidating versions summary web index")?;
+    Ok(())
+}
+
 pub(crate) fn prune_sled_actions_by_ids(
     store_root: &Path,
     db_path: &Path,
@@ -1435,6 +1445,9 @@ pub(crate) fn prune_sled_actions_by_ids(
     }
 
     if !dry_run {
+        if deleted_provenance_rows > 0 || deleted_failed_action_record_files > 0 {
+            delete_versions_summary_web_index(&db)?;
+        }
         db.flush()
             .context("flushing sled db after action-id prune")?;
     }
@@ -1697,6 +1710,9 @@ pub(crate) fn prune_sled_actions_by_relpath_size(
     }
 
     if !dry_run {
+        if deleted_provenance_rows > 0 || deleted_failed_action_record_files > 0 {
+            delete_versions_summary_web_index(&db)?;
+        }
         db.flush().context("flushing sled db after prune")?;
     }
 
@@ -2398,6 +2414,20 @@ impl ArtifactBackend for SledArtifactBackend {
         Ok(rows)
     }
 
+    fn delete_web_index_key_unflushed(&self, _store_root: &Path, index_key: &str) -> Result<()> {
+        let db = self.open_db()?;
+        if index_key == crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME {
+            delete_versions_summary_web_index(&db)?;
+        } else {
+            let tree = db
+                .open_tree(Self::TREE_WEB_INDEX_BYTES)
+                .context("opening sled tree web_index_bytes")?;
+            tree.remove(index_key.as_bytes())
+                .context("invalidating web index row")?;
+        }
+        Ok(())
+    }
+
     fn delete_web_index_keys_with_prefix(&self, _store_root: &Path, prefix: &str) -> Result<usize> {
         let db = self.open_db()?;
         let tree = db
@@ -2644,6 +2674,13 @@ impl ArtifactBackend for SnapshotArtifactBackend {
         Ok(entries)
     }
 
+    fn delete_web_index_key_unflushed(&self, _store_root: &Path, index_key: &str) -> Result<()> {
+        bail!(
+            "delete_web_index_key_unflushed is unavailable in snapshot read-only backend (index_key={})",
+            index_key
+        )
+    }
+
     fn delete_web_index_keys_with_prefix(&self, _store_root: &Path, prefix: &str) -> Result<usize> {
         bail!(
             "delete_web_index_keys_with_prefix is unavailable in snapshot read-only backend (prefix={})",
@@ -2669,6 +2706,7 @@ impl ArtifactBackend for SnapshotArtifactBackend {
 }
 
 const DEFAULT_STORE_LIST_CACHE_TTL_SECS: u64 = 60;
+const VERSIONS_SUMMARY_RECIPE_CACHE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 struct TimedCache<T> {
@@ -2685,6 +2723,10 @@ pub(crate) struct ArtifactStore {
     provenance_cache: Mutex<Option<TimedCache<Vec<Provenance>>>>,
     failed_records_cache: Mutex<Option<TimedCache<Vec<QueueFailed>>>>,
     db_size_cache: Mutex<Option<TimedCache<u64>>>,
+    versions_summary_input_lock: RwLock<()>,
+    versions_summary_input_generation: AtomicU64,
+    versions_summary_rebuild_lock: Mutex<()>,
+    versions_summary_recipe_cache: Mutex<Option<TimedCache<(String, String)>>>,
 }
 
 impl ArtifactStore {
@@ -2725,6 +2767,10 @@ impl ArtifactStore {
             provenance_cache: Mutex::new(None),
             failed_records_cache: Mutex::new(None),
             db_size_cache: Mutex::new(None),
+            versions_summary_input_lock: RwLock::new(()),
+            versions_summary_input_generation: AtomicU64::new(0),
+            versions_summary_rebuild_lock: Mutex::new(()),
+            versions_summary_recipe_cache: Mutex::new(None),
         }
     }
 
@@ -2742,6 +2788,10 @@ impl ArtifactStore {
             provenance_cache: Mutex::new(None),
             failed_records_cache: Mutex::new(None),
             db_size_cache: Mutex::new(None),
+            versions_summary_input_lock: RwLock::new(()),
+            versions_summary_input_generation: AtomicU64::new(0),
+            versions_summary_rebuild_lock: Mutex::new(()),
+            versions_summary_recipe_cache: Mutex::new(None),
         }
     }
 
@@ -2802,6 +2852,80 @@ impl ArtifactStore {
         if let Ok(mut cached) = self.db_size_cache.lock() {
             *cached = None;
         }
+    }
+
+    fn mutate_versions_summary_input<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _guard = self
+            .versions_summary_input_lock
+            .write()
+            .map_err(|_| anyhow!("locking versions summary inputs for mutation"))?;
+        self.invalidate_list_caches();
+        // Delete before the mutation so every successfully flushed write also persists the
+        // invalidation. Reuse the mutation's durable flush rather than adding another flush per
+        // completed action.
+        self.artifact_backend.delete_web_index_key_unflushed(
+            &self.root,
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+        )?;
+        let result = operation();
+        self.versions_summary_input_generation
+            .fetch_add(1, Ordering::Release);
+        self.invalidate_list_caches();
+        result
+    }
+
+    pub(crate) fn with_versions_summary_input_snapshot<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _guard = self
+            .versions_summary_input_lock
+            .read()
+            .map_err(|_| anyhow!("locking versions summary inputs for rebuild"))?;
+        operation()
+    }
+
+    pub(crate) fn versions_summary_input_generation(&self) -> u64 {
+        self.versions_summary_input_generation
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn with_versions_summary_rebuild<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _guard = self
+            .versions_summary_rebuild_lock
+            .lock()
+            .map_err(|_| anyhow!("locking versions summary rebuild"))?;
+        operation()
+    }
+
+    pub(crate) fn cached_versions_summary_recipe_fingerprint(
+        &self,
+        cache_key: &str,
+        resolve: impl FnOnce() -> Result<String>,
+    ) -> Result<String> {
+        let mut cached = self
+            .versions_summary_recipe_cache
+            .lock()
+            .map_err(|_| anyhow!("locking versions summary recipe cache"))?;
+        if let Some(cached) = cached.as_ref()
+            && cached.loaded_at.elapsed() < VERSIONS_SUMMARY_RECIPE_CACHE_TTL
+            && cached.value.0 == cache_key
+        {
+            return Ok(cached.value.1.clone());
+        }
+        // Resolution can inspect/build the bound driver image and fetch immutable release
+        // inputs. Serialize refreshes so an older concurrent result cannot overwrite a newer one.
+        // This mutex is deliberately independent of provenance mutation; the bounded TTL refreshes
+        // external runtime identity, while static recipe/card changes produce a different cache key.
+        let fingerprint = resolve()?;
+        *cached = Some(TimedCache {
+            loaded_at: Instant::now(),
+            value: Arc::new((cache_key.to_string(), fingerprint.clone())),
+        });
+        Ok(fingerprint)
     }
 
     #[cfg(test)]
@@ -2969,10 +3093,10 @@ impl ArtifactStore {
         action_id: &str,
         staging_dir: &Path,
     ) -> Result<()> {
-        self.artifact_backend
-            .promote_staging_action_dir(&self.root, action_id, staging_dir)?;
-        self.invalidate_list_caches();
-        Ok(())
+        self.mutate_versions_summary_input(|| {
+            self.artifact_backend
+                .promote_staging_action_dir(&self.root, action_id, staging_dir)
+        })
     }
 
     pub(crate) fn action_exists(&self, action_id: &str) -> bool {
@@ -3014,10 +3138,10 @@ impl ArtifactStore {
     }
 
     pub(crate) fn write_provenance(&self, provenance: &Provenance) -> Result<()> {
-        self.artifact_backend
-            .write_provenance(&self.root, provenance)?;
-        self.invalidate_list_caches();
-        Ok(())
+        self.mutate_versions_summary_input(|| {
+            self.artifact_backend
+                .write_provenance(&self.root, provenance)
+        })
     }
 
     pub(crate) fn for_each_provenance(
@@ -3047,36 +3171,46 @@ impl ArtifactStore {
         }
 
         let cache_started = Instant::now();
-        let mut cache = self
-            .provenance_cache
-            .lock()
-            .map_err(|_| anyhow!("locking provenance cache"))?;
-        if let Some(cached) = cache.as_ref()
-            && cached.loaded_at.elapsed() <= self.list_cache_ttl
         {
-            let shared = cached.value.clone();
-            let age_ms = cached.loaded_at.elapsed().as_millis();
-            info!(
-                "store.list_provenances cache_hit backend={} count={} age_ms={} elapsed_ms={}",
-                self.backend_label(),
-                shared.len(),
-                age_ms,
-                cache_started.elapsed().as_millis(),
-            );
-            return Ok(shared);
+            let cache = self
+                .provenance_cache
+                .lock()
+                .map_err(|_| anyhow!("locking provenance cache"))?;
+            if let Some(cached) = cache.as_ref()
+                && cached.loaded_at.elapsed() <= self.list_cache_ttl
+            {
+                let shared = cached.value.clone();
+                let age_ms = cached.loaded_at.elapsed().as_millis();
+                info!(
+                    "store.list_provenances cache_hit backend={} count={} age_ms={} elapsed_ms={}",
+                    self.backend_label(),
+                    shared.len(),
+                    age_ms,
+                    cache_started.elapsed().as_millis(),
+                );
+                return Ok(shared);
+            }
         }
 
+        let input_generation = self.versions_summary_input_generation();
         let started = Instant::now();
         let result = self.artifact_backend.list_provenances(&self.root);
         match result {
             Ok(provenances) => {
                 let count = provenances.len();
                 let shared = Arc::new(provenances);
-                *cache = Some(TimedCache {
-                    loaded_at: Instant::now(),
-                    value: shared.clone(),
-                });
-                drop(cache);
+                if self.versions_summary_input_generation() == input_generation {
+                    let mut cache = self
+                        .provenance_cache
+                        .lock()
+                        .map_err(|_| anyhow!("locking provenance cache after load"))?;
+                    if self.versions_summary_input_generation() == input_generation {
+                        *cache = Some(TimedCache {
+                            loaded_at: Instant::now(),
+                            value: shared.clone(),
+                        });
+                    }
+                }
                 info!(
                     "store.list_provenances cache_miss backend={} count={} elapsed_ms={}",
                     self.backend_label(),
@@ -3101,6 +3235,10 @@ impl ArtifactStore {
         Ok(self.list_provenances_shared()?.as_ref().clone())
     }
 
+    pub(crate) fn list_provenances_uncached(&self) -> Result<Vec<Provenance>> {
+        self.artifact_backend.list_provenances(&self.root)
+    }
+
     pub(crate) fn load_failed_action_records_shared(&self) -> Result<Arc<Vec<QueueFailed>>> {
         if self.list_cache_ttl.is_zero() {
             let started = Instant::now();
@@ -3117,36 +3255,46 @@ impl ArtifactStore {
         }
 
         let cache_started = Instant::now();
-        let mut cache = self
-            .failed_records_cache
-            .lock()
-            .map_err(|_| anyhow!("locking failed records cache"))?;
-        if let Some(cached) = cache.as_ref()
-            && cached.loaded_at.elapsed() <= self.list_cache_ttl
         {
-            let shared = cached.value.clone();
-            let age_ms = cached.loaded_at.elapsed().as_millis();
-            info!(
-                "store.load_failed_action_records cache_hit backend={} count={} age_ms={} elapsed_ms={}",
-                self.backend_label(),
-                shared.len(),
-                age_ms,
-                cache_started.elapsed().as_millis(),
-            );
-            return Ok(shared);
+            let cache = self
+                .failed_records_cache
+                .lock()
+                .map_err(|_| anyhow!("locking failed records cache"))?;
+            if let Some(cached) = cache.as_ref()
+                && cached.loaded_at.elapsed() <= self.list_cache_ttl
+            {
+                let shared = cached.value.clone();
+                let age_ms = cached.loaded_at.elapsed().as_millis();
+                info!(
+                    "store.load_failed_action_records cache_hit backend={} count={} age_ms={} elapsed_ms={}",
+                    self.backend_label(),
+                    shared.len(),
+                    age_ms,
+                    cache_started.elapsed().as_millis(),
+                );
+                return Ok(shared);
+            }
         }
 
+        let input_generation = self.versions_summary_input_generation();
         let started = Instant::now();
         let result = self.artifact_backend.load_failed_action_records(&self.root);
         match result {
             Ok(records) => {
                 let count = records.len();
                 let shared = Arc::new(records);
-                *cache = Some(TimedCache {
-                    loaded_at: Instant::now(),
-                    value: shared.clone(),
-                });
-                drop(cache);
+                if self.versions_summary_input_generation() == input_generation {
+                    let mut cache = self
+                        .failed_records_cache
+                        .lock()
+                        .map_err(|_| anyhow!("locking failed records cache after load"))?;
+                    if self.versions_summary_input_generation() == input_generation {
+                        *cache = Some(TimedCache {
+                            loaded_at: Instant::now(),
+                            value: shared.clone(),
+                        });
+                    }
+                }
                 info!(
                     "store.load_failed_action_records cache_miss backend={} count={} elapsed_ms={}",
                     self.backend_label(),
@@ -3256,20 +3404,17 @@ impl ArtifactStore {
     }
 
     pub(crate) fn write_failed_action_record(&self, failed: &QueueFailed) -> Result<()> {
-        self.artifact_backend
-            .write_failed_action_record(&self.root, failed)?;
-        self.invalidate_list_caches();
-        Ok(())
+        self.mutate_versions_summary_input(|| {
+            self.artifact_backend
+                .write_failed_action_record(&self.root, failed)
+        })
     }
 
     pub(crate) fn delete_failed_action_record(&self, action_id: &str) -> Result<bool> {
-        let deleted = self
-            .artifact_backend
-            .delete_failed_action_record(&self.root, action_id)?;
-        if deleted {
-            self.invalidate_list_caches();
-        }
-        Ok(deleted)
+        self.mutate_versions_summary_input(|| {
+            self.artifact_backend
+                .delete_failed_action_record(&self.root, action_id)
+        })
     }
 
     pub(crate) fn shard_dir(&self, base: PathBuf, key: &str) -> PathBuf {
@@ -3400,6 +3545,76 @@ mod tests {
             details: json!({"test": "sled-roundtrip"}),
             suggested_next_actions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn blocked_versions_recipe_resolution_does_not_block_provenance_writes() {
+        let root = make_test_root("xlsynth-bvc-versions-recipe-nonblocking");
+        let store = Arc::new(ArtifactStore::new(root.clone()));
+        store.ensure_layout().expect("store layout");
+        let (resolver_started_tx, resolver_started_rx) = mpsc::channel();
+        let (release_resolver_tx, release_resolver_rx) = mpsc::channel();
+        let resolver_store = store.clone();
+        let resolver_thread = std::thread::spawn(move || {
+            resolver_store.with_versions_summary_rebuild(|| {
+                resolver_store.cached_versions_summary_recipe_fingerprint("test-key", || {
+                    resolver_started_tx.send(()).expect("signal resolver start");
+                    release_resolver_rx.recv().expect("release resolver");
+                    Ok("a".repeat(64))
+                })
+            })
+        });
+        resolver_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("resolver should start");
+
+        let provenance = make_test_provenance(&"d".repeat(64), "payload/result.txt", 1);
+        let writer_store = store.clone();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        let writer_thread = std::thread::spawn(move || {
+            writer_tx
+                .send(writer_store.write_provenance(&provenance))
+                .expect("send writer result");
+        });
+        let writer_result = writer_rx.recv_timeout(Duration::from_secs(2));
+        release_resolver_tx.send(()).expect("release resolver");
+        resolver_thread
+            .join()
+            .expect("resolver thread")
+            .expect("resolver result");
+        writer_thread.join().expect("writer thread");
+        writer_result
+            .expect("provenance write must not wait for recipe resolution")
+            .expect("provenance write");
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup store");
+    }
+
+    #[test]
+    fn versions_recipe_cache_refreshes_runtime_identity_after_ttl() {
+        let root = make_test_root("xlsynth-bvc-versions-recipe-cache-ttl");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("store layout");
+
+        let image_a = store
+            .cached_versions_summary_recipe_fingerprint("same-recipe", || Ok("a".repeat(64)))
+            .expect("cache image A");
+        assert_eq!(image_a, "a".repeat(64));
+        {
+            let mut cached = store
+                .versions_summary_recipe_cache
+                .lock()
+                .expect("lock recipe cache");
+            cached.as_mut().expect("cached recipe").loaded_at =
+                Instant::now() - VERSIONS_SUMMARY_RECIPE_CACHE_TTL - Duration::from_secs(1);
+        }
+        let image_b = store
+            .cached_versions_summary_recipe_fingerprint("same-recipe", || Ok("b".repeat(64)))
+            .expect("refresh image B");
+        assert_eq!(image_b, "b".repeat(64));
+
+        fs::remove_dir_all(root).expect("cleanup store");
     }
 
     fn stage_test_sled_action(
@@ -4194,6 +4409,15 @@ mod tests {
         let file_tree = db
             .open_tree(SledArtifactBackend::TREE_ACTION_FILE_BYTES)
             .expect("open action_file_bytes tree");
+        let web_index_tree = db
+            .open_tree(SledArtifactBackend::TREE_WEB_INDEX_BYTES)
+            .expect("open web index tree");
+        web_index_tree
+            .insert(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                b"cached-versions",
+            )
+            .expect("seed versions index");
 
         let queue_child = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
@@ -4259,6 +4483,7 @@ mod tests {
             .expect("insert result.v bytes for action_c");
 
         db.flush().expect("flush seed db");
+        drop(web_index_tree);
         drop(file_tree);
         drop(provenance_tree);
         drop(db);
@@ -4322,6 +4547,17 @@ mod tests {
         let file_tree = db
             .open_tree(SledArtifactBackend::TREE_ACTION_FILE_BYTES)
             .expect("open action_file tree");
+        let web_index_tree = db
+            .open_tree(SledArtifactBackend::TREE_WEB_INDEX_BYTES)
+            .expect("open web index tree");
+
+        assert!(
+            web_index_tree
+                .get(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+                .expect("load versions index after prune")
+                .is_none(),
+            "pruning provenance should invalidate the cached versions index"
+        );
 
         assert!(
             provenance_tree

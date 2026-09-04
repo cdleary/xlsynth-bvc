@@ -14,8 +14,9 @@ use std::time::Instant;
 
 use crate::DASHBOARD_FAVICON_SVG;
 use crate::query::{
-    build_queue_live_status, build_unprocessed_version_rows, enqueue_processing_for_crate_version,
-    load_versions_cards_index, rebuild_versions_cards_index,
+    build_queue_live_status, build_snapshot_unprocessed_version_rows,
+    build_unprocessed_version_rows, enqueue_processing_for_crate_version,
+    ensure_versions_cards_index, load_versions_cards_index,
 };
 use crate::view::QueueLiveStatusView;
 use crate::web::render::{inject_server_timing_badge, render_versions_html};
@@ -100,15 +101,16 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
     let repo_root = state.repo_root.clone();
     let runner_owner_prefix = state.runner_owner_prefix.clone();
     let runner_control = state.runner_control.clone();
-    let show_db_size_link = state.snapshot_manifest.is_none();
+    let snapshot_mode = state.snapshot_manifest.is_some();
+    let show_db_size_link = !snapshot_mode;
     let show_live_queue = state.runner_enabled;
     match tokio::task::spawn_blocking(move || {
         let started = Instant::now();
         let rss_mib_start = process_rss_mib().unwrap_or(0);
-        let report = if let Some(indexed) = load_versions_cards_index(&store)? {
+        let index = if let Some(indexed) = load_versions_cards_index(&store, &repo_root)? {
             indexed
         } else {
-            let summary = rebuild_versions_cards_index(&store, &repo_root)?;
+            let summary = ensure_versions_cards_index(&store, &repo_root)?;
             info!(
                 "web /versions rebuilt versions summary index cards={} unattributed={} index_bytes={} elapsed_ms={}",
                 summary.card_count,
@@ -116,16 +118,24 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
                 summary.index_bytes,
                 summary.elapsed_ms
             );
-            load_versions_cards_index(&store)?.ok_or_else(|| {
+            load_versions_cards_index(&store, &repo_root)?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "versions summary index rebuild completed but index remained unavailable"
                 )
             })?
         };
         let after_cards = Instant::now();
-        let unprocessed = build_unprocessed_version_rows(&store, &repo_root, &report.cards)?;
+        let unprocessed = if snapshot_mode {
+            build_snapshot_unprocessed_version_rows(&index.report.releases)
+        } else {
+            build_unprocessed_version_rows(&store, &repo_root, &index.report.cards)?
+        };
         let after_unprocessed = Instant::now();
-        let db_size_bytes = store.artifacts_db_size_bytes().ok();
+        let db_size_bytes = if show_db_size_link {
+            store.artifacts_db_size_bytes().ok()
+        } else {
+            None
+        };
         let live_status = if show_live_queue {
             let status = build_queue_live_status(&store, &repo_root, runner_owner_prefix.as_deref())?;
             apply_runner_control_status(status, true, runner_control.as_deref())
@@ -155,14 +165,16 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
         };
         let after_queue = Instant::now();
         let html = render_versions_html(
-            &report.cards,
-            &report.unattributed_actions,
+            &index.report.cards,
+            &index.report.unattributed_actions,
+            &index.report.releases,
+            index.report.repository_head_observation.as_ref(),
             &unprocessed,
             &live_status,
             show_live_queue,
             show_db_size_link,
             db_size_bytes,
-            Utc::now(),
+            (!snapshot_mode).then_some(index.generated_utc),
         );
         cache.put_page(cache_key, html.clone());
         let rss_mib_end = process_rss_mib().unwrap_or(0);
@@ -173,8 +185,8 @@ pub(super) async fn web_versions(State(state): State<WebUiState>) -> impl IntoRe
             (after_queue - after_unprocessed).as_millis(),
             after_queue.elapsed().as_millis(),
             started.elapsed().as_millis(),
-            report.cards.len(),
-            report.unattributed_actions.len(),
+            index.report.cards.len(),
+            index.report.unattributed_actions.len(),
             unprocessed.len(),
             rss_mib_start,
             rss_mib_end,

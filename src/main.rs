@@ -83,8 +83,8 @@ const WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION: u32 = 
 const WEB_IR_FN_CORPUS_IR_INDEX_FILENAME: &str = "ir-fn-corpus-ir.v1.json";
 const WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION: u32 = 1;
 const WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE: &str = "ir-fn-corpus-ir.v1/by-hash-prefix";
-const WEB_VERSIONS_SUMMARY_INDEX_FILENAME: &str = "versions-summary.v4.json";
-const WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION: u32 = 4;
+const WEB_VERSIONS_SUMMARY_INDEX_FILENAME: &str = "versions-summary.v7.json";
+const WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION: u32 = 7;
 const WEB_STDLIB_FNS_TREND_G8R_FRAIG_FALSE_INDEX_FILENAME: &str =
     "stdlib-fns-trend-g8r-fraig-false.v1.json";
 const WEB_STDLIB_FNS_TREND_G8R_FRAIG_TRUE_INDEX_FILENAME: &str =
@@ -104,6 +104,8 @@ const STRUCTURAL_SCAN_PROGRESS_EVERY_ACTIONS: usize = 50;
 const STRUCTURAL_SCAN_PROGRESS_INTERVAL_SECS: u64 = 5;
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/xlsynth/xlsynth/releases";
 const VERSION_COMPAT_PATH: &str = "third_party/xlsynth-crate/generated_version_compat.json";
+const XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH: &str =
+    "third_party/xlsynth-crate/repository_head_observation.json";
 const VENDORED_DOWNLOAD_RELEASE_SCRIPT: &str =
     "third_party/xlsynth-crate/v0.29.0/scripts/download_release.py";
 const DRIVER_RELEASE_CACHE_DIR: &str = "driver-release-cache";

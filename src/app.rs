@@ -448,6 +448,8 @@ pub(crate) fn run() -> Result<()> {
         if runner_config.enabled {
             bail!("--snapshot-dir requires --no-runner");
         }
+        verify_static_snapshot(snapshot_dir)
+            .context("verifying static snapshot before starting web server")?;
         let snapshot_store = ArtifactStore::new_with_snapshot(store_dir, snapshot_dir.clone());
         snapshot_store.ensure_layout()?;
         web::serve_web_ui(

@@ -27,12 +27,17 @@ fn test_repo_root() -> PathBuf {
 }
 
 fn empty_versions_index_bytes() -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
-        "generated_utc": "2026-08-29T12:00:00Z",
-        "report": {"cards": [], "unattributed_actions": []}
-    }))
-    .expect("serialize empty versions index")
+    let root = temp_root().join("versions-fixture-store");
+    let store = ArtifactStore::new(root.clone());
+    store.ensure_layout().expect("versions fixture layout");
+    rebuild_versions_cards_index(&store, &test_repo_root()).expect("build versions fixture");
+    let bytes = store
+        .load_web_index_bytes(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+        .expect("load versions fixture")
+        .expect("versions fixture exists");
+    drop(store);
+    fs::remove_dir_all(root).expect("cleanup versions fixture");
+    bytes
 }
 
 fn refresh_site_manifest_entry(site_dir: &Path, relpath: &str) {
@@ -73,6 +78,40 @@ fn generated_site_links_are_relocatable() {
         "index.html"
     );
     assert!(resolve_site_link("index.html", "/xlsynth-bvc/assets/site.css").is_err());
+}
+
+#[test]
+fn site_versions_loader_rejects_truncated_release_ledger() {
+    let root = temp_root();
+    let dataset_relpath = format!("data/{}", crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME);
+    let dataset_path = root.join(&dataset_relpath);
+    fs::create_dir_all(dataset_path.parent().expect("dataset parent"))
+        .expect("create dataset parent");
+
+    let mut versions: crate::query::VersionsSummaryIndexFile =
+        serde_json::from_slice(&empty_versions_index_bytes()).expect("decode versions fixture");
+    versions
+        .report
+        .releases
+        .pop()
+        .expect("remove an older release row");
+    let bytes = serde_json::to_vec(&versions).expect("encode truncated versions fixture");
+    fs::write(&dataset_path, &bytes).expect("write truncated versions fixture");
+
+    let datasets = vec![BrowserDataset {
+        logical_key: crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME.to_string(),
+        url: dataset_relpath,
+        bytes: bytes.len() as u64,
+        sha256: sha256_hex(&bytes),
+    }];
+    let error = load_versions_report_from_site(&root, &datasets)
+        .expect_err("truncated release ledger must fail site loading");
+    assert!(
+        format!("{error:#}").contains("embedded compatibility map has"),
+        "unexpected error: {error:#}"
+    );
+
+    fs::remove_dir_all(root).expect("cleanup site fixture");
 }
 
 #[test]
@@ -265,6 +304,12 @@ fn site_build_and_verify_supports_subdirectory_base() {
     assert!(progression_html.contains("Signed G8r − Yosys/ABC"));
     assert!(progression_html.contains("id=\"include-incomplete\""));
     assert!(progression_html.contains("id=\"progression-inventory\""));
+    let releases_html =
+        fs::read_to_string(site_dir.join("releases.html")).expect("read releases HTML");
+    assert!(releases_html.contains("Crate release processing"));
+    assert!(releases_html.contains("Release ledger"));
+    assert!(releases_html.contains("not processed"));
+    assert!(index_html.contains("Processing status"));
     assert!(APP_JS.contains("Release progression data is not available in this snapshot."));
     assert!(APP_JS.contains("At least two cohort-complete releases are needed"));
     assert!(APP_JS.contains("negative means G8r is better"));
@@ -1210,6 +1255,12 @@ fn public_site_never_contains_private_executor_error_text() {
     })
     .expect("build site");
     verify_static_site(&site_dir).expect("verify site");
+    let releases_html =
+        fs::read_to_string(site_dir.join("releases.html")).expect("read releases page");
+    assert!(releases_html.contains("Repository position at release sync"));
+    assert!(releases_html.contains("Release ledger"));
+    assert!(releases_html.contains("processed"));
+    assert!(releases_html.contains("not processed"));
     for entry in WalkDir::new(&site_dir) {
         let entry = entry.expect("walk public site");
         if !entry.file_type().is_file()
@@ -1344,6 +1395,99 @@ fn site_verifier_rejects_self_consistent_script_and_unknown_catalog_field() {
         .expect_err("self-consistent unknown catalog field must fail verification");
     assert!(
         format!("{error:#}").contains("unknown field `private_path`"),
+        "unexpected error: {error:#}"
+    );
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn site_verifier_binds_release_catalog_to_versions_dataset() {
+    let root = temp_root();
+    let store = ArtifactStore::new(root.join("store"));
+    store.ensure_layout().expect("store layout");
+    store
+        .write_web_index_bytes(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &empty_versions_index_bytes(),
+        )
+        .expect("write dataset");
+    let snapshot_dir = root.join("snapshot");
+    build_static_snapshot(
+        &store,
+        &test_repo_root(),
+        &BuildStaticSnapshotOptions {
+            out_dir: snapshot_dir.clone(),
+            overwrite: false,
+            skip_rebuild_web_indices: true,
+        },
+    )
+    .expect("build snapshot");
+    let site_dir = root.join("site");
+    build_static_site(&BuildStaticSiteOptions {
+        snapshot_dir,
+        out_dir: site_dir.clone(),
+        base_url: "/".into(),
+        overwrite: false,
+    })
+    .expect("build site");
+
+    let catalog_path = site_dir.join("catalog.json");
+    let mut catalog: BrowserCatalog =
+        serde_json::from_slice(&fs::read(&catalog_path).expect("read catalog"))
+            .expect("decode catalog");
+    catalog.releases.push(CrateReleaseStatusView {
+        crate_version: "0.35.0".to_string(),
+        crate_release_datetime: "2026-08-28 17:52:54 PDT".to_string(),
+        dso_version: "0.35.0".to_string(),
+        processed: false,
+        materialized_actions: 0,
+        failed_actions: 0,
+        stdlib_enumeration_state: "not run".to_string(),
+    });
+    let embedded_snapshot =
+        load_static_snapshot_manifest(&site_dir).expect("load embedded snapshot");
+    for (relpath, bytes) in
+        expected_fixed_site_files(&catalog, &embedded_snapshot).expect("render fixed files")
+    {
+        fs::write(site_dir.join(&relpath), bytes).expect("rewrite fixed site file");
+        refresh_site_manifest_entry(&site_dir, &relpath);
+    }
+
+    let error =
+        verify_static_site(&site_dir).expect_err("catalog release rows must come from the dataset");
+    assert!(
+        format!("{error:#}").contains("release processing projection disagrees"),
+        "unexpected error: {error:#}"
+    );
+
+    catalog.releases.clear();
+    catalog.repository_head_observation = Some(RepositoryHeadObservationView {
+        schema_version: 2,
+        repository: "xlsynth/xlsynth-crate".to_string(),
+        version_compat_sha256: "c".repeat(64),
+        observed_at_utc: "2026-08-29T12:00:00Z".to_string(),
+        head_ref: "main".to_string(),
+        head_commit: "a".repeat(40),
+        head_committed_at_utc: "2026-08-29T11:00:00Z".to_string(),
+        latest_crate_version: "0.35.0".to_string(),
+        latest_release_tag: "v0.35.0".to_string(),
+        latest_release_commit: "b".repeat(40),
+        latest_release_committed_at_utc: "2026-08-28T11:00:00Z".to_string(),
+        comparison_status: "identical".to_string(),
+        commits_ahead: 9,
+        commits_behind: 0,
+    });
+    for (relpath, bytes) in
+        expected_fixed_site_files(&catalog, &embedded_snapshot).expect("render fixed files")
+    {
+        fs::write(site_dir.join(&relpath), bytes).expect("rewrite fixed site file");
+        refresh_site_manifest_entry(&site_dir, &relpath);
+    }
+
+    let error = verify_static_site(&site_dir)
+        .expect_err("catalog repository observation must come from the dataset");
+    assert!(
+        format!("{error:#}").contains("release processing projection disagrees"),
         "unexpected error: {error:#}"
     );
     fs::remove_dir_all(root).expect("cleanup");
@@ -1612,11 +1756,8 @@ fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() 
     let store = ArtifactStore::new(root.join("store"));
     store.ensure_layout().expect("store layout");
     let repo_root = std::env::current_dir().expect("current dir");
-    let crate_version = load_version_compat_map(&repo_root)
-        .expect("compat map")
-        .into_keys()
-        .next()
-        .expect("known crate version");
+    let compat = load_version_compat_map(&repo_root).expect("compat map");
+    let crate_version = compat.keys().next().expect("known crate version").clone();
     let dso_version =
         resolve_xlsynth_version_for_driver(&repo_root, &crate_version).expect("dso version");
     for action in canonical_root_actions_for_crate_version(&repo_root, &crate_version, &dso_version)
@@ -1652,34 +1793,7 @@ fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() 
             .expect("write root provenance");
     }
     let generated_utc = Utc::now();
-    let versions_json = serde_json::to_vec(&json!({
-        "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
-        "generated_utc": generated_utc,
-        "report": {
-            "cards": [{
-                "crate_version": crate_version,
-                "crate_release_datetime": null,
-                "total_materialized": 1,
-                "failed_total": 0,
-                "dso_versions": [dso_version],
-                "stdlib_enumeration": {
-                    "state": "ok",
-                    "reason": "discovery_counts",
-                    "scanned_files": 1,
-                    "failed_files": 0,
-                    "concrete_functions": 1,
-                    "suggested_actions": 1
-                },
-                "failed_by_kind": [],
-                "failures": []
-            }],
-            "unattributed_actions": []
-        }
-    }))
-    .expect("serialize versions dataset");
-    store
-        .write_web_index_bytes(crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME, &versions_json)
-        .expect("versions dataset");
+    rebuild_versions_cards_index(&store, &repo_root).expect("versions dataset");
     let comparison_json = serde_json::to_vec(&json!({
         "schema_version": crate::WEB_STDLIB_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION,
         "generated_utc": generated_utc,
@@ -1738,6 +1852,7 @@ fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() 
     verify_static_site(&site_dir).expect("verify run site");
     assert!(site_dir.join("runs.html").exists());
     assert!(site_dir.join("progression.html").exists());
+    assert!(site_dir.join("releases.html").exists());
     assert!(site_dir.join("mffc-discrepancies.html").exists());
     assert!(
         site_dir

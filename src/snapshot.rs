@@ -15,7 +15,7 @@ use crate::campaign::{campaign_analysis_path, list_finalized_campaign_runs};
 use crate::query::{
     build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_bytes,
     build_ir_fn_corpus_g8r_vs_yosys_dataset_index_bytes,
-    build_ir_fn_corpus_ir_index_bytes_for_paired_indices,
+    build_ir_fn_corpus_ir_index_bytes_for_paired_indices, load_versions_cards_index,
     rebuild_stdlib_fn_version_timeline_dataset_index, rebuild_stdlib_fns_trend_dataset_index,
     rebuild_stdlib_g8r_vs_yosys_dataset_index, rebuild_versions_cards_index,
 };
@@ -35,7 +35,9 @@ use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
-pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 9;
+// Version 10 invalidates checkpoints that may contain versions-summary.v4 but not the
+// release-ledger-bearing versions-summary.v7 dataset.
+pub(crate) const PUBLICATION_POLICY_VERSION: u32 = 10;
 pub(crate) const STATIC_SNAPSHOT_MANIFEST_FILENAME: &str = "snapshot_manifest.v1.pb";
 pub(crate) const STATIC_SNAPSHOT_WEB_INDEX_DIR: &str = "web_index";
 
@@ -1063,6 +1065,15 @@ pub(crate) fn build_static_snapshot(
     options: &BuildStaticSnapshotOptions,
 ) -> Result<BuildStaticSnapshotSummary> {
     reject_snapshot_output_overlap(&options.out_dir, store, repo_root)?;
+    if options.skip_rebuild_web_indices
+        && load_versions_cards_index(store, repo_root)
+            .context("validating cached versions summary before static snapshot")?
+            .is_none()
+    {
+        bail!(
+            "cached versions summary is missing or stale; rebuild web indices before using --skip-rebuild-web-indices"
+        );
+    }
     ensure_empty_output_dir(&options.out_dir, options.overwrite)?;
     fs::create_dir_all(options.out_dir.join(STATIC_SNAPSHOT_WEB_INDEX_DIR)).with_context(|| {
         format!(
@@ -1368,6 +1379,17 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
     )
     .context("validating IR function corpus index closure in static snapshot")?;
 
+    let versions_bytes = public_index_entries
+        .iter()
+        .find_map(|(index_key, bytes)| {
+            (index_key == WEB_VERSIONS_SUMMARY_INDEX_FILENAME).then_some(bytes.as_slice())
+        })
+        .context("static snapshot is missing the required versions summary dataset")?;
+    let versions: crate::query::VersionsSummaryIndexFile =
+        serde_json::from_slice(versions_bytes).context("decoding snapshot versions summary")?;
+    crate::query::validate_complete_versions_summary(&versions)
+        .context("validating complete snapshot versions summary")?;
+
     validate_analysis_public_run_bindings(&decoded_runs, &decoded_analysis_reports)?;
 
     if decoded_campaign_ids.into_iter().collect::<Vec<_>>() != manifest.campaign_ids
@@ -1456,15 +1478,17 @@ mod tests {
     }
 
     fn empty_versions_index_bytes() -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
-            "generated_utc": Utc::now(),
-            "report": {
-                "cards": [],
-                "unattributed_actions": []
-            }
-        }))
-        .expect("serialize empty versions index")
+        let root = make_temp_dir("versions-fixture-store");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("versions fixture layout");
+        rebuild_versions_cards_index(&store, &test_repo_root()).expect("build versions fixture");
+        let bytes = store
+            .load_web_index_bytes(WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .expect("load versions fixture")
+            .expect("versions fixture exists");
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup versions fixture");
+        bytes
     }
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
@@ -1652,6 +1676,47 @@ mod tests {
             first_manifest,
             fs::read(out_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME)).expect("second manifest")
         );
+    }
+
+    #[test]
+    fn skipped_snapshot_rejects_source_incomplete_release_ledger() {
+        let root = make_temp_dir("skip-incomplete-releases");
+        let store = ArtifactStore::new(root.join("store"));
+        store.ensure_layout().expect("ensure layout");
+        let repo_root = test_repo_root();
+        let input_fingerprint_sha256 =
+            crate::query::versions_summary_input_fingerprint(&store, &repo_root)
+                .expect("versions input fingerprint");
+        let incomplete = crate::query::VersionsSummaryIndexFile {
+            schema_version: crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
+            generated_utc: Utc::now(),
+            input_fingerprint_sha256,
+            resolved_recipe_fingerprint_sha256: "b".repeat(64),
+            version_compat_json: "{}".to_string(),
+            report: crate::view::VersionCardsReport::default(),
+        };
+        store
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &serde_json::to_vec(&incomplete).expect("serialize incomplete versions index"),
+            )
+            .expect("write incomplete versions index");
+
+        let error = build_static_snapshot(
+            &store,
+            &repo_root,
+            &BuildStaticSnapshotOptions {
+                out_dir: root.join("snapshot-out"),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect_err("skip mode must reject a source-incomplete release ledger");
+        assert!(
+            format!("{error:#}").contains("release ledger is empty"),
+            "unexpected error: {error:#}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -1918,6 +1983,103 @@ mod tests {
     }
 
     #[test]
+    fn static_snapshot_verify_rejects_self_consistent_missing_versions_ledger() {
+        let root = make_temp_dir("missing-versions-ledger");
+        let store = ArtifactStore::new(root.join("store"));
+        store.ensure_layout().expect("ensure layout");
+        store
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
+            .expect("write web index");
+        let snapshot_dir = root.join("snapshot-out");
+        build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+
+        let mut manifest = load_static_snapshot_manifest(&snapshot_dir).expect("load manifest");
+        let removed = manifest
+            .dataset_files
+            .iter()
+            .position(|entry| entry.index_key == WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .map(|index| manifest.dataset_files.remove(index))
+            .expect("versions dataset entry");
+        fs::remove_file(snapshot_dir.join(removed.relpath)).expect("remove versions dataset");
+        rewrite_snapshot_manifest(&snapshot_dir, manifest);
+
+        let error = verify_static_snapshot(&snapshot_dir)
+            .expect_err("self-consistent snapshot without versions ledger must fail");
+        assert!(
+            format!("{error:#}").contains("missing the required versions summary"),
+            "unexpected error: {error:#}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn static_snapshot_verify_rejects_self_consistent_truncated_versions_ledger() {
+        let root = make_temp_dir("truncated-versions-ledger");
+        let store = ArtifactStore::new(root.join("store"));
+        store.ensure_layout().expect("ensure layout");
+        store
+            .write_web_index_bytes(
+                WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &empty_versions_index_bytes(),
+            )
+            .expect("write web index");
+        let snapshot_dir = root.join("snapshot-out");
+        build_static_snapshot(
+            &store,
+            &test_repo_root(),
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot_dir.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .expect("build snapshot");
+
+        let versions_path = snapshot_dir
+            .join(STATIC_SNAPSHOT_WEB_INDEX_DIR)
+            .join(WEB_VERSIONS_SUMMARY_INDEX_FILENAME);
+        let mut versions: crate::query::VersionsSummaryIndexFile =
+            serde_json::from_slice(&fs::read(&versions_path).expect("read versions dataset"))
+                .expect("decode versions dataset");
+        versions
+            .report
+            .releases
+            .pop()
+            .expect("remove an older release row");
+        let truncated_bytes = serde_json::to_vec(&versions).expect("encode truncated dataset");
+        fs::write(&versions_path, &truncated_bytes).expect("write truncated versions dataset");
+        let mut manifest = load_static_snapshot_manifest(&snapshot_dir).expect("load manifest");
+        let entry = manifest
+            .dataset_files
+            .iter_mut()
+            .find(|entry| entry.index_key == WEB_VERSIONS_SUMMARY_INDEX_FILENAME)
+            .expect("versions dataset entry");
+        entry.bytes = truncated_bytes.len() as u64;
+        entry.sha256 = sha256_hex(&truncated_bytes);
+        rewrite_snapshot_manifest(&snapshot_dir, manifest);
+
+        let error = verify_static_snapshot(&snapshot_dir)
+            .expect_err("self-consistent truncated versions ledger must fail");
+        assert!(
+            format!("{error:#}").contains("embedded compatibility map has"),
+            "unexpected error: {error:#}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn static_snapshot_verify_rejects_self_consistent_private_dataset() {
         let root = make_temp_dir("verify-private-dataset");
         let store = ArtifactStore::new(root.join("store"));
@@ -2146,6 +2308,8 @@ mod tests {
                 &serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
             )
             .expect("write structural manifest");
+        rebuild_versions_cards_index(&store, &test_repo_root())
+            .expect("build source-complete versions index");
 
         let error = build_static_snapshot(
             &store,

@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 use reqwest::blocking::Client;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -12,6 +13,7 @@ use crate::model::{
     VersionCompatEntry,
 };
 use crate::store::ArtifactStore;
+use crate::view::RepositoryHeadObservationView;
 
 pub(crate) fn normalize_tag_version(version: &str) -> &str {
     version.strip_prefix('v').unwrap_or(version)
@@ -104,13 +106,109 @@ pub(crate) fn cmp_crate_versions_by_release_datetime(
     }
 }
 
+pub(crate) fn repository_comparison_status(
+    commits_ahead: u64,
+    commits_behind: u64,
+) -> &'static str {
+    match (commits_ahead > 0, commits_behind > 0) {
+        (true, true) => "diverged",
+        (true, false) => "ahead",
+        (false, true) => "behind",
+        (false, false) => "identical",
+    }
+}
+
+fn parse_repository_utc_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    if value.as_bytes().get(10) != Some(&b'T') || !value.ends_with('Z') {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .filter(|timestamp| timestamp.offset().local_minus_utc() == 0)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+pub(crate) fn validate_repository_head_observation(
+    observation: &RepositoryHeadObservationView,
+) -> Result<()> {
+    if observation.schema_version != 2
+        || observation.repository != "xlsynth/xlsynth-crate"
+        || observation.head_ref != "main"
+    {
+        bail!("repository observation identity is invalid");
+    }
+    if observation.version_compat_sha256.len() != 64
+        || !observation
+            .version_compat_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("repository observation version_compat_sha256 is not a lowercase SHA-256 digest");
+    }
+    for (label, commit) in [
+        ("head_commit", observation.head_commit.as_str()),
+        (
+            "latest_release_commit",
+            observation.latest_release_commit.as_str(),
+        ),
+    ] {
+        if commit.len() != 40
+            || !commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("repository observation {label} is not a lowercase full commit");
+        }
+    }
+    let Some(observed_at) = parse_repository_utc_timestamp(&observation.observed_at_utc) else {
+        bail!("repository observation observed_at_utc is not an RFC 3339 UTC date-time");
+    };
+    let Some(head_committed_at) =
+        parse_repository_utc_timestamp(&observation.head_committed_at_utc)
+    else {
+        bail!("repository observation head_committed_at_utc is not an RFC 3339 UTC date-time");
+    };
+    let Some(release_committed_at) =
+        parse_repository_utc_timestamp(&observation.latest_release_committed_at_utc)
+    else {
+        bail!(
+            "repository observation latest_release_committed_at_utc is not an RFC 3339 UTC date-time"
+        );
+    };
+    if observed_at < head_committed_at || observed_at < release_committed_at {
+        bail!("repository observation time predates an observed commit");
+    }
+    if observation.latest_release_tag
+        != format!(
+            "v{}",
+            normalize_tag_version(&observation.latest_crate_version)
+        )
+    {
+        bail!("repository observation latest release tag/version disagree");
+    }
+    let expected_status =
+        repository_comparison_status(observation.commits_ahead, observation.commits_behind);
+    if observation.comparison_status != expected_status {
+        bail!(
+            "repository observation comparison status is {}; expected {expected_status} from ahead/behind counts",
+            observation.comparison_status
+        );
+    }
+    let commits_match = observation.head_commit == observation.latest_release_commit;
+    let zero_distance = observation.commits_ahead == 0 && observation.commits_behind == 0;
+    if commits_match != zero_distance {
+        bail!("repository observation commit equality disagrees with ahead/behind distance");
+    }
+    Ok(())
+}
+
 pub(crate) fn load_version_compat_map(
     repo_root: &Path,
 ) -> Result<BTreeMap<String, VersionCompatEntry>> {
     let path = repo_root.join(crate::VERSION_COMPAT_PATH);
     let text = fs::read_to_string(&path).with_context(|| {
         format!(
-            "reading deployed version compatibility map: {} (update it out of band with `scripts/sync-version-compat.sh` and redeploy)",
+            "reading deployed version compatibility map: {} (update it out of band with `scripts/sync_version_compat.py` and redeploy)",
             path.display()
         )
     })?;
@@ -122,6 +220,44 @@ pub(crate) fn load_version_compat_map(
             )
         })?;
     Ok(map)
+}
+
+pub(crate) fn load_xlsynth_crate_repository_head_observation(
+    repo_root: &Path,
+) -> Result<Option<RepositoryHeadObservationView>> {
+    let path = repo_root.join(crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "reading xlsynth-crate repository observation: {}",
+                    path.display()
+                )
+            });
+        }
+    };
+    let observation: RepositoryHeadObservationView = serde_json::from_str(&text)
+        .with_context(|| format!("parsing repository observation JSON at {}", path.display()))?;
+    validate_repository_head_observation(&observation)
+        .with_context(|| format!("validating repository observation at {}", path.display()))?;
+    let compat_path = repo_root.join(crate::VERSION_COMPAT_PATH);
+    let compat_bytes = fs::read(&compat_path).with_context(|| {
+        format!(
+            "reading compatibility map while validating repository observation: {}",
+            compat_path.display()
+        )
+    })?;
+    let compat_sha256 = hex::encode(Sha256::digest(&compat_bytes));
+    if observation.version_compat_sha256 != compat_sha256 {
+        bail!(
+            "repository observation belongs to compatibility map {}, but deployed map is {}; rerun scripts/sync_version_compat.py",
+            observation.version_compat_sha256,
+            compat_sha256
+        );
+    }
+    Ok(Some(observation))
 }
 
 pub(crate) fn latest_known_driver_version(repo_root: &Path) -> Result<String> {
@@ -146,7 +282,7 @@ pub(crate) fn resolve_xlsynth_version_for_driver(
     let key = normalize_tag_version(driver_version);
     let entry = compat.get(key).ok_or_else(|| {
         anyhow!(
-            "driver crate version `{}` was not found in deployed compatibility map {}; update it out of band with `scripts/sync-version-compat.sh` and redeploy, or choose a known version",
+            "driver crate version `{}` was not found in deployed compatibility map {}; update it out of band with `scripts/sync_version_compat.py` and redeploy, or choose a known version",
             driver_version,
             crate::VERSION_COMPAT_PATH
         )
@@ -320,5 +456,65 @@ mod tests {
         assert_eq!(xlsynth_release_tag("0.45.0"), "v0.45.0");
         assert_eq!(xlsynth_release_tag("v0.45.0"), "v0.45.0");
         assert_eq!(xlsynth_release_tag("0.45.0-1"), "v0.45.0-1");
+    }
+
+    #[test]
+    fn repository_comparison_status_is_derived_from_both_counts() {
+        assert_eq!(repository_comparison_status(0, 0), "identical");
+        assert_eq!(repository_comparison_status(1, 0), "ahead");
+        assert_eq!(repository_comparison_status(0, 1), "behind");
+        assert_eq!(repository_comparison_status(1, 1), "diverged");
+        assert_eq!(repository_comparison_status(u64::MAX, 0), "ahead");
+        assert_eq!(repository_comparison_status(u64::MAX, u64::MAX), "diverged");
+    }
+
+    fn repository_observation() -> RepositoryHeadObservationView {
+        RepositoryHeadObservationView {
+            schema_version: 2,
+            repository: "xlsynth/xlsynth-crate".to_string(),
+            version_compat_sha256: "c".repeat(64),
+            observed_at_utc: "2026-09-03T22:34:04Z".to_string(),
+            head_ref: "main".to_string(),
+            head_commit: "a".repeat(40),
+            head_committed_at_utc: "2026-09-03T17:53:02Z".to_string(),
+            latest_crate_version: "0.67.1".to_string(),
+            latest_release_tag: "v0.67.1".to_string(),
+            latest_release_commit: "b".repeat(40),
+            latest_release_committed_at_utc: "2026-09-03T16:00:00Z".to_string(),
+            comparison_status: "ahead".to_string(),
+            commits_ahead: 2,
+            commits_behind: 0,
+        }
+    }
+
+    #[test]
+    fn repository_observation_requires_rfc3339_utc_date_times() {
+        let mut observation = repository_observation();
+        observation.observed_at_utc = "2026-09-03Z".to_string();
+        let error = validate_repository_head_observation(&observation)
+            .expect_err("date-only timestamps must be rejected");
+        assert!(format!("{error:#}").contains("RFC 3339 UTC date-time"));
+
+        let mut observation = repository_observation();
+        observation.observed_at_utc = "2026-09-03T15:00:00Z".to_string();
+        let error = validate_repository_head_observation(&observation)
+            .expect_err("observation time must follow commit times");
+        assert!(format!("{error:#}").contains("predates"));
+    }
+
+    #[test]
+    fn repository_observation_binds_commit_equality_to_distance() {
+        let mut observation = repository_observation();
+        observation.comparison_status = "identical".to_string();
+        observation.commits_ahead = 0;
+        let error = validate_repository_head_observation(&observation)
+            .expect_err("distinct commits cannot be identical");
+        assert!(format!("{error:#}").contains("commit equality"));
+
+        let mut observation = repository_observation();
+        observation.latest_release_commit = observation.head_commit.clone();
+        let error = validate_repository_head_observation(&observation)
+            .expect_err("equal commits cannot have nonzero distance");
+        assert!(format!("{error:#}").contains("commit equality"));
     }
 }

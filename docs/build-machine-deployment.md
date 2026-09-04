@@ -70,7 +70,7 @@ coordinators for one store fail cleanly, and overlapping publishers for one
 publication root fail even when they originate from different stores.
 
 Compatibility-map updates are out-of-band repository maintenance. A maintainer
-runs `scripts/sync-version-compat.sh`, reviews the source change, and deploys a
+runs `scripts/sync_version_compat.py`, reviews the source change, and deploys a
 new resource root. The coordinator never updates the checkout. If the deployed
 map lacks a requested crate version, the command fails and leaves all resources
 unchanged.

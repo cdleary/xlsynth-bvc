@@ -5013,12 +5013,14 @@ pub(super) fn render_action_detail_html(
 pub(super) fn render_versions_html(
     cards: &[VersionCardView],
     unattributed_actions: &[UnattributedActionView],
+    releases: &[CrateReleaseStatusView],
+    repository_head_observation: Option<&RepositoryHeadObservationView>,
     unprocessed: &[UnprocessedVersionRowView],
     live_status: &QueueLiveStatusView,
     show_live_queue: bool,
     show_db_size_link: bool,
     db_size_bytes: Option<u64>,
-    generated_utc: DateTime<Utc>,
+    generated_utc: Option<DateTime<Utc>>,
 ) -> String {
     use std::fmt::Write;
 
@@ -5249,7 +5251,19 @@ pub(super) fn render_versions_html(
   <main class=\"wrap\">",
     );
 
-    let total_versions = cards.len();
+    let total_versions = if releases.is_empty() {
+        cards.len()
+    } else {
+        releases.len()
+    };
+    let processed_versions = if releases.is_empty() {
+        cards
+            .iter()
+            .filter(|card| card.total_materialized > 0)
+            .count()
+    } else {
+        releases.iter().filter(|release| release.processed).count()
+    };
     let total_failed: usize = cards.iter().map(|c| c.failed_total).sum();
     let db_size_gib = db_size_bytes
         .map(|bytes| format!("{:.1}", bytes as f64 / (1024.0 * 1024.0 * 1024.0)))
@@ -5259,10 +5273,14 @@ pub(super) fn render_versions_html(
     } else {
         String::new()
     };
+    let generated_fragment = generated_utc
+        .map(|value| format!("generated={} | ", value.to_rfc3339()))
+        .unwrap_or_default();
     let subtitle = format!(
-        "generated={} | crate_versions={} | failed_actions={} | unprocessed_versions={}{}",
-        generated_utc.to_rfc3339(),
+        "{}crate_releases={} | processed={} | failed_actions={} | unprocessed={}{}",
+        generated_fragment,
         total_versions,
+        processed_versions,
         total_failed,
         unprocessed.len(),
         db_size_fragment
@@ -5288,6 +5306,102 @@ pub(super) fn render_versions_html(
             ""
         }
     );
+
+    if let Some(observation) = repository_head_observation {
+        let head_short: String = observation.head_commit.chars().take(12).collect();
+        let release_short: String = observation.latest_release_commit.chars().take(12).collect();
+        let distance = match (observation.commits_ahead, observation.commits_behind) {
+            (0, 0) => format!(
+                "{} is identical to {}",
+                observation.head_ref, observation.latest_release_tag
+            ),
+            (ahead, 0) => format!(
+                "{} is {} commit{} ahead of {}",
+                observation.head_ref,
+                ahead,
+                if ahead == 1 { "" } else { "s" },
+                observation.latest_release_tag
+            ),
+            (ahead, behind) => format!(
+                "{} is {} commits ahead and {} commits behind {}",
+                observation.head_ref, ahead, behind, observation.latest_release_tag
+            ),
+        };
+        let repository_url = format!("https://github.com/{}", observation.repository);
+        let head_url = format!("{}/commit/{}", repository_url, observation.head_commit);
+        let release_url = format!(
+            "{}/commit/{}",
+            repository_url, observation.latest_release_commit
+        );
+        let _ = write!(
+            html,
+            "<section class=\"card\">\
+<h2>Repository Position at Release Sync</h2>\
+<p class=\"meta\"><strong>{}</strong></p>\
+<p class=\"meta\">repository: <a href=\"{}\">{}</a> | observed: <strong>{}</strong></p>\
+<p class=\"meta\">top of tree: <a href=\"{}\"><code>{}</code></a> ({}, committed {})</p>\
+<p class=\"meta\">latest release: <a href=\"{}\"><code>{}</code></a> ({}, committed {})</p>\
+</section>",
+            html_escape(&distance),
+            html_escape(&repository_url),
+            html_escape(&observation.repository),
+            html_escape(&observation.observed_at_utc),
+            html_escape(&head_url),
+            html_escape(&head_short),
+            html_escape(&observation.head_ref),
+            html_escape(&observation.head_committed_at_utc),
+            html_escape(&release_url),
+            html_escape(&release_short),
+            html_escape(&observation.latest_release_tag),
+            html_escape(&observation.latest_release_committed_at_utc),
+        );
+    }
+
+    if !releases.is_empty() {
+        html.push_str(
+            "<section class=\"card\">\
+<h2>Release Processing Ledger</h2>\
+<p class=\"meta\">Processed means at least one action for the crate release has materialized in this artifact store.</p>\
+<table>\
+<thead><tr><th>Crate</th><th>Published</th><th>DSO</th><th>Processed</th><th>Materialized</th><th>Failed</th><th>Stdlib enumeration</th></tr></thead>\
+<tbody>",
+        );
+        for release in releases {
+            let (processed_class, processed_label) = if release.processed {
+                ("ok", "yes")
+            } else {
+                ("meta", "no")
+            };
+            let enum_class = match release.stdlib_enumeration_state.as_str() {
+                "ok" => "enum-ok",
+                "partial" => "enum-partial",
+                "failed" => "enum-failed",
+                _ => "enum-missing",
+            };
+            let _ = write!(
+                html,
+                "<tr>\
+<td><code>crate:v{}</code></td>\
+<td>{}</td>\
+<td><code>dso:v{}</code></td>\
+<td><span class=\"{}\">{}</span></td>\
+<td>{}</td><td>{}</td>\
+<td><span class=\"state-tag {}\">{}</span></td>\
+</tr>",
+                html_escape(&release.crate_version),
+                html_escape(&release.crate_release_datetime),
+                html_escape(&release.dso_version),
+                processed_class,
+                processed_label,
+                release.materialized_actions,
+                release.failed_actions,
+                enum_class,
+                html_escape(&release.stdlib_enumeration_state),
+            );
+        }
+        html.push_str("</tbody></table></section>");
+    }
+
     if !unattributed_actions.is_empty() {
         let invariant_count = unattributed_actions
             .iter()
@@ -5586,8 +5700,13 @@ pub(super) fn render_versions_html(
             let root_state_class = html_escape(&row.root_queue_state_key);
             let root_state =
                 QueueState::from_key(&row.root_queue_state_key).unwrap_or(QueueState::None);
-            let enqueue_disabled =
-                !show_live_queue || root_state.is_active() || row.active_queue_actions > 0;
+            let enqueue_disabled = !show_live_queue
+                || root_state.is_active()
+                || row.active_queue_actions.is_some_and(|count| count > 0);
+            let active_queue_actions = row
+                .active_queue_actions
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "Unavailable".to_string());
             let button_text = if !show_live_queue {
                 "Runner disabled"
             } else if enqueue_disabled {
@@ -5612,7 +5731,7 @@ pub(super) fn render_versions_html(
                 html_escape(&row.crate_release_datetime),
                 html_escape(&row.dso_version),
                 row.materialized_actions,
-                row.active_queue_actions,
+                active_queue_actions,
                 root_state_class,
                 html_escape(&row.root_queue_state_label),
                 html_escape(&row.crate_version),

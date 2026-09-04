@@ -181,9 +181,20 @@ fn validate_enumeration_status(status: &StdlibEnumerationStatusView) -> Result<(
     Ok(())
 }
 
-fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
+pub(super) fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
     if index.schema_version != crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION {
         bail!("versions summary schema version mismatch");
+    }
+    validate_hex_digest(
+        "versions_summary.input_fingerprint_sha256",
+        &index.input_fingerprint_sha256,
+    )?;
+    validate_hex_digest(
+        "versions_summary.resolved_recipe_fingerprint_sha256",
+        &index.resolved_recipe_fingerprint_sha256,
+    )?;
+    if index.version_compat_json.contains('\0') {
+        bail!("versions_summary.version_compat_json contains NUL");
     }
     validate_unique_strings(
         "versions_summary.cards.crate_version",
@@ -239,6 +250,114 @@ fn validate_versions_summary(index: &VersionsSummaryIndexFile) -> Result<()> {
         validate_slug("unattributed_action.action_kind", &action.action_kind)?;
         if let Some(version) = &action.dso_version {
             validate_version("unattributed_action.dso_version", version)?;
+        }
+    }
+    validate_unique_strings(
+        "versions_summary.releases.crate_version",
+        index
+            .report
+            .releases
+            .iter()
+            .map(|release| &release.crate_version),
+    )?;
+    let mut release_utc_by_crate = BTreeMap::new();
+    for release in &index.report.releases {
+        validate_version("release_status.crate_version", &release.crate_version)?;
+        validate_version("release_status.dso_version", &release.dso_version)?;
+        let Some(released_utc) =
+            crate::versioning::parse_compat_release_datetime_utc(&release.crate_release_datetime)
+        else {
+            bail!("release_status.crate_release_datetime is invalid");
+        };
+        release_utc_by_crate.insert(release.crate_version.clone(), released_utc);
+        if release.processed != (release.materialized_actions > 0) {
+            bail!("release_status.processed disagrees with materialized_actions");
+        }
+        if !matches!(
+            release.stdlib_enumeration_state.as_str(),
+            "unknown" | "not run" | "failed" | "partial" | "ok"
+        ) {
+            bail!("release_status.stdlib_enumeration_state is invalid");
+        }
+        let card = index
+            .report
+            .cards
+            .iter()
+            .find(|card| card.crate_version == release.crate_version);
+        match card {
+            Some(card)
+                if card.crate_release_datetime.as_deref()
+                    != Some(release.crate_release_datetime.as_str())
+                    || ((card.total_materialized > 0 || card.failed_total > 0)
+                        && card.dso_versions.is_empty())
+                    || card.dso_versions.iter().any(|version| {
+                        crate::versioning::normalize_tag_version(version) != release.dso_version
+                    })
+                    || card
+                        .failures
+                        .iter()
+                        .filter_map(|failure| failure.dso_version.as_deref())
+                        .any(|version| {
+                            crate::versioning::normalize_tag_version(version) != release.dso_version
+                        })
+                    || release.materialized_actions != card.total_materialized
+                    || release.failed_actions != card.failed_total
+                    || release.stdlib_enumeration_state
+                        != card.stdlib_enumeration.badge_label() =>
+            {
+                bail!("release_status disagrees with its version card");
+            }
+            None if release.processed
+                || release.materialized_actions != 0
+                || release.failed_actions != 0
+                || release.stdlib_enumeration_state != "not run" =>
+            {
+                bail!("release_status without a version card is not empty");
+            }
+            _ => {}
+        }
+    }
+    for card in &index.report.cards {
+        if !index
+            .report
+            .releases
+            .iter()
+            .any(|release| release.crate_version == card.crate_version)
+        {
+            bail!(
+                "version_card for crate {} is missing from release_status",
+                card.crate_version
+            );
+        }
+    }
+    if !index.report.releases.windows(2).all(|pair| {
+        crate::versioning::cmp_crate_versions_by_release_datetime(
+            &pair[0].crate_version,
+            &pair[1].crate_version,
+            &release_utc_by_crate,
+        )
+        .is_lt()
+    }) {
+        bail!("release_status rows are not strictly sorted by publication time");
+    }
+    let latest_release = index.report.releases.iter().min_by(|a, b| {
+        crate::versioning::cmp_crate_versions_by_release_datetime(
+            &a.crate_version,
+            &b.crate_version,
+            &release_utc_by_crate,
+        )
+    });
+    if let Some(observation) = &index.report.repository_head_observation {
+        validate_version(
+            "repository_head_observation.latest_crate_version",
+            &observation.latest_crate_version,
+        )?;
+        crate::versioning::validate_repository_head_observation(observation)
+            .context("validating public repository-head observation")?;
+        if latest_release.map(|release| &release.crate_version)
+            != Some(&observation.latest_crate_version)
+        {
+            bail!("repository_head_observation release comparison is inconsistent");
         }
     }
     Ok(())
@@ -1135,8 +1254,218 @@ mod tests {
         json!({
             "schema_version": crate::WEB_VERSIONS_SUMMARY_INDEX_SCHEMA_VERSION,
             "generated_utc": "2026-08-29T12:00:00Z",
-            "report": {"cards": [], "unattributed_actions": []}
+            "input_fingerprint_sha256": "a".repeat(64),
+            "resolved_recipe_fingerprint_sha256": "b".repeat(64),
+            "version_compat_json": "{}",
+            "report": {
+                "cards": [],
+                "unattributed_actions": [],
+                "releases": [],
+                "repository_head_observation": null
+            }
         })
+    }
+
+    #[test]
+    fn public_projection_rejects_unbacked_release_counts() {
+        let mut versions = empty_versions_value();
+        versions["report"]["releases"] = json!([{
+            "crate_version": "0.35.0",
+            "crate_release_datetime": "2026-08-28 17:52:54 PDT",
+            "dso_version": "0.35.0",
+            "processed": true,
+            "materialized_actions": 1,
+            "failed_actions": 0,
+            "stdlib_enumeration_state": "not run"
+        }]);
+
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &serde_json::to_vec(&versions).unwrap(),
+        )
+        .expect_err("a release without a card must have exact empty counts");
+        assert!(
+            format!("{error:#}").contains("release_status without a version card is not empty"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    fn unprocessed_release(crate_version: &str, released: &str) -> Value {
+        json!({
+            "crate_version": crate_version,
+            "crate_release_datetime": released,
+            "dso_version": crate_version,
+            "processed": false,
+            "materialized_actions": 0,
+            "failed_actions": 0,
+            "stdlib_enumeration_state": "not run"
+        })
+    }
+
+    fn processed_version_card(crate_version: &str, released: &str, dso_version: &str) -> Value {
+        json!({
+            "crate_version": crate_version,
+            "crate_release_datetime": released,
+            "total_materialized": 1,
+            "failed_total": 0,
+            "dso_versions": [dso_version],
+            "stdlib_enumeration": {
+                "state": "ok",
+                "reason": "discovery_counts",
+                "scanned_files": 1,
+                "failed_files": 0,
+                "concrete_functions": 1,
+                "suggested_actions": 1
+            },
+            "failed_by_kind": [],
+            "failures": []
+        })
+    }
+
+    fn processed_release(crate_version: &str, released: &str, dso_version: &str) -> Value {
+        json!({
+            "crate_version": crate_version,
+            "crate_release_datetime": released,
+            "dso_version": dso_version,
+            "processed": true,
+            "materialized_actions": 1,
+            "failed_actions": 0,
+            "stdlib_enumeration_state": "ok"
+        })
+    }
+
+    #[test]
+    fn public_projection_requires_every_card_in_release_ledger() {
+        let mut versions = empty_versions_value();
+        versions["report"]["cards"] = json!([processed_version_card(
+            "0.35.0",
+            "2026-08-28 17:52:54 PDT",
+            "0.35.0"
+        )]);
+
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &serde_json::to_vec(&versions).unwrap(),
+        )
+        .expect_err("every version card must have a release row");
+        assert!(
+            format!("{error:#}").contains("is missing from release_status"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn public_projection_binds_card_release_date_and_dso() {
+        let card = processed_version_card("0.35.0", "2026-08-28 17:52:54 PDT", "v0.35.0");
+        for (label, release) in [
+            (
+                "release date",
+                processed_release("0.35.0", "2026-08-29 17:52:54 PDT", "0.35.0"),
+            ),
+            (
+                "DSO version",
+                processed_release("0.35.0", "2026-08-28 17:52:54 PDT", "0.36.0"),
+            ),
+        ] {
+            let mut versions = empty_versions_value();
+            versions["report"]["cards"] = json!([card.clone()]);
+            versions["report"]["releases"] = json!([release]);
+            let error = canonicalize_public_web_index_json(
+                crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+                &serde_json::to_vec(&versions).unwrap(),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("disagrees with its version card"),
+                "{label}: unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_projection_requires_dso_evidence_for_processed_card() {
+        let mut card = processed_version_card("0.35.0", "2026-08-28 17:52:54 PDT", "0.35.0");
+        card["dso_versions"] = json!([]);
+        let mut versions = empty_versions_value();
+        versions["report"]["cards"] = json!([card]);
+        versions["report"]["releases"] = json!([processed_release(
+            "0.35.0",
+            "2026-08-28 17:52:54 PDT",
+            "0.35.0"
+        )]);
+
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &serde_json::to_vec(&versions).unwrap(),
+        )
+        .expect_err("a processed card must identify its DSO version");
+        assert!(
+            format!("{error:#}").contains("disagrees with its version card"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn public_projection_rejects_releases_out_of_publication_order() {
+        let mut versions = empty_versions_value();
+        versions["report"]["releases"] = json!([
+            unprocessed_release("0.68.0", "2026-08-28 17:52:54 PDT"),
+            unprocessed_release("0.67.1", "2026-09-04 17:52:54 PDT")
+        ]);
+
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &serde_json::to_vec(&versions).unwrap(),
+        )
+        .expect_err("releases must be newest-publication first");
+        assert!(
+            format!("{error:#}").contains("not strictly sorted by publication time"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn public_projection_rejects_contradictory_repository_comparison() {
+        let mut versions = empty_versions_value();
+        versions["report"]["releases"] =
+            json!([unprocessed_release("0.35.0", "2026-08-28 17:52:54 PDT")]);
+        versions["report"]["repository_head_observation"] = json!({
+            "schema_version": 2,
+            "repository": "xlsynth/xlsynth-crate",
+            "version_compat_sha256": "c".repeat(64),
+            "observed_at_utc": "2026-08-29T12:00:00Z",
+            "head_ref": "main",
+            "head_commit": "a".repeat(40),
+            "head_committed_at_utc": "2026-08-29T11:00:00Z",
+            "latest_crate_version": "0.35.0",
+            "latest_release_tag": "v0.35.0",
+            "latest_release_commit": "b".repeat(40),
+            "latest_release_committed_at_utc": "2026-08-28T11:00:00Z",
+            "comparison_status": "identical",
+            "commits_ahead": 9,
+            "commits_behind": 0
+        });
+
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &serde_json::to_vec(&versions).unwrap(),
+        )
+        .expect_err("comparison status must agree with ahead/behind counts");
+        assert!(
+            format!("{error:#}").contains("repository observation comparison status"),
+            "unexpected error: {error:#}"
+        );
+
+        versions["report"]["repository_head_observation"]["commits_ahead"] = json!(0);
+        let error = canonicalize_public_web_index_json(
+            crate::WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
+            &serde_json::to_vec(&versions).unwrap(),
+        )
+        .expect_err("zero-distance identical metadata must name one commit");
+        assert!(
+            format!("{error:#}").contains("commit equality"),
+            "unexpected error: {error:#}"
+        );
     }
 
     fn empty_trend_value(kind: &str) -> Value {

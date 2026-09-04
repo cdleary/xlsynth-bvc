@@ -18,6 +18,36 @@ pub(crate) struct VersionCardView {
     pub(crate) failures: Vec<FailedActionRowView>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CrateReleaseStatusView {
+    pub(crate) crate_version: String,
+    pub(crate) crate_release_datetime: String,
+    pub(crate) dso_version: String,
+    pub(crate) processed: bool,
+    pub(crate) materialized_actions: usize,
+    pub(crate) failed_actions: usize,
+    pub(crate) stdlib_enumeration_state: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RepositoryHeadObservationView {
+    pub(crate) schema_version: u32,
+    pub(crate) repository: String,
+    pub(crate) version_compat_sha256: String,
+    pub(crate) observed_at_utc: String,
+    pub(crate) head_ref: String,
+    pub(crate) head_commit: String,
+    pub(crate) head_committed_at_utc: String,
+    pub(crate) latest_crate_version: String,
+    pub(crate) latest_release_tag: String,
+    pub(crate) latest_release_commit: String,
+    pub(crate) latest_release_committed_at_utc: String,
+    pub(crate) comparison_status: String,
+    pub(crate) commits_ahead: u64,
+    pub(crate) commits_behind: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FailedKindView {
     pub(crate) kind: String,
@@ -122,7 +152,7 @@ pub(crate) struct UnprocessedVersionRowView {
     pub(crate) crate_release_datetime: String,
     pub(crate) dso_version: String,
     pub(crate) materialized_actions: usize,
-    pub(crate) active_queue_actions: usize,
+    pub(crate) active_queue_actions: Option<usize>,
     pub(crate) root_queue_state_key: String,
     pub(crate) root_queue_state_label: String,
 }
@@ -167,10 +197,14 @@ pub(crate) struct FailedKindAggregate {
     pub(crate) timeout_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct VersionCardsReport {
     pub(crate) cards: Vec<VersionCardView>,
     pub(crate) unattributed_actions: Vec<UnattributedActionView>,
+    #[serde(default)]
+    pub(crate) releases: Vec<CrateReleaseStatusView>,
+    #[serde(default)]
+    pub(crate) repository_head_observation: Option<RepositoryHeadObservationView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

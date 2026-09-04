@@ -969,6 +969,7 @@ fn failure_error(store: &ArtifactStore, action_id: &str) -> Result<String> {
 
 fn evaluate_completion(
     store: &ArtifactStore,
+    repo_root: &Path,
     manifest: &pb::CampaignRunManifest,
 ) -> Result<pb::CompletionReport> {
     let campaign = required(&manifest.campaign, "campaign_run.campaign")?;
@@ -1105,9 +1106,11 @@ fn evaluate_completion(
         {
             pb::RequiredOutputKind::RootArtifacts => {}
             pb::RequiredOutputKind::VersionsSummaryDataset => {
-                let present = load_versions_cards_index(store)?
+                let present = load_versions_cards_index(store, repo_root)?
                     .as_ref()
-                    .is_some_and(|report| versions_summary_contains_crate(report, crate_version));
+                    .is_some_and(|index| {
+                        versions_summary_contains_crate(&index.report, crate_version)
+                    });
                 add_missing_dataset_if(
                     pb::RequiredOutputKind::VersionsSummaryDataset,
                     WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
@@ -1223,17 +1226,18 @@ fn evaluated_manifest(
 ) -> Result<pb::CampaignRunManifest> {
     let planned = new_manifest(repo_root, crate_version)?;
     let existing = load_existing_manifest(store, &planned)?;
-    evaluate_stored_manifest(store, existing.unwrap_or(planned))
+    evaluate_stored_manifest(store, repo_root, existing.unwrap_or(planned))
 }
 
 fn evaluate_stored_manifest(
     store: &ArtifactStore,
+    repo_root: &Path,
     mut manifest: pb::CampaignRunManifest,
 ) -> Result<pb::CampaignRunManifest> {
     validate_manifest(&manifest)?;
     let previous_status = manifest.status;
     let previous_completion = manifest.completion.clone();
-    let completion = evaluate_completion(store, &manifest)?;
+    let completion = evaluate_completion(store, repo_root, &manifest)?;
     manifest.status = completion.status;
     manifest.completion = Some(completion);
     if manifest.status != previous_status || manifest.completion != previous_completion {
@@ -1374,16 +1378,17 @@ pub(crate) fn reconcile_stored_campaign_run(
         })
         .collect::<Result<Vec<_>>>()?;
     enqueue_processing_for_root_actions(store, repo_root, roots, priority)?;
-    let evaluated = evaluate_stored_manifest(store, manifest.clone())?;
+    let evaluated = evaluate_stored_manifest(store, repo_root, manifest.clone())?;
     let path = write_manifest(store, &evaluated)?;
     summary(&evaluated, &path, true)
 }
 
 pub(crate) fn finalize_stored_campaign_run(
     store: &ArtifactStore,
+    repo_root: &Path,
     manifest: &pb::CampaignRunManifest,
 ) -> Result<CampaignRunSummary> {
-    let evaluated = evaluate_stored_manifest(store, manifest.clone())?;
+    let evaluated = evaluate_stored_manifest(store, repo_root, manifest.clone())?;
     let path = write_manifest(store, &evaluated)?;
     summary(&evaluated, &path, true)
 }
@@ -1869,6 +1874,8 @@ mod tests {
                 failures: Vec::new(),
             }],
             unattributed_actions: Vec::new(),
+            releases: Vec::new(),
+            repository_head_observation: None,
         };
         assert!(versions_summary_contains_crate(&versions, "v0.40.0"));
         assert!(!versions_summary_contains_crate(&versions, "0.41.0"));
