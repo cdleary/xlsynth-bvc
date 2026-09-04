@@ -15,10 +15,11 @@ Select it explicitly when enqueueing a historical run:
 --scheduling-policy release-progression-ir-v1
 ```
 
-The runner validates the policy against the exact 187-hash manifest digest before enqueueing and
-records the policy name, semantic version, compiled-config digest, tiers, and reasons in the run's
-`manifest.json`. Queue priority is operational metadata rather than action identity, so the policy
-does not change cache keys or QoR results.
+The runner only accepts the policy with `--execution-mode enqueue`, validates it against the exact
+187-hash manifest digest before enqueueing, and records the policy name, semantic version,
+compiled-config digest, tiers, and reasons in the run's `manifest.json`. Queue priority is
+operational metadata rather than action identity, so the policy does not change cache keys or QoR
+results.
 
 ## Origin
 

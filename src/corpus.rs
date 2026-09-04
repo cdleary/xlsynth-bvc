@@ -301,6 +301,10 @@ pub(crate) fn run_ir_dir_corpus(
             bail!("--top-fn-name is required when --top-fn-policy=explicit");
         }
     }
+    if scheduling_policy_preset.is_some() && !matches!(execution_mode, CorpusExecutionMode::Enqueue)
+    {
+        bail!("--scheduling-policy is only supported with --execution-mode enqueue");
+    }
 
     fs::create_dir_all(output_dir)
         .with_context(|| format!("creating output dir: {}", output_dir.display()))?;
@@ -1365,11 +1369,16 @@ fn enqueue_plan(
                 queue_state_for_action(store, &action_id),
                 crate::queue::QueueState::None
             );
-        enqueue_action_with_priority(
-            store,
-            action.clone(),
-            suggested_action_queue_priority(base_priority, action),
-        )?;
+        let stage_priority_offset = suggested_action_queue_priority(0, action);
+        let action_priority = base_priority
+            .checked_add(stage_priority_offset)
+            .with_context(|| {
+                format!(
+                    "queue priority overflow after adding stage offset {} for action {}",
+                    stage_priority_offset, action_id
+                )
+            })?;
+        enqueue_action_with_priority(store, action.clone(), action_priority)?;
         if !was_known && !store.action_exists(&action_id) {
             enqueued += 1;
         }
@@ -2586,6 +2595,70 @@ mod tests {
         assert_eq!(lhs, rhs);
         assert_ne!(lhs, other);
         assert!(lhs.starts_with("sample-"));
+    }
+
+    #[test]
+    fn run_ir_dir_corpus_rejects_scheduling_policy_in_run_mode() {
+        let root = make_temp_dir("run-mode-scheduling-policy");
+        let input_dir = root.join("input");
+        let output_dir = root.join("out");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+
+        let error = run_ir_dir_corpus(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &input_dir,
+            &output_dir,
+            CorpusRecipePreset::G8rVsYabcAigDiff,
+            CorpusExecutionMode::Run,
+            CorpusTopFnPolicy::FromFilename,
+            None,
+            false,
+            "v0.39.0",
+            None,
+            crate::DEFAULT_QUEUE_PRIORITY,
+            Some(crate::cli::CorpusSchedulingPolicyPreset::ReleaseProgressionIrV1),
+            sample_driver_cli(),
+            sample_yosys_cli(),
+        )
+        .expect_err("run mode must reject queue scheduling policies");
+
+        assert!(
+            format!("{error:#}")
+                .contains("--scheduling-policy is only supported with --execution-mode enqueue")
+        );
+        assert!(!output_dir.exists());
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn enqueue_plan_rejects_stage_priority_overflow() {
+        let root = make_temp_dir("stage-priority-overflow");
+        let store = ArtifactStore::new_with_sled(root.join("store"), root.join("artifacts.sled"));
+        store.ensure_layout().expect("ensure store layout");
+        let sample = CorpusSampleSpec {
+            sample_id: "sample-1".to_string(),
+            logical_name: "sample.ir".to_string(),
+            source_path: root.join("unused.ir"),
+            source_relpath: "sample.ir".to_string(),
+            source_sha256: "a".repeat(64),
+            top_fn_name: "foo".to_string(),
+        };
+        let plan = build_action_plan(
+            &sample,
+            false,
+            "v0.39.0",
+            &sample_driver_runtime(),
+            &sample_stats_runtime(),
+            &sample_yosys_runtime(),
+            &sample_yosys_script_ref(),
+        )
+        .expect("build action plan");
+
+        let error = enqueue_plan(&store, &plan, i32::MAX)
+            .expect_err("stage priority adjustment must reject overflow");
+
+        assert!(format!("{error:#}").contains("queue priority overflow after adding stage offset"));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
