@@ -948,7 +948,7 @@ const api = new Function(prefix + '\nreturn {showComparisonDetail};')();
 const firstHash = '1'.repeat(64);
 const secondHash = '2'.repeat(64);
 const structuralDatasetKey = hash => `ir-fn-corpus-structural.v2/by-hash-prefix/${hash.slice(0, 2)}.json`;
-const irDatasetKey = hash => `ir-fn-corpus-ir.v1/by-hash-prefix/${hash.slice(0, 2)}.json`;
+const irDatasetKey = hash => `ir-fn-corpus-ir.v1/by-hash-prefix/${hash.slice(0, 3)}.json`;
 const state = {
   catalog: {datasets: [
 {logical_key: structuralDatasetKey(firstHash), url: 'first.json'},
@@ -984,18 +984,19 @@ dslx_origin: {dslx_file: `${name}.x`, dslx_fn_name: name},
 });
 const irResponse = (name, hash) => ({
   ok: true,
-  json: async () => ({entries: [{
+  json: async () => ({rows: [{entry: {
 crate_version: '0.31.0',
 structural_hash: hash,
 g8r_stats_action_id: `g8r-${name}`,
 yosys_abc_stats_action_id: `yabc-${name}`,
 g8r: {ir_action_id: `ir-${name}`, ir_top: `top-${name}`, ir_text: `fn top-${name}() -> bits[1] { ret literal.1: bits[1] = literal(value=1, id=1) }`},
 yosys_abc: {ir_action_id: `ir-${name}`, ir_top: `top-${name}`, ir_text: `fn top-${name}() -> bits[1] { ret literal.1: bits[1] = literal(value=1, id=1) }`},
-  }]}),
+  }}]}),
 });
 (async () => {
   const first = api.showComparisonDetail(sample('first', firstHash), 'plot-levels', state);
   const second = api.showComparisonDetail(sample('second', secondHash), 'plot-nodes', state);
+  await new Promise(resolve => setImmediate(resolve));
   pending.get('second.json')(structuralResponse('second', secondHash));
   pending.get('second-ir.json')(irResponse('second', secondHash));
   await second;
@@ -1091,8 +1092,12 @@ const sourceHash = 'd'.repeat(64);
 if (api.mffcStructuralGroupKey(sourceHash) !== 'ir-fn-corpus-structural.v2/by-hash-prefix/dd.json') {
   throw new Error('unexpected source structural group key');
 }
-if (api.irFnCorpusIrShardKey('ir-fn-corpus-ir.v1.json', sourceHash) !== 'ir-fn-corpus-ir.v1/by-hash-prefix/dd.json') {
+if (api.irFnCorpusIrShardKey('ir-fn-corpus-ir.v1.json', sourceHash) !== 'ir-fn-corpus-ir.v1/by-hash-prefix/ddd.json') {
   throw new Error('unexpected IR function corpus shard key');
+}
+const splitIrManifest = {shards: [{structural_prefix: 'ddd', g8r_stats_prefix: 'a', index_key: 'ir-fn-corpus-ir.v1/by-hash-prefix/ddd-g8r-a.json'}]};
+if (api.irFnCorpusIrShardKey('ir-fn-corpus-ir.v1.json', sourceHash, 'a'.repeat(64), splitIrManifest) !== 'ir-fn-corpus-ir.v1/by-hash-prefix/ddd-g8r-a.json') {
+  throw new Error('adaptive IR function corpus shard was not selected');
 }
 if (api.mffcComparisonKey('0.31.0', 'c'.repeat(64)) !== `0.31.0:${'c'.repeat(64)}`) {
   throw new Error('unexpected MFFC comparison key');
