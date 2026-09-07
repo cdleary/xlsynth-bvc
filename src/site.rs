@@ -51,6 +51,9 @@ const RELEASE_PROGRESSION_IR_SHA256: &str =
 const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 5;
 const STATIC_COMPARISON_SHARD_SCHEMA_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_PREFIX_HEX_CHARS: u8 = 1;
+const STATIC_IR_SHARD_SCHEMA_VERSION: u32 = 1;
+const STATIC_IR_SHARD_PREFIX_HEX_CHARS: u8 = 3;
+const STATIC_IR_SHARD_TARGET_BYTES: usize = 16 * 1024 * 1024;
 const STATIC_STRUCTURAL_SHARD_SCHEMA_VERSION: u32 = 1;
 const STATIC_STRUCTURAL_SHARD_PREFIX_HEX_CHARS: u8 = 2;
 const STATIC_STRUCTURAL_SHARD_NAMESPACE: &str = "ir-fn-corpus-structural.v2/by-hash-prefix";
@@ -191,6 +194,51 @@ struct StaticComparisonEntityShard {
 struct StaticComparisonEntityRow {
     source_ordinal: usize,
     entity: StaticCorpusEntityPoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticIrSource {
+    logical_key: String,
+    bytes: u64,
+    sha256: String,
+    manifest: crate::query::IrFnCorpusIrIndexManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticIrShardSummary {
+    structural_prefix: String,
+    g8r_stats_prefix: String,
+    index_key: String,
+    entry_count: usize,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticIrManifest {
+    schema_version: u32,
+    source: StaticIrSource,
+    shard_prefix_hex_chars: u8,
+    shards: Vec<StaticIrShardSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticIrShard {
+    schema_version: u32,
+    structural_prefix: String,
+    g8r_stats_prefix: String,
+    rows: Vec<StaticIrRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticIrRow {
+    source_ordinal: usize,
+    entry: crate::query::IrFnCorpusIrComparisonEntry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2484,7 +2532,7 @@ pub(crate) fn smoke_static_site(
         ("runs.html", "Campaign runs", Vec::new()),
         (
             "progression.html",
-            "Release progression",
+            "Fixed-IR release progression",
             progression_markers,
         ),
         ("releases.html", "Crate release processing", Vec::new()),

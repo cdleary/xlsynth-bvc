@@ -72,6 +72,49 @@ fn comparison_shard_key_parts(
     None
 }
 
+fn ir_shard_prefix(index_key: &str, chars: usize) -> Option<&str> {
+    let prefix = index_key
+        .strip_prefix(crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .and_then(|suffix| suffix.strip_suffix(".json"))?;
+    is_lower_hex(prefix, chars).then_some(prefix)
+}
+
+fn source_ir_shard_prefix(index_key: &str) -> Option<&str> {
+    ir_shard_prefix(index_key, 2)
+}
+
+fn static_ir_shard_selector(index_key: &str) -> Option<(&str, &str)> {
+    let stem = index_key
+        .strip_prefix(crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .and_then(|suffix| suffix.strip_suffix(".json"))?;
+    let (structural_prefix, g8r_stats_prefix) = stem.split_once("-g8r-").unwrap_or((stem, ""));
+    (is_lower_hex(structural_prefix, STATIC_IR_SHARD_PREFIX_HEX_CHARS as usize)
+        && (g8r_stats_prefix.is_empty()
+            || (g8r_stats_prefix.len() <= 64
+                && g8r_stats_prefix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))))
+    .then_some((structural_prefix, g8r_stats_prefix))
+}
+
+fn static_ir_shard_key(structural_prefix: &str, g8r_stats_prefix: &str) -> String {
+    let suffix = if g8r_stats_prefix.is_empty() {
+        structural_prefix.to_string()
+    } else {
+        format!("{structural_prefix}-g8r-{g8r_stats_prefix}")
+    };
+    format!(
+        "{}/{suffix}.json",
+        crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE
+    )
+}
+
+fn is_ir_manifest_source(index_key: &str) -> bool {
+    index_key == crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME
+}
+
 fn structural_shard_key(prefix: &str) -> String {
     format!("{STATIC_STRUCTURAL_SHARD_NAMESPACE}/{prefix}.json")
 }
@@ -327,6 +370,183 @@ fn build_comparison_datasets(
     Ok(datasets)
 }
 
+fn write_static_ir_partition(
+    out_dir: &Path,
+    target_bytes: usize,
+    structural_prefix: &str,
+    g8r_stats_prefix: String,
+    rows: Vec<StaticIrRow>,
+    datasets: &mut Vec<BrowserDataset>,
+    shard_summaries: &mut Vec<StaticIrShardSummary>,
+) -> Result<()> {
+    let shard = StaticIrShard {
+        schema_version: STATIC_IR_SHARD_SCHEMA_VERSION,
+        structural_prefix: structural_prefix.to_string(),
+        g8r_stats_prefix: g8r_stats_prefix.clone(),
+        rows,
+    };
+    let bytes = serde_json::to_vec(&shard).context("serializing static IR evidence shard")?;
+    if bytes.len() <= target_bytes {
+        let entry_count = shard.rows.len();
+        let index_key = static_ir_shard_key(structural_prefix, &g8r_stats_prefix);
+        let dataset = write_browser_dataset(out_dir, &index_key, &bytes)?;
+        shard_summaries.push(StaticIrShardSummary {
+            structural_prefix: structural_prefix.to_string(),
+            g8r_stats_prefix,
+            index_key,
+            entry_count,
+            bytes: dataset.bytes,
+            sha256: dataset.sha256.clone(),
+        });
+        datasets.push(dataset);
+        return Ok(());
+    }
+    if g8r_stats_prefix.len() == 64 {
+        bail!(
+            "one static IR evidence record exceeds the {} byte shard target",
+            target_bytes
+        );
+    }
+
+    let mut groups = BTreeMap::<String, Vec<StaticIrRow>>::new();
+    let next_len = g8r_stats_prefix.len() + 1;
+    for row in shard.rows {
+        let next_prefix = row.entry.g8r_stats_action_id[..next_len].to_string();
+        groups.entry(next_prefix).or_default().push(row);
+    }
+    for (next_prefix, rows) in groups {
+        write_static_ir_partition(
+            out_dir,
+            target_bytes,
+            structural_prefix,
+            next_prefix,
+            rows,
+            datasets,
+            shard_summaries,
+        )?;
+    }
+    Ok(())
+}
+
+fn build_ir_datasets(
+    snapshot_dir: &Path,
+    out_dir: &Path,
+    entries: &[crate::snapshot::StaticSnapshotDatasetFile],
+) -> Result<Vec<BrowserDataset>> {
+    let Some(source_manifest_entry) = entries
+        .iter()
+        .find(|entry| is_ir_manifest_source(&entry.index_key))
+    else {
+        if entries
+            .iter()
+            .any(|entry| source_ir_shard_prefix(&entry.index_key).is_some())
+        {
+            bail!("IR evidence shards exist without their source manifest");
+        }
+        return Ok(Vec::new());
+    };
+    let source_manifest_bytes = read_snapshot_json(snapshot_dir, source_manifest_entry)?;
+    let source_manifest: crate::query::IrFnCorpusIrIndexManifest =
+        serde_json::from_slice(&source_manifest_bytes)
+            .context("decoding IR evidence source manifest")?;
+    let canonical_source = crate::query::canonicalize_public_web_index_json(
+        &source_manifest_entry.index_key,
+        &source_manifest_bytes,
+    )?;
+    if canonical_source != source_manifest_bytes {
+        bail!("IR evidence source manifest is not canonical");
+    }
+
+    let source_by_key = entries
+        .iter()
+        .map(|entry| (entry.index_key.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut expected_source_keys =
+        BTreeSet::from([crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME.to_string()]);
+    let mut rows_by_prefix: BTreeMap<String, Vec<StaticIrRow>> = BTreeMap::new();
+    let mut entry_count = 0usize;
+    for summary in &source_manifest.shards {
+        expected_source_keys.insert(summary.index_key.clone());
+        let source_entry = source_by_key
+            .get(summary.index_key.as_str())
+            .copied()
+            .with_context(|| format!("missing IR evidence source shard {}", summary.index_key))?;
+        if source_entry.bytes != summary.bytes || source_entry.sha256 != summary.sha256 {
+            bail!("IR evidence source shard metadata disagrees with its manifest");
+        }
+        let bytes = read_snapshot_json(snapshot_dir, source_entry)?;
+        let canonical =
+            crate::query::canonicalize_public_web_index_json(&summary.index_key, &bytes)?;
+        if canonical != bytes {
+            bail!(
+                "IR evidence source shard is not canonical: {}",
+                summary.index_key
+            );
+        }
+        let shard: crate::query::IrFnCorpusIrShardFile = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decoding IR evidence source shard {}", summary.index_key))?;
+        if shard.prefix != summary.prefix || shard.entries.len() != summary.entry_count {
+            bail!("IR evidence source shard disagrees with its manifest summary");
+        }
+        for (source_ordinal, entry) in shard.entries.into_iter().enumerate() {
+            let prefix = hash_prefix(
+                &entry.structural_hash,
+                STATIC_IR_SHARD_PREFIX_HEX_CHARS,
+                "IR evidence structural hash",
+            )?;
+            rows_by_prefix
+                .entry(prefix.to_string())
+                .or_default()
+                .push(StaticIrRow {
+                    source_ordinal,
+                    entry,
+                });
+            entry_count += 1;
+        }
+    }
+    let actual_source_keys = source_by_key
+        .keys()
+        .filter(|key| is_ir_manifest_source(key) || source_ir_shard_prefix(key).is_some())
+        .map(|key| (*key).to_string())
+        .collect::<BTreeSet<_>>();
+    if actual_source_keys != expected_source_keys || entry_count != source_manifest.entry_count {
+        bail!("IR evidence source shard closure is inconsistent");
+    }
+
+    let mut datasets = Vec::new();
+    let mut shard_summaries = Vec::new();
+    for (structural_prefix, rows) in rows_by_prefix {
+        write_static_ir_partition(
+            out_dir,
+            STATIC_IR_SHARD_TARGET_BYTES,
+            &structural_prefix,
+            String::new(),
+            rows,
+            &mut datasets,
+            &mut shard_summaries,
+        )?;
+    }
+    let static_manifest = StaticIrManifest {
+        schema_version: STATIC_IR_SHARD_SCHEMA_VERSION,
+        source: StaticIrSource {
+            logical_key: source_manifest_entry.index_key.clone(),
+            bytes: source_manifest_entry.bytes,
+            sha256: source_manifest_entry.sha256.clone(),
+            manifest: source_manifest,
+        },
+        shard_prefix_hex_chars: STATIC_IR_SHARD_PREFIX_HEX_CHARS,
+        shards: shard_summaries,
+    };
+    let manifest_bytes =
+        serde_json::to_vec(&static_manifest).context("serializing static IR evidence manifest")?;
+    datasets.push(write_browser_dataset(
+        out_dir,
+        &source_manifest_entry.index_key,
+        &manifest_bytes,
+    )?);
+    Ok(datasets)
+}
+
 fn build_structural_datasets(
     snapshot_dir: &Path,
     out_dir: &Path,
@@ -433,6 +653,8 @@ pub(super) fn build_static_site_datasets(
             continue;
         }
         if comparison_source_schema(&entry.index_key).is_some()
+            || is_ir_manifest_source(&entry.index_key)
+            || source_ir_shard_prefix(&entry.index_key).is_some()
             || is_structural_manifest_source(&entry.index_key)
             || structural_group_hash(&entry.index_key).is_some()
         {
@@ -446,6 +668,11 @@ pub(super) fn build_static_site_datasets(
             datasets.extend(build_comparison_datasets(snapshot_dir, out_dir, entry)?);
         }
     }
+    datasets.extend(build_ir_datasets(
+        snapshot_dir,
+        out_dir,
+        &snapshot.dataset_files,
+    )?);
     datasets.extend(build_structural_datasets(
         snapshot_dir,
         out_dir,
@@ -586,6 +813,123 @@ fn validate_entity_shard(prefix: &str, shard: &StaticComparisonEntityShard) -> R
     Ok(())
 }
 
+fn validate_static_ir_shard(
+    structural_prefix: &str,
+    g8r_stats_prefix: &str,
+    shard: &StaticIrShard,
+) -> Result<()> {
+    if shard.schema_version != STATIC_IR_SHARD_SCHEMA_VERSION
+        || shard.structural_prefix != structural_prefix
+        || shard.g8r_stats_prefix != g8r_stats_prefix
+        || !is_lower_hex(structural_prefix, STATIC_IR_SHARD_PREFIX_HEX_CHARS as usize)
+        || (!g8r_stats_prefix.is_empty() && !is_lower_hex(g8r_stats_prefix, g8r_stats_prefix.len()))
+        || shard.rows.is_empty()
+    {
+        bail!("static IR evidence shard header is invalid");
+    }
+    let mut previous_ordinal = None;
+    for row in &shard.rows {
+        if previous_ordinal.is_some_and(|value| value >= row.source_ordinal)
+            || hash_prefix(
+                &row.entry.structural_hash,
+                STATIC_IR_SHARD_PREFIX_HEX_CHARS,
+                "static IR evidence structural hash",
+            )? != structural_prefix
+            || !row.entry.g8r_stats_action_id.starts_with(g8r_stats_prefix)
+        {
+            bail!("static IR evidence shard rows are misplaced or unsorted");
+        }
+        previous_ordinal = Some(row.source_ordinal);
+    }
+    let source_prefix = &structural_prefix[..2];
+    let source_key = format!(
+        "{}/{source_prefix}.json",
+        crate::WEB_IR_FN_CORPUS_IR_SHARD_NAMESPACE
+    );
+    let source = crate::query::IrFnCorpusIrShardFile {
+        schema_version: crate::WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION,
+        prefix: source_prefix.to_string(),
+        entries: shard.rows.iter().map(|row| row.entry.clone()).collect(),
+    };
+    let source_bytes = serde_json::to_vec(&source)?;
+    if crate::query::canonicalize_public_web_index_json(&source_key, &source_bytes)? != source_bytes
+    {
+        bail!("static IR evidence shard contains noncanonical source entries");
+    }
+    Ok(())
+}
+
+fn validate_static_ir_manifest(manifest: &StaticIrManifest) -> Result<()> {
+    if manifest.schema_version != STATIC_IR_SHARD_SCHEMA_VERSION
+        || manifest.shard_prefix_hex_chars != STATIC_IR_SHARD_PREFIX_HEX_CHARS
+        || !is_ir_manifest_source(&manifest.source.logical_key)
+    {
+        bail!("static IR evidence manifest header is invalid");
+    }
+    validate_digest("IR evidence source sha256", &manifest.source.sha256)?;
+    let source_bytes = serde_json::to_vec(&manifest.source.manifest)
+        .context("serializing IR evidence source manifest")?;
+    let canonical_source = crate::query::canonicalize_public_web_index_json(
+        &manifest.source.logical_key,
+        &source_bytes,
+    )?;
+    if canonical_source != source_bytes
+        || source_bytes.len() as u64 != manifest.source.bytes
+        || sha256_hex(&source_bytes) != manifest.source.sha256
+    {
+        bail!("static IR evidence source commitment is invalid");
+    }
+
+    let mut previous = None;
+    let mut selectors_by_structural = BTreeMap::<String, Vec<String>>::new();
+    let mut entry_count = 0usize;
+    for summary in &manifest.shards {
+        let selector = (
+            summary.structural_prefix.as_str(),
+            summary.g8r_stats_prefix.as_str(),
+        );
+        if summary.entry_count == 0
+            || summary.bytes > STATIC_IR_SHARD_TARGET_BYTES as u64
+            || !is_lower_hex(
+                &summary.structural_prefix,
+                STATIC_IR_SHARD_PREFIX_HEX_CHARS as usize,
+            )
+            || (!summary.g8r_stats_prefix.is_empty()
+                && !is_lower_hex(&summary.g8r_stats_prefix, summary.g8r_stats_prefix.len()))
+            || previous.as_ref().is_some_and(|value: &(String, String)| {
+                (value.0.as_str(), value.1.as_str()) >= selector
+            })
+            || summary.index_key
+                != static_ir_shard_key(&summary.structural_prefix, &summary.g8r_stats_prefix)
+        {
+            bail!("static IR evidence shard summary is invalid or unsorted");
+        }
+        validate_digest("IR evidence shard summary sha256", &summary.sha256)?;
+        entry_count = entry_count
+            .checked_add(summary.entry_count)
+            .context("static IR evidence entry count overflow")?;
+        selectors_by_structural
+            .entry(summary.structural_prefix.clone())
+            .or_default()
+            .push(summary.g8r_stats_prefix.clone());
+        previous = Some((
+            summary.structural_prefix.clone(),
+            summary.g8r_stats_prefix.clone(),
+        ));
+    }
+    if selectors_by_structural.values().any(|prefixes| {
+        prefixes
+            .windows(2)
+            .any(|pair| pair[1].starts_with(&pair[0]))
+    }) {
+        bail!("static IR evidence shard selectors overlap");
+    }
+    if entry_count != manifest.source.manifest.entry_count {
+        bail!("static IR evidence shard count does not match its source");
+    }
+    Ok(())
+}
+
 fn validate_structural_shard(prefix: &str, shard: &StaticStructuralShard) -> Result<()> {
     if shard.schema_version != STATIC_STRUCTURAL_SHARD_SCHEMA_VERSION
         || shard.prefix != prefix
@@ -676,7 +1020,8 @@ fn validate_structural_manifest(manifest: &StaticStructuralManifest) -> Result<(
 }
 
 pub(super) fn should_include_static_site_dataset_key(index_key: &str) -> bool {
-    should_include_snapshot_index_key(index_key)
+    (should_include_snapshot_index_key(index_key) && source_ir_shard_prefix(index_key).is_none())
+        || static_ir_shard_selector(index_key).is_some()
         || comparison_shard_key_parts(index_key).is_some()
         || structural_shard_prefix(index_key).is_some()
 }
@@ -685,6 +1030,14 @@ pub(super) fn canonicalize_static_site_dataset_json(
     index_key: &str,
     bytes: &[u8],
 ) -> Result<Vec<u8>> {
+    if is_ir_manifest_source(index_key) {
+        return canonicalize_typed::<StaticIrManifest>(bytes, validate_static_ir_manifest);
+    }
+    if let Some((structural_prefix, g8r_stats_prefix)) = static_ir_shard_selector(index_key) {
+        return canonicalize_typed::<StaticIrShard>(bytes, |shard| {
+            validate_static_ir_shard(structural_prefix, g8r_stats_prefix, shard)
+        });
+    }
     if comparison_source_schema(index_key).is_some() {
         return canonicalize_typed::<StaticComparisonManifest>(bytes, |manifest| {
             validate_comparison_manifest(index_key, manifest)
@@ -855,6 +1208,116 @@ fn verify_comparison_projection(
     Ok(())
 }
 
+fn verify_ir_projection(
+    site_dir: &Path,
+    source_by_key: &BTreeMap<&str, &crate::snapshot::StaticSnapshotDatasetFile>,
+    catalog_by_key: &BTreeMap<&str, &BrowserDataset>,
+    expected_keys: &mut BTreeSet<String>,
+) -> Result<()> {
+    let source_manifest_entry = source_by_key
+        .get(crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME)
+        .copied();
+    let source_ir_keys = source_by_key
+        .keys()
+        .filter(|key| is_ir_manifest_source(key) || source_ir_shard_prefix(key).is_some())
+        .map(|key| (*key).to_string())
+        .collect::<BTreeSet<_>>();
+    let Some(source_manifest_entry) = source_manifest_entry else {
+        if !source_ir_keys.is_empty() {
+            bail!("snapshot IR evidence shards exist without their manifest");
+        }
+        return Ok(());
+    };
+
+    let static_manifest_dataset =
+        catalog_dataset(catalog_by_key, crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME)?;
+    expected_keys.insert(crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME.to_string());
+    let static_manifest_bytes = read_catalog_dataset(site_dir, static_manifest_dataset)?;
+    let static_manifest: StaticIrManifest = serde_json::from_slice(&static_manifest_bytes)
+        .context("decoding static IR evidence manifest")?;
+    validate_static_ir_manifest(&static_manifest)?;
+    if static_manifest.source.logical_key != source_manifest_entry.index_key
+        || static_manifest.source.bytes != source_manifest_entry.bytes
+        || static_manifest.source.sha256 != source_manifest_entry.sha256
+    {
+        bail!("static IR evidence manifest source does not match snapshot");
+    }
+
+    let mut rows_by_source =
+        BTreeMap::<String, BTreeMap<usize, crate::query::IrFnCorpusIrComparisonEntry>>::new();
+    for summary in &static_manifest.shards {
+        expected_keys.insert(summary.index_key.clone());
+        let dataset = catalog_dataset(catalog_by_key, &summary.index_key)?;
+        if dataset.bytes != summary.bytes || dataset.sha256 != summary.sha256 {
+            bail!("static IR evidence shard metadata disagrees with manifest");
+        }
+        let bytes = read_catalog_dataset(site_dir, dataset)?;
+        let shard: StaticIrShard = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decoding static IR evidence shard {}", summary.index_key))?;
+        validate_static_ir_shard(
+            &summary.structural_prefix,
+            &summary.g8r_stats_prefix,
+            &shard,
+        )?;
+        if shard.rows.len() != summary.entry_count {
+            bail!("static IR evidence shard entry count mismatch");
+        }
+        let source_prefix = summary.structural_prefix[..2].to_string();
+        let source_rows = rows_by_source.entry(source_prefix).or_default();
+        for row in shard.rows {
+            if source_rows.insert(row.source_ordinal, row.entry).is_some() {
+                bail!("duplicate static IR evidence source ordinal");
+            }
+        }
+    }
+
+    let mut expected_source_keys =
+        BTreeSet::from([crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME.to_string()]);
+    for summary in &static_manifest.source.manifest.shards {
+        expected_source_keys.insert(summary.index_key.clone());
+        let source_entry = source_by_key
+            .get(summary.index_key.as_str())
+            .copied()
+            .with_context(|| {
+                format!(
+                    "snapshot is missing IR evidence shard {}",
+                    summary.index_key
+                )
+            })?;
+        if source_entry.bytes != summary.bytes || source_entry.sha256 != summary.sha256 {
+            bail!("snapshot IR evidence shard metadata disagrees with source manifest");
+        }
+        let entries = rows_in_source_order(
+            rows_by_source.remove(&summary.prefix).unwrap_or_default(),
+            "static IR evidence",
+        )?;
+        let reconstructed = crate::query::IrFnCorpusIrShardFile {
+            schema_version: crate::WEB_IR_FN_CORPUS_IR_INDEX_SCHEMA_VERSION,
+            prefix: summary.prefix.clone(),
+            entries,
+        };
+        let reconstructed_bytes = serde_json::to_vec(&reconstructed)
+            .context("reconstructing source IR evidence shard")?;
+        let canonical = crate::query::canonicalize_public_web_index_json(
+            &summary.index_key,
+            &reconstructed_bytes,
+        )?;
+        if canonical != reconstructed_bytes
+            || reconstructed_bytes.len() as u64 != summary.bytes
+            || sha256_hex(&reconstructed_bytes) != summary.sha256
+        {
+            bail!(
+                "static IR evidence projection does not reconstruct snapshot source {}",
+                summary.index_key
+            );
+        }
+    }
+    if !rows_by_source.is_empty() || expected_source_keys != source_ir_keys {
+        bail!("static IR evidence shards do not exactly cover snapshot sources");
+    }
+    Ok(())
+}
+
 fn verify_structural_projection(
     site_dir: &Path,
     source_by_key: &BTreeMap<&str, &crate::snapshot::StaticSnapshotDatasetFile>,
@@ -960,6 +1423,8 @@ pub(super) fn verify_static_site_dataset_projection(
     let mut expected_keys = BTreeSet::new();
     for (key, source_entry) in &source_by_key {
         if comparison_source_schema(key).is_some()
+            || is_ir_manifest_source(key)
+            || source_ir_shard_prefix(key).is_some()
             || is_structural_manifest_source(key)
             || structural_group_hash(key).is_some()
         {
@@ -986,6 +1451,12 @@ pub(super) fn verify_static_site_dataset_projection(
             )?;
         }
     }
+    verify_ir_projection(
+        site_dir,
+        &source_by_key,
+        &catalog_by_key,
+        &mut expected_keys,
+    )?;
     verify_structural_projection(
         site_dir,
         &source_by_key,
@@ -1005,4 +1476,90 @@ pub(super) fn verify_static_site_dataset_projection(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ir_side() -> crate::query::IrFnCorpusIrSide {
+        crate::query::IrFnCorpusIrSide {
+            ir_action_id: "1".repeat(64),
+            ir_top: "sample".to_string(),
+            extracted_package_sha256: "2".repeat(64),
+            source_ir_action_id: "3".repeat(64),
+            source_ir_top: "sample".to_string(),
+            source_structural_hash: "4".repeat(64),
+            dso_version: "0.1.0".to_string(),
+            root_ir_text_id: 1,
+            mffc_structure: None,
+            ir_text: "fn sample() -> bits[1] { ret literal.1: bits[1] = literal(value=1, id=1) }"
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn oversized_ir_partition_splits_only_the_hot_structural_prefix() {
+        let out_dir = std::env::temp_dir().join(format!(
+            "xlsynth-bvc-static-ir-shards-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&out_dir).expect("create shard test output");
+        let rows = (0..16)
+            .map(|ordinal| StaticIrRow {
+                source_ordinal: ordinal,
+                entry: crate::query::IrFnCorpusIrComparisonEntry {
+                    crate_version: "0.1.0".to_string(),
+                    g8r_stats_action_id: format!("{ordinal:x}{}", "0".repeat(63)),
+                    yosys_abc_stats_action_id: "5".repeat(64),
+                    structural_hash: "a".repeat(64),
+                    g8r: test_ir_side(),
+                    yosys_abc: test_ir_side(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let one_row_bytes = serde_json::to_vec(&StaticIrShard {
+            schema_version: STATIC_IR_SHARD_SCHEMA_VERSION,
+            structural_prefix: "aaa".to_string(),
+            g8r_stats_prefix: "0".to_string(),
+            rows: vec![rows[0].clone()],
+        })
+        .expect("serialize one-row shard")
+        .len();
+        let unsplit_bytes = serde_json::to_vec(&StaticIrShard {
+            schema_version: STATIC_IR_SHARD_SCHEMA_VERSION,
+            structural_prefix: "aaa".to_string(),
+            g8r_stats_prefix: String::new(),
+            rows: rows.clone(),
+        })
+        .expect("serialize unsplit shard")
+        .len();
+        let target_bytes = (one_row_bytes + unsplit_bytes) / 2;
+        let mut datasets = Vec::new();
+        let mut summaries = Vec::new();
+        write_static_ir_partition(
+            &out_dir,
+            target_bytes,
+            "aaa",
+            String::new(),
+            rows,
+            &mut datasets,
+            &mut summaries,
+        )
+        .expect("split oversized shard");
+
+        assert_eq!(datasets.len(), 16);
+        assert_eq!(summaries.len(), 16);
+        assert!(summaries.iter().all(|summary| {
+            summary.structural_prefix == "aaa"
+                && summary.g8r_stats_prefix.len() == 1
+                && summary.bytes <= target_bytes as u64
+                && static_ir_shard_selector(&summary.index_key)
+                    == Some((
+                        summary.structural_prefix.as_str(),
+                        summary.g8r_stats_prefix.as_str(),
+                    ))
+        }));
+        fs::remove_dir_all(out_dir).expect("cleanup shard test output");
+    }
 }
