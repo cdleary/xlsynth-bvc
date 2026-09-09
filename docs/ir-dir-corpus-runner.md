@@ -38,7 +38,7 @@ Current supported flags:
 - `--input-dir <dir>`
 - `--output-dir <dir>`
 - `--execution-mode enqueue|run`
-- `--recipe-preset g8r-vs-yabc-aig-diff|g8r-vs-yabc-no-fraig-aig-diff|g8r-abc-stats`
+- `--recipe-preset g8r-vs-yabc-aig-diff|g8r-vs-yabc-no-fraig-aig-diff|g8r-abc-stats|g8r-abc-vs-yabc-aig-diff`
 - `--top-fn-policy infer-single-package|explicit|from-filename`
 - `--top-fn-name <name>` when policy is `explicit`
 - `--fraig`
@@ -71,6 +71,7 @@ Public outputs are written directly into `OUTPUT_DIR/`:
 - `joined/g8r-vs-yabc-no-fraig-aig-diff.jsonl`
 - `joined/g8r-abc-stats.csv`
 - `joined/g8r-abc-stats.jsonl`
+- `joined/g8r-abc-vs-yabc-aig-diff.csv` and `.jsonl` for matched ABC runs
 - `artifacts/<sample_id>/...` for copied leaf outputs when available
 
 The summary JSON includes the exact `--store-dir` and `--artifacts-via-sled` paths for the

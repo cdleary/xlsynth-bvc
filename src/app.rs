@@ -151,6 +151,30 @@ pub(crate) fn run() -> Result<()> {
         command,
     } = Cli::parse();
     let repo_root = std::env::current_dir().context("getting current directory")?;
+    if let TopCommand::DslxCorpusIngest(opts) = &command {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::dslx_corpus::ingest(&repo_root, opts)?)?
+        );
+        return Ok(());
+    }
+    if let TopCommand::RenderDslxCorpusReport {
+        ingest_dir,
+        comparison_dir,
+        output_dir,
+    } = &command
+    {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::dslx_corpus::render_report(
+                &repo_root,
+                ingest_dir,
+                comparison_dir,
+                output_dir,
+            )?)?
+        );
+        return Ok(());
+    }
     if let TopCommand::RunIrDirCorpus {
         input_dir,
         output_dir,
@@ -1014,6 +1038,9 @@ pub(crate) fn run() -> Result<()> {
         }
         TopCommand::RunIrDirCorpus { .. } => {
             unreachable!("run-ir-dir-corpus handled before shared store initialization")
+        }
+        TopCommand::DslxCorpusIngest(..) | TopCommand::RenderDslxCorpusReport { .. } => {
+            unreachable!("DSLX corpus commands handled before shared store initialization")
         }
         TopCommand::ShowCorpusProgress { .. } => {
             unreachable!("show-corpus-progress handled before shared store initialization")
