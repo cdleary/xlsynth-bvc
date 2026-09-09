@@ -56,13 +56,17 @@ in the manifest identifies its relative source path and function, extraction kin
 optional MFFC rank, and source IR digest. Identical cone content is saved once, while all its
 occurrences are retained. Parametric functions are skipped until instantiated; failed concrete
 functions and extraction steps are recorded separately. Work bounds and driver version are
-recorded in the manifest. `--dslx-path` may be repeated for additional import roots, and
+recorded in the manifest. Discovery and conversion search the source file's directory first,
+then the snapshot root, then any additional import roots. `--dslx-path` may be repeated for those roots, and
 `--dslx-stdlib-path`, `--driver`, and `--toolchain` select external tooling. Start with an empty
-output directory outside the input tree; results stay in those user-selected output directories.
+output directory outside the input tree and resource checkout; both commands reject overlapping
+outputs before writing. Results stay in those user-selected output directories.
 
 The report contains `index.html`, `data.json`, and linked exact cone IR under `ir/`. Open the
 HTML directly or serve the directory with any local static HTTP server. The page shows coverage,
 paired nodes and depth charts, extraction and size filters, all source occurrences, failure
-summaries, and action evidence. Source derived strings are inserted as text; no external assets
+summaries, and action evidence. It checks that the manifest, sample statuses, and joined rows
+describe the same comparison run, with one joined row per completed sample. If exports disagree,
+run `refresh-corpus-status` again before rendering. Source derived strings are inserted as text; no external assets
 or backend are required. The generated outputs can contain copies of input source and IR, so
 choose where to store and share them accordingly.

@@ -119,31 +119,63 @@ fn relative_name(base: &Path, file: &Path) -> Result<String> {
     Ok(name)
 }
 
-fn checked_output_dir(input_dir: &Path, output_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+fn resolved_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .context("output has no existing ancestor")?;
+    }
+    let mut result = fs::canonicalize(ancestor).context("resolving path ancestor")?;
+    for part in absolute.strip_prefix(ancestor)?.components() {
+        match part {
+            std::path::Component::Normal(name) => result.push(name),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            _ => bail!("invalid output directory suffix"),
+        }
+    }
+    Ok(result)
+}
+
+fn checked_empty_output(output_dir: &Path, protected: &[&Path]) -> Result<PathBuf> {
+    // Resolve aliases and missing suffixes before checking containment, and use the
+    // resolved result for writes so the checks and the actual destination agree.
+    let output = resolved_path(output_dir)?;
+    for root in protected {
+        let root = resolved_path(root)?;
+        if output.starts_with(&root) || root.starts_with(&output) {
+            bail!("corpus output must not overlap an input or the resource root");
+        }
+    }
+    if let Ok(metadata) = fs::symlink_metadata(output_dir) {
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!("corpus output must be a regular directory");
+        }
+    }
+    if output.exists() && fs::read_dir(&output)?.next().is_some() {
+        bail!("corpus output directory must be empty");
+    }
+    Ok(output)
+}
+
+fn checked_output_dir(
+    input_dir: &Path,
+    output_dir: &Path,
+    repo_root: &Path,
+) -> Result<(PathBuf, PathBuf)> {
     let input = fs::canonicalize(input_dir).context("resolving DSLX input directory")?;
     if !input.is_dir() {
         bail!("DSLX input must be a directory");
     }
-    let output = if output_dir.exists() {
-        fs::canonicalize(output_dir).context("resolving corpus output directory")?
-    } else {
-        let parent = output_dir
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let name = output_dir
-            .file_name()
-            .context("output dir must name a directory")?;
-        fs::canonicalize(parent)
-            .context("output parent directory must exist")?
-            .join(name)
-    };
-    if output.starts_with(&input) || input.starts_with(&output) {
-        bail!("DSLX input and corpus output directories must not overlap");
-    }
-    if output.exists() && fs::read_dir(&output)?.next().is_some() {
-        bail!("DSLX corpus output directory must be empty");
-    }
+    let output = checked_empty_output(output_dir, &[&input, repo_root])?;
     Ok((input, output))
 }
 
@@ -191,8 +223,18 @@ fn snapshot_sources(input: &Path, output: &Path) -> Result<Vec<SourceFile>> {
     Ok(files)
 }
 
-fn import_args(cmd: &mut Command, source_dir: &Path, opts: &DslxCorpusIngestCli) {
-    let mut paths = vec![source_dir.to_string_lossy().to_string()];
+fn import_args(
+    cmd: &mut Command,
+    source_file: &Path,
+    source_dir: &Path,
+    opts: &DslxCorpusIngestCli,
+) {
+    // Match dslx-list-fns, which resolves imports beside the source file first.
+    let parent = source_file.parent().unwrap_or(source_dir);
+    let mut paths = vec![parent.to_string_lossy().to_string()];
+    if parent != source_dir {
+        paths.push(source_dir.to_string_lossy().to_string());
+    }
     paths.extend(
         opts.dslx_path
             .iter()
@@ -336,7 +378,7 @@ fn collect_cones(
     Ok(())
 }
 
-pub(crate) fn ingest(opts: &DslxCorpusIngestCli) -> Result<IngestSummary> {
+pub(crate) fn ingest(repo_root: &Path, opts: &DslxCorpusIngestCli) -> Result<IngestSummary> {
     if opts.max_files == 0
         || opts.max_functions == 0
         || (!opts.no_mffcs && opts.max_mffcs == 0)
@@ -346,7 +388,7 @@ pub(crate) fn ingest(opts: &DslxCorpusIngestCli) -> Result<IngestSummary> {
     {
         bail!("choose at least one extraction kind and positive work limits");
     }
-    let (input, output) = checked_output_dir(&opts.input_dir, &opts.output_dir)?;
+    let (input, output) = checked_output_dir(&opts.input_dir, &opts.output_dir, repo_root)?;
     let mut version = Command::new(&opts.driver);
     version.arg("--version");
     let version = version
@@ -411,7 +453,7 @@ pub(crate) fn ingest(opts: &DslxCorpusIngestCli) -> Result<IngestSummary> {
             .arg(&input_file)
             .arg("--format")
             .arg("json");
-        import_args(&mut list, &output.join("sources"), opts);
+        import_args(&mut list, &input_file, &output.join("sources"), opts);
         let log = output
             .join("logs")
             .join(format!("{}-list.stderr", sha256(file.as_bytes())));
@@ -459,7 +501,7 @@ pub(crate) fn ingest(opts: &DslxCorpusIngestCli) -> Result<IngestSummary> {
                 .arg(name)
                 .arg("--opt")
                 .arg("true");
-            import_args(&mut convert, &output.join("sources"), opts);
+            import_args(&mut convert, &input_file, &output.join("sources"), opts);
             let log = output.join("logs").join(format!(
                 "{}-convert.stderr",
                 sha256(format!("{file}\0{name}").as_bytes())
@@ -611,13 +653,26 @@ struct ReportSample<'a> {
 }
 
 fn valid_cone_path(path: &str) -> bool {
-    let path = Path::new(path);
-    path.starts_with("cones")
-        && path.extension().is_some_and(|ext| ext == "ir")
-        && path.components().count() == 2
-        && path
-            .components()
-            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    // The suffix becomes both a filesystem filename and a URL. Accept only the
+    // canonical filename spelling emitted by ingestion, without normalization.
+    let Some(stem) = path
+        .strip_prefix("cones/")
+        .and_then(|p| p.strip_suffix(".ir"))
+    else {
+        return false;
+    };
+    let Some((kind, hash)) = stem.split_once('-') else {
+        return false;
+    };
+    let valid_kind = kind == "mffc"
+        || kind
+            .strip_prefix('k')
+            .is_some_and(|k| k.parse::<u32>().is_ok_and(|n| n > 0 && n.to_string() == k));
+    valid_kind
+        && hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn read_jsonl(path: &Path) -> Result<Vec<serde_json::Value>> {
@@ -645,6 +700,90 @@ fn number(row: &serde_json::Value, name: &str) -> Result<f64> {
     Ok(n)
 }
 
+fn matching_field(lhs: &serde_json::Value, rhs: &serde_json::Value, name: &str) -> Result<()> {
+    let value = lhs
+        .get(name)
+        .with_context(|| format!("comparison export missing {name}"))?;
+    if rhs.get(name) != Some(value) {
+        bail!("comparison exports disagree on {name}; refresh the comparison exports");
+    }
+    Ok(())
+}
+
+fn validate_comparison_exports(
+    manifest: &serde_json::Value,
+    statuses: &[serde_json::Value],
+    joined: &[serde_json::Value],
+) -> Result<()> {
+    let manifest_samples = manifest
+        .get("samples")
+        .and_then(|v| v.as_array())
+        .context("comparison manifest is missing samples")?;
+    if manifest_samples != statuses {
+        bail!("comparison manifest and samples disagree; refresh the comparison exports");
+    }
+    let mut completed = BTreeMap::new();
+    for status in statuses {
+        if field(status, "preset")? != field(manifest, "recipe_preset")? {
+            bail!("comparison sample recipe disagrees with manifest");
+        }
+        for name in [
+            "dso_version",
+            "yosys_script",
+            "yosys_script_sha256",
+            "fraig",
+        ] {
+            matching_field(manifest, status, name)?;
+        }
+        for (runtime, version_field) in [
+            ("driver_runtime", "driver_crate_version"),
+            ("stats_runtime", "stats_driver_crate_version"),
+        ] {
+            let version = manifest.get(runtime).and_then(|v| v.get("driver_version"));
+            if version.is_none() || version != status.get(version_field) {
+                bail!("comparison sample runtime disagrees with manifest");
+            }
+        }
+        if field(status, "status")? == "done"
+            && completed
+                .insert(field(status, "sample_id")?, status)
+                .is_some()
+        {
+            bail!("comparison contains duplicate completed samples");
+        }
+    }
+    for row in joined {
+        let status = completed
+            .remove(field(row, "sample_id")?)
+            .context("joined row is duplicate or has no completed sample")?;
+        for name in [
+            "source_relpath",
+            "source_sha256",
+            "top_fn_name",
+            "fraig",
+            "dso_version",
+            "driver_crate_version",
+            "stats_driver_crate_version",
+            "yosys_script",
+            "yosys_script_sha256",
+            "import_ir_action_id",
+            "g8r_aig_action_id",
+            "g8r_abc_aig_action_id",
+            "g8r_stats_action_id",
+            "combo_verilog_action_id",
+            "yosys_abc_aig_action_id",
+            "yosys_abc_stats_action_id",
+            "aig_stat_diff_action_id",
+        ] {
+            matching_field(status, row, name)?;
+        }
+    }
+    if !completed.is_empty() {
+        bail!("joined export omits completed samples; refresh the comparison exports");
+    }
+    Ok(())
+}
+
 const REPORT_STYLE: &str = r#"
 :root { color-scheme: dark; font-family: system-ui, sans-serif; background:#0b1421; color:#e7f3fa; }
 body { max-width:1300px; margin:0 auto; padding:1.5rem; }
@@ -663,10 +802,12 @@ a { color:#7bd4ff; } code { overflow-wrap:anywhere; } .cols { display:grid; grid
 "#;
 
 pub(crate) fn render_report(
+    repo_root: &Path,
     ingest_dir: &Path,
     comparison_dir: &Path,
     output_dir: &Path,
 ) -> Result<ReportSummary> {
+    let output_dir = checked_empty_output(output_dir, &[repo_root, ingest_dir, comparison_dir])?;
     let ingest: IngestManifest =
         serde_json::from_slice(&fs::read(ingest_dir.join("manifest.json"))?)
             .context("reading DSLX ingest manifest")?;
@@ -681,6 +822,7 @@ pub(crate) fn render_report(
     }
     let joined = read_jsonl(&comparison_dir.join("joined/g8r-abc-vs-yabc-aig-diff.jsonl"))?;
     let statuses = read_jsonl(&comparison_dir.join("samples.jsonl"))?;
+    validate_comparison_exports(&comparison, &statuses, &joined)?;
     let is_failed = |row: &&serde_json::Value| {
         matches!(
             row.get("status").and_then(|v| v.as_str()),
@@ -710,9 +852,6 @@ pub(crate) fn render_report(
         {
             bail!("comparison has duplicate sample IDs");
         }
-    }
-    if output_dir.exists() && fs::read_dir(output_dir)?.next().is_some() {
-        bail!("report output directory must be empty");
     }
     let mut linked_ir = BTreeMap::<String, Vec<u8>>::new();
     let mut samples = Vec::new();
@@ -884,6 +1023,161 @@ pub(crate) fn render_report(
 mod tests {
     use super::*;
 
+    fn temp_dir() -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("bvc-dslx-test-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn comparison_fixture(
+        cone_name: &str,
+        digest: &str,
+    ) -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+        let row = serde_json::json!({
+            "sample_id": "one", "source_relpath": cone_name, "source_sha256": digest,
+            "top_fn_name": "cone", "fraig": false, "g8r_and_nodes": 9, "g8r_depth": 3,
+            "yosys_abc_and_nodes": 12, "yosys_abc_depth": 4,
+            "import_ir_action_id": "import", "g8r_aig_action_id": "g8r",
+            "g8r_stats_action_id": "g8r-stats", "yosys_abc_stats_action_id": "yosys-stats",
+            "g8r_abc_aig_action_id": "g8r-abc", "yosys_abc_aig_action_id": "yosys-abc",
+            "combo_verilog_action_id": "combo", "aig_stat_diff_action_id": "diff",
+            "driver_crate_version": "0.1", "stats_driver_crate_version": "0.1", "dso_version": "v0.1",
+            "yosys_script": "flows/yosys_to_aig.ys", "yosys_script_sha256": "script-digest"
+        });
+        let mut status = row.clone();
+        status["status"] = serde_json::json!("done");
+        status["preset"] = serde_json::json!("g8r-abc-vs-yabc-aig-diff");
+        let manifest = serde_json::json!({
+            "recipe_preset": "g8r-abc-vs-yabc-aig-diff", "samples": [status],
+            "fraig": false, "dso_version": "v0.1", "yosys_script": "flows/yosys_to_aig.ys",
+            "yosys_script_sha256": "script-digest", "driver_runtime": {"driver_version": "0.1"},
+            "stats_runtime": {"driver_version": "0.1"}
+        });
+        (manifest, status, row)
+    }
+
+    #[test]
+    fn report_rejects_stale_duplicate_and_incomplete_exports() {
+        let (manifest, status, row) = comparison_fixture("mffc-example.ir", "digest");
+        validate_comparison_exports(&manifest, &[status.clone()], &[row.clone()]).unwrap();
+        for name in [
+            "g8r_abc_aig_action_id",
+            "g8r_stats_action_id",
+            "source_sha256",
+            "driver_crate_version",
+        ] {
+            let mut stale = row.clone();
+            stale[name] = serde_json::json!("old-run");
+            assert!(
+                validate_comparison_exports(&manifest, &[status.clone()], &[stale]).is_err(),
+                "{name}"
+            );
+        }
+        assert!(
+            validate_comparison_exports(&manifest, &[status.clone()], &[row.clone(), row.clone()])
+                .is_err()
+        );
+        assert!(validate_comparison_exports(&manifest, &[status.clone()], &[]).is_err());
+        let mut stale_status = status.clone();
+        stale_status["g8r_abc_aig_action_id"] = serde_json::json!("old-run");
+        assert!(validate_comparison_exports(&manifest, &[stale_status], &[row.clone()]).is_err());
+        let mut stale_manifest = manifest.clone();
+        stale_manifest["driver_runtime"]["driver_version"] = serde_json::json!("old-version");
+        assert!(validate_comparison_exports(&stale_manifest, &[status], &[row]).is_err());
+    }
+
+    #[test]
+    fn cone_paths_must_have_the_canonical_relative_spelling() {
+        let filename = format!("mffc-{}.ir", "a".repeat(64));
+        assert!(valid_cone_path(&format!("cones/{filename}")));
+        for path in [
+            format!("cones//{filename}"),
+            format!("cones/./{filename}"),
+            format!("cones/../{filename}"),
+            format!("cones/dir/{filename}"),
+            format!("cones/\\{filename}"),
+            format!("/cones/{filename}"),
+            format!("cones/{filename}?query"),
+            format!("cones/k0-{}.ir", "a".repeat(64)),
+        ] {
+            assert!(!valid_cone_path(&path), "{path}");
+        }
+    }
+
+    #[test]
+    fn corpus_output_rejects_resource_and_input_overlap_before_writes() {
+        let root = temp_dir();
+        let resource = root.join("resource");
+        let input = root.join("input");
+        fs::create_dir(&resource).unwrap();
+        fs::create_dir(&input).unwrap();
+        for output in [
+            resource.join("corpus"),
+            resource.join("new/nested"),
+            resource.join("new/../report"),
+            input.join("report"),
+            root.clone(),
+        ] {
+            assert!(checked_output_dir(&input, &output, &resource).is_err());
+        }
+        assert_eq!(fs::read_dir(&resource).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&input).unwrap().count(), 0);
+        assert!(checked_output_dir(&input, &root.join("outside/new"), &resource).is_ok());
+        // Rendering must reject before trying to read even a missing manifest.
+        let error = render_report(
+            &resource,
+            &input,
+            &root.join("comparison"),
+            &resource.join("report"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("overlap"));
+        #[cfg(unix)]
+        {
+            let alias = root.join("alias");
+            std::os::unix::fs::symlink(&resource, &alias).unwrap();
+            assert!(checked_output_dir(&input, &alias.join("report"), &resource).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nested_sources_search_sibling_imports_before_corpus_root() {
+        use clap::Parser;
+        let crate::cli::TopCommand::DslxCorpusIngest(opts) = crate::cli::Cli::try_parse_from([
+            "xlsynth-bvc",
+            "dslx-corpus-ingest",
+            "--input-dir",
+            "input",
+            "--output-dir",
+            "output",
+            "--dslx-path",
+            "extra",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("ingest options");
+        };
+        for subcommand in ["dslx-list-fns", "dslx2ir"] {
+            let mut command = driver_command(&opts, subcommand);
+            import_args(
+                &mut command,
+                Path::new("sources/sub/main.x"),
+                Path::new("sources"),
+                &opts,
+            );
+            let args: Vec<_> = command.get_args().collect();
+            let index = args.iter().position(|arg| *arg == "--dslx_path").unwrap();
+            assert_eq!(args[index + 1], "sources/sub;sources;extra");
+        }
+    }
+
     #[test]
     fn report_joins_cone_and_comparison_without_inlining_source_markup() {
         let stamp = std::time::SystemTime::now()
@@ -921,33 +1215,22 @@ mod tests {
             serde_json::to_vec(&ingest).unwrap(),
         )
         .unwrap();
+        let (comparison, status, row) = comparison_fixture(&cone_name, &digest);
         fs::write(
             compare_dir.join("manifest.json"),
-            r#"{"recipe_preset":"g8r-abc-vs-yabc-aig-diff"}"#,
+            serde_json::to_vec(&comparison).unwrap(),
         )
         .unwrap();
-        fs::write(
-            compare_dir.join("samples.jsonl"),
-            format!(
-                "{}\n",
-                serde_json::json!({"sample_id": "one", "source_relpath": cone_name, "status": "done"})
-            ),
-        )
-        .unwrap();
-        let row = serde_json::json!({
-            "sample_id": "one", "source_relpath": cone_name, "source_sha256": digest,
-            "top_fn_name": "cone", "g8r_and_nodes": 9, "g8r_depth": 3,
-            "yosys_abc_and_nodes": 12, "yosys_abc_depth": 4,
-            "g8r_stats_action_id": "g8r-stats", "yosys_abc_stats_action_id": "yosys-stats",
-            "g8r_abc_aig_action_id": "g8r-abc", "yosys_abc_aig_action_id": "yosys-abc",
-            "driver_crate_version": "0.1", "dso_version": "v0.1", "yosys_script_sha256": "script-digest"
-        });
+        fs::write(compare_dir.join("samples.jsonl"), format!("{status}\n")).unwrap();
         fs::write(
             compare_dir.join("joined/g8r-abc-vs-yabc-aig-diff.jsonl"),
             format!("{row}\n"),
         )
         .unwrap();
-        let result = render_report(&ingest_dir, &compare_dir, &output_dir).expect("render report");
+        let resource = root.join("resource");
+        fs::create_dir(&resource).unwrap();
+        let result = render_report(&resource, &ingest_dir, &compare_dir, &output_dir)
+            .expect("render report");
         assert_eq!(result.completed_pairs, 1);
         assert_eq!(
             fs::read(output_dir.join("ir").join(&cone_name)).unwrap(),

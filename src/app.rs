@@ -154,7 +154,7 @@ pub(crate) fn run() -> Result<()> {
     if let TopCommand::DslxCorpusIngest(opts) = &command {
         println!(
             "{}",
-            serde_json::to_string_pretty(&crate::dslx_corpus::ingest(opts)?)?
+            serde_json::to_string_pretty(&crate::dslx_corpus::ingest(&repo_root, opts)?)?
         );
         return Ok(());
     }
@@ -167,6 +167,7 @@ pub(crate) fn run() -> Result<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&crate::dslx_corpus::render_report(
+                &repo_root,
                 ingest_dir,
                 comparison_dir,
                 output_dir,
