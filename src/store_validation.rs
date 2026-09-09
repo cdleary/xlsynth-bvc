@@ -595,6 +595,7 @@ mod tests {
             version: "v0.29.0".to_string(),
             runtime: crate::model::DriverRuntimeSpec {
                 driver_version: "0.25.0".to_string(),
+                source_revision: None,
                 release_platform: "linux-x86_64".to_string(),
                 docker_image: "driver:0.25.0".to_string(),
                 dockerfile: "docker/driver.Dockerfile".to_string(),

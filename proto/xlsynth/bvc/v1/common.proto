@@ -24,6 +24,13 @@ message CrateVersion {
   string value = 1;
 }
 
+// Immutable source identity for an unreleased xlsynth-driver build. Mutable
+// refs such as branch names and HEAD are resolved before this record is made.
+message DriverSourceRevision {
+  string repository = 1;
+  string commit = 2;
+}
+
 // A relative path normalized to "/" separators with no "." or ".." components.
 message NormalizedRelpath {
   string value = 1;
@@ -31,6 +38,8 @@ message NormalizedRelpath {
 
 // Runtime identity for xlsynth-driver-backed actions.
 message DriverRuntimeSpec {
+  // Released crate version, or for a source build the released compatibility
+  // anchor used to select the DSO and execution recipe.
   CrateVersion driver_crate_version = 1;
   string release_platform = 2;
   string docker_image = 3;
@@ -41,6 +50,9 @@ message DriverRuntimeSpec {
   // Digest of the canonical DriverReleaseCacheInputManifest for the DSO used
   // by this action. Cache setup must reproduce this digest before execution.
   Sha256Digest release_cache_input_sha256 = 7;
+  // Present only when the driver executable is built from this exact source
+  // revision instead of the crates.io release named above.
+  DriverSourceRevision source_revision = 8;
 }
 
 // Runtime identity for Yosys/ABC-backed actions.

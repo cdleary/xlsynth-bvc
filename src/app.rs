@@ -42,7 +42,7 @@ use crate::queue_progress::{WatchQueueOptions, watch_interval, watch_queue};
 use crate::runtime::*;
 use crate::service::*;
 use crate::site::{
-    BuildStaticSiteOptions, build_static_site_with_protected_roots, smoke_static_site,
+    BuildStaticSiteOptions, build_static_site_with_candidate_runs, smoke_static_site,
     verify_static_site,
 };
 use crate::sled_space::analyze_sled_space;
@@ -355,11 +355,12 @@ pub(crate) fn run() -> Result<()> {
     if let TopCommand::BuildStaticSite {
         snapshot_dir,
         out_dir,
+        candidate_run_dirs,
         base_url,
         overwrite,
     } = &command
     {
-        let summary = build_static_site_with_protected_roots(
+        let summary = build_static_site_with_candidate_runs(
             &BuildStaticSiteOptions {
                 snapshot_dir: snapshot_dir.clone(),
                 out_dir: out_dir.clone(),
@@ -371,6 +372,7 @@ pub(crate) fn run() -> Result<()> {
                 ("private store", store_dir.as_path()),
                 ("artifact database", artifacts_via_sled.as_path()),
             ],
+            candidate_run_dirs,
         )?;
         println!(
             "{}",
@@ -3576,6 +3578,7 @@ mod tests {
     fn test_runtime() -> DriverRuntimeSpec {
         DriverRuntimeSpec {
             driver_version: "0.34.0".to_string(),
+            source_revision: None,
             release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: default_driver_image("0.34.0"),
             dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),

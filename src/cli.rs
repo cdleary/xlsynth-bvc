@@ -270,6 +270,10 @@ pub enum TopCommand {
         snapshot_dir: PathBuf,
         #[arg(long, value_name = "DIR")]
         out_dir: PathBuf,
+        /// Completed fixed-IR Git candidate run to include in the progression view.
+        /// May be repeated to render more than one evaluated commit.
+        #[arg(long = "candidate-run-dir", value_name = "DIR")]
+        candidate_run_dirs: Vec<PathBuf>,
         #[arg(long, default_value = "/")]
         base_url: String,
         #[arg(long)]
@@ -441,10 +445,11 @@ impl ExplicitBool {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CorpusRecipePreset {
     G8rVsYabcAigDiff,
     G8rVsYabcNoFraigAigDiff,
+    G8rAbcStats,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -640,10 +645,17 @@ pub struct DriverCli {
         help = "Driver crate version (e.g. 0.29.0) or `latest`; defaults to latest compatible for the requested xlsynth version from generated_version_compat.json"
     )]
     pub(crate) driver_version: Option<String>,
+    #[arg(
+        long,
+        value_name = "FULL_SHA",
+        conflicts_with = "driver_version",
+        help = "Build xlsynth-driver from this exact 40-character xlsynth-crate Git commit"
+    )]
+    pub(crate) driver_git_commit: Option<String>,
     #[arg(long, default_value = crate::DEFAULT_RELEASE_PLATFORM)]
     pub(crate) release_platform: String,
-    #[arg(long, default_value = crate::DEFAULT_DOCKERFILE)]
-    pub(crate) dockerfile: PathBuf,
+    #[arg(long)]
+    pub(crate) dockerfile: Option<PathBuf>,
     #[arg(long)]
     pub(crate) docker_image: Option<String>,
 }

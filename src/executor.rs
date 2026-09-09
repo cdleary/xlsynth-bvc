@@ -5717,6 +5717,7 @@ mod tests {
     fn execution_canonicalizes_the_same_paths_used_for_action_identity() {
         let runtime = DriverRuntimeSpec {
             driver_version: "0.31.0".to_string(),
+            source_revision: None,
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             dockerfile: "docker\\xlsynth-driver.Dockerfile".to_string(),
@@ -5751,6 +5752,7 @@ mod tests {
     fn corrected_historical_ir2g8r_recipe_has_a_distinct_action_identity() {
         let runtime = DriverRuntimeSpec {
             driver_version: "0.25.0".to_string(),
+            source_revision: None,
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.25.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
@@ -6265,6 +6267,7 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
         };
         let runtime = DriverRuntimeSpec {
             driver_version: "0.31.0".to_string(),
+            source_revision: None,
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
@@ -6349,6 +6352,7 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
         };
         let runtime = DriverRuntimeSpec {
             driver_version: "0.46.0".to_string(),
+            source_revision: None,
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.46.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
@@ -6404,6 +6408,7 @@ top fn cone(leaf_2: bits[8] id=1) -> bits[1] {
     fn build_opt_ir_aig_equiv_suggestions_targets_both_fraig_variants() {
         let runtime = DriverRuntimeSpec {
             driver_version: "0.31.0".to_string(),
+            source_revision: None,
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.31.0".to_string(),
             docker_image_id: "e".repeat(64),

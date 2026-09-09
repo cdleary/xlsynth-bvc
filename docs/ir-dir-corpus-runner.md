@@ -38,12 +38,14 @@ Current supported flags:
 - `--input-dir <dir>`
 - `--output-dir <dir>`
 - `--execution-mode enqueue|run`
-- `--recipe-preset g8r-vs-yabc-aig-diff|g8r-vs-yabc-no-fraig-aig-diff`
+- `--recipe-preset g8r-vs-yabc-aig-diff|g8r-vs-yabc-no-fraig-aig-diff|g8r-abc-stats`
 - `--top-fn-policy infer-single-package|explicit|from-filename`
 - `--top-fn-name <name>` when policy is `explicit`
 - `--fraig`
 - `--version <dso:vX.Y.Z input via existing --version flag>`
-- `--driver-version <crate:vA.B.C input via existing --driver-version flag>`
+- `--driver-version <crate:vA.B.C input via existing --driver-version flag>` for released drivers
+- `--driver-git-commit <full-lowercase-40-hex>` for an exact canonical source revision; conflicts
+  with `--driver-version`
 - `--yosys-script <path>` when explicitly provided must match the selected preset's canonical
   script
 - `--priority <n>` when enqueueing
@@ -67,6 +69,8 @@ Public outputs are written directly into `OUTPUT_DIR/`:
 - `joined/g8r-vs-yabc-aig-diff.jsonl`
 - `joined/g8r-vs-yabc-no-fraig-aig-diff.csv`
 - `joined/g8r-vs-yabc-no-fraig-aig-diff.jsonl`
+- `joined/g8r-abc-stats.csv`
+- `joined/g8r-abc-stats.jsonl`
 - `artifacts/<sample_id>/...` for copied leaf outputs when available
 
 The summary JSON includes the exact `--store-dir` and `--artifacts-via-sled` paths for the
@@ -113,8 +117,9 @@ Current presets:
 
 - `g8r-vs-yabc-aig-diff`
 - `g8r-vs-yabc-no-fraig-aig-diff`
+- `g8r-abc-stats`
 
-Expansion per sample:
+The two diagnostic comparison presets expand each sample as:
 
 1. `ImportIrPackageFile`
 1. `DriverIrToG8rAig`
@@ -124,11 +129,23 @@ Expansion per sample:
 1. `DriverAigToStats`
 1. `AigStatDiff`
 
-The two presets intentionally use the same action graph shape and differ only in the Yosys/ABC
-script used by `ComboVerilogToYosysAbcAig`:
+They use the same action graph shape and differ only in the Yosys/ABC script used by
+`ComboVerilogToYosysAbcAig`:
 
 - `g8r-vs-yabc-aig-diff` uses `flows/yosys_to_aig.ys`
 - `g8r-vs-yabc-no-fraig-aig-diff` uses `flows/abc_ablate_no_fraig.ys`
+
+The generation-candidate preset deliberately schedules only the comparable G8r path:
+
+1. `ImportIrPackageFile`
+1. `DriverIrToG8rAig` with `frontend_no_prep_rewrite` and `fraig=false`
+1. `AigToYosysAbcAig` using `flows/yosys_to_aig.ys`
+1. `DriverAigToStats` using the latest-release stats runtime
+
+This makes G8r implementation revision the intended variable; DSO, lowering mode, ABC, stats,
+and recipe revision remain explicit and common. Candidate input bytes are pinned by their digests,
+and comparison to the release baseline is paired by canonical structural hash. No codegen+Yosys
+leg or branch diff is planned for `g8r-abc-stats`.
 
 For symmetry with the rest of the repo, the preset should write `yosys/abc` in data keys
 and docs, but `yabc` is a reasonable shorthand in CLI preset names and output filenames.
@@ -146,6 +163,68 @@ cargo run --bin xlsynth_bvc -- \
   --version v0.39.0 \
   --driver-version 0.34.0
 ```
+
+## Exact Git Candidate Workflow
+
+Refresh the checked-in repository observation, then pass the resolved full commit rather than a
+mutable branch name:
+
+```bash
+python3 scripts/sync_version_compat.py --update
+candidate_commit="$(jq -r '.head_commit' \
+  third_party/xlsynth-crate/repository_head_observation.json)"
+cargo run --bin xlsynth_bvc -- \
+  run-ir-dir-corpus \
+  --input-dir /tmp/xlsynth-bvc-fixed-ir-history-20260903/corpus \
+  --output-dir /tmp/xlsynth-bvc-mainline-candidate \
+  --execution-mode enqueue \
+  --recipe-preset g8r-abc-stats \
+  --top-fn-policy infer-single-package \
+  --version v0.54.7 \
+  --driver-git-commit "${candidate_commit}" \
+  --scheduling-policy release-progression-ir-v1
+```
+
+The source image checks out exactly that commit, generates a lockfile when the source repository
+does not carry one, installs with `cargo install --locked`, and retains the resolved lockfile digest
+inside the immutable image. The runtime fingerprint binds source kind, canonical repository, commit,
+explicit source-build recipe revision, Dockerfile digest, release-cache input digest, and platform.
+The built image must carry matching fingerprint, repository, commit, and recipe labels before it may
+execute; actions then bind the immutable OCI image ID.
+
+For the policy-validated fixed cohort, `manifest.json.candidate_run` records a deterministic run ID,
+`requested_ref=main` only when the exact commit matches the checked-in observation, observation
+time, candidate commit, baseline release version/tag/commit, explicit DSO, exact source-driver,
+common ABC, and stats runtimes, execution recipe, cohort count/digest, and planned/reused/new action
+counts. The run ID also binds the exact Yosys script path/digest and an immutable digest of every
+sample's planned action graph. The observation time and requested ref are excluded from it.
+
+Before any IR import or queue mutation, that immutable candidate identity is also written
+atomically to `.bvc/bvc-artifacts/corpus/corpus-candidate-run.json`. If a process stops before it
+can publish `manifest.json`, the next invocation recovers the captured release baseline from this
+durable marker before resolving or binding the source-driver image. A conflicting candidate,
+baseline, or runtime is rejected and must use a new output directory.
+Candidate preflight also requires the canonical public source-driver, released stats-driver, and
+Yosys/ABC runtime identifiers, so an unpublishable runtime override fails before any work is queued.
+`manifest.json` itself is replaced atomically. Status refresh and site generation both refuse a
+candidate manifest whose identity is missing from or disagrees with the durable marker.
+
+After all candidate samples are complete, include the typed run in a local static site:
+
+```bash
+cargo run --bin xlsynth_bvc -- \
+  build-static-site \
+  --snapshot-dir /path/to/current/snapshot \
+  --out-dir /tmp/xlsynth-bvc-candidate-site \
+  --candidate-run-dir /tmp/xlsynth-bvc-mainline-candidate
+```
+
+The option is repeatable. Rendering rejects partial, mismatched, or noncanonical candidate data;
+the captured release generation, DSO, fixed structural hashes, source-byte digests, reconstructed
+action IDs, common Yosys/ABC script/runtime, and released stats runtime must all match. Candidate
+metrics are loaded from the canonical candidate store and must match their provenance-declared
+byte digest. A valid Git generation is dated by commit time and defaults to a direct post-ABC G8r
+product comparison against its captured release.
 
 ## Scheduling Policies
 

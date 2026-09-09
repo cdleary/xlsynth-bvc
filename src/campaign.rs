@@ -412,6 +412,7 @@ fn same_driver_runtime_recipe(
     rhs: &crate::model::DriverRuntimeSpec,
 ) -> bool {
     lhs.driver_version == rhs.driver_version
+        && lhs.source_revision == rhs.source_revision
         && lhs.release_platform == rhs.release_platform
         && lhs.docker_image == rhs.docker_image
         && lhs.dockerfile == rhs.dockerfile
@@ -2018,6 +2019,7 @@ mod tests {
         store.ensure_layout().expect("layout");
         let runtime = crate::model::DriverRuntimeSpec {
             driver_version: "0.25.0".to_string(),
+            source_revision: None,
             release_platform: "ubuntu2004".to_string(),
             docker_image: "test-driver:0.25.0".to_string(),
             dockerfile: "docker/test.Dockerfile".to_string(),

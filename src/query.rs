@@ -87,8 +87,9 @@ pub(crate) fn build_stdlib_fns_trend_dataset(
             ActionSpec::DriverAigToStats {
                 aig_action_id,
                 version,
+                runtime,
                 ..
-            } => (
+            } if runtime.source_revision.is_none() => (
                 aig_action_id.as_str(),
                 normalize_tag_version(version).to_string(),
             ),
@@ -338,9 +339,13 @@ pub(crate) fn build_stdlib_fn_version_timeline_dataset(
         if let ActionSpec::DriverAigToStats {
             aig_action_id,
             version,
+            runtime,
             ..
         } = &provenance.action
         {
+            if runtime.source_revision.is_some() {
+                continue;
+            }
             let stats_dso_version = normalize_tag_version(version).to_string();
             let mut source_ctx_and_kind: Option<(StdlibTrendSourceContext, bool)> = None;
             if let Some(source_ctx) = extract_stdlib_trend_source_context(
@@ -428,6 +433,9 @@ pub(crate) fn build_stdlib_fn_version_timeline_dataset(
         else {
             continue;
         };
+        if runtime.source_revision.is_some() {
+            continue;
+        }
         if !action_delay_model.eq_ignore_ascii_case(&delay_model) {
             continue;
         }
@@ -546,8 +554,9 @@ pub(crate) fn build_stdlib_g8r_vs_yosys_dataset(
             ActionSpec::DriverAigToStats {
                 aig_action_id,
                 version,
+                runtime,
                 ..
-            } => (
+            } if runtime.source_revision.is_none() => (
                 aig_action_id.as_str(),
                 normalize_tag_version(version).to_string(),
             ),
@@ -3251,8 +3260,9 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
             ActionSpec::DriverAigToStats {
                 aig_action_id,
                 version,
+                runtime,
                 ..
-            } => (
+            } if runtime.source_revision.is_none() => (
                 aig_action_id.as_str(),
                 normalize_tag_version(version).to_string(),
             ),
@@ -3447,7 +3457,10 @@ fn extract_ir_fn_corpus_g8r_abc_vs_codegen_source_context(
             else {
                 return None;
             };
-            if *fraig || *lowering_mode != G8rLoweringMode::FrontendNoPrepRewrite {
+            if runtime.source_revision.is_some()
+                || *fraig
+                || *lowering_mode != G8rLoweringMode::FrontendNoPrepRewrite
+            {
                 return None;
             }
             let structural_hash_hint = structural_hash_from_details(&g8r_provenance.details)
@@ -3489,6 +3502,9 @@ fn extract_ir_fn_corpus_g8r_abc_vs_codegen_source_context(
             else {
                 return None;
             };
+            if runtime.source_revision.is_some() {
+                return None;
+            }
             let structural_hash_hint = structural_hash_from_details(&verilog_provenance.details)
                 .or_else(|| structural_hash_from_details(&producer.details));
             Some((
@@ -3562,8 +3578,9 @@ pub(crate) fn build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_build_state_with_s
             ActionSpec::DriverAigToStats {
                 aig_action_id,
                 version,
+                runtime,
                 ..
-            } => (
+            } if runtime.source_revision.is_none() => (
                 aig_action_id.as_str(),
                 normalize_tag_version(version).to_string(),
             ),
@@ -3693,11 +3710,15 @@ fn compute_ir_fn_corpus_stats_upsert_point(
     let ActionSpec::DriverAigToStats {
         aig_action_id,
         version,
+        runtime,
         ..
     } = &stats_provenance.action
     else {
         return Ok(None);
     };
+    if runtime.source_revision.is_some() {
+        return Ok(None);
+    }
     let stats_path = store.resolve_artifact_ref_path(&stats_provenance.output_artifact);
     let stats_text = match fs::read_to_string(&stats_path) {
         Ok(v) => v,
@@ -3732,7 +3753,10 @@ fn compute_ir_fn_corpus_stats_upsert_point(
                 runtime,
                 ..
             } => {
-                if *fraig || *lowering_mode != G8rLoweringMode::Default {
+                if runtime.source_revision.is_some()
+                    || *fraig
+                    || *lowering_mode != G8rLoweringMode::Default
+                {
                     return Ok(None);
                 }
                 (
@@ -3770,6 +3794,9 @@ fn compute_ir_fn_corpus_stats_upsert_point(
                 else {
                     return Ok(None);
                 };
+                if runtime.source_revision.is_some() {
+                    return Ok(None);
+                }
                 (
                     IrFnCorpusStatsSourceKind::YosysAbc,
                     ir_action_id.clone(),
@@ -3895,11 +3922,15 @@ fn compute_ir_fn_corpus_g8r_abc_vs_codegen_stats_upsert_point(
     let ActionSpec::DriverAigToStats {
         aig_action_id,
         version,
+        runtime,
         ..
     } = &stats_provenance.action
     else {
         return Ok(None);
     };
+    if runtime.source_revision.is_some() {
+        return Ok(None);
+    }
     let stats_path = store.resolve_artifact_ref_path(&stats_provenance.output_artifact);
     let stats_text = match fs::read_to_string(&stats_path) {
         Ok(v) => v,
@@ -3946,7 +3977,10 @@ fn compute_ir_fn_corpus_g8r_abc_vs_codegen_stats_upsert_point(
                 else {
                     return Ok(None);
                 };
-                if *fraig || *lowering_mode != G8rLoweringMode::FrontendNoPrepRewrite {
+                if runtime.source_revision.is_some()
+                    || *fraig
+                    || *lowering_mode != G8rLoweringMode::FrontendNoPrepRewrite
+                {
                     return Ok(None);
                 }
                 (
@@ -3985,6 +4019,9 @@ fn compute_ir_fn_corpus_g8r_abc_vs_codegen_stats_upsert_point(
                 else {
                     return Ok(None);
                 };
+                if runtime.source_revision.is_some() {
+                    return Ok(None);
+                }
                 (
                     IrFnCorpusStatsSourceKind::YosysAbc,
                     ir_action_id.clone(),
@@ -5883,7 +5920,10 @@ pub(crate) fn extract_stdlib_trend_source_context(
                 ..
             },
         ) => {
-            if *producer_fraig != fraig || *lowering_mode != G8rLoweringMode::Default {
+            if runtime.source_revision.is_some()
+                || *producer_fraig != fraig
+                || *lowering_mode != G8rLoweringMode::Default
+            {
                 return None;
             }
             Some(StdlibTrendSourceContext {
@@ -5922,6 +5962,9 @@ pub(crate) fn extract_stdlib_trend_source_context(
             else {
                 return None;
             };
+            if runtime.source_revision.is_some() {
+                return None;
+            }
             Some(StdlibTrendSourceContext {
                 ir_action_id: ir_action_id.clone(),
                 ir_top: top_fn_name.clone().or_else(|| {
@@ -6488,9 +6531,13 @@ fn build_stdlib_fn_timeline_index_file(store: &ArtifactStore) -> Result<StdlibFn
         if let ActionSpec::DriverAigToStats {
             aig_action_id,
             version,
+            runtime,
             ..
         } = &provenance.action
         {
+            if runtime.source_revision.is_some() {
+                continue;
+            }
             let stats_dso_version = normalize_tag_version(version).to_string();
             let mut source_ctx_and_kind: Option<(StdlibTrendSourceContext, Option<bool>)> = None;
             if let Some(source_ctx) = extract_stdlib_trend_source_context(
@@ -6601,6 +6648,9 @@ fn build_stdlib_fn_timeline_index_file(store: &ArtifactStore) -> Result<StdlibFn
         else {
             continue;
         };
+        if runtime.source_revision.is_some() {
+            continue;
+        }
         let Some((dslx_file, dslx_fn_name)) =
             resolve_direct_dslx_origin_from_opt_ir_action(&provenance_by_action_id, ir_action_id)
         else {
@@ -8539,6 +8589,7 @@ pub(crate) fn action_driver_version(action: &ActionSpec) -> Option<&str> {
             discovery_runtime, ..
         } => discovery_runtime
             .as_ref()
+            .filter(|runtime| runtime.source_revision.is_none())
             .map(|runtime| runtime.driver_version.as_str()),
         ActionSpec::DriverDslxFnToIr { runtime, .. }
         | ActionSpec::DriverIrToOpt { runtime, .. }
@@ -8549,7 +8600,10 @@ pub(crate) fn action_driver_version(action: &ActionSpec) -> Option<&str> {
         | ActionSpec::IrFnToCombinationalVerilog { runtime, .. }
         | ActionSpec::IrFnToKBoolConeCorpus { runtime, .. }
         | ActionSpec::IrFnToMffcCorpus { runtime, .. }
-        | ActionSpec::DriverAigToStats { runtime, .. } => Some(runtime.driver_version.as_str()),
+        | ActionSpec::DriverAigToStats { runtime, .. } => runtime
+            .source_revision
+            .is_none()
+            .then_some(runtime.driver_version.as_str()),
         ActionSpec::ComboVerilogToYosysAbcAig { .. }
         | ActionSpec::AigToYosysAbcAig { .. }
         | ActionSpec::AigStatDiff { .. } => None,
@@ -8581,6 +8635,73 @@ pub(crate) fn fallback_crate_for_dso(
     compat_by_dso.get(&dso).and_then(|v| v.first().cloned())
 }
 
+fn action_has_source_driver_revision(action: &ActionSpec) -> bool {
+    match action {
+        ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+            discovery_runtime, ..
+        }
+        | ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
+            discovery_runtime, ..
+        } => discovery_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.source_revision.is_some()),
+        ActionSpec::DriverDslxFnToIr { runtime, .. }
+        | ActionSpec::DriverIrToOpt { runtime, .. }
+        | ActionSpec::DriverIrToDelayInfo { runtime, .. }
+        | ActionSpec::DriverIrEquiv { runtime, .. }
+        | ActionSpec::DriverIrAigEquiv { runtime, .. }
+        | ActionSpec::DriverIrToG8rAig { runtime, .. }
+        | ActionSpec::IrFnToCombinationalVerilog { runtime, .. }
+        | ActionSpec::IrFnToKBoolConeCorpus { runtime, .. }
+        | ActionSpec::IrFnToMffcCorpus { runtime, .. }
+        | ActionSpec::DriverAigToStats { runtime, .. } => runtime.source_revision.is_some(),
+        _ => false,
+    }
+}
+
+fn action_has_source_driver_lineage_with_lookup(
+    action: &ActionSpec,
+    provenance_by_action_id: &BTreeMap<&str, &Provenance>,
+) -> bool {
+    fn visit(
+        action: &ActionSpec,
+        provenance_by_action_id: &BTreeMap<&str, &Provenance>,
+        visited: &mut BTreeSet<String>,
+    ) -> bool {
+        if action_has_source_driver_revision(action) {
+            return true;
+        }
+        let dependency_action_ids: Vec<&str> = match action {
+            ActionSpec::DriverAigToStats { aig_action_id, .. }
+            | ActionSpec::AigToYosysAbcAig { aig_action_id, .. } => {
+                vec![aig_action_id.as_str()]
+            }
+            ActionSpec::ComboVerilogToYosysAbcAig {
+                verilog_action_id, ..
+            } => vec![verilog_action_id.as_str()],
+            ActionSpec::AigStatDiff {
+                g8r_aig_stats_action_id,
+                yosys_abc_aig_stats_action_id,
+                ..
+            } => vec![
+                g8r_aig_stats_action_id.as_str(),
+                yosys_abc_aig_stats_action_id.as_str(),
+            ],
+            _ => Vec::new(),
+        };
+        dependency_action_ids.into_iter().any(|action_id| {
+            visited.insert(action_id.to_string())
+                && provenance_by_action_id
+                    .get(action_id)
+                    .is_some_and(|provenance| {
+                        visit(&provenance.action, provenance_by_action_id, visited)
+                    })
+        })
+    }
+
+    visit(action, provenance_by_action_id, &mut BTreeSet::new())
+}
+
 fn infer_crate_version_for_action_with_lookup(
     action: &ActionSpec,
     compat_by_dso: &BTreeMap<String, Vec<String>>,
@@ -8610,16 +8731,23 @@ fn infer_crate_version_for_action_with_lookup(
         inferred
     }
 
+    if action_has_source_driver_lineage_with_lookup(action, provenance_by_action_id) {
+        return None;
+    }
+
     if let ActionSpec::DriverAigToStats {
         aig_action_id,
         runtime,
         ..
     } = action
     {
-        if let Some(v) =
-            infer_by_action_id(aig_action_id, compat_by_dso, provenance_by_action_id, cache)
-        {
-            return Some(v);
+        if provenance_by_action_id.contains_key(aig_action_id.as_str()) {
+            return infer_by_action_id(
+                aig_action_id,
+                compat_by_dso,
+                provenance_by_action_id,
+                cache,
+            );
         }
         return Some(runtime.driver_version.clone());
     }
@@ -8667,7 +8795,12 @@ fn infer_crate_version_for_provenance_with_lookup(
     if let Some(v) = cache.get(provenance.action_id.as_str()) {
         return v.clone();
     }
-    let inferred = if let Some(v) = infer_crate_version_for_action_with_lookup(
+    let inferred = if action_has_source_driver_lineage_with_lookup(
+        &provenance.action,
+        provenance_by_action_id,
+    ) {
+        None
+    } else if let Some(v) = infer_crate_version_for_action_with_lookup(
         &provenance.action,
         compat_by_dso,
         provenance_by_action_id,
@@ -8690,17 +8823,18 @@ pub(crate) fn infer_crate_version_for_action(
     action: &ActionSpec,
     compat_by_dso: &BTreeMap<String, Vec<String>>,
 ) -> Option<String> {
+    if action_has_source_driver_lineage(store, action) {
+        return None;
+    }
+
     if let ActionSpec::DriverAigToStats {
         aig_action_id,
         runtime,
         ..
     } = action
     {
-        if let Ok(provenance) = store.load_provenance(aig_action_id)
-            && let Some(v) =
-                infer_crate_version_for_action(store, &provenance.action, compat_by_dso)
-        {
-            return Some(v);
+        if let Ok(provenance) = store.load_provenance(aig_action_id) {
+            return infer_crate_version_for_action(store, &provenance.action, compat_by_dso);
         }
         return Some(runtime.driver_version.clone());
     }
@@ -8714,6 +8848,7 @@ pub(crate) fn infer_crate_version_for_action(
         } => infer_verilog_driver_context(store, verilog_action_id)
             .ok()
             .flatten()
+            .filter(|ctx| ctx.runtime.source_revision.is_none())
             .map(|ctx| ctx.runtime.driver_version),
         ActionSpec::AigToYosysAbcAig { aig_action_id, .. } => {
             if let Ok(provenance) = store.load_provenance(aig_action_id) {
@@ -8741,11 +8876,56 @@ pub(crate) fn infer_crate_version_for_action(
     }
 }
 
+fn load_known_action_spec_for_lineage(
+    store: &ArtifactStore,
+    action_id: &str,
+) -> Option<ActionSpec> {
+    load_action_detail_records(store, action_id)
+        .ok()
+        .and_then(|records| action_spec_from_records(&records).cloned())
+}
+
+fn action_has_source_driver_lineage(store: &ArtifactStore, action: &ActionSpec) -> bool {
+    fn visit(store: &ArtifactStore, action: &ActionSpec, visited: &mut BTreeSet<String>) -> bool {
+        if action_has_source_driver_revision(action) {
+            return true;
+        }
+        let dependency_action_ids: Vec<&str> = match action {
+            ActionSpec::DriverAigToStats { aig_action_id, .. }
+            | ActionSpec::AigToYosysAbcAig { aig_action_id, .. } => {
+                vec![aig_action_id.as_str()]
+            }
+            ActionSpec::ComboVerilogToYosysAbcAig {
+                verilog_action_id, ..
+            } => vec![verilog_action_id.as_str()],
+            ActionSpec::AigStatDiff {
+                g8r_aig_stats_action_id,
+                yosys_abc_aig_stats_action_id,
+                ..
+            } => vec![
+                g8r_aig_stats_action_id.as_str(),
+                yosys_abc_aig_stats_action_id.as_str(),
+            ],
+            _ => Vec::new(),
+        };
+        dependency_action_ids.into_iter().any(|action_id| {
+            visited.insert(action_id.to_string())
+                && load_known_action_spec_for_lineage(store, action_id)
+                    .is_some_and(|dependency| visit(store, &dependency, visited))
+        })
+    }
+
+    visit(store, action, &mut BTreeSet::new())
+}
+
 pub(crate) fn classify_crate_version_inference_miss(
     store: &ArtifactStore,
     action: &ActionSpec,
     compat_by_dso: &BTreeMap<String, Vec<String>>,
 ) -> CrateVersionInferenceMissReason {
+    if action_has_source_driver_lineage(store, action) {
+        return CrateVersionInferenceMissReason::SourceRevision;
+    }
     if action_driver_version(action).is_some() {
         return CrateVersionInferenceMissReason::InvariantDriverVersionPresent;
     }
@@ -9062,6 +9242,7 @@ mod tests {
     fn test_runtime() -> DriverRuntimeSpec {
         DriverRuntimeSpec {
             driver_version: "0.31.0".to_string(),
+            source_revision: None,
             release_platform: "x64-linux".to_string(),
             docker_image: "ubuntu:24.04".to_string(),
             dockerfile: "FROM ubuntu:24.04".to_string(),
@@ -9513,6 +9694,207 @@ mod tests {
         action_id
     }
 
+    #[test]
+    fn source_revision_actions_are_not_attributed_to_release_crate_versions() {
+        let (store, root) = make_test_store("source-revision-release-attribution");
+        let mut source_runtime = test_runtime();
+        source_runtime.source_revision = Some(crate::model::DriverSourceRevision {
+            repository: crate::XLSYNTH_CRATE_GIT_REPOSITORY.to_string(),
+            commit: "a".repeat(40),
+        });
+        let source_g8r = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: "1".repeat(64),
+            top_fn_name: Some("main".to_string()),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
+            version: "0.35.0".to_string(),
+            runtime: source_runtime,
+        };
+        let compat_by_dso = BTreeMap::from([("0.35.0".to_string(), vec!["0.31.0".to_string()])]);
+
+        assert_eq!(action_driver_version(&source_g8r), None);
+        assert_eq!(
+            infer_crate_version_for_action(&store, &source_g8r, &compat_by_dso),
+            None,
+            "DSO compatibility must not relabel a Git-source action as a release"
+        );
+        assert_eq!(
+            classify_crate_version_inference_miss(&store, &source_g8r, &compat_by_dso),
+            CrateVersionInferenceMissReason::SourceRevision,
+        );
+
+        let mut queued_source_g8r = source_g8r.clone();
+        if let ActionSpec::DriverIrToG8rAig { ir_action_id, .. } = &mut queued_source_g8r {
+            *ir_action_id = "4".repeat(64);
+        }
+        let queued_source_g8r_id =
+            enqueue_action(&store, queued_source_g8r).expect("enqueue source-revision G8r action");
+        let queued_abc = ActionSpec::AigToYosysAbcAig {
+            aig_action_id: queued_source_g8r_id.clone(),
+            yosys_script_ref: ScriptRef {
+                path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
+                sha256: "0".repeat(64),
+            },
+            runtime: crate::runtime::test_yosys_runtime(),
+        };
+        let queued_abc_id = enqueue_action(&store, queued_abc.clone())
+            .expect("enqueue ABC action with source-revision lineage");
+        let queued_stats = ActionSpec::DriverAigToStats {
+            aig_action_id: queued_abc_id.clone(),
+            version: "0.35.0".to_string(),
+            runtime: test_runtime(),
+        };
+        enqueue_action(&store, queued_stats.clone()).expect("enqueue released stats action");
+        assert_eq!(
+            infer_crate_version_for_action(&store, &queued_stats, &compat_by_dso),
+            None,
+            "pending source-derived actions must not be attributed to a release",
+        );
+
+        write_canceled_record(
+            &store,
+            &queued_abc_id,
+            Utc::now(),
+            queued_abc,
+            "test-worker",
+            &queued_source_g8r_id,
+            &queued_source_g8r_id,
+            "synthetic dependency cancellation",
+        )
+        .expect("write canceled ABC action");
+        fs::remove_file(store.pending_queue_path(&queued_abc_id))
+            .expect("remove superseded pending ABC action");
+        assert_eq!(
+            infer_crate_version_for_action(&store, &queued_stats, &compat_by_dso),
+            None,
+            "canceled source-derived actions must not be attributed to a release",
+        );
+
+        let source_g8r_id = materialize_test_provenance(
+            &store,
+            "source-g8r",
+            source_g8r,
+            ArtifactType::AigFile,
+            "payload/source.aig",
+        );
+        let released_stats = ActionSpec::DriverAigToStats {
+            aig_action_id: source_g8r_id.clone(),
+            version: "0.35.0".to_string(),
+            runtime: test_runtime(),
+        };
+        assert_eq!(
+            infer_crate_version_for_action(&store, &released_stats, &compat_by_dso),
+            None,
+            "released stats tooling must preserve the source identity of its input"
+        );
+        assert_eq!(
+            classify_crate_version_inference_miss(&store, &released_stats, &compat_by_dso),
+            CrateVersionInferenceMissReason::SourceRevision,
+        );
+
+        let source_stats_id = materialize_test_provenance(
+            &store,
+            "source-stats",
+            released_stats.clone(),
+            ArtifactType::AigStatsFile,
+            "payload/source-stats.json",
+        );
+        let released_g8r = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: "2".repeat(64),
+            top_fn_name: Some("main".to_string()),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: 0,
+            version: "0.35.0".to_string(),
+            runtime: test_runtime(),
+        };
+        let released_g8r_id = materialize_test_provenance(
+            &store,
+            "released-g8r",
+            released_g8r,
+            ArtifactType::AigFile,
+            "payload/released.aig",
+        );
+        let release_stats = ActionSpec::DriverAigToStats {
+            aig_action_id: released_g8r_id,
+            version: "0.35.0".to_string(),
+            runtime: test_runtime(),
+        };
+        let release_stats_id = materialize_test_provenance(
+            &store,
+            "release-stats",
+            release_stats,
+            ArtifactType::AigStatsFile,
+            "payload/release-stats.json",
+        );
+        let mixed_diff = ActionSpec::AigStatDiff {
+            opt_ir_action_id: "3".repeat(64),
+            g8r_aig_stats_action_id: source_stats_id,
+            yosys_abc_aig_stats_action_id: release_stats_id,
+        };
+        assert_eq!(
+            infer_crate_version_for_action(&store, &mixed_diff, &compat_by_dso),
+            None,
+            "mixed source/release diffs must retain source lineage",
+        );
+        assert_eq!(
+            classify_crate_version_inference_miss(&store, &mixed_diff, &compat_by_dso),
+            CrateVersionInferenceMissReason::SourceRevision,
+        );
+
+        let mut source_provenance = store
+            .load_provenance(&source_g8r_id)
+            .expect("load source provenance");
+        source_provenance.suggested_next_actions = vec![SuggestedAction {
+            reason: "compute stats".to_string(),
+            action_id: compute_action_id(&released_stats).expect("stats action id"),
+            action: released_stats.clone(),
+        }];
+        store
+            .write_provenance(&source_provenance)
+            .expect("write source provenance with suggestion");
+
+        let provenances = store.list_provenances_shared().expect("list provenance");
+        let provenance_by_action_id: BTreeMap<&str, &Provenance> = provenances
+            .iter()
+            .map(|provenance| (provenance.action_id.as_str(), provenance))
+            .collect();
+        assert_eq!(
+            infer_crate_version_for_action_with_lookup(
+                &released_stats,
+                &compat_by_dso,
+                &provenance_by_action_id,
+                &mut BTreeMap::new(),
+            ),
+            None,
+        );
+        assert_eq!(
+            infer_crate_version_for_action_with_lookup(
+                &mixed_diff,
+                &compat_by_dso,
+                &provenance_by_action_id,
+                &mut BTreeMap::new(),
+            ),
+            None,
+        );
+        let source_provenance = provenance_by_action_id
+            .get(source_g8r_id.as_str())
+            .expect("source provenance in lookup");
+        assert_eq!(
+            infer_crate_version_for_provenance_with_lookup(
+                source_provenance,
+                &compat_by_dso,
+                &provenance_by_action_id,
+                &mut BTreeMap::new(),
+            ),
+            None,
+            "a released stats suggestion must not relabel source provenance"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp store");
+    }
+
     fn overwrite_test_artifact(
         store: &ArtifactStore,
         action_id: &str,
@@ -9683,7 +10065,7 @@ mod tests {
             &store,
             "g8r-stats",
             ActionSpec::DriverAigToStats {
-                aig_action_id: g8r_action_id,
+                aig_action_id: g8r_action_id.clone(),
                 version: dso_version.to_string(),
                 runtime: runtime.clone(),
             },
@@ -9696,6 +10078,39 @@ mod tests {
             ArtifactType::AigStatsFile,
             "payload/stats.json",
             r#"{"and_nodes": 10, "depth": 3}"#,
+        );
+
+        let mut source_stats_runtime = runtime.clone();
+        source_stats_runtime.source_revision = Some(crate::model::DriverSourceRevision {
+            repository: crate::XLSYNTH_CRATE_GIT_REPOSITORY.to_string(),
+            commit: "a".repeat(40),
+        });
+        let source_stats_action_id = materialize_test_provenance(
+            &store,
+            "source-g8r-stats",
+            ActionSpec::DriverAigToStats {
+                aig_action_id: g8r_action_id,
+                version: dso_version.to_string(),
+                runtime: source_stats_runtime,
+            },
+            ArtifactType::AigStatsFile,
+            "payload/source-stats.json",
+        );
+        overwrite_test_artifact(
+            &store,
+            &source_stats_action_id,
+            ArtifactType::AigStatsFile,
+            "payload/source-stats.json",
+            r#"{"and_nodes": 999, "depth": 999}"#,
+        );
+        assert!(
+            !maybe_upsert_ir_fn_corpus_g8r_vs_yosys_index_for_completed_action(
+                &store,
+                &std::env::current_dir().expect("repo root"),
+                &source_stats_action_id,
+            )
+            .expect("source stats incremental upsert"),
+            "source-built stats must not enter a release delta"
         );
 
         let verilog_action_id = materialize_test_provenance(
@@ -9770,6 +10185,10 @@ mod tests {
         );
         assert_eq!(sample.g8r_nodes, 10.0);
         assert_eq!(sample.yosys_abc_nodes, 8.0);
+        assert_eq!(
+            sample.g8r_stats_action_id, g8r_stats_action_id,
+            "the full rebuild must ignore the newer source-built stats row"
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp store");
     }
@@ -10660,6 +11079,7 @@ mod tests {
         let now = Utc::now();
         let driver_runtime = DriverRuntimeSpec {
             driver_version: "0.33.0".to_string(),
+            source_revision: None,
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.33.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),

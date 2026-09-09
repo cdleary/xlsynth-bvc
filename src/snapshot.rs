@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 
 use crate::analysis::{decode_analysis_report, validate_analysis_report_against_store};
 use crate::campaign::{campaign_analysis_path, list_finalized_campaign_runs};
+use crate::proto::{FILE_DESCRIPTOR_SET, PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256, v1 as pb};
 use crate::query::{
     build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_bytes,
     build_ir_fn_corpus_g8r_vs_yosys_dataset_index_bytes,
@@ -31,7 +32,6 @@ use crate::{
     WEB_STDLIB_G8R_VS_YOSYS_FRAIG_FALSE_INDEX_FILENAME,
     WEB_STDLIB_G8R_VS_YOSYS_FRAIG_TRUE_INDEX_FILENAME, WEB_VERSIONS_SUMMARY_INDEX_FILENAME,
 };
-use crate::{proto::FILE_DESCRIPTOR_SET, proto::v1 as pb};
 
 pub(crate) const STATIC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const STATIC_SNAPSHOT_IDENTITY_VERSION: u32 = 1;
@@ -54,6 +54,7 @@ pub(crate) struct StaticSnapshotManifest {
     pub(crate) schema_version: u32,
     pub(crate) snapshot_id: String,
     pub(crate) generated_utc: DateTime<Utc>,
+    pub(crate) schema_descriptor_sha256: String,
     pub(crate) git_commit: Option<String>,
     pub(crate) source_action_set_sha256: Option<String>,
     pub(crate) dataset_files: Vec<StaticSnapshotDatasetFile>,
@@ -709,6 +710,10 @@ fn descriptor_sha256() -> String {
     sha256_hex(FILE_DESCRIPTOR_SET)
 }
 
+fn is_supported_schema_descriptor(descriptor: &str) -> bool {
+    descriptor == descriptor_sha256() || descriptor == PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256
+}
+
 fn media_type_for_relpath(relpath: &str) -> &'static str {
     if relpath.ends_with(".json") {
         "application/json"
@@ -814,10 +819,14 @@ fn normalized_dataset_files(
     Ok(files)
 }
 
-fn snapshot_id_for_dataset_files(
+fn snapshot_id_for_dataset_files_with_descriptor(
     files: &[StaticSnapshotDatasetFile],
     source_action_set_sha256: Option<&str>,
+    schema_descriptor_sha256: &str,
 ) -> Result<String> {
+    if !is_supported_schema_descriptor(schema_descriptor_sha256) {
+        bail!("unsupported snapshot schema descriptor: {schema_descriptor_sha256}");
+    }
     let identity = pb::PublicationSnapshotIdentity {
         identity_version: STATIC_SNAPSHOT_IDENTITY_VERSION,
         publication_policy_version: PUBLICATION_POLICY_VERSION,
@@ -825,7 +834,7 @@ fn snapshot_id_for_dataset_files(
             .map(|value| digest_from_hex(value, "source_action_set_sha256"))
             .transpose()?,
         schema_descriptor_sha256: Some(digest_from_hex(
-            &descriptor_sha256(),
+            schema_descriptor_sha256,
             "schema_descriptor_sha256",
         )?),
         dataset_files: normalized_dataset_files(files)?,
@@ -834,6 +843,17 @@ fn snapshot_id_for_dataset_files(
     hasher.update(b"xlsynth-bvc/publication-snapshot/v1\0");
     hasher.update(identity.encode_to_vec());
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn snapshot_id_for_dataset_files(
+    files: &[StaticSnapshotDatasetFile],
+    source_action_set_sha256: Option<&str>,
+) -> Result<String> {
+    snapshot_id_for_dataset_files_with_descriptor(
+        files,
+        source_action_set_sha256,
+        &descriptor_sha256(),
+    )
 }
 
 pub(crate) fn encode_static_snapshot_manifest(
@@ -846,9 +866,16 @@ pub(crate) fn encode_static_snapshot_manifest(
             STATIC_SNAPSHOT_SCHEMA_VERSION
         );
     }
-    let expected_id = snapshot_id_for_dataset_files(
+    if !is_supported_schema_descriptor(&manifest.schema_descriptor_sha256) {
+        bail!(
+            "unsupported snapshot schema descriptor: {}",
+            manifest.schema_descriptor_sha256
+        );
+    }
+    let expected_id = snapshot_id_for_dataset_files_with_descriptor(
         &manifest.dataset_files,
         manifest.source_action_set_sha256.as_deref(),
+        &manifest.schema_descriptor_sha256,
     )?;
     if manifest.snapshot_id != expected_id {
         bail!(
@@ -897,7 +924,7 @@ pub(crate) fn encode_static_snapshot_manifest(
             .map(|value| digest_from_hex(value, "source_action_set_sha256"))
             .transpose()?,
         schema_descriptor_sha256: Some(digest_from_hex(
-            &descriptor_sha256(),
+            &manifest.schema_descriptor_sha256,
             "schema_descriptor_sha256",
         )?),
         publication_policy_version: PUBLICATION_POLICY_VERSION,
@@ -979,9 +1006,9 @@ pub(crate) fn load_static_snapshot_manifest(snapshot_dir: &Path) -> Result<Stati
         .as_ref()
         .context("snapshot manifest missing schema_descriptor_sha256")?;
     let descriptor = digest_to_hex(descriptor, "schema_descriptor_sha256")?;
-    if descriptor != descriptor_sha256() {
+    if !is_supported_schema_descriptor(&descriptor) {
         bail!(
-            "snapshot schema descriptor mismatch at {}; expected a fresh snapshot for this binary",
+            "unsupported snapshot schema descriptor at {}",
             manifest_path.display()
         );
     }
@@ -1026,6 +1053,7 @@ pub(crate) fn load_static_snapshot_manifest(snapshot_dir: &Path) -> Result<Stati
             "snapshot_id",
         )?,
         generated_utc,
+        schema_descriptor_sha256: descriptor,
         git_commit: wire.producing_git_commit,
         source_action_set_sha256: wire
             .source_action_set_sha256
@@ -1037,9 +1065,10 @@ pub(crate) fn load_static_snapshot_manifest(snapshot_dir: &Path) -> Result<Stati
         campaign_ids,
         run_ids,
     };
-    let expected_id = snapshot_id_for_dataset_files(
+    let expected_id = snapshot_id_for_dataset_files_with_descriptor(
         &manifest.dataset_files,
         manifest.source_action_set_sha256.as_deref(),
+        &manifest.schema_descriptor_sha256,
     )?;
     if manifest.snapshot_id != expected_id {
         bail!(
@@ -1194,6 +1223,7 @@ pub(crate) fn build_static_snapshot(
         schema_version: STATIC_SNAPSHOT_SCHEMA_VERSION,
         snapshot_id: snapshot_id.clone(),
         generated_utc,
+        schema_descriptor_sha256: descriptor_sha256(),
         git_commit,
         source_action_set_sha256,
         dataset_files,
@@ -1406,9 +1436,10 @@ pub(crate) fn verify_static_snapshot(snapshot_dir: &Path) -> Result<VerifyStatic
         );
     }
 
-    let recomputed_snapshot_id = snapshot_id_for_dataset_files(
+    let recomputed_snapshot_id = snapshot_id_for_dataset_files_with_descriptor(
         &manifest.dataset_files,
         manifest.source_action_set_sha256.as_deref(),
+        &manifest.schema_descriptor_sha256,
     )?;
     if recomputed_snapshot_id != manifest.snapshot_id {
         bail!(
@@ -1676,6 +1707,32 @@ mod tests {
             first_manifest,
             fs::read(out_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME)).expect("second manifest")
         );
+
+        let mut prior_schema_manifest =
+            load_static_snapshot_manifest(&out_dir).expect("load current-schema manifest");
+        prior_schema_manifest.schema_descriptor_sha256 =
+            PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256.to_string();
+        prior_schema_manifest.snapshot_id = snapshot_id_for_dataset_files_with_descriptor(
+            &prior_schema_manifest.dataset_files,
+            prior_schema_manifest.source_action_set_sha256.as_deref(),
+            &prior_schema_manifest.schema_descriptor_sha256,
+        )
+        .expect("compute origin/main snapshot identity");
+        fs::write(
+            out_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME),
+            encode_static_snapshot_manifest(&prior_schema_manifest)
+                .expect("encode origin/main-compatible manifest"),
+        )
+        .expect("write origin/main-compatible manifest");
+
+        let loaded_prior =
+            load_static_snapshot_manifest(&out_dir).expect("load origin/main-compatible snapshot");
+        assert_eq!(
+            loaded_prior.schema_descriptor_sha256,
+            PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256
+        );
+        verify_static_snapshot(&out_dir).expect("verify origin/main-compatible snapshot");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

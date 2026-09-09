@@ -143,6 +143,57 @@ cargo run --bin xlsynth_bvc -- \
   --driver-version 0.34.0
 ```
 
+Exact-commit mainline candidate on the pinned fixed-IR cohort:
+
+```bash
+# Refresh and review the immutable main/latest observation first.
+python3 scripts/sync_version_compat.py --update
+candidate_commit="$(jq -r '.head_commit' \
+  third_party/xlsynth-crate/repository_head_observation.json)"
+
+cargo run --bin xlsynth_bvc -- \
+  run-ir-dir-corpus \
+  --input-dir /tmp/xlsynth-bvc-fixed-ir-history-20260903/corpus \
+  --output-dir /tmp/xlsynth-bvc-mainline-candidate \
+  --execution-mode enqueue \
+  --recipe-preset g8r-abc-stats \
+  --top-fn-policy infer-single-package \
+  --version v0.54.7 \
+  --driver-git-commit "${candidate_commit}" \
+  --scheduling-policy release-progression-ir-v1
+```
+
+`--driver-git-commit` accepts only a full lowercase 40-character commit from the canonical
+`xlsynth/xlsynth-crate` repository and conflicts with `--driver-version`. The direct preset runs
+only `Git-built G8r frontend -> common Yosys/ABC -> common released-driver AIG stats`; it does not
+schedule the codegen+Yosys branch. For a policy-validated candidate run, `manifest.json` records a
+typed immutable candidate-run identity containing the exact Git commit, observed latest release
+version and commit, DSO, exact source-driver, ABC, and stats runtimes, execution recipe, exact
+Yosys script path and digest, 187-artifact cohort digest, immutable action-graph digest, and
+planned/reused/new action counts.
+Candidate runs require the canonical public source-driver, released stats-driver, and Yosys/ABC
+runtime identifiers; incompatible CLI runtime overrides fail before any import or enqueue work.
+
+Once the candidate export is complete, add it to a local static render with the repeatable
+`--candidate-run-dir` option:
+
+```bash
+cargo run --bin xlsynth_bvc -- \
+  build-static-site \
+  --snapshot-dir /path/to/current/snapshot \
+  --out-dir /tmp/xlsynth-bvc-candidate-site \
+  --candidate-run-dir /tmp/xlsynth-bvc-mainline-candidate
+```
+
+The renderer requires the snapshot to contain the candidate's captured release baseline and exact
+fixed cohort. It reconstructs the candidate and release action graphs, requires the same ABC,
+script, and released stats runtime, and reads candidate metrics only from bytes that match the
+canonical store provenance digest. It then places the Git revision chronologically by commit time
+and defaults its A/B controls to the captured release versus candidate. That pair reports the
+direct summed post-ABC G8r product change. Candidate manifests are atomically replaced, and both
+status refresh and site generation require their identity to match the durable workspace marker;
+additional candidate directories may be supplied by repeating the flag.
+
 The enqueue workflow is intentionally explicit:
 
 1. The first `run-ir-dir-corpus` invocation seeds `OUTPUT_DIR/.bvc/`, imports local IR roots,
@@ -210,14 +261,15 @@ cargo run --bin xlsynth_bvc -- \
 Current CLI notes:
 
 - Implemented presets:
-  `g8r-vs-yabc-aig-diff` and `g8r-vs-yabc-no-fraig-aig-diff`.
+  `g8r-vs-yabc-aig-diff`, `g8r-vs-yabc-no-fraig-aig-diff`, and `g8r-abc-stats`.
 - `--top-fn-policy` supports `infer-single-package`, `explicit`, and `from-filename`.
 - `infer-single-package` expects exactly one unambiguous top function in each IR file. For
   multi-function packages, use `explicit` or `from-filename`.
 - Each preset has a fixed canonical Yosys script. `--yosys-script` may be omitted, but if you pass
   it explicitly it must match the selected preset:
   `flows/yosys_to_aig.ys` for `g8r-vs-yabc-aig-diff`,
-  `flows/abc_ablate_no_fraig.ys` for `g8r-vs-yabc-no-fraig-aig-diff`.
+  `flows/abc_ablate_no_fraig.ys` for `g8r-vs-yabc-no-fraig-aig-diff`, and
+  `flows/yosys_to_aig.ys` for `g8r-abc-stats`.
 - `sample_id` is stable for a fixed corpus relpath and currently uses
   `<sanitized_basename>-<sha256(normalized_source_relpath)[0:12]>`; content identity remains
   separately visible as `source_sha256`.

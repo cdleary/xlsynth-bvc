@@ -46,8 +46,8 @@ use crate::executor::{
 use crate::model::*;
 use crate::model::{DriverRuntimeSpec, YosysRuntimeSpec};
 use crate::runtime::{
-    default_driver_image, ensure_driver_runtime_compatibility, resolve_driver_version,
-    runtime_dockerfile_sha256,
+    default_driver_image, driver_source_revision, ensure_driver_runtime_compatibility,
+    git_driver_image, resolve_driver_version, runtime_dockerfile_sha256,
 };
 #[cfg(test)]
 use crate::store::ArtifactStore;
@@ -56,7 +56,9 @@ const ACTION_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_STORE_DIR: &str = "bvc-artifacts";
 const DEFAULT_RELEASE_PLATFORM: &str = "ubuntu2004";
 const DEFAULT_DOCKERFILE: &str = "docker/xlsynth-driver.Dockerfile";
+const DEFAULT_GIT_DOCKERFILE: &str = "docker/xlsynth-driver-git.Dockerfile";
 const DEFAULT_DOCKER_IMAGE_PREFIX: &str = "xlsynth-bvc-driver";
+const XLSYNTH_CRATE_GIT_REPOSITORY: &str = "https://github.com/xlsynth/xlsynth-crate";
 const DEFAULT_YOSYS_DOCKERFILE: &str = "docker/yosys-abc.Dockerfile";
 const DEFAULT_YOSYS_DOCKER_IMAGE: &str = "xlsynth-bvc-yosys-abc:yosys-1f023432-slang-b6e440d6-py";
 const DEFAULT_YOSYS_UPSTREAM_COMMIT: &str = "1f023432681c159885f0b834a2e0717e67c4c115";
@@ -212,16 +214,51 @@ impl DriverCli {
         repo_root: &Path,
         xlsynth_version: &str,
     ) -> Result<DriverRuntimeSpec> {
-        let resolved_driver_version =
-            resolve_driver_version(repo_root, self.driver_version.as_deref(), xlsynth_version)?;
-        let docker_image = self
-            .docker_image
-            .unwrap_or_else(|| default_driver_image(&resolved_driver_version));
-        let dockerfile = self.dockerfile.to_string_lossy().to_string();
+        self.into_runtime_with_driver_version(repo_root, xlsynth_version, None)
+    }
+
+    pub(crate) fn into_runtime_with_driver_version(
+        self,
+        repo_root: &Path,
+        xlsynth_version: &str,
+        persisted_driver_version: Option<&str>,
+    ) -> Result<DriverRuntimeSpec> {
+        if self.driver_git_commit.is_some() && self.driver_version.is_some() {
+            anyhow::bail!("--driver-git-commit conflicts with --driver-version");
+        }
+        let source_revision = self
+            .driver_git_commit
+            .as_deref()
+            .map(driver_source_revision)
+            .transpose()?;
+        let resolved_driver_version = match persisted_driver_version {
+            Some(version) => crate::versioning::normalize_tag_version(version).to_string(),
+            None => {
+                resolve_driver_version(repo_root, self.driver_version.as_deref(), xlsynth_version)?
+            }
+        };
+        let docker_image = match self.docker_image {
+            Some(image) => image,
+            None => match source_revision.as_ref() {
+                Some(source) => git_driver_image(&source.commit)?,
+                None => default_driver_image(&resolved_driver_version),
+            },
+        };
+        let default_dockerfile = if source_revision.is_some() {
+            crate::DEFAULT_GIT_DOCKERFILE
+        } else {
+            crate::DEFAULT_DOCKERFILE
+        };
+        let dockerfile = self
+            .dockerfile
+            .unwrap_or_else(|| Path::new(default_dockerfile).to_path_buf())
+            .to_string_lossy()
+            .to_string();
         let runtime = crate::service::bind_driver_runtime_image(
             repo_root,
             DriverRuntimeSpec {
                 driver_version: resolved_driver_version,
+                source_revision,
                 release_platform: self.release_platform.clone(),
                 docker_image,
                 dockerfile_sha256: runtime_dockerfile_sha256(repo_root, &dockerfile)?,
@@ -616,6 +653,7 @@ mod tests {
     fn structural_hash_for_matching_target_g8r_action_uses_details_hash() {
         let runtime = DriverRuntimeSpec {
             driver_version: "0.31.0".to_string(),
+            source_revision: None,
             release_platform: DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: default_driver_image("0.31.0"),
             dockerfile: DEFAULT_DOCKERFILE.to_string(),

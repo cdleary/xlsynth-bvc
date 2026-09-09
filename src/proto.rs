@@ -20,6 +20,10 @@ pub(crate) mod v1 {
 
 pub(crate) const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/xlsynth_bvc_descriptor.bin"));
+// Descriptor set immediately before the wire-compatible optional
+// DriverRuntime.source_revision field was added.
+pub(crate) const PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256: &str =
+    "3bf017ecf749a0fb5a9c1718e726cbee0bbdfc69883faf608f7db631cee596fc";
 pub(crate) const DEFAULT_RELEASE_CAMPAIGN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/release-qor-v1.pb"));
 pub(crate) const DEFAULT_RELEASE_INPUTS: &[u8] =
