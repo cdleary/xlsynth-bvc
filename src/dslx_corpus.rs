@@ -291,14 +291,18 @@ fn collect_cones(
     function: &SourceFunction,
     kind: &str,
     manifest: &mut IngestManifest,
+    completed_extractions: &mut BTreeSet<(String, String)>,
 ) -> Result<()> {
+    let extraction_key = (function.optimized_ir_sha256.clone(), kind.to_string());
     let raw_dir = root
         .join("raw")
         .join(&function.optimized_ir_sha256)
         .join(kind);
     fs::create_dir_all(&raw_dir)?;
     let manifest_path = raw_dir.join("manifest.jsonl");
-    if !manifest_path.exists() {
+    // Extractors create the manifest before finishing. File existence alone can
+    // represent a failed or interrupted attempt from an identical source function.
+    if !completed_extractions.contains(&extraction_key) {
         let mut command = driver_command(
             opts,
             if kind == "mffc" {
@@ -341,6 +345,7 @@ fn collect_cones(
             .join(format!("{}-{kind}.stderr", function.optimized_ir_sha256));
         run_driver(command, &log)?;
     }
+    let mut pending_cones = Vec::new();
     for (driver_hash, rank) in cone_rows(&manifest_path, kind)? {
         if driver_hash.len() != 64 || !driver_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("cone extractor returned an invalid content hash");
@@ -356,7 +361,25 @@ fn collect_cones(
             continue;
         }
         let cone_relpath = format!("cones/{kind}-{content_sha256}.ir");
-        let destination = root.join(&cone_relpath);
+        pending_cones.push((
+            bytes,
+            ConeOccurrence {
+                kind: kind.to_string(),
+                cone_relpath,
+                content_sha256,
+                driver_cone_sha256: driver_hash,
+                source_relpath: function.source_relpath.clone(),
+                source_fn: function.name.clone(),
+                source_ir_sha256: function.optimized_ir_sha256.clone(),
+                ir_top,
+                rank,
+                ir_op_count,
+            },
+        ));
+    }
+    // Validate every emitted row before exporting any cone from this occurrence.
+    for (bytes, cone) in pending_cones {
+        let destination = root.join(&cone.cone_relpath);
         if destination.exists() {
             if fs::read(&destination)? != bytes {
                 bail!("cone content identity collision");
@@ -364,19 +387,9 @@ fn collect_cones(
         } else {
             fs::write(destination, bytes)?;
         }
-        manifest.cones.push(ConeOccurrence {
-            kind: kind.to_string(),
-            cone_relpath,
-            content_sha256,
-            driver_cone_sha256: driver_hash,
-            source_relpath: function.source_relpath.clone(),
-            source_fn: function.name.clone(),
-            source_ir_sha256: function.optimized_ir_sha256.clone(),
-            ir_top,
-            rank,
-            ir_op_count,
-        });
+        manifest.cones.push(cone);
     }
+    completed_extractions.insert(extraction_key);
     Ok(())
 }
 
@@ -442,6 +455,7 @@ pub(crate) fn ingest(repo_root: &Path, opts: &DslxCorpusIngestCli) -> Result<Ing
         failures: Vec::new(),
     };
     let mut attempted = 0;
+    let mut completed_extractions = BTreeSet::new();
     for file in manifest
         .files
         .iter()
@@ -558,13 +572,27 @@ pub(crate) fn ingest(repo_root: &Path, opts: &DslxCorpusIngestCli) -> Result<Ing
                 }
             };
             if !opts.no_mffcs {
-                if let Err(err) = collect_cones(opts, &output, &function, "mffc", &mut manifest) {
+                if let Err(err) = collect_cones(
+                    opts,
+                    &output,
+                    &function,
+                    "mffc",
+                    &mut manifest,
+                    &mut completed_extractions,
+                ) {
                     report_failure(&mut manifest, &file, Some(name), "mffc", &err);
                 }
             }
             if let Some(k) = opts.k {
                 let kind = format!("k{k}");
-                if let Err(err) = collect_cones(opts, &output, &function, &kind, &mut manifest) {
+                if let Err(err) = collect_cones(
+                    opts,
+                    &output,
+                    &function,
+                    &kind,
+                    &mut manifest,
+                    &mut completed_extractions,
+                ) {
                     report_failure(&mut manifest, &file, Some(name), "k_cones", &err);
                 }
             }
@@ -1183,6 +1211,93 @@ mod tests {
             let index = args.iter().position(|arg| *arg == "--dslx_path").unwrap();
             assert_eq!(args[index + 1], "sources/sub;sources;extra");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn duplicate_ir_does_not_reuse_a_failed_extraction_manifest() {
+        use clap::Parser;
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir();
+        fs::create_dir(root.join("logs")).unwrap();
+        fs::create_dir(root.join("cones")).unwrap();
+        let driver = root.join("driver");
+        fs::write(
+            &driver,
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--manifest_jsonl" ]; then
+        shift
+        manifest="$1"
+    fi
+    shift
+done
+: > "$manifest"
+printf x >> "$manifest.attempts"
+exit 1
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&driver, fs::Permissions::from_mode(0o700)).unwrap();
+        let crate::cli::TopCommand::DslxCorpusIngest(mut opts) = crate::cli::Cli::try_parse_from([
+            "xlsynth-bvc",
+            "dslx-corpus-ingest",
+            "--input-dir",
+            "input",
+            "--output-dir",
+            "output",
+            "--k",
+            "3",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("ingest options");
+        };
+        opts.driver = driver;
+        let mut manifest: IngestManifest = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "driver_version": "test", "source_tree_sha256": "test",
+            "settings": {"max_files": 2, "max_functions": 2, "max_mffcs": 2,
+                "min_internal_non_literal": 1, "max_frontier_non_literal": 0, "k": 3,
+                "max_k_cones": 2, "max_k_ir_ops": 10, "mffcs": false,
+                "optimized_dslx_to_ir": true},
+            "files": [], "functions": [], "cones": [], "failures": []
+        }))
+        .unwrap();
+        let mut function = SourceFunction {
+            source_relpath: "a/logic.x".into(),
+            name: "main".into(),
+            optimized_ir_relpath: "optimized/example.ir".into(),
+            optimized_ir_sha256: "a".repeat(64),
+            ir_top: "main".into(),
+        };
+        let mut cache = BTreeSet::new();
+        assert!(collect_cones(&opts, &root, &function, "k3", &mut manifest, &mut cache).is_err());
+        function.source_relpath = "b/logic.x".into();
+        assert!(collect_cones(&opts, &root, &function, "k3", &mut manifest, &mut cache).is_err());
+        assert!(cache.is_empty());
+        assert!(manifest.cones.is_empty());
+        let raw = root
+            .join("raw")
+            .join(&function.optimized_ir_sha256)
+            .join("k3");
+        assert_eq!(
+            fs::read(raw.join("manifest.jsonl.attempts")).unwrap(),
+            b"xx"
+        );
+        // A later successful retry may populate the cache; only that completion
+        // allows the next identical source occurrence to skip the extractor.
+        let successful = fs::read_to_string(&opts.driver)
+            .unwrap()
+            .replace("exit 1", "exit 0");
+        fs::write(&opts.driver, successful).unwrap();
+        collect_cones(&opts, &root, &function, "k3", &mut manifest, &mut cache).unwrap();
+        collect_cones(&opts, &root, &function, "k3", &mut manifest, &mut cache).unwrap();
+        assert_eq!(
+            fs::read(raw.join("manifest.jsonl.attempts")).unwrap(),
+            b"xxx"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
