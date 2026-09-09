@@ -61,6 +61,8 @@ then the snapshot root, then any additional import roots. `--dslx-path` may be r
 `--dslx-stdlib-path`, `--driver`, and `--toolchain` select external tooling. Start with an empty
 output directory outside the input tree and resource checkout; both commands reject overlapping
 outputs before writing. Results stay in those user-selected output directories.
+Source paths must be UTF-8 and cannot contain literal backslashes, so their portable snapshot
+names cannot collide with ordinary nested paths.
 
 The report contains `index.html`, `data.json`, and linked exact cone IR under `ir/`. Open the
 HTML directly or serve the directory with any local static HTTP server. The page shows coverage,

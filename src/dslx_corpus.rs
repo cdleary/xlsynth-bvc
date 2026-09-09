@@ -112,7 +112,12 @@ fn relative_name(base: &Path, file: &Path) -> Result<String> {
     let name = rel
         .to_str()
         .context("DSLX source path is not UTF-8")?
-        .replace('\\', "/");
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    // On Unix, a backslash is a literal filename character. Treating it as a
+    // separator would alias a distinct source onto another snapshot destination.
+    if name.contains('\\') {
+        bail!("DSLX source paths must not contain literal backslashes");
+    }
     if name.starts_with('/') || name.split('/').any(|part| part == ".." || part.is_empty()) {
         bail!("invalid DSLX source relative path");
     }
@@ -207,12 +212,16 @@ fn run_driver(mut cmd: Command, log: &Path) -> Result<Vec<u8>> {
 
 fn snapshot_sources(input: &Path, output: &Path) -> Result<Vec<SourceFile>> {
     let mut files = Vec::new();
+    let mut destinations = BTreeSet::new();
     for entry in WalkDir::new(input).sort_by_file_name() {
         let entry = entry.context("walking DSLX tree")?;
         if !entry.file_type().is_file() || entry.path().extension().is_none_or(|ext| ext != "x") {
             continue;
         }
         let relpath = relative_name(input, entry.path())?;
+        if !destinations.insert(relpath.clone()) {
+            bail!("duplicate DSLX source snapshot path");
+        }
         let bytes = fs::read(entry.path()).context("reading DSLX source")?;
         let destination = output.join(&relpath);
         fs::create_dir_all(destination.parent().context("source path missing parent")?)?;
@@ -1062,6 +1071,26 @@ mod tests {
             std::env::temp_dir().join(format!("bvc-dslx-test-{}-{stamp}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_rejects_literal_backslashes_without_overwriting_nested_sources() {
+        let root = temp_dir();
+        let input = root.join("input");
+        let output = root.join("snapshot");
+        fs::create_dir_all(input.join("a/b")).unwrap();
+        fs::create_dir_all(input.join(r"a\b")).unwrap();
+        let nested = b"pub fn nested(x: u8) -> u8 { x + u8:1 }\n";
+        let literal = b"pub fn literal(x: u8) -> u8 { x - u8:1 }\n";
+        fs::write(input.join("a/b/logic.x"), nested).unwrap();
+        fs::write(input.join(r"a\b/logic.x"), literal).unwrap();
+
+        let error = snapshot_sources(&input, &output).unwrap_err();
+        assert!(error.to_string().contains("literal backslashes"));
+        assert_eq!(fs::read(output.join("a/b/logic.x")).unwrap(), nested);
+        assert_eq!(fs::read(input.join(r"a\b/logic.x")).unwrap(), literal);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn comparison_fixture(
