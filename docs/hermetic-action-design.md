@@ -69,6 +69,9 @@ Current action types:
 
 For CLI flags: `--version` carries the DSO/tool release (`dso:vX.Y.Z`) and `--driver-version`
 carries the crate release (`crate:vA.B.C`), or resolves from compatibility data when omitted.
+`--driver-git-commit <40-hex-sha>` is the mutually exclusive source-runtime origin: it keeps the
+released crate version only as the selected DSO compatibility anchor and adds canonical repository
+plus exact Git commit to the runtime and action identity.
 
 ## Artifact Storage Layout (Sled + Materialization Cache)
 
@@ -188,6 +191,12 @@ fingerprint-qualified tag; planning resolves that image to an immutable image
 ID and stores it in the action protobuf. Preflight and execution of a bound
 action invoke Docker by `sha256:<image-id>` without consulting the current tag
 or Dockerfile, so retained historical images remain replayable.
+Source-driver images use `docker/xlsynth-driver-git.Dockerfile`, never the release Dockerfile.
+Their logical fingerprint additionally binds source kind, canonical repository, full commit, and an
+explicit source-build recipe revision. Matching fingerprint/repository/commit/recipe image labels
+are mandatory, and the resulting action is then bound to the OCI image ID. If the upstream source
+does not carry a `Cargo.lock`, the build generates one, installs with `--locked`, and retains its
+digest inside the immutable image.
 Driver action creation validates `crate_version <-> dso_version` compatibility against `third_party/xlsynth-crate/generated_version_compat.json`.
 There is no hardcoded default driver crate version in Rust code: actions either use an explicit `--driver-version` or resolve to the latest compatible crate version from `generated_version_compat.json` at action creation time.
 Driver action provenance records both labels explicitly as `crate:vX.Y.Z` and `dso:vX.Y.Z`.
@@ -227,8 +236,8 @@ The built-in `discover-releases` command does this polling directly and supports
 
 - `run ...` executes one action immediately (cached by action ID).
 - `--artifacts-via-sled <path>` is required for the normal store-targeting commands and points at the sled-backed artifact store. `run-ir-dir-corpus` is the exception: it manages its own self-contained store under `OUTPUT_DIR/.bvc/` and does not require the flag for the initial corpus submission/refresh command itself.
-- In CLI text output/prose we still label versions explicitly as `crate:...` or `dso:...`; command flags themselves accept raw values (for example `--version v0.35.0`, `--driver-version 0.31.0`).
-- `run-ir-dir-corpus --input-dir ... --output-dir ... --execution-mode enqueue|run --recipe-preset g8r-vs-yabc-aig-diff` imports local `.ir` files into an output-dir-local workspace, expands the fixed recipe into normal actions, and writes `manifest.json`, `samples.jsonl`, `summary.json`, joined diff tables, and copied leaf artifacts. In `enqueue` mode, the first run seeds/imports/enqueues and later reruns of the same command refresh those public exports from completed actions in `OUTPUT_DIR/.bvc/`.
+- In CLI text output/prose we still label versions explicitly as `crate:...` or `dso:...`; command flags themselves accept raw values (for example `--version v0.35.0`, `--driver-version 0.31.0`). Exact source candidates instead use `--driver-git-commit <full-lowercase-40-hex>` and may not also pass `--driver-version`.
+- `run-ir-dir-corpus --input-dir ... --output-dir ... --execution-mode enqueue|run --recipe-preset g8r-vs-yabc-aig-diff` imports local `.ir` files into an output-dir-local workspace, expands the fixed recipe into normal actions, and writes `manifest.json`, `samples.jsonl`, `summary.json`, joined diff tables, and copied leaf artifacts. The `g8r-abc-stats` preset instead schedules only frontend-isolated G8r, common ABC, and common stats; with the fixed-cohort scheduling policy and a Git driver it also emits typed candidate/main/latest provenance. In `enqueue` mode, the first run seeds/imports/enqueues and later reruns of the same command refresh those public exports from completed actions in `OUTPUT_DIR/.bvc/`.
 - For driver-backed `run` commands, `--version` is the DSO release (`dso:vX.Y.Z`) and `--driver-version` is the crate release (`crate:vA.B.C`).
 - `run download-source-subtree --version vX.Y.Z --subtree xls/modules/add_dual_path` downloads the tagged `xlsynth/xlsynth` source archive and extracts only that subtree.
 - `run ir-to-delay-info --ir-action-id ... [--top-fn-name ...] [--delay-model asap7] --version vX.Y.Z` computes textual delay info for an IR package.

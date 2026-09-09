@@ -6,8 +6,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::cli::{
@@ -34,7 +36,8 @@ use crate::service::{
 };
 use crate::store::ArtifactStore;
 
-const IR_DIR_CORPUS_MANIFEST_SCHEMA_VERSION: u32 = 3;
+const IR_DIR_CORPUS_MANIFEST_SCHEMA_VERSION: u32 = 5;
+const IR_DIR_CORPUS_CANDIDATE_RUN_SCHEMA_VERSION: u32 = 4;
 const IR_DIR_CORPUS_MANIFEST_FILENAME: &str = "manifest.json";
 const IR_DIR_CORPUS_SAMPLES_FILENAME: &str = "samples.jsonl";
 const IR_DIR_CORPUS_SUMMARY_FILENAME: &str = "summary.json";
@@ -44,9 +47,12 @@ const IR_DIR_CORPUS_INTERNAL_DIR: &str = ".bvc";
 const IR_DIR_CORPUS_INTERNAL_STORE_DIR: &str = "bvc-artifacts";
 const IR_DIR_CORPUS_INTERNAL_SLED_FILENAME: &str = "artifacts.sled";
 const IR_DIR_CORPUS_SCHEDULING_POLICY_MARKER_FILENAME: &str = "corpus-scheduling-policy.pb";
+const IR_DIR_CORPUS_CANDIDATE_RUN_MARKER_FILENAME: &str = "corpus-candidate-run.json";
+static IR_DIR_CORPUS_OUTPUT_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
+
 const IMPORTED_IR_RELPATH: &str = "payload/input.ir";
 const G8R_AIG_RELPATH: &str = "payload/result.aig";
-const G8R_STATS_RELPATH: &str = "payload/stats.json";
+pub(crate) const G8R_STATS_RELPATH: &str = "payload/stats.json";
 const COMBO_VERILOG_RELPATH: &str = "payload/result.v";
 const YOSYS_ABC_AIG_RELPATH: &str = "payload/result.aig";
 const YOSYS_ABC_STATS_RELPATH: &str = "payload/stats.json";
@@ -78,8 +84,15 @@ pub(crate) struct RunIrDirCorpusSummary {
     pub(crate) sample_id_scheme: String,
     pub(crate) sample_count: usize,
     pub(crate) completed_samples: usize,
+    pub(crate) planned_actions: usize,
+    pub(crate) reused_or_already_queued_actions: usize,
     pub(crate) enqueued_actions: usize,
     pub(crate) executed_actions: usize,
+    pub(crate) candidate_run_id: Option<String>,
+    pub(crate) candidate_commit: Option<String>,
+    pub(crate) baseline_crate_version: Option<String>,
+    pub(crate) baseline_release_commit: Option<String>,
+    pub(crate) cohort_artifact_manifest_sha256: Option<String>,
     pub(crate) status_counts: BTreeMap<String, usize>,
     pub(crate) scheduling_policy: Option<String>,
     pub(crate) prioritized_samples: usize,
@@ -109,7 +122,173 @@ struct IrDirCorpusManifest {
     yosys_script_sha256: String,
     #[serde(default)]
     scheduling_policy: Option<CorpusSchedulingPolicyRecord>,
+    #[serde(default)]
+    candidate_run: Option<IrDirCorpusCandidateRunRecord>,
     samples: Vec<IrDirCorpusSampleRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IrDirCorpusCandidateRunRecord {
+    schema_version: u32,
+    candidate_run_id: String,
+    requested_ref: Option<String>,
+    observed_at_utc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_committed_at_utc: Option<String>,
+    candidate: CandidateGitRevisionRecord,
+    baseline: CandidateReleaseRecord,
+    dso_version: String,
+    lowering_mode: String,
+    fraig: bool,
+    execution_recipe_revision: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    driver_runtime: Option<DriverRuntimeSpec>,
+    abc_runtime: YosysRuntimeSpec,
+    stats_runtime: DriverRuntimeSpec,
+    yosys_script: String,
+    yosys_script_sha256: String,
+    #[serde(default)]
+    action_manifest_sha256: String,
+    cohort_sample_count: u64,
+    cohort_artifact_manifest_sha256: String,
+    scheduling_policy_name: String,
+    scheduling_policy_config_sha256: String,
+    planned_candidate_actions: usize,
+    reused_or_already_queued_actions: usize,
+    newly_enqueued_candidate_actions: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CandidateGitRevisionRecord {
+    kind: String,
+    repository: String,
+    commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CandidateReleaseRecord {
+    kind: String,
+    crate_version: String,
+    release_tag: String,
+    commit: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CandidateRunImmutableIdentity<'a> {
+    schema_version: u32,
+    candidate: &'a CandidateGitRevisionRecord,
+    candidate_committed_at_utc: &'a str,
+    baseline: &'a CandidateReleaseRecord,
+    dso_version: &'a str,
+    lowering_mode: &'a str,
+    fraig: bool,
+    execution_recipe_revision: u32,
+    driver_runtime: &'a DriverRuntimeSpec,
+    abc_runtime: &'a YosysRuntimeSpec,
+    stats_runtime: &'a DriverRuntimeSpec,
+    yosys_script: &'a str,
+    yosys_script_sha256: &'a str,
+    action_manifest_sha256: &'a str,
+    cohort_sample_count: u64,
+    cohort_artifact_manifest_sha256: &'a str,
+}
+
+fn candidate_run_identity_sha256(candidate_run: &IrDirCorpusCandidateRunRecord) -> Result<String> {
+    if candidate_run.schema_version != IR_DIR_CORPUS_CANDIDATE_RUN_SCHEMA_VERSION {
+        bail!(
+            "candidate workspace uses unsupported candidate-run schema {}; use a new output directory",
+            candidate_run.schema_version
+        );
+    }
+    let candidate_committed_at_utc = candidate_run
+        .candidate_committed_at_utc
+        .as_deref()
+        .context("candidate workspace has no immutable commit timestamp")?;
+    let driver_runtime = candidate_run
+        .driver_runtime
+        .as_ref()
+        .context("candidate workspace has no immutable source-driver runtime")?;
+    let immutable_identity = CandidateRunImmutableIdentity {
+        schema_version: candidate_run.schema_version,
+        candidate: &candidate_run.candidate,
+        candidate_committed_at_utc,
+        baseline: &candidate_run.baseline,
+        dso_version: &candidate_run.dso_version,
+        lowering_mode: &candidate_run.lowering_mode,
+        fraig: candidate_run.fraig,
+        execution_recipe_revision: candidate_run.execution_recipe_revision,
+        driver_runtime,
+        abc_runtime: &candidate_run.abc_runtime,
+        stats_runtime: &candidate_run.stats_runtime,
+        yosys_script: &candidate_run.yosys_script,
+        yosys_script_sha256: &candidate_run.yosys_script_sha256,
+        action_manifest_sha256: &candidate_run.action_manifest_sha256,
+        cohort_sample_count: candidate_run.cohort_sample_count,
+        cohort_artifact_manifest_sha256: &candidate_run.cohort_artifact_manifest_sha256,
+    };
+    let identity_json = serde_json::to_vec(&immutable_identity)
+        .context("serializing immutable Git candidate run identity")?;
+    let mut run_id_hasher = sha2::Sha256::new();
+    run_id_hasher.update(b"xlsynth-bvc/fixed-ir-candidate-run/v4\0");
+    run_id_hasher.update(identity_json);
+    Ok(hex::encode(run_id_hasher.finalize()))
+}
+
+fn validate_persisted_candidate_run(candidate_run: &IrDirCorpusCandidateRunRecord) -> Result<()> {
+    if candidate_run.candidate_run_id != candidate_run_identity_sha256(candidate_run)? {
+        bail!("candidate workspace has a mismatched immutable candidate_run_id");
+    }
+    Ok(())
+}
+
+fn write_corpus_manifest_atomic(
+    manifest_path: &Path,
+    manifest: &IrDirCorpusManifest,
+) -> Result<()> {
+    let contents = serde_json::to_vec_pretty(manifest).context("serializing corpus manifest")?;
+    let parent = manifest_path
+        .parent()
+        .context("corpus manifest path has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("creating corpus manifest parent: {}", parent.display()))?;
+    let filename = manifest_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(IR_DIR_CORPUS_MANIFEST_FILENAME);
+    let nonce = IR_DIR_CORPUS_OUTPUT_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let temp_path = parent.join(format!(
+        ".{filename}.tmp-{}-{timestamp}-{nonce}",
+        std::process::id(),
+    ));
+    let result = (|| -> Result<()> {
+        let mut temp = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| format!("creating staged corpus manifest: {}", temp_path.display()))?;
+        temp.write_all(&contents)
+            .with_context(|| format!("writing staged corpus manifest: {}", temp_path.display()))?;
+        temp.sync_all()
+            .with_context(|| format!("syncing staged corpus manifest: {}", temp_path.display()))?;
+        drop(temp);
+        fs::rename(&temp_path, manifest_path).with_context(|| {
+            format!(
+                "atomically replacing corpus manifest: {} -> {}",
+                temp_path.display(),
+                manifest_path.display()
+            )
+        })?;
+        fs::File::open(parent)
+            .with_context(|| format!("opening corpus manifest parent: {}", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("syncing corpus manifest parent: {}", parent.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +302,10 @@ struct IrDirCorpusSampleRecord {
     fraig: bool,
     dso_version: String,
     driver_crate_version: String,
+    #[serde(default)]
+    driver_source_repository: Option<String>,
+    #[serde(default)]
+    driver_source_commit: Option<String>,
     stats_driver_crate_version: String,
     yosys_script: String,
     yosys_script_sha256: String,
@@ -161,8 +344,15 @@ struct IrDirCorpusSummaryFile {
     status_counts: BTreeMap<String, usize>,
     scheduling_policy: Option<String>,
     prioritized_samples: usize,
+    planned_actions: usize,
+    reused_or_already_queued_actions: usize,
     enqueued_actions: usize,
     executed_actions: usize,
+    candidate_run_id: Option<String>,
+    candidate_commit: Option<String>,
+    baseline_crate_version: Option<String>,
+    baseline_release_commit: Option<String>,
+    cohort_artifact_manifest_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,6 +402,8 @@ struct IrDirCorpusJoinedRow {
     fraig: bool,
     dso_version: String,
     driver_crate_version: String,
+    driver_source_repository: Option<String>,
+    driver_source_commit: Option<String>,
     stats_driver_crate_version: String,
     yosys_script: String,
     yosys_script_sha256: String,
@@ -245,6 +437,7 @@ struct CorpusSampleSpec {
 
 #[derive(Debug, Clone)]
 struct CorpusActionPlan {
+    recipe_preset: CorpusRecipePreset,
     import_action: ActionSpec,
     g8r_aig_action: ActionSpec,
     g8r_stats_action: ActionSpec,
@@ -265,6 +458,293 @@ struct CorpusActionPlan {
 struct ExecutionCounters {
     enqueued_actions: usize,
     executed_actions: usize,
+}
+
+impl CorpusActionPlan {
+    fn planned_actions(&self) -> Vec<&ActionSpec> {
+        if self.recipe_preset == CorpusRecipePreset::G8rAbcStats {
+            vec![
+                &self.g8r_aig_action,
+                &self.yosys_abc_aig_action,
+                &self.g8r_stats_action,
+            ]
+        } else {
+            vec![
+                &self.g8r_aig_action,
+                &self.g8r_stats_action,
+                &self.combo_verilog_action,
+                &self.yosys_abc_aig_action,
+                &self.yosys_abc_stats_action,
+                &self.aig_stat_diff_action,
+            ]
+        }
+    }
+
+    fn is_g8r_abc_stats(&self) -> bool {
+        self.recipe_preset == CorpusRecipePreset::G8rAbcStats
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CandidateActionManifestEntry<'a> {
+    source_relpath: &'a str,
+    source_sha256: &'a str,
+    top_fn_name: &'a str,
+    import_ir_action_id: &'a str,
+    g8r_aig_action_id: &'a str,
+    yosys_abc_aig_action_id: &'a str,
+    g8r_stats_action_id: &'a str,
+}
+
+fn candidate_action_manifest_sha256(
+    samples: &[CorpusSampleSpec],
+    plans: &[CorpusActionPlan],
+) -> Result<String> {
+    if samples.len() != plans.len() {
+        bail!("candidate sample and action-plan counts do not match");
+    }
+    let entries = samples
+        .iter()
+        .zip(plans)
+        .map(|(sample, plan)| CandidateActionManifestEntry {
+            source_relpath: &sample.source_relpath,
+            source_sha256: &sample.source_sha256,
+            top_fn_name: &sample.top_fn_name,
+            import_ir_action_id: &plan.import_ir_action_id,
+            g8r_aig_action_id: &plan.g8r_aig_action_id,
+            yosys_abc_aig_action_id: &plan.yosys_abc_aig_action_id,
+            g8r_stats_action_id: &plan.g8r_stats_action_id,
+        })
+        .collect::<Vec<_>>();
+    let encoded =
+        serde_json::to_vec(&entries).context("serializing candidate action manifest identity")?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"xlsynth-bvc/fixed-ir-candidate-actions/v1\0");
+    hasher.update(encoded);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn build_candidate_run_preflight(
+    repo_root: &Path,
+    existing_candidate_run: Option<&IrDirCorpusCandidateRunRecord>,
+    recipe_preset: CorpusRecipePreset,
+    dso_version: &str,
+    driver_runtime: &DriverRuntimeSpec,
+    stats_runtime: &DriverRuntimeSpec,
+    yosys_runtime: &YosysRuntimeSpec,
+    yosys_script_ref: &crate::model::ScriptRef,
+    scheduling_policy: Option<&CorpusSchedulingPolicyRecord>,
+    samples: &[CorpusSampleSpec],
+    plans: &[CorpusActionPlan],
+) -> Result<Option<IrDirCorpusCandidateRunRecord>> {
+    if recipe_preset != CorpusRecipePreset::G8rAbcStats {
+        if existing_candidate_run.is_some() {
+            bail!(
+                "output workspace already records a fixed-IR Git candidate; rerun with the same recipe or use a new output directory"
+            );
+        }
+        return Ok(None);
+    }
+    let Some(source_revision) = driver_runtime.source_revision.as_ref() else {
+        if existing_candidate_run.is_some() {
+            bail!(
+                "output workspace already records a fixed-IR Git candidate; rerun with its --driver-git-commit or use a new output directory"
+            );
+        }
+        return Ok(None);
+    };
+    if let Some(existing) = existing_candidate_run {
+        validate_persisted_candidate_run(existing)?;
+        if existing.candidate.repository != source_revision.repository
+            || existing.candidate.commit != source_revision.commit
+        {
+            bail!(
+                "requested Git revision does not match the candidate already recorded for this output workspace; use a new output directory"
+            );
+        }
+        if existing.driver_runtime.as_ref() != Some(driver_runtime)
+            || &existing.stats_runtime != stats_runtime
+            || &existing.abc_runtime != yosys_runtime
+        {
+            bail!("resumed candidate runtimes do not exactly match the durable workspace marker");
+        }
+    } else {
+        let canonical_source_dockerfile_sha256 =
+            crate::runtime::runtime_dockerfile_sha256(repo_root, crate::DEFAULT_GIT_DOCKERFILE)?;
+        if driver_runtime.dockerfile != crate::DEFAULT_GIT_DOCKERFILE
+            || driver_runtime.dockerfile_sha256 != canonical_source_dockerfile_sha256
+        {
+            bail!(
+                "fixed-IR Git candidates require the canonical {} source-build Dockerfile",
+                crate::DEFAULT_GIT_DOCKERFILE
+            );
+        }
+        let expected_source_image = crate::runtime::git_driver_image(&source_revision.commit)?;
+        let expected_stats_image =
+            crate::runtime::default_driver_image(&driver_runtime.driver_version);
+        if driver_runtime.release_platform != crate::DEFAULT_RELEASE_PLATFORM
+            || driver_runtime.docker_image != expected_source_image
+            || stats_runtime.driver_version != driver_runtime.driver_version
+            || stats_runtime.source_revision.is_some()
+            || stats_runtime.release_platform != crate::DEFAULT_RELEASE_PLATFORM
+            || stats_runtime.docker_image != expected_stats_image
+            || stats_runtime.dockerfile != crate::DEFAULT_DOCKERFILE
+            || yosys_runtime.docker_image != crate::DEFAULT_YOSYS_DOCKER_IMAGE
+            || yosys_runtime.dockerfile != crate::DEFAULT_YOSYS_DOCKERFILE
+            || yosys_runtime.upstream_commit.as_deref()
+                != Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT)
+            || yosys_runtime.slang_commit.is_some()
+        {
+            bail!(
+                "fixed-IR Git candidates require canonical source-driver, released stats-driver, and Yosys/ABC runtime identifiers so completed runs remain publishable"
+            );
+        }
+    }
+    let Some(scheduling_policy) = scheduling_policy else {
+        return Ok(None);
+    };
+    if samples.len() as u64 != scheduling_policy.expected_corpus_sample_count {
+        bail!(
+            "fixed-IR Git candidate expected {} samples from its scheduling policy, got {}",
+            scheduling_policy.expected_corpus_sample_count,
+            samples.len()
+        );
+    }
+    let unique_tops = samples
+        .iter()
+        .map(|sample| sample.top_fn_name.as_str())
+        .collect::<BTreeSet<_>>();
+    if unique_tops.len() != samples.len() {
+        bail!("fixed-IR Git candidate corpus contains duplicate inferred top functions");
+    }
+    let candidate = CandidateGitRevisionRecord {
+        kind: "git_revision".to_string(),
+        repository: source_revision.repository.clone(),
+        commit: source_revision.commit.clone(),
+    };
+    let (baseline, requested_ref, observed_at_utc, candidate_committed_at_utc) = if let Some(
+        existing,
+    ) =
+        existing_candidate_run
+    {
+        if crate::versioning::normalize_tag_version(&driver_runtime.driver_version)
+            != crate::versioning::normalize_tag_version(&existing.baseline.crate_version)
+        {
+            bail!(
+                "resumed candidate runtime anchor crate {} does not match persisted baseline {}; use a new output directory",
+                driver_runtime.driver_version,
+                existing.baseline.crate_version
+            );
+        }
+        (
+            existing.baseline.clone(),
+            existing.requested_ref.clone(),
+            existing.observed_at_utc.clone(),
+            existing
+                .candidate_committed_at_utc
+                .clone()
+                .context("persisted candidate run has no commit timestamp")?,
+        )
+    } else {
+        let observation = crate::versioning::load_xlsynth_crate_repository_head_observation(
+            repo_root,
+        )?
+        .context(
+            "the fixed-IR Git candidate requires a checked-in main/latest repository observation",
+        )?;
+        if driver_runtime.driver_version != observation.latest_crate_version {
+            bail!(
+                "Git candidate DSO compatibility anchor crate {} does not match observed latest release {}; refresh compatibility metadata or select the latest release DSO",
+                driver_runtime.driver_version,
+                observation.latest_crate_version
+            );
+        }
+        let candidate_committed_at_utc = if source_revision.commit == observation.head_commit {
+            observation.head_committed_at_utc.clone()
+        } else {
+            crate::service::driver_source_committed_at_utc(driver_runtime)?
+                .context("source driver runtime did not report its Git commit timestamp")?
+        };
+        (
+            CandidateReleaseRecord {
+                kind: "crate_release".to_string(),
+                crate_version: observation.latest_crate_version,
+                release_tag: observation.latest_release_tag,
+                commit: observation.latest_release_commit,
+            },
+            (source_revision.commit == observation.head_commit).then_some(observation.head_ref),
+            observation.observed_at_utc,
+            candidate_committed_at_utc,
+        )
+    };
+    let execution_recipe_revision = plans
+        .first()
+        .and_then(|plan| match &plan.g8r_aig_action {
+            ActionSpec::DriverIrToG8rAig {
+                execution_recipe_revision,
+                ..
+            } => Some(*execution_recipe_revision),
+            _ => None,
+        })
+        .context("Git candidate plan is missing its G8r execution recipe")?;
+    let planned_candidate_actions = plans
+        .iter()
+        .map(|plan| plan.planned_actions().len())
+        .sum::<usize>();
+    let action_manifest_sha256 = candidate_action_manifest_sha256(samples, plans)?;
+    let mut candidate_run = IrDirCorpusCandidateRunRecord {
+        schema_version: IR_DIR_CORPUS_CANDIDATE_RUN_SCHEMA_VERSION,
+        candidate_run_id: String::new(),
+        requested_ref,
+        observed_at_utc,
+        candidate,
+        candidate_committed_at_utc: Some(candidate_committed_at_utc),
+        baseline,
+        dso_version: crate::versioning::normalize_tag_version(dso_version).to_string(),
+        lowering_mode: "frontend_no_prep_rewrite".to_string(),
+        fraig: false,
+        execution_recipe_revision,
+        driver_runtime: Some(driver_runtime.clone()),
+        abc_runtime: yosys_runtime.clone(),
+        stats_runtime: stats_runtime.clone(),
+        yosys_script: yosys_script_ref.path.clone(),
+        yosys_script_sha256: yosys_script_ref.sha256.clone(),
+        action_manifest_sha256,
+        cohort_sample_count: scheduling_policy.expected_corpus_sample_count,
+        cohort_artifact_manifest_sha256: scheduling_policy
+            .expected_corpus_artifact_manifest_sha256
+            .clone(),
+        scheduling_policy_name: scheduling_policy.policy_name.clone(),
+        scheduling_policy_config_sha256: scheduling_policy.config_sha256.clone(),
+        planned_candidate_actions,
+        reused_or_already_queued_actions: planned_candidate_actions,
+        newly_enqueued_candidate_actions: 0,
+    };
+    candidate_run.candidate_run_id = candidate_run_identity_sha256(&candidate_run)?;
+    if let Some(existing) = existing_candidate_run
+        && candidate_run.candidate_run_id != existing.candidate_run_id
+    {
+        bail!(
+            "candidate immutable identity differs from the run already recorded for this output workspace; use a new output directory"
+        );
+    }
+    Ok(Some(candidate_run))
+}
+
+fn finalize_candidate_run_record(
+    candidate_run: Option<IrDirCorpusCandidateRunRecord>,
+    newly_enqueued_actions: usize,
+) -> Result<Option<IrDirCorpusCandidateRunRecord>> {
+    candidate_run
+        .map(|mut candidate_run| {
+            candidate_run.reused_or_already_queued_actions = candidate_run
+                .planned_candidate_actions
+                .checked_sub(newly_enqueued_actions)
+                .context("newly enqueued candidate action count exceeds planned actions")?;
+            candidate_run.newly_enqueued_candidate_actions = newly_enqueued_actions;
+            Ok(candidate_run)
+        })
+        .transpose()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +798,214 @@ fn read_manifest_scheduling_policy(
         )
     })?;
     Ok(existing.scheduling_policy)
+}
+
+fn read_manifest_candidate_run(
+    manifest_path: &Path,
+) -> Result<Option<IrDirCorpusCandidateRunRecord>> {
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(manifest_path).with_context(|| {
+        format!(
+            "reading existing corpus manifest: {}",
+            manifest_path.display()
+        )
+    })?;
+    let existing: IrDirCorpusManifest = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parsing existing corpus manifest: {}",
+            manifest_path.display()
+        )
+    })?;
+    if let Some(candidate_run) = &existing.candidate_run {
+        validate_persisted_candidate_run(candidate_run)?;
+    }
+    Ok(existing.candidate_run)
+}
+
+fn read_candidate_run_marker(marker_path: &Path) -> Result<Option<IrDirCorpusCandidateRunRecord>> {
+    if !marker_path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(marker_path)
+        .with_context(|| format!("reading candidate run marker: {}", marker_path.display()))?;
+    let candidate_run: IrDirCorpusCandidateRunRecord = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing candidate run marker: {}", marker_path.display()))?;
+    validate_persisted_candidate_run(&candidate_run)
+        .with_context(|| format!("validating candidate run marker: {}", marker_path.display()))?;
+    Ok(Some(candidate_run))
+}
+
+fn reconcile_persisted_candidate_run(
+    manifest_candidate_run: Option<IrDirCorpusCandidateRunRecord>,
+    marker_candidate_run: Option<IrDirCorpusCandidateRunRecord>,
+) -> Result<Option<IrDirCorpusCandidateRunRecord>> {
+    match (manifest_candidate_run, marker_candidate_run) {
+        (Some(manifest), Some(marker)) => {
+            if manifest.candidate_run_id != marker.candidate_run_id {
+                bail!(
+                    "corpus manifest candidate identity does not match the durable workspace marker"
+                );
+            }
+            Ok(Some(marker))
+        }
+        (Some(manifest), None) => Ok(Some(manifest)),
+        (None, Some(marker)) => Ok(Some(marker)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn candidate_resume_runtimes(
+    existing: &IrDirCorpusCandidateRunRecord,
+    recipe_preset: CorpusRecipePreset,
+    dso_version: &str,
+    driver: &DriverCli,
+    yosys: &YosysCli,
+) -> Result<(DriverRuntimeSpec, DriverRuntimeSpec, YosysRuntimeSpec)> {
+    validate_persisted_candidate_run(existing)?;
+    if recipe_preset != CorpusRecipePreset::G8rAbcStats {
+        bail!(
+            "output workspace already records a fixed-IR Git candidate; rerun with the same recipe or use a new output directory"
+        );
+    }
+    if crate::versioning::normalize_tag_version(dso_version)
+        != crate::versioning::normalize_tag_version(&existing.dso_version)
+    {
+        bail!(
+            "requested DSO version {} does not match persisted candidate DSO version {}; use a new output directory",
+            dso_version,
+            existing.dso_version
+        );
+    }
+    if driver.driver_version.is_some()
+        || driver.driver_git_commit.as_deref() != Some(existing.candidate.commit.as_str())
+    {
+        bail!(
+            "output workspace already records Git candidate {}; rerun with --driver-git-commit={} or use a new output directory",
+            existing.candidate.commit,
+            existing.candidate.commit
+        );
+    }
+    let driver_runtime = existing
+        .driver_runtime
+        .as_ref()
+        .context("candidate workspace has no immutable source-driver runtime")?;
+    let source_revision = driver_runtime
+        .source_revision
+        .as_ref()
+        .context("candidate workspace source-driver runtime has no Git revision")?;
+    if source_revision.repository != existing.candidate.repository
+        || source_revision.commit != existing.candidate.commit
+    {
+        bail!("candidate workspace source-driver runtime does not match its Git candidate");
+    }
+    if crate::versioning::normalize_tag_version(&driver_runtime.driver_version)
+        != crate::versioning::normalize_tag_version(&existing.baseline.crate_version)
+        || existing.stats_runtime.source_revision.is_some()
+        || crate::versioning::normalize_tag_version(&existing.stats_runtime.driver_version)
+            != crate::versioning::normalize_tag_version(&existing.baseline.crate_version)
+    {
+        bail!("candidate workspace runtimes do not match its persisted baseline release");
+    }
+    if driver.release_platform != driver_runtime.release_platform {
+        bail!(
+            "requested driver release platform {:?} does not match persisted candidate platform {:?}",
+            driver.release_platform,
+            driver_runtime.release_platform
+        );
+    }
+    if let Some(image) = driver.docker_image.as_deref()
+        && image != driver_runtime.docker_image
+    {
+        bail!(
+            "requested driver image {:?} does not match persisted candidate image {:?}",
+            image,
+            driver_runtime.docker_image
+        );
+    }
+    if let Some(dockerfile) = driver.dockerfile.as_ref()
+        && dockerfile.to_string_lossy() != driver_runtime.dockerfile
+    {
+        bail!(
+            "requested driver Dockerfile {} does not match persisted candidate Dockerfile {:?}",
+            dockerfile.display(),
+            driver_runtime.dockerfile
+        );
+    }
+    if yosys.yosys_docker_image != existing.abc_runtime.docker_image
+        || yosys.yosys_dockerfile.to_string_lossy() != existing.abc_runtime.dockerfile
+        || yosys.yosys_upstream_commit != existing.abc_runtime.upstream_commit
+    {
+        bail!("requested Yosys runtime does not match the persisted candidate runtime");
+    }
+    if driver_runtime.docker_image_id.is_empty()
+        || existing.stats_runtime.docker_image_id.is_empty()
+        || existing.abc_runtime.docker_image_id.is_empty()
+    {
+        bail!("candidate workspace contains a runtime without an immutable Docker image ID");
+    }
+    Ok((
+        driver_runtime.clone(),
+        existing.stats_runtime.clone(),
+        existing.abc_runtime.clone(),
+    ))
+}
+
+fn persist_candidate_run_marker(
+    store: &ArtifactStore,
+    marker_path: &Path,
+    candidate_run: Option<&IrDirCorpusCandidateRunRecord>,
+) -> Result<()> {
+    let Some(candidate_run) = candidate_run else {
+        if marker_path.exists() {
+            bail!(
+                "output workspace already contains a durable candidate run marker; rerun the same candidate or use a new output directory"
+            );
+        }
+        return Ok(());
+    };
+    validate_persisted_candidate_run(candidate_run)?;
+    if let Some(existing) = read_candidate_run_marker(marker_path)? {
+        if existing.candidate_run_id != candidate_run.candidate_run_id {
+            bail!(
+                "candidate identity differs from the durable workspace marker; use a new output directory"
+            );
+        }
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec_pretty(candidate_run)
+        .context("serializing durable candidate run marker")?;
+    store
+        .write_record_atomic("corpus-candidate", marker_path, &bytes)
+        .with_context(|| format!("persisting candidate run marker: {}", marker_path.display()))
+}
+
+pub(crate) fn validate_candidate_run_marker_provenance(
+    output_dir: &Path,
+    manifest_candidate_run_id: Option<&str>,
+) -> Result<()> {
+    let (_, workspace_store_dir, _) = corpus_workspace_paths(output_dir);
+    let marker_path = workspace_store_dir
+        .join("corpus")
+        .join(IR_DIR_CORPUS_CANDIDATE_RUN_MARKER_FILENAME);
+    let marker = read_candidate_run_marker(&marker_path)?;
+    match (manifest_candidate_run_id, marker.as_ref()) {
+        (None, None) => Ok(()),
+        (Some(manifest_id), Some(marker)) if manifest_id == marker.candidate_run_id => Ok(()),
+        (Some(_), None) => bail!(
+            "corpus candidate manifest has no durable workspace marker {}; complete run-ir-dir-corpus with the matching candidate before using public outputs",
+            marker_path.display()
+        ),
+        (None, Some(_)) => bail!(
+            "corpus manifest does not reflect durable candidate marker {}; complete run-ir-dir-corpus with the matching candidate before using public outputs",
+            marker_path.display()
+        ),
+        (Some(_), Some(_)) => bail!(
+            "corpus manifest candidate identity does not match durable workspace marker {}; complete run-ir-dir-corpus with the matching candidate before using public outputs",
+            marker_path.display()
+        ),
+    }
 }
 
 fn read_scheduling_policy_marker(
@@ -456,6 +1144,9 @@ pub(crate) fn run_ir_dir_corpus(
     {
         bail!("--scheduling-policy is only supported with --execution-mode enqueue");
     }
+    if recipe_preset == CorpusRecipePreset::G8rAbcStats && fraig {
+        bail!("recipe preset `g8r-abc-stats` requires --fraig=false");
+    }
 
     fs::create_dir_all(output_dir)
         .with_context(|| format!("creating output dir: {}", output_dir.display()))?;
@@ -469,10 +1160,59 @@ pub(crate) fn run_ir_dir_corpus(
     );
     store.ensure_layout()?;
 
-    let driver_runtime = driver.into_runtime(repo_root, version)?;
-    let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &driver_runtime)
-        .unwrap_or_else(|_| driver_runtime.clone());
-    let yosys_runtime = yosys.into_runtime(repo_root, None)?;
+    let manifest_path = output_dir.join(IR_DIR_CORPUS_MANIFEST_FILENAME);
+    let candidate_run_marker_path = workspace_store_dir
+        .join("corpus")
+        .join(IR_DIR_CORPUS_CANDIDATE_RUN_MARKER_FILENAME);
+    let existing_candidate_run = reconcile_persisted_candidate_run(
+        read_manifest_candidate_run(&manifest_path)?,
+        read_candidate_run_marker(&candidate_run_marker_path)?,
+    )?;
+    let (driver_runtime, stats_runtime, yosys_runtime) = if let Some(existing) =
+        existing_candidate_run.as_ref()
+    {
+        let runtimes =
+            candidate_resume_runtimes(existing, recipe_preset, version, &driver, &yosys)?;
+        crate::service::ensure_driver_image(repo_root, &runtimes.0).with_context(|| {
+            format!(
+                "persisted source-driver image sha256:{} is unavailable or invalid",
+                runtimes.0.docker_image_id
+            )
+        })?;
+        crate::service::ensure_driver_image(repo_root, &runtimes.1).with_context(|| {
+            format!(
+                "persisted stats-driver image sha256:{} is unavailable or invalid",
+                runtimes.1.docker_image_id
+            )
+        })?;
+        crate::service::ensure_yosys_image(repo_root, &runtimes.2).with_context(|| {
+            format!(
+                "persisted Yosys image sha256:{} is unavailable or invalid",
+                runtimes.2.docker_image_id
+            )
+        })?;
+        runtimes
+    } else {
+        let driver_runtime = driver.into_runtime_with_driver_version(repo_root, version, None)?;
+        let stats_runtime = match resolve_driver_runtime_for_aig_stats(repo_root, &driver_runtime) {
+            Ok(runtime) => runtime,
+            Err(_) if driver_runtime.source_revision.is_none() => driver_runtime.clone(),
+            Err(error) => {
+                return Err(error).context(
+                    "resolving the required released stats runtime for a source-driver candidate",
+                );
+            }
+        };
+        let yosys_runtime = yosys.into_runtime(repo_root, None)?;
+        (driver_runtime, stats_runtime, yosys_runtime)
+    };
+    let effective_dso_version = if recipe_preset == CorpusRecipePreset::G8rAbcStats
+        && driver_runtime.source_revision.is_some()
+    {
+        crate::versioning::normalize_tag_version(version).to_string()
+    } else {
+        version.to_string()
+    };
     let recipe_preset_name = recipe_preset_label(recipe_preset);
     let yosys_script = resolve_recipe_preset_yosys_script(recipe_preset, yosys_script)?;
     let yosys_script_ref = make_script_ref(repo_root, yosys_script)?;
@@ -492,7 +1232,6 @@ pub(crate) fn run_ir_dir_corpus(
     let scheduling_policy_record = scheduling_policy
         .as_ref()
         .map(|policy| policy.record.clone());
-    let manifest_path = output_dir.join(IR_DIR_CORPUS_MANIFEST_FILENAME);
     let scheduling_policy_marker_path = workspace_store_dir
         .join("corpus")
         .join(IR_DIR_CORPUS_SCHEDULING_POLICY_MARKER_FILENAME);
@@ -512,8 +1251,9 @@ pub(crate) fn run_ir_dir_corpus(
         .map(|sample| {
             build_action_plan(
                 sample,
+                recipe_preset,
                 fraig,
-                version,
+                &effective_dso_version,
                 &driver_runtime,
                 &stats_runtime,
                 &yosys_runtime,
@@ -543,6 +1283,20 @@ pub(crate) fn run_ir_dir_corpus(
     } else {
         Vec::new()
     };
+    let candidate_run = build_candidate_run_preflight(
+        repo_root,
+        existing_candidate_run.as_ref(),
+        recipe_preset,
+        &effective_dso_version,
+        &driver_runtime,
+        &stats_runtime,
+        &yosys_runtime,
+        &yosys_script_ref,
+        scheduling_policy_record.as_ref(),
+        &samples,
+        &plans,
+    )?;
+    persist_candidate_run_marker(&store, &candidate_run_marker_path, candidate_run.as_ref())?;
     persist_scheduling_policy_marker(
         &store,
         &scheduling_policy_marker_path,
@@ -573,7 +1327,7 @@ pub(crate) fn run_ir_dir_corpus(
             recipe_preset_name,
             top_fn_policy,
             fraig,
-            version,
+            &effective_dso_version,
             &driver_runtime,
             &stats_runtime,
             &yosys_script_ref,
@@ -582,6 +1336,18 @@ pub(crate) fn run_ir_dir_corpus(
 
     let joined_rows = build_joined_rows(&store, &sample_records)?;
     export_leaf_artifacts(&store, output_dir, &sample_records)?;
+    let planned_actions = plans
+        .iter()
+        .map(|plan| plan.planned_actions().len())
+        .sum::<usize>();
+    let newly_executed_or_enqueued_actions = match execution_mode {
+        CorpusExecutionMode::Enqueue => counters.enqueued_actions,
+        CorpusExecutionMode::Run => counters.executed_actions,
+    };
+    let reused_or_already_queued_actions = planned_actions
+        .checked_sub(newly_executed_or_enqueued_actions)
+        .context("new corpus action count exceeds planned corpus actions")?;
+    let candidate_run = finalize_candidate_run_record(candidate_run, counters.enqueued_actions)?;
 
     let manifest = IrDirCorpusManifest {
         schema_version: IR_DIR_CORPUS_MANIFEST_SCHEMA_VERSION,
@@ -598,13 +1364,14 @@ pub(crate) fn run_ir_dir_corpus(
         top_fn_policy: top_fn_policy_label(top_fn_policy).to_string(),
         top_fn_name: top_fn_name.map(ToOwned::to_owned),
         fraig,
-        dso_version: version.to_string(),
+        dso_version: effective_dso_version,
         driver_runtime: driver_runtime.clone(),
         stats_runtime: stats_runtime.clone(),
         yosys_runtime: yosys_runtime.clone(),
         yosys_script: yosys_script_ref.path.clone(),
         yosys_script_sha256: yosys_script_ref.sha256.clone(),
         scheduling_policy: scheduling_policy_record.clone(),
+        candidate_run: candidate_run.clone(),
         samples: sample_records.clone(),
     };
     let status_counts = count_statuses(&sample_records);
@@ -628,8 +1395,25 @@ pub(crate) fn run_ir_dir_corpus(
             .as_ref()
             .map(|policy| policy.policy_name.clone()),
         prioritized_samples: prioritized_sample_count(scheduling_policy_record.as_ref()),
+        planned_actions,
+        reused_or_already_queued_actions,
         enqueued_actions: counters.enqueued_actions,
         executed_actions: counters.executed_actions,
+        candidate_run_id: candidate_run
+            .as_ref()
+            .map(|candidate| candidate.candidate_run_id.clone()),
+        candidate_commit: candidate_run
+            .as_ref()
+            .map(|candidate| candidate.candidate.commit.clone()),
+        baseline_crate_version: candidate_run
+            .as_ref()
+            .map(|candidate| candidate.baseline.crate_version.clone()),
+        baseline_release_commit: candidate_run
+            .as_ref()
+            .map(|candidate| candidate.baseline.commit.clone()),
+        cohort_artifact_manifest_sha256: candidate_run
+            .as_ref()
+            .map(|candidate| candidate.cohort_artifact_manifest_sha256.clone()),
     };
 
     let samples_path = output_dir.join(IR_DIR_CORPUS_SAMPLES_FILENAME);
@@ -640,11 +1424,7 @@ pub(crate) fn run_ir_dir_corpus(
     let joined_jsonl_path = joined_dir.join(format!("{}.jsonl", recipe_preset_name));
     let joined_csv_path = joined_dir.join(format!("{}.csv", recipe_preset_name));
 
-    fs::write(
-        &manifest_path,
-        serde_json::to_string_pretty(&manifest).context("serializing corpus manifest")?,
-    )
-    .with_context(|| format!("writing manifest: {}", manifest_path.display()))?;
+    write_corpus_manifest_atomic(&manifest_path, &manifest)?;
     write_samples_jsonl(&samples_path, &sample_records)?;
     fs::write(
         &summary_path,
@@ -671,8 +1451,25 @@ pub(crate) fn run_ir_dir_corpus(
         sample_id_scheme: sample_id_scheme_label().to_string(),
         sample_count: sample_records.len(),
         completed_samples: summary_file.completed_samples,
+        planned_actions,
+        reused_or_already_queued_actions,
         enqueued_actions: counters.enqueued_actions,
         executed_actions: counters.executed_actions,
+        candidate_run_id: candidate_run
+            .as_ref()
+            .map(|candidate| candidate.candidate_run_id.clone()),
+        candidate_commit: candidate_run
+            .as_ref()
+            .map(|candidate| candidate.candidate.commit.clone()),
+        baseline_crate_version: candidate_run
+            .as_ref()
+            .map(|candidate| candidate.baseline.crate_version.clone()),
+        baseline_release_commit: candidate_run
+            .as_ref()
+            .map(|candidate| candidate.baseline.commit.clone()),
+        cohort_artifact_manifest_sha256: candidate_run
+            .as_ref()
+            .map(|candidate| candidate.cohort_artifact_manifest_sha256.clone()),
         status_counts,
         scheduling_policy: scheduling_policy_record
             .as_ref()
@@ -736,6 +1533,16 @@ fn build_ir_dir_corpus_status_report(
             manifest.scheduling_policy.as_ref(),
             &scheduling_policy_marker_path,
         )?;
+        if let Some(candidate_run) = manifest.candidate_run.as_ref() {
+            validate_persisted_candidate_run(candidate_run)?;
+        }
+        validate_candidate_run_marker_provenance(
+            output_dir,
+            manifest
+                .candidate_run
+                .as_ref()
+                .map(|run| run.candidate_run_id.as_str()),
+        )?;
     }
     if !workspace_artifacts_via_sled.exists() {
         bail!(
@@ -765,6 +1572,7 @@ fn build_ir_dir_corpus_status_report(
     };
 
     let top_fn_policy = parse_top_fn_policy_label(&manifest.top_fn_policy)?;
+    let recipe_preset = parse_recipe_preset_label(&manifest.recipe_preset)?;
     let yosys_script_ref = crate::model::ScriptRef {
         path: manifest.yosys_script.clone(),
         sha256: manifest.yosys_script_sha256.clone(),
@@ -779,6 +1587,7 @@ fn build_ir_dir_corpus_status_report(
     for (sample, persisted_sample) in samples.iter().zip(manifest.samples.iter()) {
         let plan = build_action_plan(
             sample,
+            recipe_preset,
             manifest.fraig,
             &manifest.dso_version,
             &manifest.driver_runtime,
@@ -885,6 +1694,7 @@ fn build_ir_dir_corpus_status_report(
             yosys_script: manifest.yosys_script.clone(),
             yosys_script_sha256: manifest.yosys_script_sha256.clone(),
             scheduling_policy: manifest.scheduling_policy.clone(),
+            candidate_run: manifest.candidate_run.clone(),
             samples: sample_records.clone(),
         };
         let refreshed_summary = IrDirCorpusSummaryFile {
@@ -905,20 +1715,51 @@ fn build_ir_dir_corpus_status_report(
                 .as_ref()
                 .map(|policy| policy.policy_name.clone()),
             prioritized_samples: prioritized_sample_count(manifest.scheduling_policy.as_ref()),
+            planned_actions: sample_records
+                .iter()
+                .map(|sample| {
+                    corpus_sample_action_statuses(sample)
+                        .len()
+                        .saturating_sub(1)
+                })
+                .sum(),
+            reused_or_already_queued_actions: sample_records
+                .iter()
+                .map(|sample| {
+                    corpus_sample_action_statuses(sample)
+                        .len()
+                        .saturating_sub(1)
+                })
+                .sum(),
             enqueued_actions: 0,
             executed_actions: 0,
+            candidate_run_id: manifest
+                .candidate_run
+                .as_ref()
+                .map(|candidate| candidate.candidate_run_id.clone()),
+            candidate_commit: manifest
+                .candidate_run
+                .as_ref()
+                .map(|candidate| candidate.candidate.commit.clone()),
+            baseline_crate_version: manifest
+                .candidate_run
+                .as_ref()
+                .map(|candidate| candidate.baseline.crate_version.clone()),
+            baseline_release_commit: manifest
+                .candidate_run
+                .as_ref()
+                .map(|candidate| candidate.baseline.commit.clone()),
+            cohort_artifact_manifest_sha256: manifest
+                .candidate_run
+                .as_ref()
+                .map(|candidate| candidate.cohort_artifact_manifest_sha256.clone()),
         };
         let samples_path = output_dir.join(IR_DIR_CORPUS_SAMPLES_FILENAME);
         let summary_path = output_dir.join(IR_DIR_CORPUS_SUMMARY_FILENAME);
         let joined_dir = output_dir.join(IR_DIR_CORPUS_JOINED_DIR);
         fs::create_dir_all(&joined_dir)
             .with_context(|| format!("creating joined dir: {}", joined_dir.display()))?;
-        fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&refreshed_manifest)
-                .context("serializing refreshed corpus manifest")?,
-        )
-        .with_context(|| format!("writing manifest: {}", manifest_path.display()))?;
+        write_corpus_manifest_atomic(&manifest_path, &refreshed_manifest)?;
         write_samples_jsonl(&samples_path, &sample_records)?;
         fs::write(
             &summary_path,
@@ -1091,8 +1932,13 @@ fn collect_sample_completion_times(
         if sample.status != "done" {
             continue;
         }
+        let terminal_action_id = if sample.aig_stat_diff_status == "not_planned" {
+            &sample.g8r_stats_action_id
+        } else {
+            &sample.aig_stat_diff_action_id
+        };
         if let Some(completed_utc) =
-            action_completion_utc(store, &sample.aig_stat_diff_action_id, status_query_mode)?
+            action_completion_utc(store, terminal_action_id, status_query_mode)?
         {
             out.push(completed_utc);
         }
@@ -1375,7 +2221,7 @@ fn top_fn_name_from_filename(source_path: &Path) -> Result<String> {
     Ok(stem.to_string())
 }
 
-fn sample_id_for_relpath(source_relpath: &str) -> String {
+pub(crate) fn sample_id_for_relpath(source_relpath: &str) -> String {
     let digest = sha2::Sha256::digest(source_relpath.as_bytes());
     let hash = hex::encode(digest);
     let readable = Path::new(source_relpath)
@@ -1402,6 +2248,7 @@ fn sample_id_for_relpath(source_relpath: &str) -> String {
 
 fn build_action_plan(
     sample: &CorpusSampleSpec,
+    recipe_preset: CorpusRecipePreset,
     fraig: bool,
     version: &str,
     driver_runtime: &DriverRuntimeSpec,
@@ -1409,6 +2256,7 @@ fn build_action_plan(
     yosys_runtime: &YosysRuntimeSpec,
     yosys_script_ref: &crate::model::ScriptRef,
 ) -> Result<CorpusActionPlan> {
+    let is_g8r_abc_stats = recipe_preset == CorpusRecipePreset::G8rAbcStats;
     let import_action = ActionSpec::ImportIrPackageFile {
         source_sha256: sample.source_sha256.clone(),
         top_fn_name: Some(sample.top_fn_name.clone()),
@@ -1418,7 +2266,11 @@ fn build_action_plan(
         ir_action_id: import_ir_action_id.clone(),
         top_fn_name: Some(sample.top_fn_name.clone()),
         fraig,
-        lowering_mode: crate::model::G8rLoweringMode::Default,
+        lowering_mode: if is_g8r_abc_stats {
+            crate::model::G8rLoweringMode::FrontendNoPrepRewrite
+        } else {
+            crate::model::G8rLoweringMode::Default
+        },
         execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
             &driver_runtime.driver_version,
         ),
@@ -1426,12 +2278,6 @@ fn build_action_plan(
         runtime: driver_runtime.clone(),
     };
     let g8r_aig_action_id = compute_action_id(&g8r_aig_action)?;
-    let g8r_stats_action = ActionSpec::DriverAigToStats {
-        aig_action_id: g8r_aig_action_id.clone(),
-        version: version.to_string(),
-        runtime: stats_runtime.clone(),
-    };
-    let g8r_stats_action_id = compute_action_id(&g8r_stats_action)?;
     let combo_verilog_action = ActionSpec::IrFnToCombinationalVerilog {
         ir_action_id: import_ir_action_id.clone(),
         top_fn_name: Some(sample.top_fn_name.clone()),
@@ -1440,14 +2286,32 @@ fn build_action_plan(
         runtime: driver_runtime.clone(),
     };
     let combo_verilog_action_id = compute_action_id(&combo_verilog_action)?;
-    let yosys_abc_aig_action = ActionSpec::ComboVerilogToYosysAbcAig {
-        verilog_action_id: combo_verilog_action_id.clone(),
-        verilog_top_module_name: Some(sample.top_fn_name.clone()),
-        frontend: YosysVerilogFrontend::Builtin,
-        yosys_script_ref: yosys_script_ref.clone(),
-        runtime: yosys_runtime.clone(),
+    let yosys_abc_aig_action = if is_g8r_abc_stats {
+        ActionSpec::AigToYosysAbcAig {
+            aig_action_id: g8r_aig_action_id.clone(),
+            yosys_script_ref: yosys_script_ref.clone(),
+            runtime: yosys_runtime.clone(),
+        }
+    } else {
+        ActionSpec::ComboVerilogToYosysAbcAig {
+            verilog_action_id: combo_verilog_action_id.clone(),
+            verilog_top_module_name: Some(sample.top_fn_name.clone()),
+            frontend: YosysVerilogFrontend::Builtin,
+            yosys_script_ref: yosys_script_ref.clone(),
+            runtime: yosys_runtime.clone(),
+        }
     };
     let yosys_abc_aig_action_id = compute_action_id(&yosys_abc_aig_action)?;
+    let g8r_stats_action = ActionSpec::DriverAigToStats {
+        aig_action_id: if is_g8r_abc_stats {
+            yosys_abc_aig_action_id.clone()
+        } else {
+            g8r_aig_action_id.clone()
+        },
+        version: version.to_string(),
+        runtime: stats_runtime.clone(),
+    };
+    let g8r_stats_action_id = compute_action_id(&g8r_stats_action)?;
     let yosys_abc_stats_action = ActionSpec::DriverAigToStats {
         aig_action_id: yosys_abc_aig_action_id.clone(),
         version: version.to_string(),
@@ -1462,6 +2326,7 @@ fn build_action_plan(
     let aig_stat_diff_action_id = compute_action_id(&aig_stat_diff_action)?;
 
     Ok(CorpusActionPlan {
+        recipe_preset,
         import_action,
         g8r_aig_action,
         g8r_stats_action,
@@ -1484,8 +2349,39 @@ fn ensure_imported_ir_action(
     sample: &CorpusSampleSpec,
     import_action: &ActionSpec,
 ) -> Result<()> {
+    let expected_source_sha256 = match import_action {
+        ActionSpec::ImportIrPackageFile { source_sha256, .. }
+            if source_sha256 == &sample.source_sha256 =>
+        {
+            source_sha256
+        }
+        ActionSpec::ImportIrPackageFile { .. } => {
+            bail!("corpus import action does not match its discovered source digest")
+        }
+        _ => bail!("corpus import plan does not contain an IR package import action"),
+    };
     let action_id = compute_action_id(import_action)?;
     if store.action_exists(&action_id) {
+        let provenance = store
+            .load_provenance(&action_id)
+            .with_context(|| format!("loading existing corpus import {action_id}"))?;
+        let declared_output = provenance
+            .output_files
+            .iter()
+            .find(|output| output.path == "input.ir")
+            .context("existing corpus import does not declare input.ir")?;
+        let artifact_path = store.resolve_artifact_ref_path(&provenance.output_artifact);
+        if compute_action_id(&provenance.action)? != action_id
+            || provenance.output_artifact.action_id != action_id
+            || provenance.output_artifact.artifact_type != ArtifactType::IrPackageFile
+            || provenance.output_artifact.relpath != IMPORTED_IR_RELPATH
+            || declared_output.sha256 != *expected_source_sha256
+            || sha256_file(&artifact_path)? != *expected_source_sha256
+        {
+            bail!(
+                "existing corpus import {action_id} does not contain the bytes bound by its source digest"
+            );
+        }
         return Ok(());
     }
 
@@ -1511,6 +2407,14 @@ fn ensure_imported_ir_action(
             imported_path.display()
         )
     })?;
+    let copied_sha256 = sha256_file(&imported_path)?;
+    if copied_sha256 != *expected_source_sha256 {
+        bail!(
+            "imported IR changed after discovery: expected {}, copied {}",
+            expected_source_sha256,
+            copied_sha256
+        );
+    }
     let output_files = collect_output_files(&payload_dir)?;
     let provenance = Provenance {
         schema_version: crate::ACTION_SCHEMA_VERSION,
@@ -1547,14 +2451,7 @@ fn checked_enqueue_plan_priorities(
     plan: &CorpusActionPlan,
     base_priority: i32,
 ) -> Result<Vec<i32>> {
-    let actions = [
-        &plan.g8r_aig_action,
-        &plan.g8r_stats_action,
-        &plan.combo_verilog_action,
-        &plan.yosys_abc_aig_action,
-        &plan.yosys_abc_stats_action,
-        &plan.aig_stat_diff_action,
-    ];
+    let actions = plan.planned_actions();
     actions
         .iter()
         .map(|action| {
@@ -1576,14 +2473,7 @@ fn enqueue_plan(
     plan: &CorpusActionPlan,
     priorities: &[i32],
 ) -> Result<usize> {
-    let actions = [
-        &plan.g8r_aig_action,
-        &plan.g8r_stats_action,
-        &plan.combo_verilog_action,
-        &plan.yosys_abc_aig_action,
-        &plan.yosys_abc_stats_action,
-        &plan.aig_stat_diff_action,
-    ];
+    let actions = plan.planned_actions();
     if priorities.len() != actions.len() {
         bail!("corpus enqueue plan priority count does not match action count");
     }
@@ -1608,14 +2498,7 @@ fn execute_plan(
     plan: &CorpusActionPlan,
     counters: &mut ExecutionCounters,
 ) -> Result<()> {
-    let actions = [
-        &plan.g8r_aig_action,
-        &plan.g8r_stats_action,
-        &plan.combo_verilog_action,
-        &plan.yosys_abc_aig_action,
-        &plan.yosys_abc_stats_action,
-        &plan.aig_stat_diff_action,
-    ];
+    let actions = plan.planned_actions();
     for action in actions {
         let action_id = compute_action_id(action)?;
         let existed = store.action_exists(&action_id);
@@ -1643,22 +2526,40 @@ fn build_sample_record(
     let import_ir_status = action_status_label(store, &plan.import_ir_action_id);
     let g8r_aig_status = action_status_label(store, &plan.g8r_aig_action_id);
     let g8r_stats_status = action_status_label(store, &plan.g8r_stats_action_id);
-    let combo_verilog_status = action_status_label(store, &plan.combo_verilog_action_id);
+    let combo_verilog_status = if plan.is_g8r_abc_stats() {
+        "not_planned".to_string()
+    } else {
+        action_status_label(store, &plan.combo_verilog_action_id)
+    };
     let yosys_abc_aig_status = action_status_label(store, &plan.yosys_abc_aig_action_id);
-    let yosys_abc_stats_status = action_status_label(store, &plan.yosys_abc_stats_action_id);
-    let aig_stat_diff_status = action_status_label(store, &plan.aig_stat_diff_action_id);
+    let yosys_abc_stats_status = if plan.is_g8r_abc_stats() {
+        "not_planned".to_string()
+    } else {
+        action_status_label(store, &plan.yosys_abc_stats_action_id)
+    };
+    let aig_stat_diff_status = if plan.is_g8r_abc_stats() {
+        "not_planned".to_string()
+    } else {
+        action_status_label(store, &plan.aig_stat_diff_action_id)
+    };
 
-    let terminal_error = action_error_summary(store, &plan.aig_stat_diff_action_id)
-        .or_else(|| action_error_summary(store, &plan.yosys_abc_stats_action_id))
-        .or_else(|| action_error_summary(store, &plan.yosys_abc_aig_action_id))
-        .or_else(|| action_error_summary(store, &plan.combo_verilog_action_id))
-        .or_else(|| action_error_summary(store, &plan.g8r_stats_action_id))
-        .or_else(|| action_error_summary(store, &plan.g8r_aig_action_id))
-        .or_else(|| {
-            run_errors
-                .get(&sample.sample_id)
-                .map(|s| summarize_error(s))
-        });
+    let terminal_error = if plan.is_g8r_abc_stats() {
+        action_error_summary(store, &plan.g8r_stats_action_id)
+            .or_else(|| action_error_summary(store, &plan.yosys_abc_aig_action_id))
+            .or_else(|| action_error_summary(store, &plan.g8r_aig_action_id))
+    } else {
+        action_error_summary(store, &plan.aig_stat_diff_action_id)
+            .or_else(|| action_error_summary(store, &plan.yosys_abc_stats_action_id))
+            .or_else(|| action_error_summary(store, &plan.yosys_abc_aig_action_id))
+            .or_else(|| action_error_summary(store, &plan.combo_verilog_action_id))
+            .or_else(|| action_error_summary(store, &plan.g8r_stats_action_id))
+            .or_else(|| action_error_summary(store, &plan.g8r_aig_action_id))
+    }
+    .or_else(|| {
+        run_errors
+            .get(&sample.sample_id)
+            .map(|error| summarize_error(error))
+    });
 
     build_sample_record_with_statuses(
         sample,
@@ -1709,48 +2610,74 @@ fn build_sample_record_from_queue_state(
         &plan.g8r_stats_action_id,
         &persisted_sample.g8r_stats_status,
     );
-    let combo_verilog_status = queue_or_persisted_action_status_label(
-        store,
-        &plan.combo_verilog_action_id,
-        &persisted_sample.combo_verilog_status,
-    );
+    let combo_verilog_status = if plan.is_g8r_abc_stats() {
+        "not_planned".to_string()
+    } else {
+        queue_or_persisted_action_status_label(
+            store,
+            &plan.combo_verilog_action_id,
+            &persisted_sample.combo_verilog_status,
+        )
+    };
     let yosys_abc_aig_status = queue_or_persisted_action_status_label(
         store,
         &plan.yosys_abc_aig_action_id,
         &persisted_sample.yosys_abc_aig_status,
     );
-    let yosys_abc_stats_status = queue_or_persisted_action_status_label(
-        store,
-        &plan.yosys_abc_stats_action_id,
-        &persisted_sample.yosys_abc_stats_status,
-    );
-    let aig_stat_diff_status = queue_or_persisted_action_status_label(
-        store,
-        &plan.aig_stat_diff_action_id,
-        &persisted_sample.aig_stat_diff_status,
-    );
+    let yosys_abc_stats_status = if plan.is_g8r_abc_stats() {
+        "not_planned".to_string()
+    } else {
+        queue_or_persisted_action_status_label(
+            store,
+            &plan.yosys_abc_stats_action_id,
+            &persisted_sample.yosys_abc_stats_status,
+        )
+    };
+    let aig_stat_diff_status = if plan.is_g8r_abc_stats() {
+        "not_planned".to_string()
+    } else {
+        queue_or_persisted_action_status_label(
+            store,
+            &plan.aig_stat_diff_action_id,
+            &persisted_sample.aig_stat_diff_status,
+        )
+    };
 
-    let statuses = [
-        aig_stat_diff_status.as_str(),
-        yosys_abc_stats_status.as_str(),
-        yosys_abc_aig_status.as_str(),
-        g8r_stats_status.as_str(),
-        g8r_aig_status.as_str(),
-        combo_verilog_status.as_str(),
-    ];
-    let terminal_error = queue_files_action_error_summary(store, &plan.aig_stat_diff_action_id)
-        .or_else(|| queue_files_action_error_summary(store, &plan.yosys_abc_stats_action_id))
-        .or_else(|| queue_files_action_error_summary(store, &plan.yosys_abc_aig_action_id))
-        .or_else(|| queue_files_action_error_summary(store, &plan.combo_verilog_action_id))
-        .or_else(|| queue_files_action_error_summary(store, &plan.g8r_stats_action_id))
-        .or_else(|| queue_files_action_error_summary(store, &plan.g8r_aig_action_id))
-        .or_else(|| {
-            if summarize_sample_status(&statuses, false) == "failed" {
-                persisted_sample.error.clone()
-            } else {
-                None
-            }
-        });
+    let statuses = if plan.is_g8r_abc_stats() {
+        vec![
+            g8r_stats_status.as_str(),
+            yosys_abc_aig_status.as_str(),
+            g8r_aig_status.as_str(),
+        ]
+    } else {
+        vec![
+            aig_stat_diff_status.as_str(),
+            yosys_abc_stats_status.as_str(),
+            yosys_abc_aig_status.as_str(),
+            g8r_stats_status.as_str(),
+            g8r_aig_status.as_str(),
+            combo_verilog_status.as_str(),
+        ]
+    };
+    let terminal_error = if plan.is_g8r_abc_stats() {
+        queue_files_action_error_summary(store, &plan.g8r_stats_action_id)
+            .or_else(|| queue_files_action_error_summary(store, &plan.yosys_abc_aig_action_id))
+            .or_else(|| queue_files_action_error_summary(store, &plan.g8r_aig_action_id))
+    } else {
+        queue_files_action_error_summary(store, &plan.aig_stat_diff_action_id)
+            .or_else(|| queue_files_action_error_summary(store, &plan.yosys_abc_stats_action_id))
+            .or_else(|| queue_files_action_error_summary(store, &plan.yosys_abc_aig_action_id))
+            .or_else(|| queue_files_action_error_summary(store, &plan.combo_verilog_action_id))
+            .or_else(|| queue_files_action_error_summary(store, &plan.g8r_stats_action_id))
+            .or_else(|| queue_files_action_error_summary(store, &plan.g8r_aig_action_id))
+    }
+    .or_else(|| {
+        if summarize_sample_status(&statuses, false) == "failed" {
+            persisted_sample.error.clone()
+        } else {
+            None
+        }
+    });
 
     build_sample_record_with_statuses(
         sample,
@@ -1792,14 +2719,22 @@ fn build_sample_record_with_statuses(
     aig_stat_diff_status: String,
     terminal_error: Option<String>,
 ) -> IrDirCorpusSampleRecord {
-    let statuses = [
-        aig_stat_diff_status.as_str(),
-        yosys_abc_stats_status.as_str(),
-        yosys_abc_aig_status.as_str(),
-        g8r_stats_status.as_str(),
-        g8r_aig_status.as_str(),
-        combo_verilog_status.as_str(),
-    ];
+    let statuses = if plan.is_g8r_abc_stats() {
+        vec![
+            g8r_stats_status.as_str(),
+            yosys_abc_aig_status.as_str(),
+            g8r_aig_status.as_str(),
+        ]
+    } else {
+        vec![
+            aig_stat_diff_status.as_str(),
+            yosys_abc_stats_status.as_str(),
+            yosys_abc_aig_status.as_str(),
+            g8r_stats_status.as_str(),
+            g8r_aig_status.as_str(),
+            combo_verilog_status.as_str(),
+        ]
+    };
     let overall_status = summarize_sample_status(&statuses, terminal_error.is_some());
 
     IrDirCorpusSampleRecord {
@@ -1812,6 +2747,14 @@ fn build_sample_record_with_statuses(
         fraig,
         dso_version: dso_version.to_string(),
         driver_crate_version: driver_runtime.driver_version.clone(),
+        driver_source_repository: driver_runtime
+            .source_revision
+            .as_ref()
+            .map(|source| source.repository.clone()),
+        driver_source_commit: driver_runtime
+            .source_revision
+            .as_ref()
+            .map(|source| source.commit.clone()),
         stats_driver_crate_version: stats_runtime.driver_version.clone(),
         yosys_script: yosys_script_ref.path.clone(),
         yosys_script_sha256: yosys_script_ref.sha256.clone(),
@@ -1863,7 +2806,7 @@ fn queue_or_persisted_action_status_label(
     }
 }
 
-fn corpus_sample_action_statuses(sample: &IrDirCorpusSampleRecord) -> [(&str, &str); 7] {
+fn corpus_sample_action_statuses(sample: &IrDirCorpusSampleRecord) -> Vec<(&str, &str)> {
     [
         (&sample.import_ir_action_id, &sample.import_ir_status),
         (&sample.g8r_aig_action_id, &sample.g8r_aig_status),
@@ -1885,6 +2828,10 @@ fn corpus_sample_action_statuses(sample: &IrDirCorpusSampleRecord) -> [(&str, &s
             &sample.aig_stat_diff_status,
         ),
     ]
+    .into_iter()
+    .filter(|(_, status)| status.as_str() != "not_planned")
+    .map(|(action_id, status)| (action_id.as_str(), status.as_str()))
+    .collect()
 }
 
 fn action_status_label(store: &ArtifactStore, action_id: &str) -> String {
@@ -1950,28 +2897,47 @@ fn build_joined_rows(
         if sample.status != "done" {
             continue;
         }
-        let diff_provenance = store
-            .load_provenance(&sample.aig_stat_diff_action_id)
-            .with_context(|| {
-                format!(
-                    "loading aig-stat-diff provenance for sample {}",
-                    sample.sample_id
-                )
-            })?;
-        let diff_path = store.resolve_artifact_ref_path(&diff_provenance.output_artifact);
-        let diff_json: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(&diff_path)
-                .with_context(|| format!("reading diff JSON: {}", diff_path.display()))?,
-        )
-        .with_context(|| format!("parsing diff JSON: {}", diff_path.display()))?;
-        let g8r_stats = diff_json
-            .get("g8r_stats")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let yosys_stats = diff_json
-            .get("yosys_abc_stats")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let (g8r_stats, yosys_stats, diff_json) = if sample.aig_stat_diff_status == "not_planned" {
+            let stats_provenance = store
+                .load_provenance(&sample.g8r_stats_action_id)
+                .with_context(|| {
+                    format!(
+                        "loading g8r+ABC stats provenance for sample {}",
+                        sample.sample_id
+                    )
+                })?;
+            let stats_path = store.resolve_artifact_ref_path(&stats_provenance.output_artifact);
+            let stats_json: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&stats_path).with_context(|| {
+                    format!("reading g8r+ABC stats JSON: {}", stats_path.display())
+                })?)
+                .with_context(|| format!("parsing g8r+ABC stats JSON: {}", stats_path.display()))?;
+            (stats_json, json!({}), json!({}))
+        } else {
+            let diff_provenance = store
+                .load_provenance(&sample.aig_stat_diff_action_id)
+                .with_context(|| {
+                    format!(
+                        "loading aig-stat-diff provenance for sample {}",
+                        sample.sample_id
+                    )
+                })?;
+            let diff_path = store.resolve_artifact_ref_path(&diff_provenance.output_artifact);
+            let diff_json: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(&diff_path)
+                    .with_context(|| format!("reading diff JSON: {}", diff_path.display()))?,
+            )
+            .with_context(|| format!("parsing diff JSON: {}", diff_path.display()))?;
+            let g8r_stats = diff_json
+                .get("g8r_stats")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let yosys_stats = diff_json
+                .get("yosys_abc_stats")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            (g8r_stats, yosys_stats, diff_json)
+        };
         let g8r_and_nodes = stats_metric(&g8r_stats, "and_nodes")
             .or_else(|| stats_metric(&g8r_stats, "live_nodes"));
         let g8r_depth = stats_metric(&g8r_stats, "depth");
@@ -1990,6 +2956,8 @@ fn build_joined_rows(
             fraig: sample.fraig,
             dso_version: sample.dso_version.clone(),
             driver_crate_version: sample.driver_crate_version.clone(),
+            driver_source_repository: sample.driver_source_repository.clone(),
+            driver_source_commit: sample.driver_source_commit.clone(),
             stats_driver_crate_version: sample.stats_driver_crate_version.clone(),
             yosys_script: sample.yosys_script.clone(),
             yosys_script_sha256: sample.yosys_script_sha256.clone(),
@@ -2125,15 +3093,17 @@ fn export_leaf_artifacts(
             },
             &sample_dir.join("g8r_stats.json"),
         )?;
-        copy_artifact_if_present(
-            store,
-            &ArtifactRef {
-                action_id: sample.combo_verilog_action_id.clone(),
-                artifact_type: ArtifactType::VerilogFile,
-                relpath: COMBO_VERILOG_RELPATH.to_string(),
-            },
-            &sample_dir.join("combo.v"),
-        )?;
+        if sample.combo_verilog_status != "not_planned" {
+            copy_artifact_if_present(
+                store,
+                &ArtifactRef {
+                    action_id: sample.combo_verilog_action_id.clone(),
+                    artifact_type: ArtifactType::VerilogFile,
+                    relpath: COMBO_VERILOG_RELPATH.to_string(),
+                },
+                &sample_dir.join("combo.v"),
+            )?;
+        }
         copy_artifact_if_present(
             store,
             &ArtifactRef {
@@ -2143,24 +3113,28 @@ fn export_leaf_artifacts(
             },
             &sample_dir.join("yosys_abc.aig"),
         )?;
-        copy_artifact_if_present(
-            store,
-            &ArtifactRef {
-                action_id: sample.yosys_abc_stats_action_id.clone(),
-                artifact_type: ArtifactType::AigStatsFile,
-                relpath: YOSYS_ABC_STATS_RELPATH.to_string(),
-            },
-            &sample_dir.join("yosys_abc_stats.json"),
-        )?;
-        copy_artifact_if_present(
-            store,
-            &ArtifactRef {
-                action_id: sample.aig_stat_diff_action_id.clone(),
-                artifact_type: ArtifactType::AigStatDiffFile,
-                relpath: AIG_STAT_DIFF_RELPATH.to_string(),
-            },
-            &sample_dir.join("aig_stat_diff.json"),
-        )?;
+        if sample.yosys_abc_stats_status != "not_planned" {
+            copy_artifact_if_present(
+                store,
+                &ArtifactRef {
+                    action_id: sample.yosys_abc_stats_action_id.clone(),
+                    artifact_type: ArtifactType::AigStatsFile,
+                    relpath: YOSYS_ABC_STATS_RELPATH.to_string(),
+                },
+                &sample_dir.join("yosys_abc_stats.json"),
+            )?;
+        }
+        if sample.aig_stat_diff_status != "not_planned" {
+            copy_artifact_if_present(
+                store,
+                &ArtifactRef {
+                    action_id: sample.aig_stat_diff_action_id.clone(),
+                    artifact_type: ArtifactType::AigStatDiffFile,
+                    relpath: AIG_STAT_DIFF_RELPATH.to_string(),
+                },
+                &sample_dir.join("aig_stat_diff.json"),
+            )?;
+        }
     }
     Ok(())
 }
@@ -2206,7 +3180,7 @@ fn write_joined_jsonl(path: &Path, rows: &[IrDirCorpusJoinedRow]) -> Result<()> 
 fn write_joined_csv(path: &Path, rows: &[IrDirCorpusJoinedRow]) -> Result<()> {
     let mut text = String::new();
     text.push_str(
-        "sample_id,logical_name,source_relpath,source_sha256,top_fn_policy,top_fn_name,fraig,dso_version,driver_crate_version,stats_driver_crate_version,yosys_script,yosys_script_sha256,import_ir_action_id,g8r_aig_action_id,g8r_stats_action_id,combo_verilog_action_id,yosys_abc_aig_action_id,yosys_abc_stats_action_id,aig_stat_diff_action_id,g8r_and_nodes,g8r_depth,g8r_product,yosys_abc_and_nodes,yosys_abc_depth,yosys_abc_product,g8r_product_loss,delta_and_nodes_yosys_minus_g8r,delta_depth_yosys_minus_g8r\n",
+        "sample_id,logical_name,source_relpath,source_sha256,top_fn_policy,top_fn_name,fraig,dso_version,driver_crate_version,driver_source_repository,driver_source_commit,stats_driver_crate_version,yosys_script,yosys_script_sha256,import_ir_action_id,g8r_aig_action_id,g8r_stats_action_id,combo_verilog_action_id,yosys_abc_aig_action_id,yosys_abc_stats_action_id,aig_stat_diff_action_id,g8r_and_nodes,g8r_depth,g8r_product,yosys_abc_and_nodes,yosys_abc_depth,yosys_abc_product,g8r_product_loss,delta_and_nodes_yosys_minus_g8r,delta_depth_yosys_minus_g8r\n",
     );
     for row in rows {
         let fields = [
@@ -2219,6 +3193,8 @@ fn write_joined_csv(path: &Path, rows: &[IrDirCorpusJoinedRow]) -> Result<()> {
             csv_escape(&row.fraig.to_string()),
             csv_escape(&row.dso_version),
             csv_escape(&row.driver_crate_version),
+            csv_escape(row.driver_source_repository.as_deref().unwrap_or("")),
+            csv_escape(row.driver_source_commit.as_deref().unwrap_or("")),
             csv_escape(&row.stats_driver_crate_version),
             csv_escape(&row.yosys_script),
             csv_escape(&row.yosys_script_sha256),
@@ -2279,6 +3255,19 @@ fn recipe_preset_spec(recipe_preset: CorpusRecipePreset) -> CorpusRecipePresetSp
             label: "g8r-vs-yabc-no-fraig-aig-diff",
             yosys_script: "flows/abc_ablate_no_fraig.ys",
         },
+        CorpusRecipePreset::G8rAbcStats => CorpusRecipePresetSpec {
+            label: "g8r-abc-stats",
+            yosys_script: "flows/yosys_to_aig.ys",
+        },
+    }
+}
+
+fn parse_recipe_preset_label(label: &str) -> Result<CorpusRecipePreset> {
+    match label {
+        "g8r-vs-yabc-aig-diff" => Ok(CorpusRecipePreset::G8rVsYabcAigDiff),
+        "g8r-vs-yabc-no-fraig-aig-diff" => Ok(CorpusRecipePreset::G8rVsYabcNoFraigAigDiff),
+        "g8r-abc-stats" => Ok(CorpusRecipePreset::G8rAbcStats),
+        other => bail!("unsupported corpus recipe preset in manifest: {}", other),
     }
 }
 
@@ -2356,6 +3345,7 @@ mod tests {
     fn sample_driver_runtime() -> DriverRuntimeSpec {
         DriverRuntimeSpec {
             driver_version: "0.34.0".to_string(),
+            source_revision: None,
             release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: crate::runtime::default_driver_image("0.34.0"),
             dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
@@ -2390,8 +3380,9 @@ mod tests {
     fn sample_driver_cli() -> DriverCli {
         DriverCli {
             driver_version: Some("0.34.0".to_string()),
+            driver_git_commit: None,
             release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
-            dockerfile: PathBuf::from(crate::DEFAULT_DOCKERFILE),
+            dockerfile: Some(PathBuf::from(crate::DEFAULT_DOCKERFILE)),
             docker_image: None,
         }
     }
@@ -2502,6 +3493,8 @@ mod tests {
             fraig: false,
             dso_version: "v0.39.0".to_string(),
             driver_crate_version: driver_runtime.driver_version.clone(),
+            driver_source_repository: None,
+            driver_source_commit: None,
             stats_driver_crate_version: stats_runtime.driver_version.clone(),
             yosys_script: yosys_script_ref.path.clone(),
             yosys_script_sha256: yosys_script_ref.sha256.clone(),
@@ -2584,6 +3577,7 @@ mod tests {
             .map(|sample| {
                 build_action_plan(
                     sample,
+                    CorpusRecipePreset::G8rVsYabcAigDiff,
                     false,
                     "v0.39.0",
                     &driver_runtime,
@@ -2617,6 +3611,7 @@ mod tests {
             yosys_script: yosys_script_ref.path.clone(),
             yosys_script_sha256: yosys_script_ref.sha256.clone(),
             scheduling_policy: None,
+            candidate_run: None,
             samples: samples
                 .iter()
                 .zip(plans.iter())
@@ -2931,6 +3926,7 @@ mod tests {
         };
         let plan = build_action_plan(
             &sample,
+            CorpusRecipePreset::G8rVsYabcAigDiff,
             false,
             "v0.39.0",
             &sample_driver_runtime(),
@@ -2958,6 +3954,550 @@ mod tests {
                 crate::queue::QueueState::None
             ));
         }
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn g8r_abc_stats_preset_plans_only_direct_candidate_stages() {
+        let root = make_temp_dir("g8r-abc-stats-plan");
+        let store = ArtifactStore::new_with_sled(root.join("store"), root.join("artifacts.sled"));
+        store.ensure_layout().expect("ensure store layout");
+        let sample = CorpusSampleSpec {
+            sample_id: "sample-1".to_string(),
+            logical_name: "sample.ir".to_string(),
+            source_path: root.join("unused.ir"),
+            source_relpath: "sample.ir".to_string(),
+            source_sha256: "a".repeat(64),
+            top_fn_name: "foo".to_string(),
+        };
+        let mut driver_runtime = sample_driver_runtime();
+        driver_runtime.source_revision = Some(crate::model::DriverSourceRevision {
+            repository: crate::XLSYNTH_CRATE_GIT_REPOSITORY.to_string(),
+            commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        });
+        let stats_runtime = sample_stats_runtime();
+        let plan = build_action_plan(
+            &sample,
+            CorpusRecipePreset::G8rAbcStats,
+            false,
+            "v0.39.0",
+            &driver_runtime,
+            &stats_runtime,
+            &sample_yosys_runtime(),
+            &sample_yosys_script_ref(),
+        )
+        .expect("build action plan");
+        assert_eq!(plan.planned_actions().len(), 3);
+        let ActionSpec::DriverIrToG8rAig {
+            fraig,
+            lowering_mode,
+            ..
+        } = &plan.g8r_aig_action
+        else {
+            panic!("expected g8r action");
+        };
+        assert!(!fraig);
+        assert_eq!(
+            *lowering_mode,
+            crate::model::G8rLoweringMode::FrontendNoPrepRewrite
+        );
+        let ActionSpec::AigToYosysAbcAig { aig_action_id, .. } = &plan.yosys_abc_aig_action else {
+            panic!("expected direct AIG-to-ABC action");
+        };
+        assert_eq!(aig_action_id, &plan.g8r_aig_action_id);
+        let ActionSpec::DriverAigToStats {
+            aig_action_id,
+            runtime,
+            ..
+        } = &plan.g8r_stats_action
+        else {
+            panic!("expected stats action");
+        };
+        assert_eq!(aig_action_id, &plan.yosys_abc_aig_action_id);
+        assert!(runtime.source_revision.is_none());
+
+        let priorities = checked_enqueue_plan_priorities(&plan, 0).expect("priorities");
+        assert_eq!(
+            enqueue_plan(&store, &plan, &priorities).expect("enqueue"),
+            3
+        );
+        assert_eq!(
+            enqueue_plan(&store, &plan, &priorities).expect("idempotent enqueue"),
+            0
+        );
+        let record = build_sample_record(
+            &store,
+            &sample,
+            &plan,
+            &BTreeMap::new(),
+            "g8r-abc-stats",
+            CorpusTopFnPolicy::FromFilename,
+            false,
+            "v0.39.0",
+            &driver_runtime,
+            &stats_runtime,
+            &sample_yosys_script_ref(),
+        );
+        assert_eq!(record.status, "pending");
+        assert_eq!(record.combo_verilog_status, "not_planned");
+        assert_eq!(record.yosys_abc_stats_status, "not_planned");
+        assert_eq!(record.aig_stat_diff_status, "not_planned");
+        assert_eq!(plan.g8r_stats_action_id, plan.yosys_abc_stats_action_id);
+
+        stage_provenance_record(
+            &store,
+            plan.g8r_stats_action.clone(),
+            ArtifactRef {
+                action_id: plan.g8r_stats_action_id.clone(),
+                artifact_type: ArtifactType::AigStatsFile,
+                relpath: G8R_STATS_RELPATH.to_string(),
+            },
+            Utc::now(),
+            serde_json::json!({}),
+            vec![(G8R_STATS_RELPATH.to_string(), b"stats".to_vec())],
+        );
+        let mut completed_record = record.clone();
+        completed_record.status = "done".to_string();
+        export_leaf_artifacts(&store, &root, &[completed_record])
+            .expect("export direct candidate artifacts");
+        let exported_sample = root
+            .join(IR_DIR_CORPUS_EXPORTED_ARTIFACTS_DIR)
+            .join(&sample.sample_id);
+        assert!(exported_sample.join("g8r_stats.json").exists());
+        assert!(!exported_sample.join("combo.v").exists());
+        assert!(!exported_sample.join("yosys_abc_stats.json").exists());
+        assert!(!exported_sample.join("aig_stat_diff.json").exists());
+        assert_eq!(
+            record.driver_source_commit.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(corpus_sample_action_statuses(&record).len(), 4);
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn candidate_run_manifest_binds_exact_git_and_release_identities() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let observation =
+            crate::versioning::load_xlsynth_crate_repository_head_observation(repo_root)
+                .expect("load repository observation")
+                .expect("repository observation");
+        let sample = CorpusSampleSpec {
+            sample_id: "sample-1".to_string(),
+            logical_name: "sample.ir".to_string(),
+            source_path: repo_root.join("unused.ir"),
+            source_relpath: format!("{}.ir", "a".repeat(64)),
+            source_sha256: "b".repeat(64),
+            top_fn_name: "foo".to_string(),
+        };
+        let mut driver_runtime = sample_driver_runtime();
+        driver_runtime.driver_version = observation.latest_crate_version.clone();
+        driver_runtime.source_revision = Some(crate::model::DriverSourceRevision {
+            repository: crate::XLSYNTH_CRATE_GIT_REPOSITORY.to_string(),
+            commit: observation.head_commit.clone(),
+        });
+        driver_runtime.docker_image =
+            crate::runtime::git_driver_image(&observation.head_commit).expect("Git image");
+        driver_runtime.dockerfile = crate::DEFAULT_GIT_DOCKERFILE.to_string();
+        driver_runtime.dockerfile_sha256 = hex::encode(sha2::Sha256::digest(include_bytes!(
+            "../docker/xlsynth-driver-git.Dockerfile"
+        )));
+        let mut stats_runtime = sample_stats_runtime();
+        stats_runtime.driver_version = observation.latest_crate_version.clone();
+        stats_runtime.docker_image =
+            crate::runtime::default_driver_image(&observation.latest_crate_version);
+        let yosys_runtime = sample_yosys_runtime();
+        let yosys_script_ref = sample_yosys_script_ref();
+        let plan = build_action_plan(
+            &sample,
+            CorpusRecipePreset::G8rAbcStats,
+            false,
+            "v0.54.7",
+            &driver_runtime,
+            &stats_runtime,
+            &yosys_runtime,
+            &yosys_script_ref,
+        )
+        .expect("build action plan");
+        let mut policy = sample_scheduling_policy_record(&"c".repeat(64));
+        policy.expected_corpus_sample_count = 1;
+        let first = build_candidate_run_preflight(
+            repo_root,
+            None,
+            CorpusRecipePreset::G8rAbcStats,
+            "v0.54.7",
+            &driver_runtime,
+            &stats_runtime,
+            &yosys_runtime,
+            &yosys_script_ref,
+            Some(&policy),
+            std::slice::from_ref(&sample),
+            std::slice::from_ref(&plan),
+        )
+        .expect("build candidate record")
+        .expect("candidate record");
+        let first = finalize_candidate_run_record(Some(first), 3)
+            .expect("finalize candidate record")
+            .expect("finalized candidate record");
+        assert_eq!(
+            first.schema_version,
+            IR_DIR_CORPUS_CANDIDATE_RUN_SCHEMA_VERSION
+        );
+        assert_eq!(first.requested_ref.as_deref(), Some("main"));
+        assert_eq!(
+            first.candidate_committed_at_utc,
+            Some(observation.head_committed_at_utc)
+        );
+        assert_eq!(first.driver_runtime.as_ref(), Some(&driver_runtime));
+        assert_eq!(first.candidate.commit, observation.head_commit);
+        assert_eq!(first.baseline.commit, observation.latest_release_commit);
+
+        let resume_driver = DriverCli {
+            driver_version: None,
+            driver_git_commit: Some(first.candidate.commit.clone()),
+            release_platform: driver_runtime.release_platform.clone(),
+            dockerfile: None,
+            docker_image: None,
+        };
+        let resume_yosys = YosysCli {
+            yosys_dockerfile: PathBuf::from(&yosys_runtime.dockerfile),
+            yosys_docker_image: yosys_runtime.docker_image.clone(),
+            yosys_upstream_commit: yosys_runtime.upstream_commit.clone(),
+        };
+        let (resumed_driver, resumed_stats, resumed_yosys) = candidate_resume_runtimes(
+            &first,
+            CorpusRecipePreset::G8rAbcStats,
+            "0.54.7",
+            &resume_driver,
+            &resume_yosys,
+        )
+        .expect("select persisted candidate runtimes");
+        assert_eq!(resumed_driver, driver_runtime);
+        assert_eq!(resumed_stats, stats_runtime);
+        assert_eq!(resumed_yosys, yosys_runtime);
+        assert_eq!(
+            resumed_driver.docker_image_id,
+            first
+                .driver_runtime
+                .as_ref()
+                .expect("persisted source runtime")
+                .docker_image_id,
+            "resume must retain the content-addressed image even if its tag moves"
+        );
+
+        let mut custom_yosys_runtime = yosys_runtime.clone();
+        custom_yosys_runtime.upstream_commit = Some("0".repeat(40));
+        let custom_yosys_plan = build_action_plan(
+            &sample,
+            CorpusRecipePreset::G8rAbcStats,
+            false,
+            "v0.54.7",
+            &driver_runtime,
+            &stats_runtime,
+            &custom_yosys_runtime,
+            &yosys_script_ref,
+        )
+        .expect("build custom Yosys plan");
+        let runtime_error = build_candidate_run_preflight(
+            repo_root,
+            None,
+            CorpusRecipePreset::G8rAbcStats,
+            "v0.54.7",
+            &driver_runtime,
+            &stats_runtime,
+            &custom_yosys_runtime,
+            &yosys_script_ref,
+            Some(&policy),
+            std::slice::from_ref(&sample),
+            std::slice::from_ref(&custom_yosys_plan),
+        )
+        .expect_err("unpublishable candidate runtime must fail preflight");
+        assert!(
+            runtime_error
+                .to_string()
+                .contains("canonical source-driver")
+        );
+
+        let mut legacy_json =
+            serde_json::to_value(&first).expect("serialize candidate record as legacy JSON");
+        let legacy_object = legacy_json
+            .as_object_mut()
+            .expect("candidate record object");
+        legacy_object.insert("schema_version".to_string(), serde_json::json!(1));
+        legacy_object.remove("driver_runtime");
+        legacy_object.remove("action_manifest_sha256");
+        let legacy: IrDirCorpusCandidateRunRecord =
+            serde_json::from_value(legacy_json).expect("read schema-1 candidate record");
+        assert_eq!(legacy.schema_version, 1);
+        assert!(legacy.driver_runtime.is_none());
+        assert!(legacy.action_manifest_sha256.is_empty());
+
+        assert_eq!(first.reused_or_already_queued_actions, 0);
+        let resumed = build_candidate_run_preflight(
+            repo_root,
+            Some(&first),
+            CorpusRecipePreset::G8rAbcStats,
+            "v0.54.7",
+            &driver_runtime,
+            &stats_runtime,
+            &yosys_runtime,
+            &yosys_script_ref,
+            Some(&policy),
+            std::slice::from_ref(&sample),
+            std::slice::from_ref(&plan),
+        )
+        .expect("resume matching candidate record")
+        .expect("resumed candidate record");
+        assert_eq!(resumed.candidate_run_id, first.candidate_run_id);
+        assert_eq!(resumed.baseline.crate_version, first.baseline.crate_version);
+        assert_eq!(resumed.baseline.commit, first.baseline.commit);
+        assert_eq!(resumed.observed_at_utc, first.observed_at_utc);
+        assert_eq!(first.dso_version, "0.54.7");
+
+        let equivalent_spelling = build_candidate_run_preflight(
+            repo_root,
+            Some(&first),
+            CorpusRecipePreset::G8rAbcStats,
+            "0.54.7",
+            &driver_runtime,
+            &stats_runtime,
+            &yosys_runtime,
+            &yosys_script_ref,
+            Some(&policy),
+            std::slice::from_ref(&sample),
+            std::slice::from_ref(&plan),
+        )
+        .expect("resume candidate with equivalent DSO spelling")
+        .expect("equivalent-spelling candidate record");
+        assert_eq!(equivalent_spelling.candidate_run_id, first.candidate_run_id);
+
+        let mut other_runtime = driver_runtime.clone();
+        other_runtime
+            .source_revision
+            .as_mut()
+            .expect("source revision")
+            .commit = "0123456789abcdef0123456789abcdef01234567".to_string();
+        other_runtime.docker_image = crate::runtime::git_driver_image(
+            &other_runtime
+                .source_revision
+                .as_ref()
+                .expect("source revision")
+                .commit,
+        )
+        .expect("other Git image");
+        let other_plan = build_action_plan(
+            &sample,
+            CorpusRecipePreset::G8rAbcStats,
+            false,
+            "v0.54.7",
+            &other_runtime,
+            &stats_runtime,
+            &yosys_runtime,
+            &yosys_script_ref,
+        )
+        .expect("build other action plan");
+        let other = build_candidate_run_preflight(
+            repo_root,
+            None,
+            CorpusRecipePreset::G8rAbcStats,
+            "v0.54.7",
+            &other_runtime,
+            &stats_runtime,
+            &yosys_runtime,
+            &yosys_script_ref,
+            Some(&policy),
+            std::slice::from_ref(&sample),
+            std::slice::from_ref(&other_plan),
+        )
+        .expect("build other candidate record")
+        .expect("other candidate record");
+        let other = finalize_candidate_run_record(Some(other), 3)
+            .expect("finalize other candidate record")
+            .expect("finalized other candidate record");
+        assert_eq!(other.requested_ref, None);
+        assert_eq!(
+            other.candidate_committed_at_utc.as_deref(),
+            Some("2000-01-01T00:00:00Z")
+        );
+        assert_ne!(first.candidate_run_id, other.candidate_run_id);
+        assert_ne!(plan.g8r_aig_action_id, other_plan.g8r_aig_action_id);
+
+        let mut rebuilt_runtime = driver_runtime.clone();
+        rebuilt_runtime.docker_image_id = "f".repeat(64);
+        let rebuilt_plan = build_action_plan(
+            &sample,
+            CorpusRecipePreset::G8rAbcStats,
+            false,
+            "v0.54.7",
+            &rebuilt_runtime,
+            &stats_runtime,
+            &yosys_runtime,
+            &yosys_script_ref,
+        )
+        .expect("build plan for rebuilt runtime");
+        let rebuilt = build_candidate_run_preflight(
+            repo_root,
+            None,
+            CorpusRecipePreset::G8rAbcStats,
+            "v0.54.7",
+            &rebuilt_runtime,
+            &stats_runtime,
+            &yosys_runtime,
+            &yosys_script_ref,
+            Some(&policy),
+            std::slice::from_ref(&sample),
+            std::slice::from_ref(&rebuilt_plan),
+        )
+        .expect("build candidate record for rebuilt runtime")
+        .expect("rebuilt candidate record");
+        assert_eq!(rebuilt.candidate.commit, first.candidate.commit);
+        assert_ne!(rebuilt.driver_runtime, first.driver_runtime);
+        assert_ne!(rebuilt.candidate_run_id, first.candidate_run_id);
+        assert_ne!(rebuilt_plan.g8r_aig_action_id, plan.g8r_aig_action_id);
+        let drift_error = build_candidate_run_preflight(
+            repo_root,
+            Some(&first),
+            CorpusRecipePreset::G8rAbcStats,
+            "v0.54.7",
+            &rebuilt_runtime,
+            &stats_runtime,
+            &yosys_runtime,
+            &yosys_script_ref,
+            Some(&policy),
+            std::slice::from_ref(&sample),
+            std::slice::from_ref(&rebuilt_plan),
+        )
+        .expect_err("resuming with a rebuilt runtime must fail closed");
+        assert!(
+            drift_error
+                .to_string()
+                .contains("runtimes do not exactly match")
+        );
+
+        let marker_root = make_temp_dir("candidate-run-marker");
+        let marker_store = ArtifactStore::new(marker_root.join("store"));
+        marker_store.ensure_layout().expect("marker store layout");
+        let marker_path = marker_store
+            .root
+            .join("corpus")
+            .join(IR_DIR_CORPUS_CANDIDATE_RUN_MARKER_FILENAME);
+        persist_candidate_run_marker(&marker_store, &marker_path, Some(&first))
+            .expect("persist candidate marker before queue mutation");
+        let recovered = reconcile_persisted_candidate_run(
+            None,
+            read_candidate_run_marker(&marker_path).expect("read candidate marker"),
+        )
+        .expect("reconcile marker without manifest")
+        .expect("recovered candidate identity");
+        assert_eq!(recovered.candidate_run_id, first.candidate_run_id);
+        let marker_error =
+            persist_candidate_run_marker(&marker_store, &marker_path, Some(&rebuilt))
+                .expect_err("durable marker must reject a replacement identity");
+        assert!(marker_error.to_string().contains("identity differs"));
+        fs::remove_dir_all(marker_root).expect("cleanup marker store");
+
+        let refresh_fixture = make_status_fixture();
+        let refresh_manifest_path = refresh_fixture
+            .output_dir
+            .join(IR_DIR_CORPUS_MANIFEST_FILENAME);
+        let refresh_manifest_before =
+            fs::read(&refresh_manifest_path).expect("read pre-refresh manifest");
+        let refresh_marker_path = refresh_fixture
+            .store
+            .root
+            .join("corpus")
+            .join(IR_DIR_CORPUS_CANDIDATE_RUN_MARKER_FILENAME);
+        persist_candidate_run_marker(&refresh_fixture.store, &refresh_marker_path, Some(&first))
+            .expect("persist marker ahead of public manifest");
+        let refresh_output_dir = refresh_fixture.output_dir.clone();
+        let refresh_root = refresh_fixture.root.clone();
+        drop(refresh_fixture.store);
+        let refresh_error = refresh_ir_dir_corpus_status(&refresh_output_dir, 1800, 10)
+            .expect_err("refresh must reject a candidate marker absent from the manifest");
+        assert!(format!("{refresh_error:#}").contains("does not reflect durable candidate marker"));
+        assert_eq!(
+            fs::read(&refresh_manifest_path).expect("read rejected refresh manifest"),
+            refresh_manifest_before
+        );
+        fs::remove_dir_all(refresh_root).expect("cleanup refresh fixture");
+    }
+
+    #[test]
+    #[ignore = "requires Docker, network access, and a source-driver image build"]
+    fn docker_source_and_release_drivers_run_same_dso_candidate_chain() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let observation =
+            crate::versioning::load_xlsynth_crate_repository_head_observation(repo_root)
+                .expect("load repository observation")
+                .expect("repository observation");
+        let dso_version = crate::versioning::resolve_xlsynth_version_for_driver(
+            repo_root,
+            &observation.latest_crate_version,
+        )
+        .expect("resolve baseline DSO");
+        let root = make_temp_dir("docker-source-release-candidate");
+        let input_dir = root.join("input");
+        fs::create_dir_all(&input_dir).expect("create input");
+        fs::write(
+            input_dir.join("smoke.ir"),
+            "package smoke\n\ntop fn identity(x: bits[8] id=1) -> bits[8] {\n  ret identity.2: bits[8] = identity(x, id=2)\n}\n",
+        )
+        .expect("write smoke IR");
+        let yosys = YosysCli {
+            yosys_dockerfile: PathBuf::from(crate::DEFAULT_YOSYS_DOCKERFILE),
+            yosys_docker_image: crate::DEFAULT_YOSYS_DOCKER_IMAGE.to_string(),
+            yosys_upstream_commit: Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT.to_string()),
+        };
+        let source_summary = run_ir_dir_corpus(
+            repo_root,
+            &input_dir,
+            &root.join("source"),
+            CorpusRecipePreset::G8rAbcStats,
+            CorpusExecutionMode::Run,
+            CorpusTopFnPolicy::InferSinglePackage,
+            None,
+            false,
+            &dso_version,
+            None,
+            0,
+            None,
+            DriverCli {
+                driver_version: None,
+                driver_git_commit: Some(observation.head_commit.clone()),
+                release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
+                dockerfile: None,
+                docker_image: None,
+            },
+            yosys.clone(),
+        )
+        .expect("run source candidate chain");
+        let release_summary = run_ir_dir_corpus(
+            repo_root,
+            &input_dir,
+            &root.join("release"),
+            CorpusRecipePreset::G8rAbcStats,
+            CorpusExecutionMode::Run,
+            CorpusTopFnPolicy::InferSinglePackage,
+            None,
+            false,
+            &dso_version,
+            None,
+            0,
+            None,
+            DriverCli {
+                driver_version: Some(observation.latest_crate_version),
+                driver_git_commit: None,
+                release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
+                dockerfile: None,
+                docker_image: None,
+            },
+            yosys,
+        )
+        .expect("run release baseline chain");
+        assert_eq!(source_summary.completed_samples, 1);
+        assert_eq!(release_summary.completed_samples, 1);
+        assert_eq!(source_summary.executed_actions, 3);
+        assert_eq!(release_summary.executed_actions, 3);
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -3005,6 +4545,18 @@ mod tests {
                 .resolve_artifact_ref_path(&provenance.output_artifact)
                 .exists()
         );
+        fs::write(
+            store.resolve_artifact_ref_path(&provenance.output_artifact),
+            "tampered IR bytes",
+        )
+        .expect("tamper imported IR");
+        let error = ensure_imported_ir_action(&store, &sample, &action)
+            .expect_err("a reused import with different bytes must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("does not contain the bytes bound by its source digest")
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -3034,6 +4586,8 @@ mod tests {
             fraig: false,
             dso_version: "v0.39.0".to_string(),
             driver_crate_version: "0.34.0".to_string(),
+            driver_source_repository: None,
+            driver_source_commit: None,
             stats_driver_crate_version: "0.39.0".to_string(),
             yosys_script: "flows/yosys_to_aig.ys".to_string(),
             yosys_script_sha256: "scriptsha".to_string(),

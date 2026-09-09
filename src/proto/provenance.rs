@@ -1349,6 +1349,7 @@ mod tests {
     fn sample_discovery_details(failed_file: bool) -> Value {
         let source_runtime = model::DriverRuntimeSpec {
             driver_version: "0.47.0".into(),
+            source_revision: None,
             release_platform: "ubuntu2004".into(),
             docker_image: "xlsynth-bvc-driver:0.47.0".into(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".into(),
@@ -1358,6 +1359,7 @@ mod tests {
         };
         let enumeration_runtime = model::DriverRuntimeSpec {
             driver_version: "0.48.0".into(),
+            source_revision: None,
             release_platform: "ubuntu2004".into(),
             docker_image: "xlsynth-bvc-driver:0.48.0".into(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".into(),
@@ -1573,6 +1575,7 @@ mod tests {
             version: "v0.29.0".to_string(),
             runtime: model::DriverRuntimeSpec {
                 driver_version: "0.25.0".to_string(),
+                source_revision: None,
                 release_platform: "ubuntu2004".to_string(),
                 docker_image: "xlsynth-bvc-driver:0.25.0".to_string(),
                 dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),

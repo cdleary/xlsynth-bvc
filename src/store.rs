@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use sled::transaction::{
     ConflictableTransactionError, ConflictableTransactionResult, Transactional,
 };
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Write};
 use std::ops::ControlFlow;
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::model::{ArtifactRef, Provenance, QueueFailed};
-use crate::proto::{FILE_DESCRIPTOR_SET, v1 as pb};
+use crate::proto::{FILE_DESCRIPTOR_SET, PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256, v1 as pb};
 use crate::proto::{
     decode_queue_canceled, decode_queue_failed, decode_queue_item, decode_queue_running,
     encode_queue_failed,
@@ -118,10 +118,56 @@ fn validate_store_path_without_links(
     Ok(())
 }
 
+fn sync_store_directory_chain(store_root: &Path, path: &Path, label: &str) -> Result<()> {
+    let relative = path.strip_prefix(store_root).with_context(|| {
+        format!(
+            "{label} must be inside the private store: {}",
+            path.display()
+        )
+    })?;
+    let mut directories = vec![store_root.to_path_buf()];
+    let mut current = store_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        directories.push(current.clone());
+    }
+    for directory in directories.into_iter().rev() {
+        fs::File::open(&directory)
+            .with_context(|| format!("opening {label} directory: {}", directory.display()))?
+            .sync_all()
+            .with_context(|| format!("syncing {label} directory: {}", directory.display()))?;
+    }
+    Ok(())
+}
+
 fn ensure_store_directory_without_links(store_root: &Path, path: &Path, label: &str) -> Result<()> {
     validate_store_path_without_links(store_root, path, StorePathLeafKind::Directory, label)?;
+    let directory_existed = match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| format!("statting {label}: {}", path.display()));
+        }
+    };
     fs::create_dir_all(path).with_context(|| format!("creating {label}: {}", path.display()))?;
     validate_store_path_without_links(store_root, path, StorePathLeafKind::Directory, label)?;
+    let synced_directories =
+        DURABLY_SYNCED_ATOMIC_RECORD_DIRS.get_or_init(|| Mutex::new(HashSet::new()));
+    let directory_was_synced = synced_directories
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(path);
+    // Some producers pre-create the record shard before reaching this writer. Sync each exact
+    // destination directory at least once per process so that pre-created directory entries are
+    // durable too, without adding a directory-chain fsync to every record write. A directory that
+    // disappeared is always re-synced after recreation, even if it remains in the cache.
+    if !directory_existed || !directory_was_synced {
+        sync_store_directory_chain(store_root, path, label)?;
+        synced_directories
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.to_path_buf());
+    }
     Ok(())
 }
 
@@ -197,6 +243,72 @@ const STORE_FORMAT_INIT_LOCK: &str = ".store-format-init.lock";
 const STORE_FORMAT_MARKER_STAGING: &str = ".store-format.pb.staging";
 static FAILED_ACTION_MIRROR_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 static ATOMIC_RECORD_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
+static DURABLY_SYNCED_ATOMIC_RECORD_DIRS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn write_store_format_marker_atomic(
+    store_root: &Path,
+    marker_path: &Path,
+    staging_path: &Path,
+    descriptor_sha256: &[u8],
+) -> Result<()> {
+    if staging_path.exists() {
+        fs::remove_file(staging_path).with_context(|| {
+            format!(
+                "removing abandoned store format staging file: {}",
+                staging_path.display()
+            )
+        })?;
+    }
+    let marker = pb::StoreFormat {
+        format_version: STORE_FORMAT_VERSION,
+        format_name: STORE_FORMAT_NAME.to_string(),
+        schema_descriptor_sha256: Some(pb::Sha256Digest {
+            value: descriptor_sha256.to_vec(),
+        }),
+    };
+    let result = (|| -> Result<()> {
+        let mut staging = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(staging_path)
+            .with_context(|| {
+                format!(
+                    "creating staged store format marker: {}",
+                    staging_path.display()
+                )
+            })?;
+        staging
+            .write_all(&marker.encode_to_vec())
+            .with_context(|| {
+                format!(
+                    "writing staged store format marker: {}",
+                    staging_path.display()
+                )
+            })?;
+        staging.sync_all().with_context(|| {
+            format!(
+                "syncing staged store format marker: {}",
+                staging_path.display()
+            )
+        })?;
+        drop(staging);
+        fs::rename(staging_path, marker_path).with_context(|| {
+            format!(
+                "promoting staged store format marker: {} -> {}",
+                staging_path.display(),
+                marker_path.display()
+            )
+        })?;
+        fs::File::open(store_root)
+            .with_context(|| format!("opening store root: {}", store_root.display()))?
+            .sync_all()
+            .with_context(|| format!("syncing store root: {}", store_root.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(staging_path);
+    }
+    result
+}
 
 fn ensure_store_format_marker(store_root: &Path) -> Result<()> {
     fs::create_dir_all(store_root)
@@ -242,11 +354,28 @@ fn ensure_store_format_marker(store_root: &Path) -> Result<()> {
         let digest = marker
             .schema_descriptor_sha256
             .context("store format marker missing schema_descriptor_sha256")?;
-        if digest.value != descriptor_sha256 {
+        if digest.value != descriptor_sha256
+            && hex::encode(&digest.value) != PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256
+        {
             bail!(
                 "store schema descriptor mismatch in {}; this binary requires a fresh or deliberately upgraded protobuf store",
                 marker_path.display()
             );
+        }
+        if digest.value != descriptor_sha256 {
+            write_store_format_marker_atomic(
+                store_root,
+                &marker_path,
+                &staging_path,
+                &descriptor_sha256,
+            )
+            .with_context(|| {
+                format!(
+                    "upgrading compatible store schema marker: {}",
+                    marker_path.display()
+                )
+            })?;
+            return Ok(());
         }
         if staging_path.exists() {
             fs::remove_file(&staging_path).with_context(|| {
@@ -255,6 +384,10 @@ fn ensure_store_format_marker(store_root: &Path) -> Result<()> {
                     staging_path.display()
                 )
             })?;
+            fs::File::open(store_root)
+                .with_context(|| format!("opening store root: {}", store_root.display()))?
+                .sync_all()
+                .with_context(|| format!("syncing store root: {}", store_root.display()))?;
         }
         return Ok(());
     }
@@ -287,27 +420,7 @@ fn ensure_store_format_marker(store_root: &Path) -> Result<()> {
             path.display()
         );
     }
-    let marker = pb::StoreFormat {
-        format_version: STORE_FORMAT_VERSION,
-        format_name: STORE_FORMAT_NAME.to_string(),
-        schema_descriptor_sha256: Some(pb::Sha256Digest {
-            value: descriptor_sha256,
-        }),
-    };
-    fs::write(&staging_path, marker.encode_to_vec()).with_context(|| {
-        format!(
-            "writing staged store format marker: {}",
-            staging_path.display()
-        )
-    })?;
-    fs::rename(&staging_path, &marker_path).with_context(|| {
-        format!(
-            "promoting staged store format marker: {} -> {}",
-            staging_path.display(),
-            marker_path.display()
-        )
-    })?;
-    Ok(())
+    write_store_format_marker_atomic(store_root, &marker_path, &staging_path, &descriptor_sha256)
 }
 
 fn promote_staging_action_dir_fs(staging_dir: &Path, final_dir: &Path) -> Result<()> {
@@ -2989,6 +3102,9 @@ impl ArtifactStore {
         temp_file
             .write_all(contents)
             .with_context(|| format!("writing atomic record staging file: {}", temp.display()))?;
+        temp_file
+            .sync_all()
+            .with_context(|| format!("syncing atomic record staging file: {}", temp.display()))?;
         drop(temp_file);
         validate_store_path_without_links(
             &self.root,
@@ -3002,7 +3118,7 @@ impl ArtifactStore {
             StorePathLeafKind::RegularFileOrMissing,
             "atomic record destination",
         )?;
-        match fs::rename(&temp, destination) {
+        let promotion = match fs::rename(&temp, destination) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ensure_store_directory_without_links(&self.root, parent, "atomic record parent")?;
@@ -3030,7 +3146,37 @@ impl ArtifactStore {
                     )
                 })
             }
-        }
+        };
+        promotion?;
+        fs::File::open(parent)
+            .with_context(|| {
+                format!(
+                    "opening atomic record destination parent: {}",
+                    parent.display()
+                )
+            })?
+            .sync_all()
+            .with_context(|| {
+                format!(
+                    "syncing atomic record destination parent: {}",
+                    parent.display()
+                )
+            })?;
+        fs::File::open(&staging)
+            .with_context(|| {
+                format!(
+                    "opening atomic record staging directory: {}",
+                    staging.display()
+                )
+            })?
+            .sync_all()
+            .with_context(|| {
+                format!(
+                    "syncing atomic record staging directory: {}",
+                    staging.display()
+                )
+            })?;
+        Ok(())
     }
 
     pub(crate) fn driver_release_cache_root(&self) -> PathBuf {
@@ -3712,6 +3858,40 @@ mod tests {
         .expect("decode marker");
         assert_eq!(marker.format_version, STORE_FORMAT_VERSION);
         assert_eq!(marker.format_name, STORE_FORMAT_NAME);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn compatible_prior_store_schema_marker_is_upgraded() {
+        let root = make_test_root("xlsynth-bvc-store-compatible-schema");
+        std::fs::create_dir_all(&root).expect("create test root");
+        let prior_marker = pb::StoreFormat {
+            format_version: STORE_FORMAT_VERSION,
+            format_name: STORE_FORMAT_NAME.to_string(),
+            schema_descriptor_sha256: Some(pb::Sha256Digest {
+                value: hex::decode(PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256)
+                    .expect("decode prior descriptor digest"),
+            }),
+        };
+        std::fs::write(root.join(STORE_FORMAT_MARKER), prior_marker.encode_to_vec())
+            .expect("write prior schema marker");
+
+        ensure_store_format_marker(&root).expect("upgrade compatible store schema marker");
+        let upgraded = pb::StoreFormat::decode(
+            std::fs::read(root.join(STORE_FORMAT_MARKER))
+                .expect("read upgraded marker")
+                .as_slice(),
+        )
+        .expect("decode upgraded marker");
+        assert_eq!(
+            upgraded
+                .schema_descriptor_sha256
+                .expect("upgraded descriptor digest")
+                .value,
+            Sha256::digest(FILE_DESCRIPTOR_SET).to_vec()
+        );
+        assert!(!root.join(STORE_FORMAT_MARKER_STAGING).exists());
+        ensure_store_format_marker(&root).expect("upgraded marker remains reusable");
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -4503,6 +4683,7 @@ mod tests {
         }
         let runtime = DriverRuntimeSpec {
             driver_version: "v0.37.0".to_string(),
+            source_revision: None,
             release_platform: "linux-x64".to_string(),
             docker_image: "xlsynth-driver:test".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),

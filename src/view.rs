@@ -235,6 +235,7 @@ impl UnattributedActionSource {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CrateVersionInferenceMissReason {
+    SourceRevision,
     UnmappedDsoVersion,
     MissingDependencyProvenance,
     MissingDependencyCrateContext,
@@ -246,6 +247,7 @@ pub(crate) enum CrateVersionInferenceMissReason {
 impl CrateVersionInferenceMissReason {
     pub(crate) fn as_label(self) -> &'static str {
         match self {
+            Self::SourceRevision => "source_revision",
             Self::UnmappedDsoVersion => "unmapped_dso_version",
             Self::MissingDependencyProvenance => "missing_dependency_provenance",
             Self::MissingDependencyCrateContext => "missing_dependency_crate_context",

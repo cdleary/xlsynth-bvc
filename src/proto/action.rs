@@ -238,6 +238,13 @@ pub(crate) fn driver_runtime_to_proto(
             &value.release_cache_input_sha256,
             &format!("{field}.release_cache_input_sha256"),
         )?),
+        source_revision: value
+            .source_revision
+            .as_ref()
+            .map(|source| pb::DriverSourceRevision {
+                repository: source.repository.clone(),
+                commit: source.commit.clone(),
+            }),
     })
 }
 
@@ -315,7 +322,29 @@ fn validate_driver_runtime(value: &pb::DriverRuntimeSpec, field: &str) -> Result
             &format!("{field}.release_cache_input_sha256"),
         )?,
         &format!("{field}.release_cache_input_sha256"),
-    )
+    )?;
+    if let Some(source) = value.source_revision.as_ref() {
+        validate_nonempty(
+            &source.repository,
+            &format!("{field}.source_revision.repository"),
+        )?;
+        if source.repository != crate::XLSYNTH_CRATE_GIT_REPOSITORY {
+            bail!(
+                "{field}.source_revision.repository must be the canonical xlsynth-crate repository"
+            );
+        }
+        if source.commit.len() != 40
+            || !source
+                .commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!(
+                "{field}.source_revision.commit must be a full lowercase 40-character hexadecimal commit"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_yosys_verilog_frontend(
@@ -1059,6 +1088,13 @@ pub(crate) fn driver_runtime_from_proto(
         )?
         .value
         .clone(),
+        source_revision: value
+            .source_revision
+            .as_ref()
+            .map(|source| model::DriverSourceRevision {
+                repository: source.repository.clone(),
+                commit: source.commit.clone(),
+            }),
         release_platform: value.release_platform.clone(),
         docker_image: value.docker_image.clone(),
         dockerfile: relpath_value(&value.dockerfile, &format!("{field}.dockerfile"))?,
@@ -1423,6 +1459,7 @@ mod tests {
     fn driver_runtime_fixture() -> model::DriverRuntimeSpec {
         model::DriverRuntimeSpec {
             driver_version: "v0.47.0".to_string(),
+            source_revision: None,
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.47.0".to_string(),
             dockerfile: "docker\\xlsynth-driver.Dockerfile".to_string(),
@@ -1673,6 +1710,30 @@ mod tests {
             )),
         };
         assert!(ValidatedActionSpec::try_from(action).is_err());
+    }
+
+    #[test]
+    fn driver_source_revision_round_trips_and_binds_action_identity() {
+        let (_, mut action) = sample_actions()
+            .into_iter()
+            .find(|(name, _)| *name == "driver_ir_to_g8r_aig")
+            .expect("g8r action fixture");
+        let release_id = compute_model_action_id_v2(&action).expect("release action id");
+        let model::ActionSpec::DriverIrToG8rAig { runtime, .. } = &mut action else {
+            panic!("expected DriverIrToG8rAig");
+        };
+        runtime.source_revision = Some(model::DriverSourceRevision {
+            repository: crate::XLSYNTH_CRATE_GIT_REPOSITORY.to_string(),
+            commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        });
+        let source_id = compute_model_action_id_v2(&action).expect("source action id");
+        assert_ne!(release_id, source_id);
+
+        let validated = ValidatedActionSpec::try_from(&action).expect("validate source action");
+        let bytes = validated.as_proto().encode_to_vec();
+        let decoded = pb::ActionSpec::decode(bytes.as_slice()).expect("decode source action");
+        let decoded = ValidatedActionSpec::try_from(decoded).expect("validate decoded action");
+        assert_eq!(decoded, validated);
     }
 
     #[test]

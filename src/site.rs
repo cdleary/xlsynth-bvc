@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use prost::Message;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -20,12 +21,18 @@ use walkdir::WalkDir;
 mod site_shards;
 
 use crate::analysis::decode_analysis_report;
+use crate::model::{
+    ActionSpec, ArtifactType, DriverRuntimeSpec, G8rLoweringMode, ScriptRef, YosysRuntimeSpec,
+};
 use crate::proto::v1 as pb;
 use crate::query::{VersionsSummaryIndexFile, validate_complete_versions_summary};
 use crate::snapshot::{
     load_static_snapshot_manifest, should_include_snapshot_index_key, verify_static_snapshot,
 };
-use crate::versioning::cmp_dotted_numeric_version;
+use crate::store::ArtifactStore;
+use crate::versioning::{
+    cmp_dotted_numeric_version, normalize_tag_version, parse_compat_release_datetime_utc,
+};
 use crate::view::{
     CrateReleaseStatusView, RepositoryHeadObservationView, StdlibAigStatsPoint,
     StdlibG8rVsYosysDataset, StdlibG8rVsYosysSample, VersionCardsReport,
@@ -45,10 +52,15 @@ const STYLE_CSS: &str = include_str!("site_assets/style.css");
 const APP_JS: &str = include_str!("site_assets/app.js");
 const RELEASE_PROGRESSION_IR_HASHES: &str =
     include_str!("site_assets/release_progression_ir_hashes.txt");
+const RELEASE_PROGRESSION_IR_ARTIFACTS: &str =
+    include_str!("site_assets/release_progression_ir_artifacts.tsv");
 const RELEASE_PROGRESSION_IR_COUNT: usize = 187;
 const RELEASE_PROGRESSION_IR_SHA256: &str =
     "a70a2e38b978d07b8bfc642f7a7cd6806a35bfa4de52f8c9919cd880057e2f77";
-const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 5;
+const RELEASE_PROGRESSION_ARTIFACT_MANIFEST_SHA256: &str =
+    "d5b7560b8a90c7093e3c406f5ce2a3589ff634084f23b016866c9f3406115260";
+const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 7;
+const CANDIDATE_PROGRESSION_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 const STATIC_COMPARISON_SHARD_SCHEMA_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_PREFIX_HEX_CHARS: u8 = 1;
 const STATIC_IR_SHARD_SCHEMA_VERSION: u32 = 1;
@@ -101,6 +113,7 @@ struct BrowserCatalog {
     base_url: String,
     datasets: Vec<BrowserDataset>,
     runs: Vec<BrowserRun>,
+    candidate_evidence: Vec<BrowserCandidateEvidenceRef>,
     progression: BrowserProgressionCatalog,
     releases: Vec<CrateReleaseStatusView>,
     repository_head_observation: Option<RepositoryHeadObservationView>,
@@ -110,6 +123,15 @@ struct BrowserCatalog {
 #[serde(deny_unknown_fields)]
 struct BrowserDataset {
     logical_key: String,
+    url: String,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BrowserCandidateEvidenceRef {
+    generation_id: String,
     url: String,
     bytes: u64,
     sha256: String,
@@ -324,7 +346,7 @@ struct BrowserFinding {
     evidence_action_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct BrowserProgressionCatalog {
     dataset_key: String,
@@ -344,16 +366,59 @@ enum BrowserProgressionCoverage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum BrowserProgressionOrigin {
+    CrateRelease,
+    GitRevision {
+        repository: String,
+        commit: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_ref: Option<String>,
+        baseline_crate_version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        baseline_release_commit: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct BrowserCandidateProgressionSample {
+    fn_key: String,
+    structural_hash: String,
+    source_sha256: String,
+    ir_node_count: u64,
+    g8r_nodes: f64,
+    g8r_levels: f64,
+    yosys_abc_nodes: f64,
+    yosys_abc_levels: f64,
+    g8r_product: f64,
+    yosys_abc_product: f64,
+    g8r_product_loss: f64,
+    ir_action_id: String,
+    g8r_stats_action_id: String,
+    yosys_abc_stats_action_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct BrowserProgressionGeneration {
     generation_id: String,
-    crate_version: String,
+    origin: BrowserProgressionOrigin,
+    display_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_time_utc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    crate_version: Option<String>,
     dso_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baseline_generation_id: Option<String>,
     coverage: BrowserProgressionCoverage,
     observed_ir_count: u64,
     cohort_ir_count: u64,
     missing_cohort_ir_count: u64,
     extra_ir_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    candidate_samples: Vec<BrowserCandidateProgressionSample>,
 }
 
 #[derive(Debug)]
@@ -361,6 +426,151 @@ struct ProgressionGenerationSource {
     crate_version: String,
     dso_version: String,
     structural_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CandidateCorpusManifestInput {
+    schema_version: u32,
+    recipe_preset: String,
+    fraig: bool,
+    dso_version: String,
+    driver_runtime: DriverRuntimeSpec,
+    stats_runtime: DriverRuntimeSpec,
+    yosys_runtime: YosysRuntimeSpec,
+    yosys_script: String,
+    yosys_script_sha256: String,
+    candidate_run: Option<CandidateRunInput>,
+    samples: Vec<CandidateSampleInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CandidateSampleInput {
+    sample_id: String,
+    source_relpath: String,
+    source_sha256: String,
+    top_fn_name: String,
+    fraig: bool,
+    dso_version: String,
+    import_ir_action_id: String,
+    g8r_aig_action_id: String,
+    g8r_stats_action_id: String,
+    yosys_abc_aig_action_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateProgressionEvidence {
+    schema_version: u32,
+    manifest: CandidateCorpusManifestInput,
+    stats: Vec<CandidateStatsEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateStatsEvidence {
+    sample_id: String,
+    g8r_stats_action_id: String,
+    source_output_bytes: u64,
+    source_output_sha256: String,
+    metric_projection_sha256: String,
+    and_nodes: f64,
+    depth: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct CandidateStatsMetricProjection {
+    and_nodes: f64,
+    depth: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CandidateRunInput {
+    schema_version: u32,
+    candidate_run_id: String,
+    requested_ref: Option<String>,
+    observed_at_utc: String,
+    candidate_committed_at_utc: Option<String>,
+    candidate: CandidateGitRevisionInput,
+    baseline: CandidateReleaseInput,
+    dso_version: String,
+    lowering_mode: String,
+    fraig: bool,
+    execution_recipe_revision: u32,
+    driver_runtime: DriverRuntimeSpec,
+    abc_runtime: YosysRuntimeSpec,
+    stats_runtime: DriverRuntimeSpec,
+    yosys_script: String,
+    yosys_script_sha256: String,
+    action_manifest_sha256: String,
+    cohort_sample_count: u64,
+    cohort_artifact_manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CandidateGitRevisionInput {
+    kind: String,
+    repository: String,
+    commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CandidateReleaseInput {
+    kind: String,
+    crate_version: String,
+    release_tag: String,
+    commit: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CandidateRunImmutableIdentityInput<'a> {
+    schema_version: u32,
+    candidate: &'a CandidateGitRevisionInput,
+    candidate_committed_at_utc: &'a str,
+    baseline: &'a CandidateReleaseInput,
+    dso_version: &'a str,
+    lowering_mode: &'a str,
+    fraig: bool,
+    execution_recipe_revision: u32,
+    driver_runtime: &'a DriverRuntimeSpec,
+    abc_runtime: &'a YosysRuntimeSpec,
+    stats_runtime: &'a DriverRuntimeSpec,
+    yosys_script: &'a str,
+    yosys_script_sha256: &'a str,
+    action_manifest_sha256: &'a str,
+    cohort_sample_count: u64,
+    cohort_artifact_manifest_sha256: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct CandidateActionManifestEntryInput<'a> {
+    source_relpath: &'a str,
+    source_sha256: &'a str,
+    top_fn_name: &'a str,
+    import_ir_action_id: &'a str,
+    g8r_aig_action_id: &'a str,
+    yosys_abc_aig_action_id: &'a str,
+    g8r_stats_action_id: &'a str,
+}
+
+fn candidate_action_manifest_sha256(samples: &[CandidateSampleInput]) -> Result<String> {
+    let entries = samples
+        .iter()
+        .map(|sample| CandidateActionManifestEntryInput {
+            source_relpath: &sample.source_relpath,
+            source_sha256: &sample.source_sha256,
+            top_fn_name: &sample.top_fn_name,
+            import_ir_action_id: &sample.import_ir_action_id,
+            g8r_aig_action_id: &sample.g8r_aig_action_id,
+            yosys_abc_aig_action_id: &sample.yosys_abc_aig_action_id,
+            g8r_stats_action_id: &sample.g8r_stats_action_id,
+        })
+        .collect::<Vec<_>>();
+    let encoded =
+        serde_json::to_vec(&entries).context("serializing candidate action manifest identity")?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"xlsynth-bvc/fixed-ir-candidate-actions/v1\0");
+    hasher.update(encoded);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -387,6 +597,30 @@ fn decode_canonical_browser_catalog(bytes: &[u8]) -> Result<BrowserCatalog> {
         bail!("browser catalog is not canonically encoded");
     }
     Ok(catalog)
+}
+
+fn encode_candidate_progression_evidence(
+    evidence: &CandidateProgressionEvidence,
+) -> Result<Vec<u8>> {
+    serde_json::to_vec_pretty(evidence).context("serializing canonical candidate evidence")
+}
+
+fn decode_canonical_candidate_progression_evidence(
+    bytes: &[u8],
+) -> Result<CandidateProgressionEvidence> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("decoding candidate evidence JSON value")?;
+    let evidence: CandidateProgressionEvidence =
+        serde_json::from_value(value.clone()).context("decoding typed candidate evidence")?;
+    let projected =
+        serde_json::to_value(&evidence).context("projecting typed candidate evidence to JSON")?;
+    if value != projected {
+        bail!("candidate evidence contains values outside its typed public schema");
+    }
+    if encode_candidate_progression_evidence(&evidence)? != bytes {
+        bail!("candidate evidence is not canonically encoded");
+    }
+    Ok(evidence)
 }
 
 fn progression_ir_sha256(structural_hashes: &[String]) -> Result<String> {
@@ -433,6 +667,59 @@ fn release_progression_ir_hashes() -> Result<Vec<String>> {
     Ok(hashes)
 }
 
+fn release_progression_ir_artifacts() -> Result<BTreeMap<String, String>> {
+    let mut artifacts = BTreeMap::new();
+    let mut previous: Option<String> = None;
+    let mut hasher = Sha256::new();
+    hasher.update(b"xlsynth-bvc/ir-dir-corpus-artifact-manifest/v1\0");
+    for (index, line) in RELEASE_PROGRESSION_IR_ARTIFACTS.lines().enumerate() {
+        let (structural_hash, source_sha256) = line
+            .split_once('\t')
+            .with_context(|| format!("fixed IR artifact manifest line {} has no tab", index + 1))?;
+        for (field, digest) in [
+            ("structural hash", structural_hash),
+            ("source SHA-256", source_sha256),
+        ] {
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                bail!(
+                    "fixed IR artifact manifest line {} has invalid {field}",
+                    index + 1
+                );
+            }
+        }
+        if previous
+            .as_deref()
+            .is_some_and(|value| value >= structural_hash)
+        {
+            bail!("fixed IR artifact manifest must be strictly sorted and unique");
+        }
+        previous = Some(structural_hash.to_string());
+        hasher.update(hex::decode(structural_hash).context("decoding structural hash")?);
+        hasher.update(hex::decode(source_sha256).context("decoding source SHA-256")?);
+        artifacts.insert(structural_hash.to_string(), source_sha256.to_string());
+    }
+    if artifacts.len() != RELEASE_PROGRESSION_IR_COUNT {
+        bail!(
+            "fixed IR artifact manifest has the wrong size: expected={} actual={}",
+            RELEASE_PROGRESSION_IR_COUNT,
+            artifacts.len()
+        );
+    }
+    let digest = hex::encode(hasher.finalize());
+    if digest != RELEASE_PROGRESSION_ARTIFACT_MANIFEST_SHA256 {
+        bail!(
+            "fixed IR artifact manifest identity changed: expected={} actual={}",
+            RELEASE_PROGRESSION_ARTIFACT_MANIFEST_SHA256,
+            digest
+        );
+    }
+    Ok(artifacts)
+}
+
 fn progression_generation_id(crate_version: &str, dso_version: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"xlsynth-bvc/release-progression-fixed-ir-generation/v2\0");
@@ -462,7 +749,8 @@ fn empty_browser_progression_catalog() -> Result<BrowserProgressionCatalog> {
         u64::try_from(cohort.len()).context("fixed IR cohort size exceeds u64")?;
     let cohort_ir_sha256 = Some(progression_ir_sha256(&cohort)?);
     Ok(BrowserProgressionCatalog {
-        dataset_key: crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME.to_string(),
+        dataset_key: crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
+            .to_string(),
         cohort_ir_count,
         cohort_ir_sha256,
         cohort_ir_hashes: cohort,
@@ -471,8 +759,16 @@ fn empty_browser_progression_catalog() -> Result<BrowserProgressionCatalog> {
     })
 }
 
+#[cfg(test)]
 fn build_browser_progression_catalog(
     dataset: &StdlibG8rVsYosysDataset,
+) -> Result<BrowserProgressionCatalog> {
+    build_browser_progression_catalog_with_releases(dataset, &[])
+}
+
+fn build_browser_progression_catalog_with_releases(
+    dataset: &StdlibG8rVsYosysDataset,
+    releases: &[CrateReleaseStatusView],
 ) -> Result<BrowserProgressionCatalog> {
     let fixed_samples = dataset
         .samples
@@ -520,6 +816,17 @@ fn build_browser_progression_catalog(
     let cohort_ir_count =
         u64::try_from(cohort.len()).context("fixed IR cohort size exceeds u64")?;
 
+    let event_time_by_crate = releases
+        .iter()
+        .filter_map(|release| {
+            parse_compat_release_datetime_utc(&release.crate_release_datetime).map(|datetime| {
+                (
+                    normalize_tag_version(&release.crate_version).to_string(),
+                    datetime.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut generations = Vec::with_capacity(sources.len());
     for source in sources {
         let ir_set = source
@@ -542,18 +849,33 @@ fn build_browser_progression_catalog(
             .context("observed fixed IR count exceeds u64")?;
         generations.push(BrowserProgressionGeneration {
             generation_id: progression_generation_id(&source.crate_version, &source.dso_version),
-            crate_version: source.crate_version,
+            origin: BrowserProgressionOrigin::CrateRelease,
+            display_label: format!("v{}", normalize_tag_version(&source.crate_version)),
+            event_time_utc: event_time_by_crate
+                .get(normalize_tag_version(&source.crate_version))
+                .cloned(),
+            crate_version: Some(source.crate_version),
             dso_version: source.dso_version,
+            baseline_generation_id: None,
             coverage,
             observed_ir_count,
             cohort_ir_count,
             missing_cohort_ir_count,
             extra_ir_count,
+            candidate_samples: Vec::new(),
         });
     }
     generations.sort_by(|left, right| {
-        cmp_dotted_numeric_version(&left.crate_version, &right.crate_version)
+        left.event_time_utc
+            .cmp(&right.event_time_utc)
+            .then_with(|| {
+                cmp_dotted_numeric_version(
+                    left.crate_version.as_deref().unwrap_or_default(),
+                    right.crate_version.as_deref().unwrap_or_default(),
+                )
+            })
             .then_with(|| cmp_dotted_numeric_version(&left.dso_version, &right.dso_version))
+            .then_with(|| left.generation_id.cmp(&right.generation_id))
     });
     let cohort_complete_generation_count = u64::try_from(
         generations
@@ -563,7 +885,8 @@ fn build_browser_progression_catalog(
     )
     .context("complete fixed-IR generation count exceeds u64")?;
     Ok(BrowserProgressionCatalog {
-        dataset_key: crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME.to_string(),
+        dataset_key: crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
+            .to_string(),
         cohort_ir_count,
         cohort_ir_sha256,
         cohort_ir_hashes: cohort,
@@ -572,16 +895,14 @@ fn build_browser_progression_catalog(
     })
 }
 
-fn build_browser_progression_catalog_from_site(
+fn load_progression_comparison_dataset_from_site(
     site_dir: &Path,
     datasets: &[BrowserDataset],
-    _runs: &[BrowserRun],
-) -> Result<BrowserProgressionCatalog> {
-    let Some(comparison_entry) = datasets
-        .iter()
-        .find(|dataset| dataset.logical_key == crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME)
-    else {
-        return empty_browser_progression_catalog();
+) -> Result<Option<StdlibG8rVsYosysDataset>> {
+    let Some(comparison_entry) = datasets.iter().find(|dataset| {
+        dataset.logical_key == crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
+    }) else {
+        return Ok(None);
     };
     let comparison_bytes = fs::read(site_dir.join(&comparison_entry.url)).with_context(|| {
         format!(
@@ -593,7 +914,7 @@ fn build_browser_progression_catalog_from_site(
         .context("decoding fixed-IR release progression comparison manifest")?;
     if comparison.schema_version != STATIC_COMPARISON_SHARD_SCHEMA_VERSION
         || comparison.source.schema_version
-            != crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_SCHEMA_VERSION
+            != crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_SCHEMA_VERSION
         || comparison.dataset.fraig
     {
         bail!("fixed-IR release progression comparison dataset has the wrong schema or fraig mode");
@@ -639,7 +960,948 @@ fn build_browser_progression_catalog_from_site(
         );
     }
     comparison.dataset.samples = sample_rows.into_iter().map(|row| row.sample).collect();
-    build_browser_progression_catalog(&comparison.dataset)
+    Ok(Some(comparison.dataset))
+}
+
+fn is_canonical_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_rfc3339_utc(value: &str, field: &str) -> Result<String> {
+    let datetime = DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("parsing {field} as RFC 3339"))?
+        .with_timezone(&Utc);
+    Ok(datetime.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+fn validate_candidate_driver_runtime(
+    runtime: &DriverRuntimeSpec,
+    require_source: bool,
+) -> Result<()> {
+    if runtime.driver_version.is_empty()
+        || runtime.release_platform.is_empty()
+        || runtime.docker_image.is_empty()
+        || runtime.dockerfile.is_empty()
+        || !is_canonical_lower_hex(&runtime.docker_image_id, 64)
+        || !is_canonical_lower_hex(&runtime.dockerfile_sha256, 64)
+        || !is_canonical_lower_hex(&runtime.release_cache_input_sha256, 64)
+        || runtime.source_revision.is_some() != require_source
+    {
+        bail!("candidate corpus manifest contains an invalid driver runtime");
+    }
+    Ok(())
+}
+
+fn candidate_run_identity_sha256(candidate_run: &CandidateRunInput) -> Result<String> {
+    let immutable_identity = CandidateRunImmutableIdentityInput {
+        schema_version: candidate_run.schema_version,
+        candidate: &candidate_run.candidate,
+        candidate_committed_at_utc: candidate_run
+            .candidate_committed_at_utc
+            .as_deref()
+            .context("candidate run identity has no commit timestamp")?,
+        baseline: &candidate_run.baseline,
+        dso_version: &candidate_run.dso_version,
+        lowering_mode: &candidate_run.lowering_mode,
+        fraig: candidate_run.fraig,
+        execution_recipe_revision: candidate_run.execution_recipe_revision,
+        driver_runtime: &candidate_run.driver_runtime,
+        abc_runtime: &candidate_run.abc_runtime,
+        stats_runtime: &candidate_run.stats_runtime,
+        yosys_script: &candidate_run.yosys_script,
+        yosys_script_sha256: &candidate_run.yosys_script_sha256,
+        action_manifest_sha256: &candidate_run.action_manifest_sha256,
+        cohort_sample_count: candidate_run.cohort_sample_count,
+        cohort_artifact_manifest_sha256: &candidate_run.cohort_artifact_manifest_sha256,
+    };
+    let identity_json = serde_json::to_vec(&immutable_identity)
+        .context("serializing candidate run identity for verification")?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"xlsynth-bvc/fixed-ir-candidate-run/v4\0");
+    hasher.update(identity_json);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn validate_candidate_corpus_manifest_input(manifest: &CandidateCorpusManifestInput) -> Result<()> {
+    let candidate_run = manifest
+        .candidate_run
+        .as_ref()
+        .context("candidate corpus manifest has no typed candidate_run")?;
+    let expected_candidate_image =
+        crate::runtime::git_driver_image(&candidate_run.candidate.commit)?;
+    let baseline_version = normalize_tag_version(&candidate_run.baseline.crate_version);
+    let expected_stats_image = crate::runtime::default_driver_image(baseline_version);
+    if manifest.schema_version != 5
+        || manifest.recipe_preset != "g8r-abc-stats"
+        || manifest.fraig
+        || candidate_run.schema_version != 4
+        || manifest.driver_runtime != candidate_run.driver_runtime
+        || manifest.stats_runtime != candidate_run.stats_runtime
+        || manifest.yosys_runtime != candidate_run.abc_runtime
+        || manifest.yosys_script != candidate_run.yosys_script
+        || manifest.yosys_script_sha256 != candidate_run.yosys_script_sha256
+        || candidate_run.candidate.kind != "git_revision"
+        || candidate_run.baseline.kind != "crate_release"
+        || candidate_run.lowering_mode != "frontend_no_prep_rewrite"
+        || candidate_run.fraig
+        || candidate_run.dso_version != normalize_tag_version(&candidate_run.dso_version)
+        || normalize_tag_version(&manifest.dso_version)
+            != normalize_tag_version(&candidate_run.dso_version)
+        || candidate_run.cohort_sample_count != RELEASE_PROGRESSION_IR_COUNT as u64
+        || candidate_run.cohort_artifact_manifest_sha256
+            != RELEASE_PROGRESSION_ARTIFACT_MANIFEST_SHA256
+    {
+        bail!("candidate corpus manifest does not match the fixed-IR G8r+ABC contract");
+    }
+    if candidate_run.candidate.repository != crate::XLSYNTH_CRATE_GIT_REPOSITORY
+        || !is_canonical_lower_hex(&candidate_run.candidate.commit, 40)
+        || !is_canonical_lower_hex(&candidate_run.baseline.commit, 40)
+        || !is_canonical_lower_hex(&candidate_run.candidate_run_id, 64)
+        || candidate_run
+            .requested_ref
+            .as_deref()
+            .is_some_and(|value| value != "main")
+        || normalize_tag_version(&candidate_run.baseline.release_tag)
+            != normalize_tag_version(&candidate_run.baseline.crate_version)
+        || candidate_run.driver_runtime.driver_version
+            != normalize_tag_version(&candidate_run.baseline.crate_version)
+        || candidate_run.stats_runtime.driver_version
+            != normalize_tag_version(&candidate_run.baseline.crate_version)
+        || candidate_run.yosys_script != crate::DEFAULT_YOSYS_FLOW_SCRIPT
+        || !is_canonical_lower_hex(&candidate_run.yosys_script_sha256, 64)
+        || !is_canonical_lower_hex(&candidate_run.action_manifest_sha256, 64)
+        || candidate_run.abc_runtime.docker_image.is_empty()
+        || candidate_run.abc_runtime.dockerfile.is_empty()
+        || !is_canonical_lower_hex(&candidate_run.abc_runtime.docker_image_id, 64)
+        || !is_canonical_lower_hex(&candidate_run.abc_runtime.dockerfile_sha256, 64)
+        || candidate_run
+            .abc_runtime
+            .upstream_commit
+            .as_deref()
+            .is_some_and(|value| !is_canonical_lower_hex(value, 40))
+        || candidate_run
+            .abc_runtime
+            .slang_commit
+            .as_deref()
+            .is_some_and(|value| !is_canonical_lower_hex(value, 40))
+    {
+        bail!("candidate corpus manifest has invalid immutable identity");
+    }
+    if candidate_run.driver_runtime.dockerfile != crate::DEFAULT_GIT_DOCKERFILE
+        || candidate_run.driver_runtime.dockerfile_sha256
+            != sha256_hex(include_bytes!("../docker/xlsynth-driver-git.Dockerfile"))
+    {
+        bail!("candidate corpus manifest does not use the canonical source-build Dockerfile");
+    }
+    if candidate_run.driver_runtime.release_platform != crate::DEFAULT_RELEASE_PLATFORM
+        || candidate_run.driver_runtime.docker_image != expected_candidate_image
+        || candidate_run.stats_runtime.release_platform != crate::DEFAULT_RELEASE_PLATFORM
+        || candidate_run.stats_runtime.docker_image != expected_stats_image
+        || candidate_run.stats_runtime.dockerfile != crate::DEFAULT_DOCKERFILE
+        || candidate_run.abc_runtime.docker_image != crate::DEFAULT_YOSYS_DOCKER_IMAGE
+        || candidate_run.abc_runtime.dockerfile != crate::DEFAULT_YOSYS_DOCKERFILE
+        || candidate_run.abc_runtime.upstream_commit.as_deref()
+            != Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT)
+        || candidate_run.abc_runtime.slang_commit.is_some()
+    {
+        bail!("candidate corpus manifest does not use canonical public runtime identifiers");
+    }
+    validate_candidate_driver_runtime(&candidate_run.driver_runtime, true)?;
+    validate_candidate_driver_runtime(&candidate_run.stats_runtime, false)?;
+    let source_revision = candidate_run
+        .driver_runtime
+        .source_revision
+        .as_ref()
+        .expect("validated source runtime");
+    if source_revision.repository != candidate_run.candidate.repository
+        || source_revision.commit != candidate_run.candidate.commit
+    {
+        bail!("candidate source runtime does not match its Git revision");
+    }
+    for sample in &manifest.samples {
+        crate::query::validate_safe_public_text(
+            "candidate sample top function",
+            &sample.top_fn_name,
+            512,
+        )?;
+    }
+    if manifest.samples.len() != RELEASE_PROGRESSION_IR_COUNT
+        || manifest
+            .samples
+            .windows(2)
+            .any(|pair| pair[0].source_relpath >= pair[1].source_relpath)
+        || candidate_action_manifest_sha256(&manifest.samples)?
+            != candidate_run.action_manifest_sha256
+    {
+        bail!(
+            "candidate corpus manifest has an incomplete, unsorted, or mismatched action manifest"
+        );
+    }
+    canonical_rfc3339_utc(
+        &candidate_run.observed_at_utc,
+        "candidate observation timestamp",
+    )?;
+    canonical_rfc3339_utc(
+        candidate_run
+            .candidate_committed_at_utc
+            .as_deref()
+            .context("candidate corpus manifest has no commit timestamp")?,
+        "candidate commit timestamp",
+    )?;
+    if candidate_run.candidate_run_id != candidate_run_identity_sha256(candidate_run)? {
+        bail!("candidate corpus manifest has a mismatched candidate_run_id");
+    }
+    Ok(())
+}
+
+fn validate_candidate_baseline_release_observation(
+    candidate_run: &CandidateRunInput,
+    observation: Option<&RepositoryHeadObservationView>,
+) -> Result<bool> {
+    let observation =
+        observation.context("candidate comparison has no checked repository observation")?;
+    let is_latest_release = normalize_tag_version(&candidate_run.baseline.crate_version)
+        == normalize_tag_version(&observation.latest_crate_version);
+    if !is_latest_release {
+        return Ok(false);
+    }
+    if normalize_tag_version(&candidate_run.baseline.release_tag)
+        != normalize_tag_version(&observation.latest_release_tag)
+        || candidate_run.baseline.commit != observation.latest_release_commit
+    {
+        bail!(
+            "candidate captured release baseline does not match the checked latest-release observation"
+        );
+    }
+    Ok(true)
+}
+
+fn verified_candidate_requested_ref(
+    candidate_run: &CandidateRunInput,
+    observation: Option<&RepositoryHeadObservationView>,
+) -> Result<Option<String>> {
+    let observation =
+        observation.context("candidate comparison has no checked repository observation")?;
+    let Some(requested_ref) = candidate_run.requested_ref.as_ref() else {
+        return Ok(None);
+    };
+    if candidate_run.candidate.commit != observation.head_commit
+        || requested_ref != &observation.head_ref
+    {
+        return Ok(None);
+    }
+    if candidate_run.candidate_committed_at_utc.as_deref()
+        != Some(observation.head_committed_at_utc.as_str())
+    {
+        bail!("current-head candidate commit timestamp does not match the checked observation");
+    }
+    Ok(Some(requested_ref.clone()))
+}
+
+fn progression_generation_cmp(
+    left: &BrowserProgressionGeneration,
+    right: &BrowserProgressionGeneration,
+) -> std::cmp::Ordering {
+    left.event_time_utc
+        .cmp(&right.event_time_utc)
+        .then_with(|| match (&left.crate_version, &right.crate_version) {
+            (Some(left), Some(right)) => cmp_dotted_numeric_version(left, right),
+            _ => left.display_label.cmp(&right.display_label),
+        })
+        .then_with(|| cmp_dotted_numeric_version(&left.dso_version, &right.dso_version))
+        .then_with(|| left.generation_id.cmp(&right.generation_id))
+}
+
+fn baseline_progression_samples<'a>(
+    dataset: &'a StdlibG8rVsYosysDataset,
+    crate_version: &str,
+    dso_version: &str,
+) -> Result<BTreeMap<String, &'a StdlibG8rVsYosysSample>> {
+    let artifacts = release_progression_ir_artifacts()?;
+    let crate_version = normalize_tag_version(crate_version);
+    let dso_version = normalize_tag_version(dso_version);
+    let mut samples = BTreeMap::new();
+    for sample in dataset.samples.iter().filter(|sample| {
+        is_progression_fixed_ir_sample(sample)
+            && normalize_tag_version(&sample.crate_version) == crate_version
+            && normalize_tag_version(&sample.dso_version) == dso_version
+    }) {
+        let structural_hash = normalized_progression_ir_hash(sample).with_context(|| {
+            format!(
+                "baseline progression sample {} has no structural hash",
+                sample.fn_key
+            )
+        })?;
+        if !artifacts.contains_key(&structural_hash) {
+            continue;
+        }
+        if samples.insert(structural_hash.clone(), sample).is_some() {
+            bail!(
+                "baseline progression generation contains duplicate structural hash: {structural_hash}"
+            );
+        }
+    }
+    Ok(samples)
+}
+
+fn candidate_structural_hash(source_relpath: &str) -> Result<String> {
+    let filename = Path::new(source_relpath)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("candidate source path has no UTF-8 filename")?;
+    if filename != source_relpath {
+        bail!("candidate source path must be a canonical corpus basename");
+    }
+    let structural_hash = filename
+        .strip_suffix(".ir")
+        .context("candidate source filename does not end in .ir")?;
+    if !is_canonical_lower_hex(structural_hash, 64) {
+        bail!("candidate source filename does not contain a canonical structural hash");
+    }
+    Ok(structural_hash.to_string())
+}
+
+fn validate_candidate_progression_generation(
+    generation: &BrowserProgressionGeneration,
+    release_catalog: &BrowserProgressionCatalog,
+    dataset: &StdlibG8rVsYosysDataset,
+    repository_observation: Option<&RepositoryHeadObservationView>,
+) -> Result<()> {
+    let BrowserProgressionOrigin::GitRevision {
+        repository,
+        commit,
+        requested_ref,
+        baseline_crate_version,
+        baseline_release_commit,
+    } = &generation.origin
+    else {
+        bail!("candidate progression generation has a non-Git origin");
+    };
+    if repository != crate::XLSYNTH_CRATE_GIT_REPOSITORY
+        || !is_canonical_lower_hex(commit, 40)
+        || baseline_release_commit
+            .as_deref()
+            .is_some_and(|value| !is_canonical_lower_hex(value, 40))
+        || !is_canonical_lower_hex(&generation.generation_id, 64)
+        || generation.crate_version.is_some()
+    {
+        bail!("candidate progression generation has invalid immutable identity");
+    }
+    let observation = repository_observation
+        .context("candidate progression has no checked repository observation")?;
+    let baseline_is_latest = normalize_tag_version(baseline_crate_version)
+        == normalize_tag_version(&observation.latest_crate_version);
+    let expected_release_commit =
+        baseline_is_latest.then_some(observation.latest_release_commit.as_str());
+    if baseline_release_commit.as_deref() != expected_release_commit {
+        bail!("candidate progression baseline release commit is not independently verified");
+    }
+    if requested_ref.as_ref().is_some_and(|requested_ref| {
+        commit != &observation.head_commit || requested_ref != &observation.head_ref
+    }) {
+        bail!("candidate progression requested ref is not independently verified at its commit");
+    }
+    let expected_label = format!(
+        "{}@{}",
+        requested_ref.as_deref().unwrap_or("git"),
+        &commit[..8]
+    );
+    if generation.display_label != expected_label {
+        bail!("candidate progression generation has a misleading display label");
+    }
+    let event_time_utc = canonical_rfc3339_utc(
+        generation
+            .event_time_utc
+            .as_deref()
+            .context("candidate progression generation has no commit timestamp")?,
+        "candidate commit timestamp",
+    )?;
+    if requested_ref.is_some() && event_time_utc != observation.head_committed_at_utc {
+        bail!(
+            "current-head candidate progression timestamp does not match the checked observation"
+        );
+    }
+    let baseline_id = generation
+        .baseline_generation_id
+        .as_deref()
+        .context("candidate progression generation has no captured baseline")?;
+    let baseline_generation = release_catalog
+        .generations
+        .iter()
+        .find(|value| value.generation_id == baseline_id)
+        .context("candidate progression baseline generation is unavailable")?;
+    if baseline_generation.origin != BrowserProgressionOrigin::CrateRelease
+        || baseline_generation.crate_version.as_deref()
+            != Some(normalize_tag_version(baseline_crate_version))
+        || normalize_tag_version(&baseline_generation.dso_version)
+            != normalize_tag_version(&generation.dso_version)
+    {
+        bail!("candidate progression baseline identity or DSO does not match");
+    }
+    let artifacts = release_progression_ir_artifacts()?;
+    let baseline_samples =
+        baseline_progression_samples(dataset, baseline_crate_version, &generation.dso_version)?;
+    if baseline_samples.len() != RELEASE_PROGRESSION_IR_COUNT {
+        bail!("candidate progression baseline is not cohort complete");
+    }
+    let mut seen = BTreeSet::new();
+    for sample in &generation.candidate_samples {
+        if !seen.insert(sample.structural_hash.clone()) {
+            bail!("candidate progression generation contains a duplicate structural hash");
+        }
+        let expected_source_sha256 = artifacts
+            .get(&sample.structural_hash)
+            .context("candidate progression sample is outside the fixed cohort")?;
+        if &sample.source_sha256 != expected_source_sha256 {
+            bail!("candidate progression sample IR bytes do not match the fixed cohort");
+        }
+        let baseline = baseline_samples
+            .get(&sample.structural_hash)
+            .context("candidate progression sample has no release baseline")?;
+        let expected_ir_action_id =
+            crate::executor::compute_action_id(&ActionSpec::ImportIrPackageFile {
+                source_sha256: sample.source_sha256.clone(),
+                top_fn_name: baseline.ir_top.clone(),
+            })?;
+        for (field, action_id) in [
+            ("IR action", &sample.ir_action_id),
+            ("G8r stats action", &sample.g8r_stats_action_id),
+            ("reference stats action", &sample.yosys_abc_stats_action_id),
+        ] {
+            if !is_canonical_lower_hex(action_id, 64) {
+                bail!("candidate progression sample has invalid {field} ID");
+            }
+        }
+        let metrics = [
+            sample.g8r_nodes,
+            sample.g8r_levels,
+            sample.yosys_abc_nodes,
+            sample.yosys_abc_levels,
+            sample.g8r_product,
+            sample.yosys_abc_product,
+            sample.g8r_product_loss,
+        ];
+        if metrics.iter().any(|value| !value.is_finite())
+            || metrics[..6].iter().any(|value| *value < 0.0)
+            || sample.g8r_product != sample.g8r_nodes * sample.g8r_levels
+            || sample.yosys_abc_product != sample.yosys_abc_nodes * sample.yosys_abc_levels
+            || sample.g8r_product_loss != sample.g8r_product - sample.yosys_abc_product
+            || sample.ir_action_id != expected_ir_action_id
+            || sample.yosys_abc_nodes != baseline.yosys_abc_nodes
+            || sample.yosys_abc_levels != baseline.yosys_abc_levels
+            || sample.yosys_abc_product != baseline.yosys_abc_product
+            || sample.yosys_abc_stats_action_id != baseline.yosys_abc_stats_action_id
+            || sample.ir_node_count != baseline.ir_node_count
+        {
+            bail!("candidate progression sample disagrees with its metrics or baseline reference");
+        }
+    }
+    let expected_hashes = artifacts.keys().cloned().collect::<BTreeSet<_>>();
+    if seen != expected_hashes
+        || generation.candidate_samples.len() != RELEASE_PROGRESSION_IR_COUNT
+        || generation.observed_ir_count != RELEASE_PROGRESSION_IR_COUNT as u64
+        || generation.cohort_ir_count != RELEASE_PROGRESSION_IR_COUNT as u64
+        || generation.missing_cohort_ir_count != 0
+        || generation.extra_ir_count != 0
+        || generation.coverage != BrowserProgressionCoverage::CohortComplete
+    {
+        bail!("candidate progression generation is not exactly cohort complete");
+    }
+    Ok(())
+}
+
+fn read_candidate_corpus_manifest(run_dir: &Path) -> Result<CandidateCorpusManifestInput> {
+    let manifest_path = run_dir.join("manifest.json");
+    serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .with_context(|| format!("reading candidate manifest {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("decoding candidate manifest {}", manifest_path.display()))
+}
+
+fn preflight_candidate_run_dirs(candidate_run_dirs: &[PathBuf]) -> Result<()> {
+    for run_dir in candidate_run_dirs {
+        let manifest = read_candidate_corpus_manifest(run_dir)?;
+        validate_candidate_corpus_manifest_input(&manifest)
+            .with_context(|| format!("validating candidate run {}", run_dir.display()))?;
+        crate::corpus::validate_candidate_run_marker_provenance(
+            run_dir,
+            manifest
+                .candidate_run
+                .as_ref()
+                .map(|candidate| candidate.candidate_run_id.as_str()),
+        )
+        .with_context(|| format!("validating candidate marker {}", run_dir.display()))?;
+    }
+    Ok(())
+}
+
+fn candidate_stats_metric(value: &serde_json::Value, key: &str) -> Result<f64> {
+    let value = value
+        .get(key)
+        .or_else(|| {
+            (key == "and_nodes")
+                .then(|| value.get("live_nodes"))
+                .flatten()
+        })
+        .with_context(|| format!("candidate stats have no {key} metric"))?;
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_f64()
+            .with_context(|| format!("candidate {key} metric is not representable as f64")),
+        serde_json::Value::String(text) => text
+            .parse::<f64>()
+            .with_context(|| format!("candidate {key} metric is not numeric")),
+        _ => bail!("candidate {key} metric is not numeric"),
+    }
+}
+
+fn candidate_stats_metric_projection_sha256(and_nodes: f64, depth: f64) -> Result<String> {
+    if !and_nodes.is_finite() || and_nodes < 0.0 || !depth.is_finite() || depth < 0.0 {
+        bail!("candidate stats metrics must be finite and nonnegative");
+    }
+    let projection = CandidateStatsMetricProjection { and_nodes, depth };
+    let encoded = serde_json::to_vec(&projection)
+        .context("serializing canonical candidate stats metric projection")?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"xlsynth-bvc/candidate-stats-metric-projection/v1\0");
+    hasher.update(encoded);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn read_verified_candidate_stats_with_evidence(
+    run_dir: &Path,
+    store: &ArtifactStore,
+    sample: &CandidateSampleInput,
+    expected_action: &ActionSpec,
+) -> Result<(serde_json::Value, CandidateStatsEvidence)> {
+    let expected_action_id = crate::executor::compute_action_id(expected_action)?;
+    if sample.g8r_stats_action_id != expected_action_id {
+        bail!("candidate sample stats action ID does not match its immutable action graph");
+    }
+    let provenance = store
+        .load_provenance(&expected_action_id)
+        .with_context(|| format!("loading candidate stats provenance {expected_action_id}"))?;
+    if provenance.action_id != expected_action_id
+        || crate::executor::compute_action_id(&provenance.action)? != expected_action_id
+        || provenance.output_artifact.action_id != expected_action_id
+        || provenance.output_artifact.artifact_type != ArtifactType::AigStatsFile
+        || provenance.output_artifact.relpath != crate::corpus::G8R_STATS_RELPATH
+    {
+        bail!("candidate stats provenance does not match its expected action or output");
+    }
+    let output_file_path = crate::corpus::G8R_STATS_RELPATH
+        .strip_prefix("payload/")
+        .context("candidate stats output is not rooted below payload")?;
+    let declared_output = provenance
+        .output_files
+        .iter()
+        .find(|file| file.path == output_file_path)
+        .context("candidate stats provenance does not declare its output bytes")?;
+    let stats_path = run_dir
+        .join("artifacts")
+        .join(&sample.sample_id)
+        .join("g8r_stats.json");
+    let stats_bytes = fs::read(&stats_path)
+        .with_context(|| format!("reading exported candidate stats {}", stats_path.display()))?;
+    if declared_output.bytes != stats_bytes.len() as u64
+        || declared_output.sha256 != sha256_hex(&stats_bytes)
+    {
+        bail!("exported candidate stats do not match their immutable provenance digest");
+    }
+    let value = serde_json::from_slice(&stats_bytes)
+        .with_context(|| format!("decoding exported candidate stats {}", stats_path.display()))?;
+    let and_nodes = candidate_stats_metric(&value, "and_nodes")?;
+    let depth = candidate_stats_metric(&value, "depth")?;
+    let metric_projection_sha256 = candidate_stats_metric_projection_sha256(and_nodes, depth)?;
+    let evidence = CandidateStatsEvidence {
+        sample_id: sample.sample_id.clone(),
+        g8r_stats_action_id: expected_action_id,
+        source_output_bytes: declared_output.bytes,
+        source_output_sha256: declared_output.sha256.clone(),
+        metric_projection_sha256,
+        and_nodes,
+        depth,
+    };
+    Ok((value, evidence))
+}
+
+fn candidate_progression_generation_from_manifest<F>(
+    manifest: CandidateCorpusManifestInput,
+    release_catalog: &BrowserProgressionCatalog,
+    dataset: &StdlibG8rVsYosysDataset,
+    repository_observation: Option<&RepositoryHeadObservationView>,
+    mut read_stats: F,
+) -> Result<BrowserProgressionGeneration>
+where
+    F: FnMut(&CandidateSampleInput, &ActionSpec) -> Result<serde_json::Value>,
+{
+    validate_candidate_corpus_manifest_input(&manifest)?;
+    let candidate_run = manifest
+        .candidate_run
+        .context("candidate corpus manifest has no typed candidate_run")?;
+    let baseline_release_commit_verified =
+        validate_candidate_baseline_release_observation(&candidate_run, repository_observation)?;
+    let verified_requested_ref =
+        verified_candidate_requested_ref(&candidate_run, repository_observation)?;
+    let event_time_utc = canonical_rfc3339_utc(
+        candidate_run
+            .candidate_committed_at_utc
+            .as_deref()
+            .expect("validated candidate commit timestamp"),
+        "candidate commit timestamp",
+    )?;
+    let baseline_generation = release_catalog
+        .generations
+        .iter()
+        .find(|generation| {
+            generation.origin == BrowserProgressionOrigin::CrateRelease
+                && generation.crate_version.as_deref()
+                    == Some(normalize_tag_version(&candidate_run.baseline.crate_version))
+                && normalize_tag_version(&generation.dso_version)
+                    == normalize_tag_version(&candidate_run.dso_version)
+        })
+        .context("candidate's captured release baseline is absent from the progression dataset")?;
+    let baseline_samples = baseline_progression_samples(
+        dataset,
+        &candidate_run.baseline.crate_version,
+        &candidate_run.dso_version,
+    )?;
+    let artifacts = release_progression_ir_artifacts()?;
+    let script_ref = ScriptRef {
+        path: candidate_run.yosys_script.clone(),
+        sha256: candidate_run.yosys_script_sha256.clone(),
+    };
+    let mut samples = BTreeMap::new();
+    for sample in &manifest.samples {
+        let structural_hash = candidate_structural_hash(&sample.source_relpath)?;
+        let expected_source_sha256 = artifacts
+            .get(&structural_hash)
+            .context("candidate sample is outside the fixed cohort")?;
+        let baseline = baseline_samples
+            .get(&structural_hash)
+            .context("candidate sample has no matching G8r+ABC release baseline")?;
+        let import_action = ActionSpec::ImportIrPackageFile {
+            source_sha256: sample.source_sha256.clone(),
+            top_fn_name: Some(sample.top_fn_name.clone()),
+        };
+        let import_action_id = crate::executor::compute_action_id(&import_action)?;
+        let candidate_g8r_action = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: import_action_id.clone(),
+            top_fn_name: Some(sample.top_fn_name.clone()),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+            execution_recipe_revision: candidate_run.execution_recipe_revision,
+            version: candidate_run.dso_version.clone(),
+            runtime: candidate_run.driver_runtime.clone(),
+        };
+        let candidate_g8r_action_id = crate::executor::compute_action_id(&candidate_g8r_action)?;
+        let candidate_abc_action = ActionSpec::AigToYosysAbcAig {
+            aig_action_id: candidate_g8r_action_id.clone(),
+            yosys_script_ref: script_ref.clone(),
+            runtime: candidate_run.abc_runtime.clone(),
+        };
+        let candidate_abc_action_id = crate::executor::compute_action_id(&candidate_abc_action)?;
+        let candidate_stats_action = ActionSpec::DriverAigToStats {
+            aig_action_id: candidate_abc_action_id.clone(),
+            version: candidate_run.dso_version.clone(),
+            runtime: candidate_run.stats_runtime.clone(),
+        };
+        let mut baseline_stats_action_ids = BTreeSet::new();
+        for top_fn_name in [None, baseline.ir_top.clone()] {
+            let baseline_g8r_action = ActionSpec::DriverIrToG8rAig {
+                ir_action_id: baseline.ir_action_id.clone(),
+                top_fn_name,
+                fraig: false,
+                lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+                execution_recipe_revision: candidate_run.execution_recipe_revision,
+                version: candidate_run.dso_version.clone(),
+                runtime: candidate_run.stats_runtime.clone(),
+            };
+            let baseline_g8r_action_id = crate::executor::compute_action_id(&baseline_g8r_action)?;
+            let baseline_abc_action = ActionSpec::AigToYosysAbcAig {
+                aig_action_id: baseline_g8r_action_id,
+                yosys_script_ref: script_ref.clone(),
+                runtime: candidate_run.abc_runtime.clone(),
+            };
+            let baseline_abc_action_id = crate::executor::compute_action_id(&baseline_abc_action)?;
+            let baseline_stats_action = ActionSpec::DriverAigToStats {
+                aig_action_id: baseline_abc_action_id,
+                version: candidate_run.dso_version.clone(),
+                runtime: candidate_run.stats_runtime.clone(),
+            };
+            baseline_stats_action_ids
+                .insert(crate::executor::compute_action_id(&baseline_stats_action)?);
+        }
+        if sample.sample_id != crate::corpus::sample_id_for_relpath(&sample.source_relpath)
+            || sample.fraig
+            || normalize_tag_version(&sample.dso_version)
+                != normalize_tag_version(&candidate_run.dso_version)
+            || &sample.source_sha256 != expected_source_sha256
+            || sample.import_ir_action_id != import_action_id
+            || baseline.ir_top.as_deref() != Some(sample.top_fn_name.as_str())
+            || sample.g8r_aig_action_id != candidate_g8r_action_id
+            || sample.yosys_abc_aig_action_id != candidate_abc_action_id
+            || !baseline_stats_action_ids.contains(&baseline.g8r_stats_action_id)
+        {
+            bail!(
+                "candidate sample does not match its fixed IR, action graph, or common G8r+ABC release baseline"
+            );
+        }
+        let stats = read_stats(sample, &candidate_stats_action)?;
+        let g8r_nodes = candidate_stats_metric(&stats, "and_nodes")?;
+        let g8r_levels = candidate_stats_metric(&stats, "depth")?;
+        let g8r_product = g8r_nodes * g8r_levels;
+        let browser_sample = BrowserCandidateProgressionSample {
+            fn_key: baseline.fn_key.clone(),
+            structural_hash: structural_hash.clone(),
+            source_sha256: sample.source_sha256.clone(),
+            ir_node_count: baseline.ir_node_count,
+            g8r_nodes,
+            g8r_levels,
+            yosys_abc_nodes: baseline.yosys_abc_nodes,
+            yosys_abc_levels: baseline.yosys_abc_levels,
+            g8r_product,
+            yosys_abc_product: baseline.yosys_abc_product,
+            g8r_product_loss: g8r_product - baseline.yosys_abc_product,
+            ir_action_id: import_action_id,
+            g8r_stats_action_id: sample.g8r_stats_action_id.clone(),
+            yosys_abc_stats_action_id: baseline.yosys_abc_stats_action_id.clone(),
+        };
+        if samples
+            .insert(structural_hash.clone(), browser_sample)
+            .is_some()
+        {
+            bail!("candidate samples contain duplicate structural hash {structural_hash}");
+        }
+    }
+    let origin = BrowserProgressionOrigin::GitRevision {
+        repository: candidate_run.candidate.repository,
+        commit: candidate_run.candidate.commit.clone(),
+        requested_ref: verified_requested_ref.clone(),
+        baseline_crate_version: normalize_tag_version(&candidate_run.baseline.crate_version)
+            .to_string(),
+        baseline_release_commit: baseline_release_commit_verified
+            .then_some(candidate_run.baseline.commit),
+    };
+    let generation = BrowserProgressionGeneration {
+        generation_id: candidate_run.candidate_run_id,
+        origin,
+        display_label: format!(
+            "{}@{}",
+            verified_requested_ref.as_deref().unwrap_or("git"),
+            &candidate_run.candidate.commit[..8]
+        ),
+        event_time_utc: Some(event_time_utc),
+        crate_version: None,
+        dso_version: normalize_tag_version(&candidate_run.dso_version).to_string(),
+        baseline_generation_id: Some(baseline_generation.generation_id.clone()),
+        coverage: BrowserProgressionCoverage::CohortComplete,
+        observed_ir_count: samples.len() as u64,
+        cohort_ir_count: RELEASE_PROGRESSION_IR_COUNT as u64,
+        missing_cohort_ir_count: RELEASE_PROGRESSION_IR_COUNT.saturating_sub(samples.len()) as u64,
+        extra_ir_count: samples
+            .keys()
+            .filter(|hash| !artifacts.contains_key(*hash))
+            .count() as u64,
+        candidate_samples: samples.into_values().collect(),
+    };
+    validate_candidate_progression_generation(
+        &generation,
+        release_catalog,
+        dataset,
+        repository_observation,
+    )?;
+    Ok(generation)
+}
+
+fn load_candidate_progression_generation_with_evidence(
+    run_dir: &Path,
+    release_catalog: &BrowserProgressionCatalog,
+    dataset: &StdlibG8rVsYosysDataset,
+    repository_observation: Option<&RepositoryHeadObservationView>,
+) -> Result<(BrowserProgressionGeneration, CandidateProgressionEvidence)> {
+    let manifest = read_candidate_corpus_manifest(run_dir)?;
+    let evidence_manifest = manifest.clone();
+    let store = ArtifactStore::new_with_sled(
+        run_dir.join(".bvc/bvc-artifacts"),
+        run_dir.join(".bvc/artifacts.sled"),
+    );
+    let mut stats_evidence = Vec::with_capacity(manifest.samples.len());
+    let generation = candidate_progression_generation_from_manifest(
+        manifest,
+        release_catalog,
+        dataset,
+        repository_observation,
+        |sample, expected_action| {
+            let (value, evidence) = read_verified_candidate_stats_with_evidence(
+                run_dir,
+                &store,
+                sample,
+                expected_action,
+            )?;
+            stats_evidence.push(evidence);
+            Ok(value)
+        },
+    )?;
+    Ok((
+        generation,
+        CandidateProgressionEvidence {
+            schema_version: CANDIDATE_PROGRESSION_EVIDENCE_SCHEMA_VERSION,
+            manifest: evidence_manifest,
+            stats: stats_evidence,
+        },
+    ))
+}
+
+fn candidate_progression_generation_from_evidence(
+    evidence: CandidateProgressionEvidence,
+    release_catalog: &BrowserProgressionCatalog,
+    dataset: &StdlibG8rVsYosysDataset,
+    repository_observation: Option<&RepositoryHeadObservationView>,
+) -> Result<BrowserProgressionGeneration> {
+    if evidence.schema_version != CANDIDATE_PROGRESSION_EVIDENCE_SCHEMA_VERSION {
+        bail!(
+            "unsupported candidate progression evidence schema version: {}",
+            evidence.schema_version
+        );
+    }
+    if evidence.stats.len() != evidence.manifest.samples.len()
+        || !evidence
+            .stats
+            .iter()
+            .zip(&evidence.manifest.samples)
+            .all(|(stats, sample)| stats.sample_id == sample.sample_id)
+    {
+        bail!("candidate evidence stats do not exactly follow the manifest sample order");
+    }
+    let mut stats_by_sample = BTreeMap::new();
+    for stats in evidence.stats {
+        let sample_id = stats.sample_id.clone();
+        if stats_by_sample.insert(sample_id.clone(), stats).is_some() {
+            bail!("candidate evidence contains duplicate stats for {sample_id}");
+        }
+    }
+    let generation = candidate_progression_generation_from_manifest(
+        evidence.manifest,
+        release_catalog,
+        dataset,
+        repository_observation,
+        |sample, expected_action| {
+            let stats = stats_by_sample.remove(&sample.sample_id).with_context(|| {
+                format!("candidate evidence has no stats for {}", sample.sample_id)
+            })?;
+            let expected_action_id = crate::executor::compute_action_id(expected_action)?;
+            let expected_metric_projection_sha256 =
+                candidate_stats_metric_projection_sha256(stats.and_nodes, stats.depth)?;
+            if stats.g8r_stats_action_id != sample.g8r_stats_action_id
+                || stats.g8r_stats_action_id != expected_action_id
+                || stats.source_output_bytes == 0
+                || !is_canonical_lower_hex(&stats.source_output_sha256, 64)
+                || !is_canonical_lower_hex(&stats.metric_projection_sha256, 64)
+                || stats.metric_projection_sha256 != expected_metric_projection_sha256
+            {
+                bail!(
+                    "candidate evidence stats do not match their action, source output, or metric projection digest"
+                );
+            }
+            Ok(serde_json::json!({"and_nodes": stats.and_nodes, "depth": stats.depth}))
+        },
+    )?;
+    if !stats_by_sample.is_empty() {
+        bail!("candidate evidence contains stats outside the candidate manifest");
+    }
+    Ok(generation)
+}
+
+fn combine_progression_generations(
+    mut release_catalog: BrowserProgressionCatalog,
+    candidates: Vec<BrowserProgressionGeneration>,
+    dataset: &StdlibG8rVsYosysDataset,
+    repository_observation: Option<&RepositoryHeadObservationView>,
+) -> Result<BrowserProgressionCatalog> {
+    let mut generation_ids = release_catalog
+        .generations
+        .iter()
+        .map(|generation| generation.generation_id.clone())
+        .collect::<BTreeSet<_>>();
+    for candidate in candidates {
+        validate_candidate_progression_generation(
+            &candidate,
+            &release_catalog,
+            dataset,
+            repository_observation,
+        )?;
+        if !generation_ids.insert(candidate.generation_id.clone()) {
+            bail!("progression contains duplicate generation identity");
+        }
+        release_catalog.generations.push(candidate);
+    }
+    release_catalog
+        .generations
+        .sort_by(progression_generation_cmp);
+    release_catalog.cohort_complete_generation_count = release_catalog
+        .generations
+        .iter()
+        .filter(|generation| generation.coverage == BrowserProgressionCoverage::CohortComplete)
+        .count() as u64;
+    Ok(release_catalog)
+}
+
+fn build_browser_progression_catalog_and_candidate_evidence_from_site(
+    site_dir: &Path,
+    datasets: &[BrowserDataset],
+    releases: &[CrateReleaseStatusView],
+    repository_observation: Option<&RepositoryHeadObservationView>,
+    candidate_run_dirs: &[PathBuf],
+) -> Result<(BrowserProgressionCatalog, Vec<CandidateProgressionEvidence>)> {
+    let Some(dataset) = load_progression_comparison_dataset_from_site(site_dir, datasets)? else {
+        if !candidate_run_dirs.is_empty() {
+            bail!("cannot add a candidate without the fixed-IR release progression dataset");
+        }
+        return Ok((empty_browser_progression_catalog()?, Vec::new()));
+    };
+    let release_catalog = build_browser_progression_catalog_with_releases(&dataset, releases)?;
+    let candidate_pairs = candidate_run_dirs
+        .iter()
+        .map(|run_dir| {
+            load_candidate_progression_generation_with_evidence(
+                run_dir,
+                &release_catalog,
+                &dataset,
+                repository_observation,
+            )
+            .with_context(|| format!("loading candidate run {}", run_dir.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (candidates, evidence): (Vec<_>, Vec<_>) = candidate_pairs.into_iter().unzip();
+    let catalog = combine_progression_generations(
+        release_catalog,
+        candidates,
+        &dataset,
+        repository_observation,
+    )?;
+    Ok((catalog, evidence))
+}
+
+fn build_browser_progression_catalog_from_site(
+    site_dir: &Path,
+    datasets: &[BrowserDataset],
+    releases: &[CrateReleaseStatusView],
+    repository_observation: Option<&RepositoryHeadObservationView>,
+    candidate_run_dirs: &[PathBuf],
+) -> Result<BrowserProgressionCatalog> {
+    build_browser_progression_catalog_and_candidate_evidence_from_site(
+        site_dir,
+        datasets,
+        releases,
+        repository_observation,
+        candidate_run_dirs,
+    )
+    .map(|(catalog, _)| catalog)
 }
 
 fn load_versions_report_from_site(
@@ -958,6 +2220,26 @@ fn expected_catalog_site_relpaths(
         insert_unique_site_relpath(&mut data, dataset.url.clone())?;
     }
 
+    if !catalog
+        .candidate_evidence
+        .windows(2)
+        .all(|pair| pair[0].generation_id < pair[1].generation_id)
+    {
+        bail!("browser catalog candidate evidence is not strictly sorted by generation ID");
+    }
+    for evidence in &catalog.candidate_evidence {
+        if !is_canonical_lower_hex(&evidence.generation_id, 64)
+            || !is_canonical_lower_hex(&evidence.sha256, 64)
+        {
+            bail!("browser catalog candidate evidence has an invalid identity or digest");
+        }
+        let expected_url = format!("data/candidates/{}/evidence.json", evidence.generation_id);
+        if evidence.url != expected_url {
+            bail!("browser catalog candidate evidence URL is not canonical");
+        }
+        insert_unique_site_relpath(&mut data, evidence.url.clone())?;
+    }
+
     for run in &catalog.runs {
         let expected_page_url = format!("runs/{}/", run.run_id);
         let expected_page_relpath = format!("runs/{}/index.html", run.run_id);
@@ -1016,8 +2298,8 @@ fn actual_site_relpaths(site_dir: &Path) -> Result<BTreeSet<String>> {
 
 fn progression_body(root_site_url: &str) -> String {
     format!(
-        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Fixed-IR release progression</h1><p class=\"meta\">Aggregate quality and per-artifact distributions for the same structural IR corpus across crate releases; negative means G8r is better</p><p id=\"error\" role=\"alert\"></p></header><main id=\"progression\" data-dataset-key=\"{}\"><div class=\"toolbar\"><label>Baseline <select id=\"baseline-version\" aria-label=\"Baseline crate release\"></select></label><label>Current <select id=\"current-version\" aria-label=\"Current crate release\"></select></label><label><input id=\"include-incomplete\" type=\"checkbox\"> Include incomplete generations</label></div><p id=\"progression-status\" class=\"meta\" aria-live=\"polite\">Loading release data…</p><section id=\"progression-summary\" class=\"grid\" aria-live=\"polite\"></section><h2>Quality versus distribution</h2><section id=\"progression-chart\" class=\"progression-chart\" aria-live=\"polite\"><p class=\"muted\">Loading release data…</p></section><h2>Fixed-IR coverage</h2><section id=\"progression-inventory\" aria-live=\"polite\"></section><section id=\"progression-table\" aria-live=\"polite\"></section></main>",
-        crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
+        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Fixed-IR generation progression</h1><p class=\"meta\">Aggregate quality and per-artifact distributions for the same structural IR corpus across crate releases and evaluated Git revisions; lower means G8r is better</p><p id=\"error\" role=\"alert\"></p></header><main id=\"progression\" data-dataset-key=\"{}\"><div class=\"toolbar\"><label>Baseline <select id=\"baseline-version\" aria-label=\"Baseline generation\"></select></label><label>Current <select id=\"current-version\" aria-label=\"Current generation\"></select></label><label><input id=\"include-incomplete\" type=\"checkbox\"> Include incomplete generations</label></div><p id=\"progression-status\" class=\"meta\" aria-live=\"polite\">Loading generation data…</p><section id=\"progression-summary\" class=\"grid\" aria-live=\"polite\"></section><h2>Quality versus distribution</h2><section id=\"progression-chart\" class=\"progression-chart\" aria-live=\"polite\"><p class=\"muted\">Loading generation data…</p></section><h2>Fixed-IR coverage</h2><section id=\"progression-inventory\" aria-live=\"polite\"></section><section id=\"progression-table\" aria-live=\"polite\"></section></main>",
+        crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
     )
 }
 
@@ -1192,7 +2474,7 @@ fn expected_fixed_site_files(
     files.insert(
         "progression.html".to_string(),
         html_shell(
-            "xlsynth-bvc release progression",
+            "xlsynth-bvc generation progression",
             &root_site_url,
             &progression_body(&root_site_url),
             &css_name,
@@ -1439,11 +2721,352 @@ pub(crate) fn build_static_site_with_protected_roots(
     options: &BuildStaticSiteOptions,
     protected_roots: &[(&str, &Path)],
 ) -> Result<BuildStaticSiteSummary> {
+    build_static_site_with_candidate_runs(options, protected_roots, &[])
+}
+
+fn unique_site_sibling_path(out_dir: &Path, role: &str) -> Result<PathBuf> {
+    let parent = out_dir
+        .parent()
+        .context("static site output path has no parent")?;
+    let name = out_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("static site output has no UTF-8 filename")?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos();
+    let path = parent.join(format!(".{name}.{role}-{}-{nanos}", std::process::id()));
+    if path.exists() {
+        bail!(
+            "static site temporary path already exists: {}",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+fn acquire_site_publication_lock(out_dir: &Path) -> Result<fs::File> {
+    let parent = out_dir
+        .parent()
+        .context("static site output path has no parent")?;
+    let name = out_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("static site output has no UTF-8 filename")?;
+    let lock_path = parent.join(format!(".{name}.publish.lock"));
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .with_context(|| {
+            format!(
+                "opening static site publication lock: {}",
+                lock_path.display()
+            )
+        })?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("locking static site publication: {}", lock_path.display()))?;
+    Ok(lock_file)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn atomic_exchange_site_directories(current: &Path, replacement: &Path) -> Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    renameat_with(CWD, current, CWD, replacement, RenameFlags::EXCHANGE).with_context(|| {
+        format!(
+            "atomically exchanging current and replacement static sites: {} <-> {}",
+            current.display(),
+            replacement.display()
+        )
+    })
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
+fn atomic_install_site_directory(replacement: &Path, destination: &Path) -> Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    renameat_with(CWD, replacement, CWD, destination, RenameFlags::NOREPLACE).with_context(|| {
+        format!(
+            "atomically installing static site without replacing an existing destination: {} -> {}",
+            replacement.display(),
+            destination.display()
+        )
+    })
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    target_vendor = "apple"
+)))]
+fn atomic_install_site_directory(replacement: &Path, destination: &Path) -> Result<()> {
+    bail!(
+        "atomic no-replace static-site installation is unsupported on this platform: {} -> {}",
+        replacement.display(),
+        destination.display()
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn atomic_exchange_site_directories(current: &Path, replacement: &Path) -> Result<()> {
+    bail!(
+        "atomic static-site overwrite is unsupported on this platform: {} <-> {}",
+        current.display(),
+        replacement.display()
+    )
+}
+
+fn sync_site_tree(root: &Path) -> Result<()> {
+    let mut directories = Vec::new();
+    for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
+        let entry =
+            entry.with_context(|| format!("walking staged static site: {}", root.display()))?;
+        let path = entry.path();
+        let file_type = entry.file_type();
+        if file_type.is_file() {
+            fs::File::open(path)
+                .with_context(|| format!("opening staged static-site file: {}", path.display()))?
+                .sync_all()
+                .with_context(|| format!("syncing staged static-site file: {}", path.display()))?;
+        } else if file_type.is_dir() {
+            directories.push(path.to_path_buf());
+        } else {
+            bail!(
+                "staged static site contains a non-file, non-directory entry: {}",
+                path.display()
+            );
+        }
+    }
+    directories.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| right.cmp(left))
+    });
+    for directory in directories {
+        fs::File::open(&directory)
+            .with_context(|| {
+                format!(
+                    "opening staged static-site directory: {}",
+                    directory.display()
+                )
+            })?
+            .sync_all()
+            .with_context(|| {
+                format!(
+                    "syncing staged static-site directory: {}",
+                    directory.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn sync_site_parent_directory(out_dir: &Path) -> Result<()> {
+    let raw_parent = out_dir
+        .parent()
+        .context("static site output path has no parent")?;
+    let parent = if raw_parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        raw_parent
+    };
+    fs::File::open(parent)
+        .with_context(|| format!("opening static site parent: {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing static site parent: {}", parent.display()))
+}
+
+pub(crate) fn build_static_site_with_candidate_runs(
+    options: &BuildStaticSiteOptions,
+    protected_roots: &[(&str, &Path)],
+    candidate_run_dirs: &[PathBuf],
+) -> Result<BuildStaticSiteSummary> {
+    reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected_roots)?;
+    for candidate_run_dir in candidate_run_dirs {
+        reject_site_output_overlap(&options.out_dir, candidate_run_dir, &[]).with_context(
+            || {
+                format!(
+                    "static site output overlaps candidate run {}",
+                    candidate_run_dir.display()
+                )
+            },
+        )?;
+    }
+    if options.out_dir.exists() {
+        if !options.overwrite {
+            bail!(
+                "static site output directory already exists; rerun with --overwrite: {}",
+                options.out_dir.display()
+            );
+        }
+        if !options.out_dir.is_dir() {
+            bail!(
+                "static site output exists but is not a directory: {}",
+                options.out_dir.display()
+            );
+        }
+    }
+
+    let staging_dir = unique_site_sibling_path(&options.out_dir, "staging")?;
+    let staging_options = BuildStaticSiteOptions {
+        snapshot_dir: options.snapshot_dir.clone(),
+        out_dir: staging_dir.clone(),
+        base_url: options.base_url.clone(),
+        overwrite: false,
+    };
+    let mut summary = match build_static_site_with_candidate_runs_in_place(
+        &staging_options,
+        protected_roots,
+        candidate_run_dirs,
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            if staging_dir.exists() {
+                let _ = fs::remove_dir_all(&staging_dir);
+            }
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = sync_site_tree(&staging_dir) {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(error).context("flushing verified static site before publication");
+    }
+
+    let _publication_lock = match acquire_site_publication_lock(&options.out_dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(error);
+        }
+    };
+    let replace_existing_site = options.out_dir.exists();
+    if replace_existing_site {
+        if !options.overwrite {
+            let _ = fs::remove_dir_all(&staging_dir);
+            bail!(
+                "static site output directory was created concurrently; refusing to overwrite it: {}",
+                options.out_dir.display()
+            );
+        }
+        if !options.out_dir.is_dir() {
+            let _ = fs::remove_dir_all(&staging_dir);
+            bail!(
+                "static site output was replaced concurrently by a non-directory: {}",
+                options.out_dir.display()
+            );
+        }
+    }
+
+    if replace_existing_site {
+        if let Err(exchange_error) =
+            atomic_exchange_site_directories(&options.out_dir, &staging_dir)
+        {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(exchange_error);
+        }
+        if let Err(sync_error) = sync_site_parent_directory(&options.out_dir) {
+            if let Err(restore_error) =
+                atomic_exchange_site_directories(&options.out_dir, &staging_dir)
+            {
+                bail!(
+                    "persisting atomic static-site replacement failed: {sync_error}; restoring the prior site also failed: {restore_error}"
+                );
+            }
+            if let Err(rollback_sync_error) = sync_site_parent_directory(&options.out_dir) {
+                bail!(
+                    "persisting atomic static-site replacement failed: {sync_error}; the prior site was restored in memory but that rollback could not be made durable: {rollback_sync_error}; both generations were retained"
+                );
+            }
+            if let Err(cleanup_error) = fs::remove_dir_all(&staging_dir) {
+                bail!(
+                    "persisting atomic static-site replacement failed: {sync_error}; the durable prior site was restored but removing the rejected replacement failed: {cleanup_error}"
+                );
+            }
+            if let Err(cleanup_sync_error) = sync_site_parent_directory(&options.out_dir) {
+                bail!(
+                    "persisting atomic static-site replacement failed: {sync_error}; the durable prior site was restored but replacement cleanup could not be made durable: {cleanup_sync_error}"
+                );
+            }
+            return Err(sync_error).context("persisting atomic static-site replacement");
+        }
+        fs::remove_dir_all(&staging_dir).with_context(|| {
+            format!(
+                "removing replaced static site after atomic exchange: {}",
+                staging_dir.display()
+            )
+        })?;
+        sync_site_parent_directory(&options.out_dir)?;
+    } else {
+        if let Err(install_error) = atomic_install_site_directory(&staging_dir, &options.out_dir) {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(install_error).context(
+                "installing verified static site without replacing a concurrent destination",
+            );
+        }
+        if let Err(sync_error) = sync_site_parent_directory(&options.out_dir) {
+            if let Err(rollback_error) =
+                atomic_install_site_directory(&options.out_dir, &staging_dir)
+            {
+                bail!(
+                    "persisting initial static-site installation failed: {sync_error}; moving the installed generation back to recovery staging also failed: {rollback_error}"
+                );
+            }
+            if let Err(rollback_sync_error) = sync_site_parent_directory(&options.out_dir) {
+                bail!(
+                    "persisting initial static-site installation failed: {sync_error}; the generation was moved back to recovery staging but that rollback could not be made durable: {rollback_sync_error}"
+                );
+            }
+            if let Err(cleanup_error) = fs::remove_dir_all(&staging_dir) {
+                bail!(
+                    "persisting initial static-site installation failed: {sync_error}; the absent destination was durably restored but removing recovery staging failed: {cleanup_error}"
+                );
+            }
+            if let Err(cleanup_sync_error) = sync_site_parent_directory(&options.out_dir) {
+                bail!(
+                    "persisting initial static-site installation failed: {sync_error}; rollback cleanup could not be made durable: {cleanup_sync_error}"
+                );
+            }
+            return Err(sync_error).context("persisting initial static-site installation");
+        }
+    }
+    summary.out_dir = options.out_dir.display().to_string();
+    Ok(summary)
+}
+
+fn build_static_site_with_candidate_runs_in_place(
+    options: &BuildStaticSiteOptions,
+    protected_roots: &[(&str, &Path)],
+    candidate_run_dirs: &[PathBuf],
+) -> Result<BuildStaticSiteSummary> {
     verify_static_snapshot(&options.snapshot_dir).context("verifying source snapshot")?;
     let snapshot = load_static_snapshot_manifest(&options.snapshot_dir)?;
     let base_url = normalize_base_url(&options.base_url)?;
     let root_site_url = site_root_url("index.html")?;
     reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected_roots)?;
+    for candidate_run_dir in candidate_run_dirs {
+        reject_site_output_overlap(&options.out_dir, candidate_run_dir, &[]).with_context(
+            || {
+                format!(
+                    "static site output overlaps candidate run {}",
+                    candidate_run_dir.display()
+                )
+            },
+        )?;
+    }
+    preflight_candidate_run_dirs(candidate_run_dirs)?;
     ensure_empty_output_dir(&options.out_dir, options.overwrite)?;
 
     let (css_name, js_name) = static_site_asset_names();
@@ -1527,15 +3150,42 @@ pub(crate) fn build_static_site_with_protected_roots(
         run.findings_protobuf_url = Some(target_relpath);
         run.findings = findings;
     }
-    let progression =
-        build_browser_progression_catalog_from_site(&options.out_dir, &datasets, &runs)?;
     let versions = load_versions_report_from_site(&options.out_dir, &datasets)?;
+    let (progression, candidate_evidence_inputs) =
+        build_browser_progression_catalog_and_candidate_evidence_from_site(
+            &options.out_dir,
+            &datasets,
+            &versions.releases,
+            versions.repository_head_observation.as_ref(),
+            candidate_run_dirs,
+        )?;
+    let mut candidate_evidence = Vec::with_capacity(candidate_evidence_inputs.len());
+    for evidence in candidate_evidence_inputs {
+        let generation_id = evidence
+            .manifest
+            .candidate_run
+            .as_ref()
+            .context("candidate evidence has no candidate run identity")?
+            .candidate_run_id
+            .clone();
+        let url = format!("data/candidates/{generation_id}/evidence.json");
+        let bytes = encode_candidate_progression_evidence(&evidence)?;
+        write_file(&options.out_dir, &url, &bytes)?;
+        candidate_evidence.push(BrowserCandidateEvidenceRef {
+            generation_id,
+            url,
+            bytes: bytes.len() as u64,
+            sha256: sha256_hex(&bytes),
+        });
+    }
+    candidate_evidence.sort_by(|a, b| a.generation_id.cmp(&b.generation_id));
     let catalog = BrowserCatalog {
         schema_version: BROWSER_CATALOG_SCHEMA_VERSION,
         snapshot_id: snapshot.snapshot_id.clone(),
         base_url: base_url.clone(),
         datasets,
         runs,
+        candidate_evidence,
         progression,
         releases: versions.releases,
         repository_head_observation: versions.repository_head_observation,
@@ -1554,7 +3204,7 @@ pub(crate) fn build_static_site_with_protected_roots(
         &options.out_dir,
         "progression.html",
         html_shell(
-            "xlsynth-bvc release progression",
+            "xlsynth-bvc generation progression",
             &root_site_url,
             &progression_body(&root_site_url),
             &css_name,
@@ -2141,9 +3791,18 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         }
     }
 
+    let candidate_evidence_urls = catalog
+        .candidate_evidence
+        .iter()
+        .map(|evidence| evidence.url.clone())
+        .collect::<BTreeSet<_>>();
     let declared_dataset_urls = declared
         .keys()
-        .filter(|relpath| relpath.starts_with("data/") && relpath.ends_with(".json"))
+        .filter(|relpath| {
+            relpath.starts_with("data/")
+                && relpath.ends_with(".json")
+                && !candidate_evidence_urls.contains(*relpath)
+        })
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut catalog_dataset_keys = BTreeSet::new();
@@ -2202,8 +3861,62 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     {
         bail!("browser release processing projection disagrees with source dataset");
     }
+    let release_progression = build_browser_progression_catalog_from_site(
+        site_dir,
+        &catalog.datasets,
+        &catalog.releases,
+        catalog.repository_head_observation.as_ref(),
+        &[],
+    )?;
     let expected_progression =
-        build_browser_progression_catalog_from_site(site_dir, &catalog.datasets, &catalog.runs)?;
+        match load_progression_comparison_dataset_from_site(site_dir, &catalog.datasets)? {
+            Some(dataset) => {
+                let mut candidate_generations =
+                    Vec::with_capacity(catalog.candidate_evidence.len());
+                for evidence_ref in &catalog.candidate_evidence {
+                    let bytes = fs::read(site_dir.join(&evidence_ref.url)).with_context(|| {
+                        format!("reading candidate evidence {}", evidence_ref.url)
+                    })?;
+                    if bytes.len() as u64 != evidence_ref.bytes
+                        || sha256_hex(&bytes) != evidence_ref.sha256
+                    {
+                        bail!(
+                            "browser catalog candidate evidence metadata mismatch: {}",
+                            evidence_ref.generation_id
+                        );
+                    }
+                    let evidence = decode_canonical_candidate_progression_evidence(&bytes)?;
+                    let evidence_generation_id = evidence
+                        .manifest
+                        .candidate_run
+                        .as_ref()
+                        .context("candidate evidence has no candidate run identity")?
+                        .candidate_run_id
+                        .clone();
+                    if evidence_generation_id != evidence_ref.generation_id {
+                        bail!("candidate evidence identity disagrees with its catalog reference");
+                    }
+                    let generation = candidate_progression_generation_from_evidence(
+                        evidence,
+                        &release_progression,
+                        &dataset,
+                        catalog.repository_head_observation.as_ref(),
+                    )?;
+                    if generation.generation_id != evidence_ref.generation_id {
+                        bail!("candidate evidence generated an unexpected progression identity");
+                    }
+                    candidate_generations.push(generation);
+                }
+                combine_progression_generations(
+                    release_progression,
+                    candidate_generations,
+                    &dataset,
+                    catalog.repository_head_observation.as_ref(),
+                )?
+            }
+            None if catalog.candidate_evidence.is_empty() => release_progression,
+            None => bail!("candidate evidence exists without a release comparison dataset"),
+        };
     if catalog.progression != expected_progression {
         bail!("browser release progression projection disagrees with source datasets");
     }
@@ -2465,29 +4178,47 @@ pub(crate) fn smoke_static_site(
     let catalog = decode_canonical_browser_catalog(
         &fs::read(site_dir.join("catalog.json")).context("reading browser smoke catalog")?,
     )?;
-    let mut complete_versions = catalog
+    let complete_generations = catalog
         .progression
         .generations
         .iter()
         .filter(|generation| generation.coverage == BrowserProgressionCoverage::CohortComplete)
-        .map(|generation| generation.crate_version.clone())
         .collect::<Vec<_>>();
-    complete_versions.sort_by(|left, right| cmp_dotted_numeric_version(left, right));
-    complete_versions.dedup();
-    let progression_markers = if complete_versions.len() >= 2 {
+    let progression_markers = if complete_generations.len() >= 2 {
+        let current = complete_generations
+            .iter()
+            .rev()
+            .find(|generation| {
+                matches!(
+                    generation.origin,
+                    BrowserProgressionOrigin::GitRevision { .. }
+                )
+            })
+            .copied()
+            .unwrap_or_else(|| complete_generations.last().expect("nonempty generations"));
+        let baseline = current
+            .baseline_generation_id
+            .as_ref()
+            .and_then(|id| {
+                complete_generations
+                    .iter()
+                    .find(|generation| generation.generation_id == *id)
+                    .copied()
+            })
+            .unwrap_or(complete_generations[complete_generations.len() - 2]);
         vec![
             ("data-progression-rendered=\"true\"".to_string(), 1),
             (
                 format!(
                     "data-progression-baseline-version=\"{}\"",
-                    complete_versions[complete_versions.len() - 2]
+                    baseline.display_label
                 ),
                 1,
             ),
             (
                 format!(
                     "data-progression-current-version=\"{}\"",
-                    complete_versions[complete_versions.len() - 1]
+                    current.display_label
                 ),
                 1,
             ),
@@ -2532,7 +4263,7 @@ pub(crate) fn smoke_static_site(
         ("runs.html", "Campaign runs", Vec::new()),
         (
             "progression.html",
-            "Fixed-IR release progression",
+            "Fixed-IR generation progression",
             progression_markers,
         ),
         ("releases.html", "Crate release processing", Vec::new()),

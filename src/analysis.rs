@@ -832,6 +832,7 @@ mod tests {
     fn test_runtime() -> crate::model::DriverRuntimeSpec {
         crate::model::DriverRuntimeSpec {
             driver_version: "0.31.0".to_string(),
+            source_revision: None,
             release_platform: "test".to_string(),
             docker_image: "test:image".to_string(),
             dockerfile: "docker/test.Dockerfile".to_string(),

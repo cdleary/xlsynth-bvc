@@ -407,6 +407,7 @@ mod tests {
     fn runtime() -> model::DriverRuntimeSpec {
         model::DriverRuntimeSpec {
             driver_version: "0.47.0".to_string(),
+            source_revision: None,
             release_platform: "ubuntu2004".to_string(),
             docker_image: "xlsynth-bvc-driver:0.47.0".to_string(),
             dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),

@@ -5,6 +5,10 @@ use fs2::FileExt;
 use prost::Message;
 
 const RUNTIME_FINGERPRINT_LABEL: &str = "org.xlsynth-bvc.runtime-fingerprint";
+const DRIVER_SOURCE_REPOSITORY_LABEL: &str = "org.xlsynth-bvc.driver-source-repository";
+const DRIVER_SOURCE_COMMIT_LABEL: &str = "org.xlsynth-bvc.driver-source-commit";
+const DRIVER_SOURCE_BUILD_RECIPE_LABEL: &str = "org.xlsynth-bvc.driver-source-build-recipe";
+const DRIVER_SOURCE_BUILD_RECIPE_REVISION: &str = "git-source-v1";
 
 fn runtime_fingerprint(kind: &str, fields: &[&str]) -> String {
     let mut hasher = Sha256::new();
@@ -18,16 +22,28 @@ fn runtime_fingerprint(kind: &str, fields: &[&str]) -> String {
 }
 
 fn driver_runtime_fingerprint(runtime: &DriverRuntimeSpec) -> Result<String> {
-    Ok(runtime_fingerprint(
-        "driver",
-        &[
-            &runtime.driver_version,
-            &runtime.release_platform,
-            &runtime.dockerfile,
-            &runtime.dockerfile_sha256,
-            &runtime.release_cache_input_sha256,
-        ],
-    ))
+    let release_fields = [
+        runtime.driver_version.as_str(),
+        runtime.release_platform.as_str(),
+        runtime.dockerfile.as_str(),
+        runtime.dockerfile_sha256.as_str(),
+        runtime.release_cache_input_sha256.as_str(),
+    ];
+    let Some(source) = runtime.source_revision.as_ref() else {
+        return Ok(runtime_fingerprint("driver", &release_fields));
+    };
+    let source_fields = [
+        release_fields[0],
+        release_fields[1],
+        release_fields[2],
+        release_fields[3],
+        release_fields[4],
+        "git",
+        DRIVER_SOURCE_BUILD_RECIPE_REVISION,
+        source.repository.as_str(),
+        source.commit.as_str(),
+    ];
+    Ok(runtime_fingerprint("driver", &source_fields))
 }
 
 fn yosys_runtime_fingerprint(runtime: &YosysRuntimeSpec) -> Result<String> {
@@ -1097,25 +1113,55 @@ fn checked_runtime_dockerfile(
     Ok(path)
 }
 
-fn inspect_image_runtime_fingerprint(image: &str) -> Result<Option<String>> {
-    let format = format!(
-        "{{{{ index .Config.Labels \"{}\" }}}}",
-        RUNTIME_FINGERPRINT_LABEL
-    );
+fn inspect_image_label(image: &str, label: &str) -> Result<Option<String>> {
+    let format = format!("{{{{ index .Config.Labels \"{label}\" }}}}");
     let output = Command::new("docker")
         .args(["image", "inspect", "--format", &format, image])
         .output()
-        .context("running `docker image inspect` for runtime fingerprint")?;
+        .with_context(|| format!("running `docker image inspect` for label {label}"))?;
     if !output.status.success() {
         return Ok(None);
     }
     Ok(Some(
         String::from_utf8(output.stdout)
-            .context("decoding docker runtime fingerprint label")?
+            .with_context(|| format!("decoding docker image label {label}"))?
             .trim()
             .to_string(),
     ))
 }
+
+fn inspect_image_runtime_fingerprint(image: &str) -> Result<Option<String>> {
+    inspect_image_label(image, RUNTIME_FINGERPRINT_LABEL)
+}
+
+fn require_driver_source_labels(image: &str, runtime: &DriverRuntimeSpec) -> Result<()> {
+    let Some(source) = runtime.source_revision.as_ref() else {
+        return Ok(());
+    };
+    for (label, expected) in [
+        (DRIVER_SOURCE_REPOSITORY_LABEL, source.repository.as_str()),
+        (DRIVER_SOURCE_COMMIT_LABEL, source.commit.as_str()),
+        (
+            DRIVER_SOURCE_BUILD_RECIPE_LABEL,
+            DRIVER_SOURCE_BUILD_RECIPE_REVISION,
+        ),
+    ] {
+        let actual = inspect_image_label(image, label)?
+            .with_context(|| format!("built docker image `{image}` is missing"))?;
+        if actual != expected {
+            bail!(
+                "docker image `{image}` label {label} mismatch: expected {expected} got {}",
+                if actual.is_empty() || actual == "<no value>" {
+                    "<missing>"
+                } else {
+                    actual.as_str()
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
 fn normalize_docker_image_id(value: &str) -> Result<String> {
     let value = value.strip_prefix("sha256:").unwrap_or(value);
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1141,6 +1187,66 @@ fn inspect_image_id(image: &str) -> Result<Option<String>> {
 
 pub(crate) fn docker_image_content_ref(image_id: &str) -> Result<String> {
     Ok(format!("sha256:{}", normalize_docker_image_id(image_id)?))
+}
+
+pub(crate) fn driver_source_committed_at_utc(
+    runtime: &DriverRuntimeSpec,
+) -> Result<Option<String>> {
+    let Some(source) = runtime.source_revision.as_ref() else {
+        return Ok(None);
+    };
+    if runtime.docker_image_id.is_empty() {
+        bail!("source driver runtime has no immutable docker image ID");
+    }
+    #[cfg(test)]
+    {
+        let _ = source;
+        return Ok(Some("2000-01-01T00:00:00Z".to_string()));
+    }
+    #[cfg(not(test))]
+    {
+        let image = docker_image_content_ref(&runtime.docker_image_id)?;
+        require_driver_source_labels(&image, runtime)?;
+        let output = Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--pull",
+                "never",
+                &image,
+                "git",
+                "-C",
+                "/opt/xlsynth-crate",
+                "show",
+                "-s",
+                "--format=%cI",
+                &source.commit,
+            ])
+            .output()
+            .with_context(|| {
+                format!(
+                    "reading source commit time {} from driver image `{image}`",
+                    source.commit
+                )
+            })?;
+        if !output.status.success() {
+            bail!(
+                "source driver image `{image}` could not report commit time for {}: {}",
+                source.commit,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let raw =
+            String::from_utf8(output.stdout).context("decoding source driver commit timestamp")?;
+        let raw = raw.trim();
+        let committed_at = chrono::DateTime::parse_from_rfc3339(raw)
+            .with_context(|| format!("source driver returned invalid commit timestamp `{raw}`"))?;
+        Ok(Some(
+            committed_at
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ))
+    }
 }
 
 fn require_image_runtime_fingerprint(image: &str, expected: &str) -> Result<()> {
@@ -1188,18 +1294,36 @@ fn driver_image_build_args(
     fingerprint: &str,
     image_ref: &str,
 ) -> Vec<OsString> {
-    vec![
+    let mut args = vec![
         OsString::from("build"),
         OsString::from("--file"),
         dockerfile.into_os_string(),
         OsString::from("--tag"),
         OsString::from(image_ref),
-        OsString::from("--build-arg"),
-        OsString::from(format!("DRIVER_CRATE_VERSION={}", runtime.driver_version)),
+    ];
+    if let Some(source) = runtime.source_revision.as_ref() {
+        args.extend([
+            OsString::from("--build-arg"),
+            OsString::from(format!("DRIVER_GIT_REPOSITORY={}", source.repository)),
+            OsString::from("--build-arg"),
+            OsString::from(format!("DRIVER_GIT_COMMIT={}", source.commit)),
+            OsString::from("--build-arg"),
+            OsString::from(format!(
+                "DRIVER_SOURCE_BUILD_RECIPE={DRIVER_SOURCE_BUILD_RECIPE_REVISION}"
+            )),
+        ]);
+    } else {
+        args.extend([
+            OsString::from("--build-arg"),
+            OsString::from(format!("DRIVER_CRATE_VERSION={}", runtime.driver_version)),
+        ]);
+    }
+    args.extend([
         OsString::from("--build-arg"),
         OsString::from(format!("BVC_RUNTIME_FINGERPRINT={fingerprint}")),
         OsString::from("."),
-    ]
+    ]);
+    args
 }
 
 fn yosys_image_build_args(
@@ -1244,6 +1368,7 @@ pub(crate) fn ensure_driver_image(
     if !runtime.docker_image_id.is_empty() {
         let content_ref = docker_image_content_ref(&runtime.docker_image_id)?;
         require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
+        require_driver_source_labels(&content_ref, runtime)?;
         return Ok(None);
     }
 
@@ -1257,6 +1382,7 @@ pub(crate) fn ensure_driver_image(
                 build_ref
             );
         }
+        require_driver_source_labels(&build_ref, runtime)?;
         return Ok(None);
     }
 
@@ -1277,6 +1403,7 @@ pub(crate) fn ensure_driver_image(
     }
 
     require_image_runtime_fingerprint(&build_ref, &fingerprint)?;
+    require_driver_source_labels(&build_ref, runtime)?;
     Ok(Some(CommandTrace {
         argv: os_args_to_string("docker", &build_args),
         exit_code: status.code().unwrap_or(1),
@@ -1376,6 +1503,7 @@ pub(crate) fn bind_driver_runtime_image(
             .with_context(|| format!("driver image `{build_ref}` disappeared after preparation"))?;
         let content_ref = docker_image_content_ref(&image_id)?;
         require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
+        require_driver_source_labels(&content_ref, &runtime)?;
         runtime.docker_image_id = image_id;
         Ok(runtime)
     }
@@ -3226,6 +3354,7 @@ mod tests {
     fn fake_driver_runtime(driver_version: &str, image: String) -> DriverRuntimeSpec {
         DriverRuntimeSpec {
             driver_version: driver_version.to_string(),
+            source_revision: None,
             release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: image,
             dockerfile: "testdata/persistent_runners/fake-driver.Dockerfile".to_string(),
@@ -3286,6 +3415,65 @@ mod tests {
         assert_ne!(
             yosys_fingerprint,
             yosys_runtime_fingerprint(&slang_yosys).expect("slang yosys fingerprint")
+        );
+    }
+
+    #[test]
+    fn source_driver_fingerprint_and_build_args_bind_exact_commit() {
+        let release = fake_driver_runtime("0.47.0", "driver:test".to_string());
+        let release_fingerprint =
+            driver_runtime_fingerprint(&release).expect("release fingerprint");
+        assert_eq!(
+            release_fingerprint,
+            runtime_fingerprint(
+                "driver",
+                &[
+                    &release.driver_version,
+                    &release.release_platform,
+                    &release.dockerfile,
+                    &release.dockerfile_sha256,
+                    &release.release_cache_input_sha256,
+                ],
+            ),
+            "released-runtime fingerprint must retain its historical field sequence"
+        );
+
+        let mut source = release.clone();
+        source.source_revision = Some(DriverSourceRevision {
+            repository: crate::XLSYNTH_CRATE_GIT_REPOSITORY.to_string(),
+            commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        });
+        source.dockerfile = crate::DEFAULT_GIT_DOCKERFILE.to_string();
+        let source_fingerprint = driver_runtime_fingerprint(&source).expect("source fingerprint");
+        assert_ne!(release_fingerprint, source_fingerprint);
+        let args = driver_image_build_args(
+            &source,
+            PathBuf::from(&source.dockerfile),
+            &source_fingerprint,
+            "driver:source-test",
+        )
+        .into_iter()
+        .map(|value| value.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+        assert!(args.contains(&format!(
+            "DRIVER_GIT_REPOSITORY={}",
+            crate::XLSYNTH_CRATE_GIT_REPOSITORY
+        )));
+        assert!(
+            args.contains(
+                &"DRIVER_GIT_COMMIT=0123456789abcdef0123456789abcdef01234567".to_string()
+            )
+        );
+        assert!(args.contains(&format!("BVC_RUNTIME_FINGERPRINT={source_fingerprint}")));
+        assert!(args.contains(&format!(
+            "DRIVER_SOURCE_BUILD_RECIPE={DRIVER_SOURCE_BUILD_RECIPE_REVISION}"
+        )));
+
+        source.source_revision.as_mut().expect("source").commit =
+            "1123456789abcdef0123456789abcdef01234567".to_string();
+        assert_ne!(
+            source_fingerprint,
+            driver_runtime_fingerprint(&source).expect("changed source fingerprint")
         );
     }
 

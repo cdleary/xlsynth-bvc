@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::thread;
 
-use crate::model::{DriverRuntimeSpec, YosysRuntimeSpec};
+use crate::model::{DriverRuntimeSpec, DriverSourceRevision, YosysRuntimeSpec};
 
 pub(crate) fn default_driver_image(driver_version: &str) -> String {
     let mut tag = driver_version.replace(
@@ -17,6 +17,33 @@ pub(crate) fn default_driver_image(driver_version: &str) -> String {
         tag = "unknown".to_string();
     }
     format!("{}:{}", crate::DEFAULT_DOCKER_IMAGE_PREFIX, tag)
+}
+
+pub(crate) fn validate_driver_git_commit(commit: &str) -> Result<String> {
+    if commit.len() != 40
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("driver Git commit must be a full lowercase 40-character hexadecimal SHA");
+    }
+    Ok(commit.to_string())
+}
+
+pub(crate) fn driver_source_revision(commit: &str) -> Result<DriverSourceRevision> {
+    Ok(DriverSourceRevision {
+        repository: crate::XLSYNTH_CRATE_GIT_REPOSITORY.to_string(),
+        commit: validate_driver_git_commit(commit)?,
+    })
+}
+
+pub(crate) fn git_driver_image(commit: &str) -> Result<String> {
+    let commit = validate_driver_git_commit(commit)?;
+    Ok(format!(
+        "{}:git-{}",
+        crate::DEFAULT_DOCKER_IMAGE_PREFIX,
+        &commit[..12]
+    ))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -85,6 +112,13 @@ pub(crate) fn resolve_driver_runtime_for_aig_stats(
 ) -> Result<DriverRuntimeSpec> {
     let source_driver_version =
         crate::versioning::normalize_tag_version(&source_runtime.driver_version);
+    if source_runtime.source_revision.is_some() {
+        return bound_driver_runtime_for_driver_version(
+            repo_root,
+            source_driver_version,
+            &source_runtime.release_platform,
+        );
+    }
     let latest_driver_version = crate::versioning::latest_known_driver_version(repo_root)?;
     if crate::versioning::cmp_dotted_numeric_version(&latest_driver_version, source_driver_version)
         != std::cmp::Ordering::Greater
@@ -138,6 +172,7 @@ fn bound_driver_runtime_for_driver_version(
         repo_root,
         DriverRuntimeSpec {
             driver_version: driver_version.to_string(),
+            source_revision: None,
             release_platform: release_platform.to_string(),
             docker_image: default_driver_image(driver_version),
             dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
@@ -224,6 +259,7 @@ pub(crate) fn default_driver_runtime_for_version(
         repo_root,
         DriverRuntimeSpec {
             driver_version: driver_version.clone(),
+            source_revision: None,
             release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: default_driver_image(&driver_version),
             dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
@@ -266,6 +302,7 @@ pub(crate) fn explicit_driver_runtime_recipe_for_crate_version(
     let driver_version = crate::versioning::normalize_tag_version(crate_version).to_string();
     let runtime = DriverRuntimeSpec {
         driver_version: driver_version.clone(),
+        source_revision: None,
         release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
         docker_image: default_driver_image(&driver_version),
         dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
@@ -390,6 +427,7 @@ mod tests {
             .expect("source DSO");
         DriverRuntimeSpec {
             driver_version: driver_version.to_string(),
+            source_revision: None,
             release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: default_driver_image(driver_version),
             dockerfile: "old/deployment.Dockerfile".to_string(),
@@ -444,6 +482,52 @@ mod tests {
         let list_fns = resolve_driver_runtime_for_dslx_list_fns(repo_root, &source)
             .expect("substitute list-fns runtime");
         assert_substitute_runtime_is_self_consistent(repo_root, &source, &list_fns, &latest);
+    }
+
+    #[test]
+    fn driver_git_commit_requires_full_lowercase_sha() {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            validate_driver_git_commit(commit).expect("valid SHA"),
+            commit
+        );
+        assert_eq!(
+            driver_source_revision(commit)
+                .expect("source revision")
+                .repository,
+            crate::XLSYNTH_CRATE_GIT_REPOSITORY
+        );
+        assert_eq!(
+            git_driver_image(commit).expect("Git image"),
+            "xlsynth-bvc-driver:git-0123456789ab"
+        );
+        for invalid in [
+            "HEAD",
+            "0123456789ab",
+            "0123456789ABCDEF0123456789ABCDEF01234567",
+            "g123456789abcdef0123456789abcdef01234567",
+        ] {
+            assert!(validate_driver_git_commit(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn source_driver_uses_released_stats_runtime_at_compatibility_anchor() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (_, latest) = oldest_and_latest_driver_versions(repo_root);
+        let mut source = source_runtime(repo_root, &latest);
+        source.source_revision = Some(
+            driver_source_revision("0123456789abcdef0123456789abcdef01234567")
+                .expect("source revision"),
+        );
+        source.dockerfile = crate::DEFAULT_GIT_DOCKERFILE.to_string();
+
+        let stats = resolve_driver_runtime_for_aig_stats(repo_root, &source)
+            .expect("released AIG stats runtime");
+        assert_eq!(stats.driver_version, source.driver_version);
+        assert!(stats.source_revision.is_none());
+        assert_eq!(stats.dockerfile, crate::DEFAULT_DOCKERFILE);
+        assert_ne!(stats.docker_image_id, source.docker_image_id);
     }
 
     #[test]
