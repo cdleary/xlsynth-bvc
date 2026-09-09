@@ -19,6 +19,17 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Snapshot local DSLX, optimize concrete functions, and extract cone IR.
+    DslxCorpusIngest(DslxCorpusIngestCli),
+    /// Render a standalone page from an ingested DSLX corpus and a comparison run.
+    RenderDslxCorpusReport {
+        #[arg(long, value_name = "DIR")]
+        ingest_dir: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        comparison_dir: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        output_dir: PathBuf,
+    },
     RunIrDirCorpus {
         #[arg(long, value_name = "DIR")]
         input_dir: PathBuf,
@@ -433,6 +444,42 @@ pub enum TopCommand {
     },
 }
 
+#[derive(Debug, Args)]
+pub struct DslxCorpusIngestCli {
+    #[arg(long, value_name = "DIR")]
+    pub(crate) input_dir: PathBuf,
+    #[arg(long, value_name = "DIR")]
+    pub(crate) output_dir: PathBuf,
+    #[arg(long, default_value = "xlsynth-driver")]
+    pub(crate) driver: PathBuf,
+    #[arg(long)]
+    pub(crate) toolchain: Option<PathBuf>,
+    /// Additional DSLX import path; repeat this option for multiple directories.
+    #[arg(long)]
+    pub(crate) dslx_path: Vec<PathBuf>,
+    #[arg(long)]
+    pub(crate) dslx_stdlib_path: Option<PathBuf>,
+    #[arg(long, default_value_t = 50)]
+    pub(crate) max_files: usize,
+    #[arg(long, default_value_t = 500)]
+    pub(crate) max_functions: usize,
+    #[arg(long, default_value_t = 200)]
+    pub(crate) max_mffcs: u64,
+    #[arg(long, default_value_t = 4)]
+    pub(crate) min_internal_non_literal: u64,
+    #[arg(long, default_value_t = 0)]
+    pub(crate) max_frontier_non_literal: u64,
+    #[arg(long)]
+    pub(crate) no_mffcs: bool,
+    /// Also extract Boolean cones of this frontier size.
+    #[arg(long)]
+    pub(crate) k: Option<u32>,
+    #[arg(long, default_value_t = 200)]
+    pub(crate) max_k_cones: u64,
+    #[arg(long, default_value_t = 16)]
+    pub(crate) max_k_ir_ops: u64,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ExplicitBool {
     True,
@@ -450,6 +497,7 @@ pub enum CorpusRecipePreset {
     G8rVsYabcAigDiff,
     G8rVsYabcNoFraigAigDiff,
     G8rAbcStats,
+    G8rAbcVsYabcAigDiff,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

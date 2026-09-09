@@ -314,6 +314,10 @@ struct IrDirCorpusSampleRecord {
     import_ir_status: String,
     g8r_aig_action_id: String,
     g8r_aig_status: String,
+    #[serde(default)]
+    g8r_abc_aig_action_id: Option<String>,
+    #[serde(default)]
+    g8r_abc_aig_status: Option<String>,
     g8r_stats_action_id: String,
     g8r_stats_status: String,
     combo_verilog_action_id: String,
@@ -409,6 +413,7 @@ struct IrDirCorpusJoinedRow {
     yosys_script_sha256: String,
     import_ir_action_id: String,
     g8r_aig_action_id: String,
+    g8r_abc_aig_action_id: Option<String>,
     g8r_stats_action_id: String,
     combo_verilog_action_id: String,
     yosys_abc_aig_action_id: String,
@@ -440,6 +445,7 @@ struct CorpusActionPlan {
     recipe_preset: CorpusRecipePreset,
     import_action: ActionSpec,
     g8r_aig_action: ActionSpec,
+    g8r_abc_aig_action: Option<ActionSpec>,
     g8r_stats_action: ActionSpec,
     combo_verilog_action: ActionSpec,
     yosys_abc_aig_action: ActionSpec,
@@ -447,6 +453,7 @@ struct CorpusActionPlan {
     aig_stat_diff_action: ActionSpec,
     import_ir_action_id: String,
     g8r_aig_action_id: String,
+    g8r_abc_aig_action_id: Option<String>,
     g8r_stats_action_id: String,
     combo_verilog_action_id: String,
     yosys_abc_aig_action_id: String,
@@ -469,14 +476,18 @@ impl CorpusActionPlan {
                 &self.g8r_stats_action,
             ]
         } else {
-            vec![
-                &self.g8r_aig_action,
+            let mut actions = vec![&self.g8r_aig_action];
+            if let Some(abc) = self.g8r_abc_aig_action.as_ref() {
+                actions.push(abc);
+            }
+            actions.extend([
                 &self.g8r_stats_action,
                 &self.combo_verilog_action,
                 &self.yosys_abc_aig_action,
                 &self.yosys_abc_stats_action,
                 &self.aig_stat_diff_action,
-            ]
+            ]);
+            actions
         }
     }
 
@@ -1146,6 +1157,9 @@ pub(crate) fn run_ir_dir_corpus(
     }
     if recipe_preset == CorpusRecipePreset::G8rAbcStats && fraig {
         bail!("recipe preset `g8r-abc-stats` requires --fraig=false");
+    }
+    if fraig && matches!(recipe_preset, CorpusRecipePreset::G8rAbcVsYabcAigDiff) {
+        bail!("g8r-abc-vs-yabc-aig-diff requires --fraig=false for a matched ABC comparison");
     }
 
     fs::create_dir_all(output_dir)
@@ -2257,6 +2271,10 @@ fn build_action_plan(
     yosys_script_ref: &crate::model::ScriptRef,
 ) -> Result<CorpusActionPlan> {
     let is_g8r_abc_stats = recipe_preset == CorpusRecipePreset::G8rAbcStats;
+    let matched_abc = matches!(recipe_preset, CorpusRecipePreset::G8rAbcVsYabcAigDiff);
+    if matched_abc && fraig {
+        bail!("matched ABC comparison cannot enable driver FRAIG");
+    }
     let import_action = ActionSpec::ImportIrPackageFile {
         source_sha256: sample.source_sha256.clone(),
         top_fn_name: Some(sample.top_fn_name.clone()),
@@ -2266,7 +2284,7 @@ fn build_action_plan(
         ir_action_id: import_ir_action_id.clone(),
         top_fn_name: Some(sample.top_fn_name.clone()),
         fraig,
-        lowering_mode: if is_g8r_abc_stats {
+        lowering_mode: if is_g8r_abc_stats || matched_abc {
             crate::model::G8rLoweringMode::FrontendNoPrepRewrite
         } else {
             crate::model::G8rLoweringMode::Default
@@ -2278,6 +2296,15 @@ fn build_action_plan(
         runtime: driver_runtime.clone(),
     };
     let g8r_aig_action_id = compute_action_id(&g8r_aig_action)?;
+    let g8r_abc_aig_action = matched_abc.then(|| ActionSpec::AigToYosysAbcAig {
+        aig_action_id: g8r_aig_action_id.clone(),
+        yosys_script_ref: yosys_script_ref.clone(),
+        runtime: yosys_runtime.clone(),
+    });
+    let g8r_abc_aig_action_id = g8r_abc_aig_action
+        .as_ref()
+        .map(compute_action_id)
+        .transpose()?;
     let combo_verilog_action = ActionSpec::IrFnToCombinationalVerilog {
         ir_action_id: import_ir_action_id.clone(),
         top_fn_name: Some(sample.top_fn_name.clone()),
@@ -2306,7 +2333,9 @@ fn build_action_plan(
         aig_action_id: if is_g8r_abc_stats {
             yosys_abc_aig_action_id.clone()
         } else {
-            g8r_aig_action_id.clone()
+            g8r_abc_aig_action_id
+                .clone()
+                .unwrap_or_else(|| g8r_aig_action_id.clone())
         },
         version: version.to_string(),
         runtime: stats_runtime.clone(),
@@ -2329,6 +2358,7 @@ fn build_action_plan(
         recipe_preset,
         import_action,
         g8r_aig_action,
+        g8r_abc_aig_action,
         g8r_stats_action,
         combo_verilog_action,
         yosys_abc_aig_action,
@@ -2336,6 +2366,7 @@ fn build_action_plan(
         aig_stat_diff_action,
         import_ir_action_id,
         g8r_aig_action_id,
+        g8r_abc_aig_action_id,
         g8r_stats_action_id,
         combo_verilog_action_id,
         yosys_abc_aig_action_id,
@@ -2525,6 +2556,10 @@ fn build_sample_record(
 ) -> IrDirCorpusSampleRecord {
     let import_ir_status = action_status_label(store, &plan.import_ir_action_id);
     let g8r_aig_status = action_status_label(store, &plan.g8r_aig_action_id);
+    let g8r_abc_aig_status = plan
+        .g8r_abc_aig_action_id
+        .as_deref()
+        .map(|id| action_status_label(store, id));
     let g8r_stats_status = action_status_label(store, &plan.g8r_stats_action_id);
     let combo_verilog_status = if plan.is_g8r_abc_stats() {
         "not_planned".to_string()
@@ -2552,6 +2587,11 @@ fn build_sample_record(
             .or_else(|| action_error_summary(store, &plan.yosys_abc_stats_action_id))
             .or_else(|| action_error_summary(store, &plan.yosys_abc_aig_action_id))
             .or_else(|| action_error_summary(store, &plan.combo_verilog_action_id))
+            .or_else(|| {
+                plan.g8r_abc_aig_action_id
+                    .as_deref()
+                    .and_then(|id| action_error_summary(store, id))
+            })
             .or_else(|| action_error_summary(store, &plan.g8r_stats_action_id))
             .or_else(|| action_error_summary(store, &plan.g8r_aig_action_id))
     }
@@ -2573,6 +2613,7 @@ fn build_sample_record(
         yosys_script_ref,
         import_ir_status,
         g8r_aig_status,
+        g8r_abc_aig_status,
         g8r_stats_status,
         combo_verilog_status,
         yosys_abc_aig_status,
@@ -2605,6 +2646,16 @@ fn build_sample_record_from_queue_state(
         &plan.g8r_aig_action_id,
         &persisted_sample.g8r_aig_status,
     );
+    let g8r_abc_aig_status = plan.g8r_abc_aig_action_id.as_deref().map(|id| {
+        queue_or_persisted_action_status_label(
+            store,
+            id,
+            persisted_sample
+                .g8r_abc_aig_status
+                .as_deref()
+                .unwrap_or("missing"),
+        )
+    });
     let g8r_stats_status = queue_or_persisted_action_status_label(
         store,
         &plan.g8r_stats_action_id,
@@ -2643,7 +2694,7 @@ fn build_sample_record_from_queue_state(
         )
     };
 
-    let statuses = if plan.is_g8r_abc_stats() {
+    let mut statuses = if plan.is_g8r_abc_stats() {
         vec![
             g8r_stats_status.as_str(),
             yosys_abc_aig_status.as_str(),
@@ -2659,6 +2710,9 @@ fn build_sample_record_from_queue_state(
             combo_verilog_status.as_str(),
         ]
     };
+    if let Some(status) = &g8r_abc_aig_status {
+        statuses.push(status);
+    }
     let terminal_error = if plan.is_g8r_abc_stats() {
         queue_files_action_error_summary(store, &plan.g8r_stats_action_id)
             .or_else(|| queue_files_action_error_summary(store, &plan.yosys_abc_aig_action_id))
@@ -2668,6 +2722,11 @@ fn build_sample_record_from_queue_state(
             .or_else(|| queue_files_action_error_summary(store, &plan.yosys_abc_stats_action_id))
             .or_else(|| queue_files_action_error_summary(store, &plan.yosys_abc_aig_action_id))
             .or_else(|| queue_files_action_error_summary(store, &plan.combo_verilog_action_id))
+            .or_else(|| {
+                plan.g8r_abc_aig_action_id
+                    .as_deref()
+                    .and_then(|id| queue_files_action_error_summary(store, id))
+            })
             .or_else(|| queue_files_action_error_summary(store, &plan.g8r_stats_action_id))
             .or_else(|| queue_files_action_error_summary(store, &plan.g8r_aig_action_id))
     }
@@ -2691,6 +2750,7 @@ fn build_sample_record_from_queue_state(
         yosys_script_ref,
         import_ir_status,
         g8r_aig_status,
+        g8r_abc_aig_status,
         g8r_stats_status,
         combo_verilog_status,
         yosys_abc_aig_status,
@@ -2712,6 +2772,7 @@ fn build_sample_record_with_statuses(
     yosys_script_ref: &crate::model::ScriptRef,
     import_ir_status: String,
     g8r_aig_status: String,
+    g8r_abc_aig_status: Option<String>,
     g8r_stats_status: String,
     combo_verilog_status: String,
     yosys_abc_aig_status: String,
@@ -2719,7 +2780,7 @@ fn build_sample_record_with_statuses(
     aig_stat_diff_status: String,
     terminal_error: Option<String>,
 ) -> IrDirCorpusSampleRecord {
-    let statuses = if plan.is_g8r_abc_stats() {
+    let mut statuses = if plan.is_g8r_abc_stats() {
         vec![
             g8r_stats_status.as_str(),
             yosys_abc_aig_status.as_str(),
@@ -2735,6 +2796,9 @@ fn build_sample_record_with_statuses(
             combo_verilog_status.as_str(),
         ]
     };
+    if let Some(status) = &g8r_abc_aig_status {
+        statuses.push(status);
+    }
     let overall_status = summarize_sample_status(&statuses, terminal_error.is_some());
 
     IrDirCorpusSampleRecord {
@@ -2763,6 +2827,8 @@ fn build_sample_record_with_statuses(
         import_ir_status,
         g8r_aig_action_id: plan.g8r_aig_action_id.clone(),
         g8r_aig_status,
+        g8r_abc_aig_action_id: plan.g8r_abc_aig_action_id.clone(),
+        g8r_abc_aig_status,
         g8r_stats_action_id: plan.g8r_stats_action_id.clone(),
         g8r_stats_status,
         combo_verilog_action_id: plan.combo_verilog_action_id.clone(),
@@ -2807,7 +2873,7 @@ fn queue_or_persisted_action_status_label(
 }
 
 fn corpus_sample_action_statuses(sample: &IrDirCorpusSampleRecord) -> Vec<(&str, &str)> {
-    [
+    let mut actions = vec![
         (&sample.import_ir_action_id, &sample.import_ir_status),
         (&sample.g8r_aig_action_id, &sample.g8r_aig_status),
         (&sample.g8r_stats_action_id, &sample.g8r_stats_status),
@@ -2827,11 +2893,15 @@ fn corpus_sample_action_statuses(sample: &IrDirCorpusSampleRecord) -> Vec<(&str,
             &sample.aig_stat_diff_action_id,
             &sample.aig_stat_diff_status,
         ),
-    ]
-    .into_iter()
-    .filter(|(_, status)| status.as_str() != "not_planned")
-    .map(|(action_id, status)| (action_id.as_str(), status.as_str()))
-    .collect()
+    ];
+    if let (Some(id), Some(status)) = (&sample.g8r_abc_aig_action_id, &sample.g8r_abc_aig_status) {
+        actions.push((id, status));
+    }
+    actions
+        .into_iter()
+        .filter(|(_, status)| status.as_str() != "not_planned")
+        .map(|(id, status)| (id.as_str(), status.as_str()))
+        .collect()
 }
 
 fn action_status_label(store: &ArtifactStore, action_id: &str) -> String {
@@ -2963,6 +3033,7 @@ fn build_joined_rows(
             yosys_script_sha256: sample.yosys_script_sha256.clone(),
             import_ir_action_id: sample.import_ir_action_id.clone(),
             g8r_aig_action_id: sample.g8r_aig_action_id.clone(),
+            g8r_abc_aig_action_id: sample.g8r_abc_aig_action_id.clone(),
             g8r_stats_action_id: sample.g8r_stats_action_id.clone(),
             combo_verilog_action_id: sample.combo_verilog_action_id.clone(),
             yosys_abc_aig_action_id: sample.yosys_abc_aig_action_id.clone(),
@@ -3084,6 +3155,17 @@ fn export_leaf_artifacts(
             },
             &sample_dir.join("g8r.aig"),
         )?;
+        if let Some(action_id) = &sample.g8r_abc_aig_action_id {
+            copy_artifact_if_present(
+                store,
+                &ArtifactRef {
+                    action_id: action_id.clone(),
+                    artifact_type: ArtifactType::AigFile,
+                    relpath: G8R_AIG_RELPATH.to_string(),
+                },
+                &sample_dir.join("g8r_abc.aig"),
+            )?;
+        }
         copy_artifact_if_present(
             store,
             &ArtifactRef {
@@ -3180,7 +3262,7 @@ fn write_joined_jsonl(path: &Path, rows: &[IrDirCorpusJoinedRow]) -> Result<()> 
 fn write_joined_csv(path: &Path, rows: &[IrDirCorpusJoinedRow]) -> Result<()> {
     let mut text = String::new();
     text.push_str(
-        "sample_id,logical_name,source_relpath,source_sha256,top_fn_policy,top_fn_name,fraig,dso_version,driver_crate_version,driver_source_repository,driver_source_commit,stats_driver_crate_version,yosys_script,yosys_script_sha256,import_ir_action_id,g8r_aig_action_id,g8r_stats_action_id,combo_verilog_action_id,yosys_abc_aig_action_id,yosys_abc_stats_action_id,aig_stat_diff_action_id,g8r_and_nodes,g8r_depth,g8r_product,yosys_abc_and_nodes,yosys_abc_depth,yosys_abc_product,g8r_product_loss,delta_and_nodes_yosys_minus_g8r,delta_depth_yosys_minus_g8r\n",
+        "sample_id,logical_name,source_relpath,source_sha256,top_fn_policy,top_fn_name,fraig,dso_version,driver_crate_version,driver_source_repository,driver_source_commit,stats_driver_crate_version,yosys_script,yosys_script_sha256,import_ir_action_id,g8r_aig_action_id,g8r_stats_action_id,combo_verilog_action_id,yosys_abc_aig_action_id,yosys_abc_stats_action_id,aig_stat_diff_action_id,g8r_and_nodes,g8r_depth,g8r_product,yosys_abc_and_nodes,yosys_abc_depth,yosys_abc_product,g8r_product_loss,delta_and_nodes_yosys_minus_g8r,delta_depth_yosys_minus_g8r,g8r_abc_aig_action_id\n",
     );
     for row in rows {
         let fields = [
@@ -3214,6 +3296,7 @@ fn write_joined_csv(path: &Path, rows: &[IrDirCorpusJoinedRow]) -> Result<()> {
             csv_escape(&optional_f64(row.g8r_product_loss)),
             csv_escape(&optional_f64(row.delta_and_nodes_yosys_minus_g8r)),
             csv_escape(&optional_f64(row.delta_depth_yosys_minus_g8r)),
+            csv_escape(row.g8r_abc_aig_action_id.as_deref().unwrap_or("")),
         ];
         text.push_str(&fields.join(","));
         text.push('\n');
@@ -3255,6 +3338,10 @@ fn recipe_preset_spec(recipe_preset: CorpusRecipePreset) -> CorpusRecipePresetSp
             label: "g8r-vs-yabc-no-fraig-aig-diff",
             yosys_script: "flows/abc_ablate_no_fraig.ys",
         },
+        CorpusRecipePreset::G8rAbcVsYabcAigDiff => CorpusRecipePresetSpec {
+            label: "g8r-abc-vs-yabc-aig-diff",
+            yosys_script: "flows/yosys_to_aig.ys",
+        },
         CorpusRecipePreset::G8rAbcStats => CorpusRecipePresetSpec {
             label: "g8r-abc-stats",
             yosys_script: "flows/yosys_to_aig.ys",
@@ -3267,6 +3354,7 @@ fn parse_recipe_preset_label(label: &str) -> Result<CorpusRecipePreset> {
         "g8r-vs-yabc-aig-diff" => Ok(CorpusRecipePreset::G8rVsYabcAigDiff),
         "g8r-vs-yabc-no-fraig-aig-diff" => Ok(CorpusRecipePreset::G8rVsYabcNoFraigAigDiff),
         "g8r-abc-stats" => Ok(CorpusRecipePreset::G8rAbcStats),
+        "g8r-abc-vs-yabc-aig-diff" => Ok(CorpusRecipePreset::G8rAbcVsYabcAigDiff),
         other => bail!("unsupported corpus recipe preset in manifest: {}", other),
     }
 }
@@ -3503,6 +3591,11 @@ mod tests {
             import_ir_status: "done".to_string(),
             g8r_aig_action_id: plan.g8r_aig_action_id.clone(),
             g8r_aig_status: "pending".to_string(),
+            g8r_abc_aig_action_id: plan.g8r_abc_aig_action_id.clone(),
+            g8r_abc_aig_status: plan
+                .g8r_abc_aig_action_id
+                .as_ref()
+                .map(|_| "pending".to_string()),
             g8r_stats_action_id: plan.g8r_stats_action_id.clone(),
             g8r_stats_status: "pending".to_string(),
             combo_verilog_action_id: plan.combo_verilog_action_id.clone(),
@@ -4502,6 +4595,102 @@ mod tests {
     }
 
     #[test]
+    fn matched_abc_recipe_uses_one_script_and_g8r_frontend_lowering() {
+        let sample = CorpusSampleSpec {
+            sample_id: "sample".into(),
+            logical_name: "example.ir".into(),
+            source_path: PathBuf::from("example.ir"),
+            source_relpath: "example.ir".into(),
+            source_sha256: "a".repeat(64),
+            top_fn_name: "cone".into(),
+        };
+        let script = sample_yosys_script_ref();
+        let build = |fraig| {
+            build_action_plan(
+                &sample,
+                CorpusRecipePreset::G8rAbcVsYabcAigDiff,
+                fraig,
+                "v0.39.0",
+                &sample_driver_runtime(),
+                &sample_stats_runtime(),
+                &sample_yosys_runtime(),
+                &script,
+            )
+        };
+        let plan = build(false).expect("matched action plan");
+        let g8r_abc_id = plan.g8r_abc_aig_action_id.as_ref().expect("G8r ABC action");
+        assert_eq!(plan.planned_actions().len(), 7);
+        assert!(matches!(
+            &plan.g8r_aig_action,
+            ActionSpec::DriverIrToG8rAig {
+                fraig: false,
+                lowering_mode: crate::model::G8rLoweringMode::FrontendNoPrepRewrite,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &plan.g8r_abc_aig_action,
+            Some(ActionSpec::AigToYosysAbcAig { aig_action_id, yosys_script_ref, .. })
+                if aig_action_id == &plan.g8r_aig_action_id && yosys_script_ref.sha256 == script.sha256
+        ));
+        assert!(matches!(
+            &plan.g8r_stats_action,
+            ActionSpec::DriverAigToStats { aig_action_id, .. } if aig_action_id == g8r_abc_id
+        ));
+        assert!(matches!(
+            &plan.yosys_abc_aig_action,
+            ActionSpec::ComboVerilogToYosysAbcAig { yosys_script_ref, .. }
+                if yosys_script_ref.sha256 == script.sha256
+        ));
+        assert!(
+            format!("{:#}", build(true).expect_err("FRAIG is incompatible"))
+                .contains("cannot enable driver FRAIG")
+        );
+        assert_eq!(
+            parse_recipe_preset_label("g8r-abc-vs-yabc-aig-diff")
+                .map(recipe_preset_label)
+                .expect("parse new preset"),
+            "g8r-abc-vs-yabc-aig-diff"
+        );
+    }
+
+    #[test]
+    fn matched_abc_corpus_exports_enqueued_branch_and_refreshes() {
+        let (root, output_dir, summary) =
+            run_enqueue_corpus_for_recipe(CorpusRecipePreset::G8rAbcVsYabcAigDiff, None);
+        let manifest = read_status_manifest(&output_dir);
+        let rows = read_samples_jsonl(&output_dir);
+        assert_eq!(summary.recipe_preset, "g8r-abc-vs-yabc-aig-diff");
+        assert_eq!(summary.enqueued_actions, 7);
+        assert_eq!(manifest.yosys_script, "flows/yosys_to_aig.ys");
+        assert_eq!(rows.len(), 1);
+        let abc_id = rows[0]
+            .g8r_abc_aig_action_id
+            .as_deref()
+            .expect("ABC action ID");
+        assert!(!abc_id.is_empty());
+        assert_eq!(rows[0].g8r_abc_aig_status.as_deref(), Some("pending"));
+        let csv = fs::read_to_string(output_dir.join("joined/g8r-abc-vs-yabc-aig-diff.csv"))
+            .expect("joined CSV");
+        assert!(
+            csv.lines()
+                .next()
+                .unwrap()
+                .ends_with(",g8r_abc_aig_action_id")
+        );
+        let refreshed =
+            refresh_ir_dir_corpus_status(&output_dir, 1800, 10).expect("refresh matched recipe");
+        assert_eq!(refreshed.sample_counts.get("pending"), Some(&1));
+        assert_eq!(
+            read_samples_jsonl(&output_dir)[0]
+                .g8r_abc_aig_action_id
+                .as_deref(),
+            Some(abc_id)
+        );
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn ensure_imported_ir_action_is_idempotent() {
         let root = make_temp_dir("import-idempotent");
         let store = ArtifactStore::new_with_sled(root.join("store"), root.join("artifacts.sled"));
@@ -4596,6 +4785,8 @@ mod tests {
             import_ir_status: "done".to_string(),
             g8r_aig_action_id: "g8r".to_string(),
             g8r_aig_status: "pending".to_string(),
+            g8r_abc_aig_action_id: None,
+            g8r_abc_aig_status: None,
             g8r_stats_action_id: "g8rstats".to_string(),
             g8r_stats_status: "pending".to_string(),
             combo_verilog_action_id: "combo".to_string(),
