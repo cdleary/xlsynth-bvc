@@ -136,8 +136,10 @@ fn resolved_path(path: &Path) -> Result<PathBuf> {
         match part {
             std::path::Component::Normal(name) => result.push(name),
             std::path::Component::CurDir => {}
+            // A missing/../existing-link suffix can re-enter an existing symlink.
+            // Do not turn it into an unchecked lexical path used later for writes.
             std::path::Component::ParentDir => {
-                result.pop();
+                bail!("output has a parent traversal after a missing directory")
             }
             _ => bail!("invalid output directory suffix"),
         }
@@ -1142,6 +1144,11 @@ mod tests {
             let alias = root.join("alias");
             std::os::unix::fs::symlink(&resource, &alias).unwrap();
             assert!(checked_output_dir(&input, &alias.join("report"), &resource).is_err());
+            assert!(
+                checked_output_dir(&input, &root.join("missing/../alias/report"), &resource)
+                    .is_err()
+            );
+            assert!(!resource.join("report").exists());
         }
         fs::remove_dir_all(root).unwrap();
     }
