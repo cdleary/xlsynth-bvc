@@ -190,9 +190,25 @@ fn candidate_baseline_is_bound_to_checked_latest_release_observation() {
         candidate_run.baseline.crate_version = observation.latest_crate_version.clone();
         candidate_run.baseline.release_tag = observation.latest_release_tag.clone();
         candidate_run.baseline.commit = observation.latest_release_commit.clone();
+        candidate_run.driver_runtime.driver_version = observation.latest_crate_version.clone();
+        candidate_run.stats_runtime.driver_version = observation.latest_crate_version.clone();
+        candidate_run.stats_runtime.docker_image =
+            crate::runtime::default_driver_image(&observation.latest_crate_version);
         candidate_run.candidate_run_id =
             candidate_run_identity_sha256(candidate_run).expect("candidate run identity");
     }
+    manifest.driver_runtime = manifest
+        .candidate_run
+        .as_ref()
+        .expect("candidate run")
+        .driver_runtime
+        .clone();
+    manifest.stats_runtime = manifest
+        .candidate_run
+        .as_ref()
+        .expect("candidate run")
+        .stats_runtime
+        .clone();
     validate_candidate_corpus_manifest_input(&manifest).expect("valid candidate manifest");
     assert!(
         validate_candidate_baseline_release_observation(
@@ -232,6 +248,7 @@ fn candidate_requested_ref_is_only_published_when_observation_binds_it() {
     let mut manifest = candidate_manifest_input(&observation.head_commit);
     let candidate_run = manifest.candidate_run.as_mut().expect("candidate run");
     candidate_run.requested_ref = Some(observation.head_ref.clone());
+    candidate_run.candidate_committed_at_utc = Some(observation.head_committed_at_utc.clone());
     assert_eq!(
         verified_candidate_requested_ref(candidate_run, Some(&observation))
             .expect("verified requested ref"),
