@@ -164,13 +164,15 @@ cargo run --bin xlsynth_bvc -- \
   --scheduling-policy release-progression-ir-v1
 ```
 
+Use `--scheduling-policy mffc-progression-ir-v1` with the materialized 904-artifact `mffc-v1` directory to evaluate the same release or Git identity on the fixed MFFC suite. Both completed run types can be published on the progression page and compared to any same-cohort generation.
+
 `--driver-git-commit` accepts only a full lowercase 40-character commit from the canonical
 `xlsynth/xlsynth-crate` repository and conflicts with `--driver-version`. The direct preset runs
 only `Git-built G8r frontend -> common Yosys/ABC -> common released-driver AIG stats`; it does not
 schedule the codegen+Yosys branch. For a policy-validated candidate run, `manifest.json` records a
 typed immutable candidate-run identity containing the exact Git commit, observed latest release
 version and commit, DSO, exact source-driver, ABC, and stats runtimes, execution recipe, exact
-Yosys script path and digest, 187-artifact cohort digest, immutable action-graph digest, and
+Yosys script path and digest, fixed-cohort artifact digest, immutable action-graph digest, and
 planned/reused/new action counts.
 Candidate runs require the canonical public source-driver, released stats-driver, and Yosys/ABC
 runtime identifiers; incompatible CLI runtime overrides fail before any import or enqueue work.

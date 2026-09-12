@@ -516,6 +516,7 @@ pub enum CorpusTopFnPolicy {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CorpusSchedulingPolicyPreset {
     ReleaseProgressionIrV1,
+    MffcProgressionIrV1,
 }
 
 #[derive(Debug, Subcommand)]

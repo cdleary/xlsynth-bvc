@@ -1,33 +1,32 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# Fixed IR release-progression corpus
+# Fixed IR progression cohorts
 
-The release-progression chart deliberately uses a pinned benchmark cohort, not the functions enumerated by each xlsynth release. Its canonical manifest is `src/site_assets/release_progression_ir_hashes.txt`: 187 sorted, unique whole-function structural hashes. `src/site.rs` pins both the count and the domain-separated manifest digest, so changing the cohort is an explicit versioned decision.
+The progression chart uses named, pinned benchmark cohorts rather than the functions enumerated by each xlsynth release. Every release and evaluated Git revision becomes a generation inside a cohort, and any two generations in that cohort can be compared with the same aggregate and per-artifact views.
 
-`src/site_assets/release_progression_ir_artifacts.tsv` additionally binds each structural hash to
-the SHA-256 of the canonical IR file bytes. The scheduling policy validates a domain-separated
-digest of these 187 pairs: the prefix `xlsynth-bvc/ir-dir-corpus-artifact-manifest/v1\0`,
-followed by each sorted pair as raw 32-byte structural and content digests. A renamed, truncated, or
-replaced IR file is rejected before enqueue.
+The initial cohorts are:
+
+- `whole-functions-v1`: 187 sorted, unique whole-function structural hashes in `src/site_assets/release_progression_ir_hashes.txt`.
+- `mffc-v1`: 904 sorted, unique MFFC structural hashes in `src/site_assets/mffc_progression_ir_hashes.txt`.
+
+Each companion `*_artifacts.tsv` binds a structural hash to the SHA-256 of the exact canonical IR bytes. The validator hashes each sorted pair with the domain prefix `xlsynth-bvc/ir-dir-corpus-artifact-manifest/v1\0`; a renamed, truncated, or replaced IR file is rejected before enqueue or publication. `src/site.rs` also pins each member count and domain-separated cohort digest, so changing either population is an explicit versioned decision.
+
+The MFFC cohort additionally retains its extraction lineage in `src/site_assets/mffc_progression_sources.jsonl`: source function/action identities, source structural hash, extracted top, originating crate versions, and occurrence count.
 
 ## Scheduling policy
 
-The cohort identity stays separate from operational scheduling. The checked-in
-`campaigns/release-progression-ir-v1.textproto` policy identifies persistent Yosys/ABC
-critical-path samples by structural hash and assigns their action graphs a queue-priority boost.
-Select it explicitly when enqueueing a historical run:
+Cohort identity stays separate from operational scheduling. Both policies validate the complete exact-byte artifact manifest before enqueue:
 
 ```text
---scheduling-policy release-progression-ir-v1
+--scheduling-policy release-progression-ir-v1  # whole-functions-v1
+--scheduling-policy mffc-progression-ir-v1     # mffc-v1
 ```
 
-The runner only accepts the policy with `--execution-mode enqueue`, validates it against the exact
-187-artifact content manifest before enqueueing, and records the policy name, semantic version,
-compiled-config digest, tiers, and reasons in the run's `manifest.json`. Queue priority is
-operational metadata rather than action identity, so the policy does not change cache keys or QoR
-results.
+The whole-function policy also assigns a queue-priority boost to known persistent Yosys/ABC stragglers. The MFFC policy currently changes no relative priorities; it provides the same fail-closed cohort validation and candidate-run identity for the larger suite.
 
-## Origin
+Policies are accepted only with `--execution-mode enqueue`. The run records the policy name, semantic version, compiled-config digest, tiers, and reasons in `manifest.json`. Queue priority is operational metadata rather than action identity, so selecting a policy does not change cache keys or QoR results.
+
+## Whole-function cohort origin
 
 The cohort was captured on 2026-09-03 from a production static-site snapshot whose `catalog.json` SHA-256 is `5a99a8efcc222687995a12ef0fe1a7f70dfd5ab87812b3c895df3c5943aaeeb2`. The snapshot's `ir-fn-corpus-ir.v1.json` descriptor SHA-256 is `d08e478594386e648347757ac9bef9d5d652d71a9752c479848b54ebc3bc0aba`; its paired `ir-fn-corpus-g8r-abc-vs-codegen-yosys-abc.v1.json` descriptor SHA-256 is `cd778dec73387f41ddf137616a3ad2fced7290f488fb86a215b93a3633e59246`.
 
@@ -37,6 +36,27 @@ It is the common set of exact whole-function structural hashes with paired G8r a
 - xlsynth crate `0.68.0`, DSO `0.54.7`: 187 artifacts
 
 The two sets were identical. Requiring each indexed IR action to equal its source IR action excludes generated k3 cones and MFFCs. The corresponding canonical IR packages were materialized one function per file, named `<structural-hash>.ir`, and are the inputs to historical backtests. The checked-in manifest's raw SHA-256 is `bd6a384406f764baebe95089b792fe483ef84f0a8eda3ee8ea8047767a77ce38`; its code-pinned domain-separated digest is `a70a2e38b978d07b8bfc642f7a7cd6806a35bfa4de52f8c9919cd880057e2f77`.
+
+## MFFC cohort origin
+
+`mffc-v1` was captured on 2026-09-04 from the structurally deduplicated canonical A/B corpus at `/tmp/xlsynth-reassoc-reuse-backtest.3IMB2v/canonical-corpus-manifest.json`. The source snapshot contained 34,076 unique structural functions: 33,172 whole-function/k=3 entries and 904 MFFCs. Only the 904 records whose manifest kind is `mffc` enter this cohort.
+
+The checked-in source-lineage JSONL has raw SHA-256 `6b2f583fb147ad893dd0bedb778b8207ad49f3f550f4f73850dfea4cb0f36641`. The cohort identity is `f80befb2248a9757b7512068a4818308ecff1e77bcd78701b1a67338f979e5f8`; its exact-byte artifact-manifest identity is `cfc36afcd8b178687690a03d6c8b555e9517e7606ae8062d502452cf29e8861c`.
+
+To materialize a runnable directory from that retained corpus:
+
+```bash
+source_root=/tmp/xlsynth-reassoc-reuse-backtest.3IMB2v/canonical-corpus
+corpus_out=/tmp/xlsynth-bvc-mffc-progression-v1
+mkdir -p "$corpus_out"
+while IFS=$'\t' read -r structural_hash source_sha256; do
+  source_file="$source_root/$structural_hash.ir"
+  test "$(sha256sum "$source_file" | cut -d' ' -f1)" = "$source_sha256"
+  cp "$source_file" "$corpus_out/$structural_hash.ir"
+done < src/site_assets/mffc_progression_ir_artifacts.tsv
+```
+
+Then evaluate a release or exact Git revision with `run-ir-dir-corpus`, `--recipe-preset g8r-abc-stats`, `--top-fn-policy infer-single-package`, and `--scheduling-policy mffc-progression-ir-v1`. Completed actions are cache-addressed and runs are resumable.
 
 ## Reproducing the manifest
 
@@ -86,4 +106,4 @@ jq -s -r --rawfile manifest "$manifest_out" '
 
 The materialized directory contains 187 files. Hashing each file with its hash-only filename in sorted order produces `983fab9ccbfc6d6cb3ce112215730203b0c7731514281ebd4610a61cd82fc6a6`. Run the `g8r-vs-yabc-aig-diff` corpus recipe against that directory for every historical crate/DSO pair.
 
-The checked-in manifest is the benchmark identity. Do not replace it merely because a newer release adds or removes input functions; create and review a new cohort version when intentionally changing the benchmark.
+Each checked-in named manifest is the benchmark identity. Do not replace it merely because a newer release adds or removes input functions; create and review a new cohort version when intentionally changing the benchmark.

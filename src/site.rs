@@ -54,12 +54,22 @@ const RELEASE_PROGRESSION_IR_HASHES: &str =
     include_str!("site_assets/release_progression_ir_hashes.txt");
 const RELEASE_PROGRESSION_IR_ARTIFACTS: &str =
     include_str!("site_assets/release_progression_ir_artifacts.tsv");
+const MFFC_PROGRESSION_IR_HASHES: &str = include_str!("site_assets/mffc_progression_ir_hashes.txt");
+const MFFC_PROGRESSION_IR_ARTIFACTS: &str =
+    include_str!("site_assets/mffc_progression_ir_artifacts.tsv");
+const WHOLE_FUNCTION_PROGRESSION_COHORT_ID: &str = "whole-functions-v1";
+const MFFC_PROGRESSION_COHORT_ID: &str = "mffc-v1";
 const RELEASE_PROGRESSION_IR_COUNT: usize = 187;
 const RELEASE_PROGRESSION_IR_SHA256: &str =
     "a70a2e38b978d07b8bfc642f7a7cd6806a35bfa4de52f8c9919cd880057e2f77";
 const RELEASE_PROGRESSION_ARTIFACT_MANIFEST_SHA256: &str =
     "d5b7560b8a90c7093e3c406f5ce2a3589ff634084f23b016866c9f3406115260";
-const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 7;
+const MFFC_PROGRESSION_IR_COUNT: usize = 904;
+const MFFC_PROGRESSION_IR_SHA256: &str =
+    "f80befb2248a9757b7512068a4818308ecff1e77bcd78701b1a67338f979e5f8";
+const MFFC_PROGRESSION_ARTIFACT_MANIFEST_SHA256: &str =
+    "cfc36afcd8b178687690a03d6c8b555e9517e7606ae8062d502452cf29e8861c";
+const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 8;
 const CANDIDATE_PROGRESSION_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 const STATIC_COMPARISON_SHARD_SCHEMA_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_PREFIX_HEX_CHARS: u8 = 1;
@@ -114,9 +124,16 @@ struct BrowserCatalog {
     datasets: Vec<BrowserDataset>,
     runs: Vec<BrowserRun>,
     candidate_evidence: Vec<BrowserCandidateEvidenceRef>,
-    progression: BrowserProgressionCatalog,
+    progression: BrowserProgressionIndex,
     releases: Vec<CrateReleaseStatusView>,
     repository_head_observation: Option<RepositoryHeadObservationView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct BrowserProgressionIndex {
+    default_cohort_id: String,
+    cohorts: Vec<BrowserProgressionCatalog>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +148,7 @@ struct BrowserDataset {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct BrowserCandidateEvidenceRef {
+    cohort_id: String,
     generation_id: String,
     url: String,
     bytes: u64,
@@ -349,13 +367,59 @@ struct BrowserFinding {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct BrowserProgressionCatalog {
+    cohort_id: String,
+    display_label: String,
+    artifact_kind: BrowserProgressionArtifactKind,
     dataset_key: String,
     cohort_ir_count: u64,
     cohort_ir_sha256: Option<String>,
+    cohort_artifact_manifest_sha256: String,
     cohort_ir_hashes: Vec<String>,
     cohort_complete_generation_count: u64,
     generations: Vec<BrowserProgressionGeneration>,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BrowserProgressionArtifactKind {
+    WholeFunction,
+    Mffc,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProgressionCohortDescriptor {
+    cohort_id: &'static str,
+    display_label: &'static str,
+    artifact_kind: BrowserProgressionArtifactKind,
+    ir_hashes: &'static str,
+    ir_artifacts: &'static str,
+    expected_count: usize,
+    expected_ir_sha256: &'static str,
+    expected_artifact_manifest_sha256: &'static str,
+}
+
+const PROGRESSION_COHORTS: [ProgressionCohortDescriptor; 2] = [
+    ProgressionCohortDescriptor {
+        cohort_id: WHOLE_FUNCTION_PROGRESSION_COHORT_ID,
+        display_label: "Whole functions",
+        artifact_kind: BrowserProgressionArtifactKind::WholeFunction,
+        ir_hashes: RELEASE_PROGRESSION_IR_HASHES,
+        ir_artifacts: RELEASE_PROGRESSION_IR_ARTIFACTS,
+        expected_count: RELEASE_PROGRESSION_IR_COUNT,
+        expected_ir_sha256: RELEASE_PROGRESSION_IR_SHA256,
+        expected_artifact_manifest_sha256: RELEASE_PROGRESSION_ARTIFACT_MANIFEST_SHA256,
+    },
+    ProgressionCohortDescriptor {
+        cohort_id: MFFC_PROGRESSION_COHORT_ID,
+        display_label: "MFFCs",
+        artifact_kind: BrowserProgressionArtifactKind::Mffc,
+        ir_hashes: MFFC_PROGRESSION_IR_HASHES,
+        ir_artifacts: MFFC_PROGRESSION_IR_ARTIFACTS,
+        expected_count: MFFC_PROGRESSION_IR_COUNT,
+        expected_ir_sha256: MFFC_PROGRESSION_IR_SHA256,
+        expected_artifact_manifest_sha256: MFFC_PROGRESSION_ARTIFACT_MANIFEST_SHA256,
+    },
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -633,15 +697,37 @@ fn progression_ir_sha256(structural_hashes: &[String]) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn release_progression_ir_hashes() -> Result<Vec<String>> {
-    let hashes = RELEASE_PROGRESSION_IR_HASHES
+fn progression_cohort(cohort_id: &str) -> Result<&'static ProgressionCohortDescriptor> {
+    PROGRESSION_COHORTS
+        .iter()
+        .find(|cohort| cohort.cohort_id == cohort_id)
+        .with_context(|| format!("unknown progression cohort {cohort_id:?}"))
+}
+
+fn progression_cohort_for_candidate(
+    candidate_run: &CandidateRunInput,
+) -> Result<&'static ProgressionCohortDescriptor> {
+    PROGRESSION_COHORTS
+        .iter()
+        .find(|cohort| {
+            candidate_run.cohort_sample_count == cohort.expected_count as u64
+                && candidate_run.cohort_artifact_manifest_sha256
+                    == cohort.expected_artifact_manifest_sha256
+        })
+        .context("candidate corpus does not match a registered fixed progression cohort")
+}
+
+fn progression_ir_hashes(cohort: &ProgressionCohortDescriptor) -> Result<Vec<String>> {
+    let hashes = cohort
+        .ir_hashes
         .lines()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    if hashes.len() != RELEASE_PROGRESSION_IR_COUNT {
+    if hashes.len() != cohort.expected_count {
         bail!(
-            "fixed IR release-progression manifest has the wrong size: expected={} actual={}",
-            RELEASE_PROGRESSION_IR_COUNT,
+            "fixed IR progression manifest for {} has the wrong size: expected={} actual={}",
+            cohort.cohort_id,
+            cohort.expected_count,
             hashes.len()
         );
     }
@@ -651,31 +737,49 @@ fn release_progression_ir_hashes() -> Result<Vec<String>> {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }) {
-        bail!("fixed IR release-progression manifest contains a noncanonical SHA-256 digest");
+        bail!(
+            "fixed IR progression manifest for {} contains a noncanonical SHA-256 digest",
+            cohort.cohort_id
+        );
     }
     if hashes.windows(2).any(|pair| pair[0] >= pair[1]) {
-        bail!("fixed IR release-progression manifest must be strictly sorted and unique");
+        bail!(
+            "fixed IR progression manifest for {} must be strictly sorted and unique",
+            cohort.cohort_id
+        );
     }
     let digest = progression_ir_sha256(&hashes)?;
-    if digest != RELEASE_PROGRESSION_IR_SHA256 {
+    if digest != cohort.expected_ir_sha256 {
         bail!(
-            "fixed IR release-progression manifest identity changed: expected={} actual={}",
-            RELEASE_PROGRESSION_IR_SHA256,
+            "fixed IR progression manifest identity changed for {}: expected={} actual={}",
+            cohort.cohort_id,
+            cohort.expected_ir_sha256,
             digest
         );
     }
     Ok(hashes)
 }
 
-fn release_progression_ir_artifacts() -> Result<BTreeMap<String, String>> {
+#[cfg(test)]
+fn release_progression_ir_hashes() -> Result<Vec<String>> {
+    progression_ir_hashes(progression_cohort(WHOLE_FUNCTION_PROGRESSION_COHORT_ID)?)
+}
+
+fn progression_ir_artifacts(
+    cohort: &ProgressionCohortDescriptor,
+) -> Result<BTreeMap<String, String>> {
     let mut artifacts = BTreeMap::new();
     let mut previous: Option<String> = None;
     let mut hasher = Sha256::new();
     hasher.update(b"xlsynth-bvc/ir-dir-corpus-artifact-manifest/v1\0");
-    for (index, line) in RELEASE_PROGRESSION_IR_ARTIFACTS.lines().enumerate() {
-        let (structural_hash, source_sha256) = line
-            .split_once('\t')
-            .with_context(|| format!("fixed IR artifact manifest line {} has no tab", index + 1))?;
+    for (index, line) in cohort.ir_artifacts.lines().enumerate() {
+        let (structural_hash, source_sha256) = line.split_once('\t').with_context(|| {
+            format!(
+                "fixed IR artifact manifest for {} line {} has no tab",
+                cohort.cohort_id,
+                index + 1
+            )
+        })?;
         for (field, digest) in [
             ("structural hash", structural_hash),
             ("source SHA-256", source_sha256),
@@ -686,7 +790,8 @@ fn release_progression_ir_artifacts() -> Result<BTreeMap<String, String>> {
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             {
                 bail!(
-                    "fixed IR artifact manifest line {} has invalid {field}",
+                    "fixed IR artifact manifest for {} line {} has invalid {field}",
+                    cohort.cohort_id,
                     index + 1
                 );
             }
@@ -695,35 +800,54 @@ fn release_progression_ir_artifacts() -> Result<BTreeMap<String, String>> {
             .as_deref()
             .is_some_and(|value| value >= structural_hash)
         {
-            bail!("fixed IR artifact manifest must be strictly sorted and unique");
+            bail!(
+                "fixed IR artifact manifest for {} must be strictly sorted and unique",
+                cohort.cohort_id
+            );
         }
         previous = Some(structural_hash.to_string());
         hasher.update(hex::decode(structural_hash).context("decoding structural hash")?);
         hasher.update(hex::decode(source_sha256).context("decoding source SHA-256")?);
         artifacts.insert(structural_hash.to_string(), source_sha256.to_string());
     }
-    if artifacts.len() != RELEASE_PROGRESSION_IR_COUNT {
+    if artifacts.len() != cohort.expected_count {
         bail!(
-            "fixed IR artifact manifest has the wrong size: expected={} actual={}",
-            RELEASE_PROGRESSION_IR_COUNT,
+            "fixed IR artifact manifest for {} has the wrong size: expected={} actual={}",
+            cohort.cohort_id,
+            cohort.expected_count,
             artifacts.len()
         );
     }
-    let digest = hex::encode(hasher.finalize());
-    if digest != RELEASE_PROGRESSION_ARTIFACT_MANIFEST_SHA256 {
+    let hash_set = progression_ir_hashes(cohort)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if artifacts.keys().cloned().collect::<BTreeSet<_>>() != hash_set {
         bail!(
-            "fixed IR artifact manifest identity changed: expected={} actual={}",
-            RELEASE_PROGRESSION_ARTIFACT_MANIFEST_SHA256,
+            "fixed IR hash and artifact manifests disagree for {}",
+            cohort.cohort_id
+        );
+    }
+    let digest = hex::encode(hasher.finalize());
+    if digest != cohort.expected_artifact_manifest_sha256 {
+        bail!(
+            "fixed IR artifact manifest identity changed for {}: expected={} actual={}",
+            cohort.cohort_id,
+            cohort.expected_artifact_manifest_sha256,
             digest
         );
     }
     Ok(artifacts)
 }
 
-fn progression_generation_id(crate_version: &str, dso_version: &str) -> String {
+#[cfg(test)]
+fn release_progression_ir_artifacts() -> Result<BTreeMap<String, String>> {
+    progression_ir_artifacts(progression_cohort(WHOLE_FUNCTION_PROGRESSION_COHORT_ID)?)
+}
+
+fn progression_generation_id(cohort_id: &str, crate_version: &str, dso_version: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"xlsynth-bvc/release-progression-fixed-ir-generation/v2\0");
-    for value in [crate_version, dso_version] {
+    hasher.update(b"xlsynth-bvc/fixed-ir-generation/v3\0");
+    for value in [cohort_id, crate_version, dso_version] {
         hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value.as_bytes());
     }
@@ -736,24 +860,36 @@ fn normalized_progression_ir_hash(sample: &StdlibG8rVsYosysSample) -> Option<Str
         .then(|| value.to_ascii_lowercase())
 }
 
-fn is_progression_fixed_ir_sample(sample: &StdlibG8rVsYosysSample) -> bool {
-    !sample
-        .ir_top
-        .as_deref()
-        .is_some_and(|top| top.starts_with("__k3_cone_") || top.starts_with("__mffc_"))
+fn progression_sample_matches_kind(
+    sample: &StdlibG8rVsYosysSample,
+    artifact_kind: BrowserProgressionArtifactKind,
+) -> bool {
+    let top = sample.ir_top.as_deref().unwrap_or_default();
+    match artifact_kind {
+        BrowserProgressionArtifactKind::WholeFunction => {
+            !top.starts_with("__k3_cone_") && !top.starts_with("__mffc_")
+        }
+        BrowserProgressionArtifactKind::Mffc => top.starts_with("__mffc_"),
+    }
 }
 
-fn empty_browser_progression_catalog() -> Result<BrowserProgressionCatalog> {
-    let cohort = release_progression_ir_hashes()?;
+fn empty_browser_progression_catalog_for(
+    cohort: &ProgressionCohortDescriptor,
+) -> Result<BrowserProgressionCatalog> {
+    let hashes = progression_ir_hashes(cohort)?;
     let cohort_ir_count =
-        u64::try_from(cohort.len()).context("fixed IR cohort size exceeds u64")?;
-    let cohort_ir_sha256 = Some(progression_ir_sha256(&cohort)?);
+        u64::try_from(hashes.len()).context("fixed IR cohort size exceeds u64")?;
+    let cohort_ir_sha256 = Some(progression_ir_sha256(&hashes)?);
     Ok(BrowserProgressionCatalog {
+        cohort_id: cohort.cohort_id.to_string(),
+        display_label: cohort.display_label.to_string(),
+        artifact_kind: cohort.artifact_kind,
         dataset_key: crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
             .to_string(),
         cohort_ir_count,
         cohort_ir_sha256,
-        cohort_ir_hashes: cohort,
+        cohort_artifact_manifest_sha256: cohort.expected_artifact_manifest_sha256.to_string(),
+        cohort_ir_hashes: hashes,
         cohort_complete_generation_count: 0,
         generations: Vec::new(),
     })
@@ -766,25 +902,38 @@ fn build_browser_progression_catalog(
     build_browser_progression_catalog_with_releases(dataset, &[])
 }
 
+#[cfg(test)]
 fn build_browser_progression_catalog_with_releases(
     dataset: &StdlibG8rVsYosysDataset,
     releases: &[CrateReleaseStatusView],
 ) -> Result<BrowserProgressionCatalog> {
+    build_browser_progression_catalog_for_cohort(
+        dataset,
+        releases,
+        progression_cohort(WHOLE_FUNCTION_PROGRESSION_COHORT_ID)?,
+    )
+}
+
+fn build_browser_progression_catalog_for_cohort(
+    dataset: &StdlibG8rVsYosysDataset,
+    releases: &[CrateReleaseStatusView],
+    cohort: &ProgressionCohortDescriptor,
+) -> Result<BrowserProgressionCatalog> {
     let fixed_samples = dataset
         .samples
         .iter()
-        .filter(|sample| is_progression_fixed_ir_sample(sample))
+        .filter(|sample| progression_sample_matches_kind(sample, cohort.artifact_kind))
         .collect::<Vec<_>>();
     if fixed_samples.is_empty() {
-        return empty_browser_progression_catalog();
+        return empty_browser_progression_catalog_for(cohort);
     }
 
     let mut grouped = BTreeMap::<(String, String), BTreeSet<String>>::new();
     for sample in fixed_samples {
         let structural_hash = normalized_progression_ir_hash(sample).with_context(|| {
             format!(
-                "fixed-IR release progression sample {} in crate {} has no valid structural hash",
-                sample.fn_key, sample.crate_version
+                "{} progression sample {} in crate {} has no valid structural hash",
+                cohort.cohort_id, sample.fn_key, sample.crate_version
             )
         })?;
         let generation = grouped
@@ -792,7 +941,8 @@ fn build_browser_progression_catalog_with_releases(
             .or_default();
         if !generation.insert(structural_hash.clone()) {
             bail!(
-                "fixed-IR release progression generation contains duplicate structural hash: crate={} dso={} hash={}",
+                "{} progression generation contains duplicate structural hash: crate={} dso={} hash={}",
+                cohort.cohort_id,
                 sample.crate_version,
                 sample.dso_version,
                 structural_hash
@@ -810,11 +960,11 @@ fn build_browser_progression_catalog_with_releases(
             },
         )
         .collect::<Vec<_>>();
-    let cohort = release_progression_ir_hashes()?;
-    let cohort_set = cohort.iter().cloned().collect::<BTreeSet<_>>();
-    let cohort_ir_sha256 = Some(progression_ir_sha256(&cohort)?);
+    let hashes = progression_ir_hashes(cohort)?;
+    let cohort_set = hashes.iter().cloned().collect::<BTreeSet<_>>();
+    let cohort_ir_sha256 = Some(progression_ir_sha256(&hashes)?);
     let cohort_ir_count =
-        u64::try_from(cohort.len()).context("fixed IR cohort size exceeds u64")?;
+        u64::try_from(hashes.len()).context("fixed IR cohort size exceeds u64")?;
 
     let event_time_by_crate = releases
         .iter()
@@ -848,7 +998,11 @@ fn build_browser_progression_catalog_with_releases(
         let observed_ir_count = u64::try_from(ir_set.intersection(&cohort_set).count())
             .context("observed fixed IR count exceeds u64")?;
         generations.push(BrowserProgressionGeneration {
-            generation_id: progression_generation_id(&source.crate_version, &source.dso_version),
+            generation_id: progression_generation_id(
+                cohort.cohort_id,
+                &source.crate_version,
+                &source.dso_version,
+            ),
             origin: BrowserProgressionOrigin::CrateRelease,
             display_label: format!("v{}", normalize_tag_version(&source.crate_version)),
             event_time_utc: event_time_by_crate
@@ -865,18 +1019,7 @@ fn build_browser_progression_catalog_with_releases(
             candidate_samples: Vec::new(),
         });
     }
-    generations.sort_by(|left, right| {
-        left.event_time_utc
-            .cmp(&right.event_time_utc)
-            .then_with(|| {
-                cmp_dotted_numeric_version(
-                    left.crate_version.as_deref().unwrap_or_default(),
-                    right.crate_version.as_deref().unwrap_or_default(),
-                )
-            })
-            .then_with(|| cmp_dotted_numeric_version(&left.dso_version, &right.dso_version))
-            .then_with(|| left.generation_id.cmp(&right.generation_id))
-    });
+    generations.sort_by(progression_generation_cmp);
     let cohort_complete_generation_count = u64::try_from(
         generations
             .iter()
@@ -885,11 +1028,15 @@ fn build_browser_progression_catalog_with_releases(
     )
     .context("complete fixed-IR generation count exceeds u64")?;
     Ok(BrowserProgressionCatalog {
+        cohort_id: cohort.cohort_id.to_string(),
+        display_label: cohort.display_label.to_string(),
+        artifact_kind: cohort.artifact_kind,
         dataset_key: crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME
             .to_string(),
         cohort_ir_count,
         cohort_ir_sha256,
-        cohort_ir_hashes: cohort,
+        cohort_artifact_manifest_sha256: cohort.expected_artifact_manifest_sha256.to_string(),
+        cohort_ir_hashes: hashes,
         cohort_complete_generation_count,
         generations,
     })
@@ -1030,6 +1177,7 @@ fn validate_candidate_corpus_manifest_input(manifest: &CandidateCorpusManifestIn
         .candidate_run
         .as_ref()
         .context("candidate corpus manifest has no typed candidate_run")?;
+    let cohort = progression_cohort_for_candidate(candidate_run)?;
     let expected_candidate_image =
         crate::runtime::git_driver_image(&candidate_run.candidate.commit)?;
     let baseline_version = normalize_tag_version(&candidate_run.baseline.crate_version);
@@ -1050,9 +1198,6 @@ fn validate_candidate_corpus_manifest_input(manifest: &CandidateCorpusManifestIn
         || candidate_run.dso_version != normalize_tag_version(&candidate_run.dso_version)
         || normalize_tag_version(&manifest.dso_version)
             != normalize_tag_version(&candidate_run.dso_version)
-        || candidate_run.cohort_sample_count != RELEASE_PROGRESSION_IR_COUNT as u64
-        || candidate_run.cohort_artifact_manifest_sha256
-            != RELEASE_PROGRESSION_ARTIFACT_MANIFEST_SHA256
     {
         bail!("candidate corpus manifest does not match the fixed-IR G8r+ABC contract");
     }
@@ -1128,7 +1273,7 @@ fn validate_candidate_corpus_manifest_input(manifest: &CandidateCorpusManifestIn
             512,
         )?;
     }
-    if manifest.samples.len() != RELEASE_PROGRESSION_IR_COUNT
+    if manifest.samples.len() != cohort.expected_count
         || manifest
             .samples
             .windows(2)
@@ -1217,15 +1362,16 @@ fn progression_generation_cmp(
 
 fn baseline_progression_samples<'a>(
     dataset: &'a StdlibG8rVsYosysDataset,
+    cohort: &ProgressionCohortDescriptor,
     crate_version: &str,
     dso_version: &str,
 ) -> Result<BTreeMap<String, &'a StdlibG8rVsYosysSample>> {
-    let artifacts = release_progression_ir_artifacts()?;
+    let artifacts = progression_ir_artifacts(cohort)?;
     let crate_version = normalize_tag_version(crate_version);
     let dso_version = normalize_tag_version(dso_version);
     let mut samples = BTreeMap::new();
     for sample in dataset.samples.iter().filter(|sample| {
-        is_progression_fixed_ir_sample(sample)
+        progression_sample_matches_kind(sample, cohort.artifact_kind)
             && normalize_tag_version(&sample.crate_version) == crate_version
             && normalize_tag_version(&sample.dso_version) == dso_version
     }) {
@@ -1270,6 +1416,7 @@ fn validate_candidate_progression_generation(
     dataset: &StdlibG8rVsYosysDataset,
     repository_observation: Option<&RepositoryHeadObservationView>,
 ) -> Result<()> {
+    let cohort = progression_cohort(&release_catalog.cohort_id)?;
     let BrowserProgressionOrigin::GitRevision {
         repository,
         commit,
@@ -1341,10 +1488,14 @@ fn validate_candidate_progression_generation(
     {
         bail!("candidate progression baseline identity or DSO does not match");
     }
-    let artifacts = release_progression_ir_artifacts()?;
-    let baseline_samples =
-        baseline_progression_samples(dataset, baseline_crate_version, &generation.dso_version)?;
-    if baseline_samples.len() != RELEASE_PROGRESSION_IR_COUNT {
+    let artifacts = progression_ir_artifacts(cohort)?;
+    let baseline_samples = baseline_progression_samples(
+        dataset,
+        cohort,
+        baseline_crate_version,
+        &generation.dso_version,
+    )?;
+    if baseline_samples.len() != cohort.expected_count {
         bail!("candidate progression baseline is not cohort complete");
     }
     let mut seen = BTreeSet::new();
@@ -1401,9 +1552,9 @@ fn validate_candidate_progression_generation(
     }
     let expected_hashes = artifacts.keys().cloned().collect::<BTreeSet<_>>();
     if seen != expected_hashes
-        || generation.candidate_samples.len() != RELEASE_PROGRESSION_IR_COUNT
-        || generation.observed_ir_count != RELEASE_PROGRESSION_IR_COUNT as u64
-        || generation.cohort_ir_count != RELEASE_PROGRESSION_IR_COUNT as u64
+        || generation.candidate_samples.len() != cohort.expected_count
+        || generation.observed_ir_count != cohort.expected_count as u64
+        || generation.cohort_ir_count != cohort.expected_count as u64
         || generation.missing_cohort_ir_count != 0
         || generation.extra_ir_count != 0
         || generation.coverage != BrowserProgressionCoverage::CohortComplete
@@ -1543,6 +1694,10 @@ where
     let candidate_run = manifest
         .candidate_run
         .context("candidate corpus manifest has no typed candidate_run")?;
+    let cohort = progression_cohort_for_candidate(&candidate_run)?;
+    if release_catalog.cohort_id != cohort.cohort_id {
+        bail!("candidate cohort does not match its release progression catalog");
+    }
     let baseline_release_commit_verified =
         validate_candidate_baseline_release_observation(&candidate_run, repository_observation)?;
     let verified_requested_ref =
@@ -1567,10 +1722,11 @@ where
         .context("candidate's captured release baseline is absent from the progression dataset")?;
     let baseline_samples = baseline_progression_samples(
         dataset,
+        cohort,
         &candidate_run.baseline.crate_version,
         &candidate_run.dso_version,
     )?;
-    let artifacts = release_progression_ir_artifacts()?;
+    let artifacts = progression_ir_artifacts(cohort)?;
     let script_ref = ScriptRef {
         path: candidate_run.yosys_script.clone(),
         sha256: candidate_run.yosys_script_sha256.clone(),
@@ -1701,8 +1857,8 @@ where
         baseline_generation_id: Some(baseline_generation.generation_id.clone()),
         coverage: BrowserProgressionCoverage::CohortComplete,
         observed_ir_count: samples.len() as u64,
-        cohort_ir_count: RELEASE_PROGRESSION_IR_COUNT as u64,
-        missing_cohort_ir_count: RELEASE_PROGRESSION_IR_COUNT.saturating_sub(samples.len()) as u64,
+        cohort_ir_count: cohort.expected_count as u64,
+        missing_cohort_ir_count: cohort.expected_count.saturating_sub(samples.len()) as u64,
         extra_ir_count: samples
             .keys()
             .filter(|hash| !artifacts.contains_key(*hash))
@@ -1851,40 +2007,83 @@ fn combine_progression_generations(
     Ok(release_catalog)
 }
 
+fn empty_browser_progression_index() -> Result<BrowserProgressionIndex> {
+    Ok(BrowserProgressionIndex {
+        default_cohort_id: WHOLE_FUNCTION_PROGRESSION_COHORT_ID.to_string(),
+        cohorts: PROGRESSION_COHORTS
+            .iter()
+            .map(empty_browser_progression_catalog_for)
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
 fn build_browser_progression_catalog_and_candidate_evidence_from_site(
     site_dir: &Path,
     datasets: &[BrowserDataset],
     releases: &[CrateReleaseStatusView],
     repository_observation: Option<&RepositoryHeadObservationView>,
     candidate_run_dirs: &[PathBuf],
-) -> Result<(BrowserProgressionCatalog, Vec<CandidateProgressionEvidence>)> {
+) -> Result<(BrowserProgressionIndex, Vec<CandidateProgressionEvidence>)> {
     let Some(dataset) = load_progression_comparison_dataset_from_site(site_dir, datasets)? else {
         if !candidate_run_dirs.is_empty() {
             bail!("cannot add a candidate without the fixed-IR release progression dataset");
         }
-        return Ok((empty_browser_progression_catalog()?, Vec::new()));
+        return Ok((empty_browser_progression_index()?, Vec::new()));
     };
-    let release_catalog = build_browser_progression_catalog_with_releases(&dataset, releases)?;
-    let candidate_pairs = candidate_run_dirs
+    let release_catalogs = PROGRESSION_COHORTS
         .iter()
-        .map(|run_dir| {
-            load_candidate_progression_generation_with_evidence(
-                run_dir,
-                &release_catalog,
+        .map(|cohort| build_browser_progression_catalog_for_cohort(&dataset, releases, cohort))
+        .collect::<Result<Vec<_>>>()?;
+    let mut candidates_by_cohort = BTreeMap::<String, Vec<BrowserProgressionGeneration>>::new();
+    let mut evidence = Vec::with_capacity(candidate_run_dirs.len());
+    for run_dir in candidate_run_dirs {
+        let manifest = read_candidate_corpus_manifest(run_dir)?;
+        let candidate_run = manifest
+            .candidate_run
+            .as_ref()
+            .context("candidate corpus manifest has no typed candidate_run")?;
+        let cohort = progression_cohort_for_candidate(candidate_run)?;
+        let release_catalog = release_catalogs
+            .iter()
+            .find(|catalog| catalog.cohort_id == cohort.cohort_id)
+            .expect("registered cohort has a release catalog");
+        let (generation, candidate_evidence) = load_candidate_progression_generation_with_evidence(
+            run_dir,
+            release_catalog,
+            &dataset,
+            repository_observation,
+        )
+        .with_context(|| format!("loading candidate run {}", run_dir.display()))?;
+        candidates_by_cohort
+            .entry(cohort.cohort_id.to_string())
+            .or_default()
+            .push(generation);
+        evidence.push(candidate_evidence);
+    }
+    let cohorts = release_catalogs
+        .into_iter()
+        .map(|release_catalog| {
+            let candidates = candidates_by_cohort
+                .remove(&release_catalog.cohort_id)
+                .unwrap_or_default();
+            combine_progression_generations(
+                release_catalog,
+                candidates,
                 &dataset,
                 repository_observation,
             )
-            .with_context(|| format!("loading candidate run {}", run_dir.display()))
         })
         .collect::<Result<Vec<_>>>()?;
-    let (candidates, evidence): (Vec<_>, Vec<_>) = candidate_pairs.into_iter().unzip();
-    let catalog = combine_progression_generations(
-        release_catalog,
-        candidates,
-        &dataset,
-        repository_observation,
-    )?;
-    Ok((catalog, evidence))
+    if !candidates_by_cohort.is_empty() {
+        bail!("candidate generations remain outside the registered progression cohorts");
+    }
+    Ok((
+        BrowserProgressionIndex {
+            default_cohort_id: WHOLE_FUNCTION_PROGRESSION_COHORT_ID.to_string(),
+            cohorts,
+        },
+        evidence,
+    ))
 }
 
 fn build_browser_progression_catalog_from_site(
@@ -1893,7 +2092,7 @@ fn build_browser_progression_catalog_from_site(
     releases: &[CrateReleaseStatusView],
     repository_observation: Option<&RepositoryHeadObservationView>,
     candidate_run_dirs: &[PathBuf],
-) -> Result<BrowserProgressionCatalog> {
+) -> Result<BrowserProgressionIndex> {
     build_browser_progression_catalog_and_candidate_evidence_from_site(
         site_dir,
         datasets,
@@ -2298,7 +2497,7 @@ fn actual_site_relpaths(site_dir: &Path) -> Result<BTreeSet<String>> {
 
 fn progression_body(root_site_url: &str) -> String {
     format!(
-        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Fixed-IR generation progression</h1><p class=\"meta\">Aggregate quality and per-artifact distributions for the same structural IR corpus across crate releases and evaluated Git revisions; lower means G8r is better</p><p id=\"error\" role=\"alert\"></p></header><main id=\"progression\" data-dataset-key=\"{}\"><div class=\"toolbar\"><label>Baseline <select id=\"baseline-version\" aria-label=\"Baseline generation\"></select></label><label>Current <select id=\"current-version\" aria-label=\"Current generation\"></select></label><label><input id=\"include-incomplete\" type=\"checkbox\"> Include incomplete generations</label></div><p id=\"progression-status\" class=\"meta\" aria-live=\"polite\">Loading generation data…</p><section id=\"progression-summary\" class=\"grid\" aria-live=\"polite\"></section><h2>Quality versus distribution</h2><section id=\"progression-chart\" class=\"progression-chart\" aria-live=\"polite\"><p class=\"muted\">Loading generation data…</p></section><h2>Fixed-IR coverage</h2><section id=\"progression-inventory\" aria-live=\"polite\"></section><section id=\"progression-table\" aria-live=\"polite\"></section></main>",
+        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Fixed-IR generation progression</h1><p class=\"meta\">Aggregate quality and per-artifact distributions for the same structural IR corpus across crate releases and evaluated Git revisions; lower means G8r is better</p><p id=\"error\" role=\"alert\"></p></header><main id=\"progression\" data-dataset-key=\"{}\"><div class=\"toolbar\"><label>Fixed cohort <select id=\"progression-cohort\" aria-label=\"Fixed artifact cohort\"></select></label><label>Baseline <select id=\"baseline-version\" aria-label=\"Baseline generation\"></select></label><label>Current <select id=\"current-version\" aria-label=\"Current generation\"></select></label><label><input id=\"include-incomplete\" type=\"checkbox\"> Include incomplete generations</label></div><p id=\"progression-status\" class=\"meta\" aria-live=\"polite\">Loading generation data…</p><section id=\"progression-summary\" class=\"grid\" aria-live=\"polite\"></section><h2>Quality versus distribution</h2><section id=\"progression-chart\" class=\"progression-chart\" aria-live=\"polite\"><p class=\"muted\">Loading generation data…</p></section><h2>Fixed-IR coverage</h2><section id=\"progression-inventory\" aria-live=\"polite\"></section><section id=\"progression-table\" aria-live=\"polite\"></section></main>",
         crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
     )
 }
@@ -3161,17 +3360,20 @@ fn build_static_site_with_candidate_runs_in_place(
         )?;
     let mut candidate_evidence = Vec::with_capacity(candidate_evidence_inputs.len());
     for evidence in candidate_evidence_inputs {
-        let generation_id = evidence
+        let candidate_run = evidence
             .manifest
             .candidate_run
             .as_ref()
-            .context("candidate evidence has no candidate run identity")?
-            .candidate_run_id
-            .clone();
+            .context("candidate evidence has no candidate run identity")?;
+        let cohort_id = progression_cohort_for_candidate(candidate_run)?
+            .cohort_id
+            .to_string();
+        let generation_id = candidate_run.candidate_run_id.clone();
         let url = format!("data/candidates/{generation_id}/evidence.json");
         let bytes = encode_candidate_progression_evidence(&evidence)?;
         write_file(&options.out_dir, &url, &bytes)?;
         candidate_evidence.push(BrowserCandidateEvidenceRef {
+            cohort_id,
             generation_id,
             url,
             bytes: bytes.len() as u64,
@@ -3872,7 +4074,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         match load_progression_comparison_dataset_from_site(site_dir, &catalog.datasets)? {
             Some(dataset) => {
                 let mut candidate_generations =
-                    Vec::with_capacity(catalog.candidate_evidence.len());
+                    BTreeMap::<String, Vec<BrowserProgressionGeneration>>::new();
                 for evidence_ref in &catalog.candidate_evidence {
                     let bytes = fs::read(site_dir.join(&evidence_ref.url)).with_context(|| {
                         format!("reading candidate evidence {}", evidence_ref.url)
@@ -3886,33 +4088,60 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
                         );
                     }
                     let evidence = decode_canonical_candidate_progression_evidence(&bytes)?;
-                    let evidence_generation_id = evidence
+                    let candidate_run = evidence
                         .manifest
                         .candidate_run
                         .as_ref()
-                        .context("candidate evidence has no candidate run identity")?
-                        .candidate_run_id
-                        .clone();
-                    if evidence_generation_id != evidence_ref.generation_id {
+                        .context("candidate evidence has no candidate run identity")?;
+                    let cohort = progression_cohort_for_candidate(candidate_run)?;
+                    if candidate_run.candidate_run_id != evidence_ref.generation_id
+                        || cohort.cohort_id != evidence_ref.cohort_id
+                    {
                         bail!("candidate evidence identity disagrees with its catalog reference");
                     }
+                    let release_catalog = release_progression
+                        .cohorts
+                        .iter()
+                        .find(|value| value.cohort_id == evidence_ref.cohort_id)
+                        .context(
+                            "candidate evidence references an unavailable progression cohort",
+                        )?;
                     let generation = candidate_progression_generation_from_evidence(
                         evidence,
-                        &release_progression,
+                        release_catalog,
                         &dataset,
                         catalog.repository_head_observation.as_ref(),
                     )?;
                     if generation.generation_id != evidence_ref.generation_id {
                         bail!("candidate evidence generated an unexpected progression identity");
                     }
-                    candidate_generations.push(generation);
+                    candidate_generations
+                        .entry(evidence_ref.cohort_id.clone())
+                        .or_default()
+                        .push(generation);
                 }
-                combine_progression_generations(
-                    release_progression,
-                    candidate_generations,
-                    &dataset,
-                    catalog.repository_head_observation.as_ref(),
-                )?
+                let cohorts = release_progression
+                    .cohorts
+                    .into_iter()
+                    .map(|release_catalog| {
+                        let candidates = candidate_generations
+                            .remove(&release_catalog.cohort_id)
+                            .unwrap_or_default();
+                        combine_progression_generations(
+                            release_catalog,
+                            candidates,
+                            &dataset,
+                            catalog.repository_head_observation.as_ref(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if !candidate_generations.is_empty() {
+                    bail!("candidate evidence remains outside registered progression cohorts");
+                }
+                BrowserProgressionIndex {
+                    default_cohort_id: release_progression.default_cohort_id,
+                    cohorts,
+                }
             }
             None if catalog.candidate_evidence.is_empty() => release_progression,
             None => bail!("candidate evidence exists without a release comparison dataset"),
@@ -4178,8 +4407,13 @@ pub(crate) fn smoke_static_site(
     let catalog = decode_canonical_browser_catalog(
         &fs::read(site_dir.join("catalog.json")).context("reading browser smoke catalog")?,
     )?;
-    let complete_generations = catalog
+    let progression_catalog = catalog
         .progression
+        .cohorts
+        .iter()
+        .find(|cohort| cohort.cohort_id == catalog.progression.default_cohort_id)
+        .context("browser catalog has no default progression cohort")?;
+    let complete_generations = progression_catalog
         .generations
         .iter()
         .filter(|generation| generation.coverage == BrowserProgressionCoverage::CohortComplete)

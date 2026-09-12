@@ -849,10 +849,18 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
         decode_canonical_browser_catalog(&catalog_bytes).expect("decode candidate browser catalog");
     assert_eq!(catalog.candidate_evidence.len(), 1);
     assert_eq!(catalog.candidate_evidence[0].generation_id, generation_id);
+    assert_eq!(
+        catalog.candidate_evidence[0].cohort_id,
+        WHOLE_FUNCTION_PROGRESSION_COHORT_ID
+    );
     assert!(site_dir.join(&catalog.candidate_evidence[0].url).is_file());
     let evidence_url = catalog.candidate_evidence[0].url.clone();
     let candidate = catalog
         .progression
+        .cohorts
+        .iter_mut()
+        .find(|cohort| cohort.cohort_id == WHOLE_FUNCTION_PROGRESSION_COHORT_ID)
+        .expect("whole-function progression cohort")
         .generations
         .iter_mut()
         .find(|generation| generation.generation_id == generation_id)
@@ -1235,6 +1243,15 @@ fn site_build_and_verify_supports_subdirectory_base() {
     )
     .expect("decode browser catalog");
     assert_eq!(catalog.schema_version, BROWSER_CATALOG_SCHEMA_VERSION);
+    assert_eq!(
+        catalog.progression.default_cohort_id,
+        WHOLE_FUNCTION_PROGRESSION_COHORT_ID
+    );
+    assert_eq!(catalog.progression.cohorts.len(), 2);
+    assert!(catalog.progression.cohorts.iter().any(|cohort| {
+        cohort.cohort_id == MFFC_PROGRESSION_COHORT_ID
+            && cohort.cohort_ir_count == MFFC_PROGRESSION_IR_COUNT as u64
+    }));
     let index_html = fs::read_to_string(site_dir.join("index.html")).expect("read homepage HTML");
     assert!(index_html.contains("Boolean synthesis comparison"));
     assert!(index_html.contains("id=\"home-overview\""));
@@ -1263,6 +1280,7 @@ fn site_build_and_verify_supports_subdirectory_base() {
             .contains(crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME)
     );
     assert!(progression_html.contains("Quality versus distribution"));
+    assert!(progression_html.contains("id=\"progression-cohort\""));
     assert!(progression_html.contains("id=\"include-incomplete\""));
     assert!(progression_html.contains("id=\"progression-inventory\""));
     let releases_html =
@@ -1272,7 +1290,7 @@ fn site_build_and_verify_supports_subdirectory_base() {
     assert!(releases_html.contains("not processed"));
     assert!(index_html.contains("Processing status"));
     assert!(APP_JS.contains("Progression data is not available in this snapshot."));
-    assert!(APP_JS.contains("At least two cohort-complete generations are needed"));
+    assert!(APP_JS.contains("at least two cohort-complete generations are needed"));
     assert!(APP_JS.contains("Aggregate quality"));
     assert!(APP_JS.contains("sample.structural_hash"));
     assert!(APP_JS.contains("contains duplicate fixed IR"));
@@ -1492,6 +1510,74 @@ if (href !== 'ir-fn-g8r-abc-vs-codegen-yosys-abc/?crate_version=0.68.0&losses_on
         "node failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn mffc_progression_catalog_uses_the_pinned_structural_population() {
+    let cohort = progression_cohort(MFFC_PROGRESSION_COHORT_ID).expect("MFFC cohort");
+    let hashes = progression_ir_hashes(cohort).expect("pinned MFFC hashes");
+    let artifacts = progression_ir_artifacts(cohort).expect("pinned MFFC artifacts");
+    assert_eq!(hashes.len(), MFFC_PROGRESSION_IR_COUNT);
+    assert_eq!(artifacts.len(), MFFC_PROGRESSION_IR_COUNT);
+    assert_eq!(
+        progression_ir_sha256(&hashes).expect("MFFC cohort digest"),
+        MFFC_PROGRESSION_IR_SHA256
+    );
+
+    let sample = |crate_version: &str, structural_hash: &str, index: usize| {
+        crate::view::StdlibG8rVsYosysSample {
+            fn_key: format!("mffc-{crate_version}-{index}"),
+            crate_version: crate_version.to_string(),
+            dso_version: "0.1.0".to_string(),
+            stdlib_root_action_id: None,
+            ir_action_id: sha256_hex(format!("ir-{crate_version}-{index}").as_bytes()),
+            ir_top: Some(format!("__mffc_{index}")),
+            structural_hash: Some(structural_hash.to_string()),
+            ir_node_count: 1,
+            g8r_nodes: 1.0,
+            g8r_levels: 1.0,
+            yosys_abc_nodes: 1.0,
+            yosys_abc_levels: 1.0,
+            g8r_product: 1.0,
+            yosys_abc_product: 1.0,
+            g8r_product_loss: 0.0,
+            g8r_stats_action_id: sha256_hex(format!("g8r-{crate_version}-{index}").as_bytes()),
+            yosys_abc_stats_action_id: sha256_hex(
+                format!("yosys-{crate_version}-{index}").as_bytes(),
+            ),
+        }
+    };
+    let mut samples = Vec::new();
+    for (index, hash) in hashes.iter().enumerate() {
+        samples.push(sample("0.1.0", hash, index));
+        if index + 1 < hashes.len() {
+            samples.push(sample("0.2.0", hash, index));
+        }
+    }
+    let dataset = StdlibG8rVsYosysDataset {
+        fraig: false,
+        samples,
+        min_ir_nodes: 1,
+        max_ir_nodes: 1,
+        g8r_only_count: 0,
+        yosys_only_count: 0,
+        available_crate_versions: vec!["0.1.0".to_string(), "0.2.0".to_string()],
+    };
+    let catalog = build_browser_progression_catalog_for_cohort(&dataset, &[], cohort)
+        .expect("build fixed MFFC progression");
+    assert_eq!(catalog.cohort_id, MFFC_PROGRESSION_COHORT_ID);
+    assert_eq!(catalog.artifact_kind, BrowserProgressionArtifactKind::Mffc);
+    assert_eq!(catalog.cohort_complete_generation_count, 1);
+    assert_eq!(catalog.generations.len(), 2);
+    assert_eq!(
+        catalog.generations[0].coverage,
+        BrowserProgressionCoverage::CohortComplete
+    );
+    assert_eq!(
+        catalog.generations[1].coverage,
+        BrowserProgressionCoverage::Partial
+    );
+    assert_eq!(catalog.generations[1].missing_cohort_ir_count, 1);
 }
 
 #[test]
@@ -1844,7 +1930,7 @@ const generation = (generation_id, dso_version) => ({
   extra_ir_count: 0,
 });
 const rolling = api.releaseGenerations(
-  {progression: {cohort_ir_count: 2, cohort_ir_hashes: [hash('a'), hash('b')], generations: [generation('new', '0.10.0'), generation('old', '0.9.0')]}},
+  {cohort_id: 'whole-functions-v1', artifact_kind: 'whole_function', cohort_ir_count: 2, cohort_ir_hashes: [hash('a'), hash('b')], generations: [generation('new', '0.10.0'), generation('old', '0.9.0')]},
   [
     {...sample('a', 'a', 0), crate_version: '1.0.0', dso_version: '0.9.0'},
     {...sample('a', 'a', 0), crate_version: '1.0.0', dso_version: '0.10.0'},
@@ -1857,13 +1943,13 @@ if (rolling.length !== 2 || rolling.some(value => value.samples.length !== 1)
   throw new Error(`mixed DSO populations must remain separate: ${JSON.stringify(rolling)}`);
 }
 const candidateRows = api.releaseGenerations(
-  {progression: {cohort_ir_count: 1, cohort_ir_hashes: [hash('a')], generations: [
+  {cohort_id: 'whole-functions-v1', artifact_kind: 'whole_function', cohort_ir_count: 1, cohort_ir_hashes: [hash('a')], generations: [
     {...generation('release', '0.9.0'), event_time_utc: '2026-08-29T00:00:00Z', coverage: 'cohort_complete', observed_ir_count: 1, missing_cohort_ir_count: 0},
     {generation_id: 'candidate', origin: {kind: 'git_revision', commit: hash('c')}, display_label: 'main@cccccccc',
       event_time_utc: '2026-09-07T19:26:18Z', dso_version: '0.9.0', baseline_generation_id: 'release',
       coverage: 'cohort_complete', observed_ir_count: 1, cohort_ir_count: 1, missing_cohort_ir_count: 0,
       extra_ir_count: 0, candidate_samples: [sample('candidate-a', 'a', 2, 102, 100)]},
-  ]}},
+  ]},
   [{...sample('release-a', 'a', 0), crate_version: '1.0.0', dso_version: '0.9.0'}],
 );
 if (candidateRows.length !== 2 || candidateRows[1].display_label !== 'main@cccccccc'

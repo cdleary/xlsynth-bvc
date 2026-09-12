@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: 1
+policy_name: "mffc-progression-ir"
+semantic_version: 1
+expected_corpus_sample_count: 904
+expected_corpus_artifact_manifest_sha256 {
+  value: "\xcf\xc3\x6a\xfc\xd8\xb1\x78\x68\x76\x90\xa0\x3d\x6c\x8b\x55\x5e\x95\x17\xe7\x60\x6a\xe8\x06\x2d\x50\x24\x52\xcf\x29\xe8\x86\x1c"
+}
