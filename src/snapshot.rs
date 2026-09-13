@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 
 use crate::analysis::{decode_analysis_report, validate_analysis_report_against_store};
 use crate::campaign::{campaign_analysis_path, list_finalized_campaign_runs};
-use crate::proto::{FILE_DESCRIPTOR_SET, PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256, v1 as pb};
+use crate::proto::{COMPATIBLE_PRIOR_SCHEMA_DESCRIPTOR_SHA256S, FILE_DESCRIPTOR_SET, v1 as pb};
 use crate::query::{
     build_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_bytes,
     build_ir_fn_corpus_g8r_vs_yosys_dataset_index_bytes,
@@ -711,7 +711,8 @@ fn descriptor_sha256() -> String {
 }
 
 fn is_supported_schema_descriptor(descriptor: &str) -> bool {
-    descriptor == descriptor_sha256() || descriptor == PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256
+    descriptor == descriptor_sha256()
+        || COMPATIBLE_PRIOR_SCHEMA_DESCRIPTOR_SHA256S.contains(&descriptor)
 }
 
 fn media_type_for_relpath(relpath: &str) -> &'static str {
@@ -1711,7 +1712,7 @@ mod tests {
         let mut prior_schema_manifest =
             load_static_snapshot_manifest(&out_dir).expect("load current-schema manifest");
         prior_schema_manifest.schema_descriptor_sha256 =
-            PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256.to_string();
+            crate::proto::PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256.to_string();
         prior_schema_manifest.snapshot_id = snapshot_id_for_dataset_files_with_descriptor(
             &prior_schema_manifest.dataset_files,
             prior_schema_manifest.source_action_set_sha256.as_deref(),
@@ -1729,7 +1730,7 @@ mod tests {
             load_static_snapshot_manifest(&out_dir).expect("load origin/main-compatible snapshot");
         assert_eq!(
             loaded_prior.schema_descriptor_sha256,
-            PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256
+            crate::proto::PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256
         );
         verify_static_snapshot(&out_dir).expect("verify origin/main-compatible snapshot");
         fs::remove_dir_all(root).expect("cleanup");

@@ -115,6 +115,12 @@ Browser catalogs and publication pointers are deny-unknown typed projections.
 Their raw bytes must equal the canonical Rust encoding during verification;
 semantic deserialization alone is insufficient.
 
+Fixed-corpus progression runs are admitted from the corpus runner's operational
+JSON boundary, validated against the pinned cohort and reconstructed action
+graph, and immediately encoded as `FixedCorpusProgressionRunEvidence`. Release
+and Git generations use the same protobuf record; only the final browser
+catalog contains their JSON projection.
+
 ## Regeneration and verification
 
 A schema change must pass:
