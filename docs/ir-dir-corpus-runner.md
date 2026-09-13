@@ -210,22 +210,26 @@ Yosys/ABC runtime identifiers, so an unpublishable runtime override fails before
 `manifest.json` itself is replaced atomically. Status refresh and site generation both refuse a
 candidate manifest whose identity is missing from or disagrees with the durable marker.
 
-After all candidate samples are complete, include the typed run in a local static site:
+After all samples are complete, include release and Git runs in a local static site:
 
 ```bash
 cargo run --bin xlsynth_bvc -- \
   build-static-site \
   --snapshot-dir /path/to/current/snapshot \
   --out-dir /tmp/xlsynth-bvc-candidate-site \
-  --candidate-run-dir /tmp/xlsynth-bvc-mainline-candidate
+  --progression-run-dir /tmp/xlsynth-bvc-release-0.70.0 \
+  --progression-run-dir /tmp/xlsynth-bvc-mainline-candidate
 ```
 
-The option is repeatable. Rendering rejects partial, mismatched, or noncanonical candidate data;
-the captured release generation, DSO, fixed structural hashes, source-byte digests, reconstructed
-action IDs, common Yosys/ABC script/runtime, and released stats runtime must all match. Candidate
-metrics are loaded from the canonical candidate store and must match their provenance-declared
-byte digest. A valid Git generation is dated by commit time and defaults to a direct post-ABC G8r
-product comparison against its captured release.
+The option is repeatable. A release run must use `g8r-abc-vs-yabc-aig-diff`; an unmatched
+`g8r-vs-yabc-aig-diff` run is rejected because its G8r metrics are not comparable to the Git
+G8r+ABC path. Rendering rejects partial, mismatched, or noncanonical run data. DSO, fixed structural
+hashes, source-byte digests, the complete reconstructed action graph, common Yosys/ABC
+script/runtime, and stats runtime must all match. Metrics are loaded from each canonical run store
+and must match their provenance-declared byte digest. The site retains every admitted generation as
+typed protobuf evidence and emits JSON only for the final browser projection. A valid Git
+generation is dated by commit time and defaults to a direct post-ABC G8r product comparison against
+its captured release. `--candidate-run-dir` remains a hidden compatibility alias.
 
 ## Scheduling Policies
 

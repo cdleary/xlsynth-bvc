@@ -435,16 +435,7 @@ fn candidate_stats_are_read_from_digest_verified_provenance() {
         read_verified_candidate_stats_with_evidence(&run_dir, &store, &sample, &expected_action)
             .expect("read verified stats");
     assert_eq!(stats["and_nodes"], 3);
-    let evidence_json = String::from_utf8(
-        encode_candidate_progression_evidence(&CandidateProgressionEvidence {
-            schema_version: CANDIDATE_PROGRESSION_EVIDENCE_SCHEMA_VERSION,
-            manifest: candidate_manifest_input(&"8".repeat(40)),
-            stats: vec![evidence],
-        })
-        .expect("encode candidate evidence"),
-    )
-    .expect("UTF-8 evidence");
-    assert!(!evidence_json.contains("/srv/private/customer-a"));
+    assert!(!format!("{evidence:?}").contains("/srv/private/customer-a"));
     fs::write(&stats_path, br#"{"and_nodes":9,"depth":9}"#).expect("tamper stats");
     let error =
         read_verified_candidate_stats_with_evidence(&run_dir, &store, &sample, &expected_action)
@@ -489,7 +480,7 @@ fn build_historical_candidate_site_fixture(root: &Path) -> (PathBuf, String) {
         .ensure_layout()
         .expect("candidate store layout");
     let mut release_samples = Vec::new();
-    let mut candidate_samples = Vec::new();
+    let mut run_samples = Vec::new();
     let mut g8r_points = Vec::new();
     let mut yosys_points = Vec::new();
     for (index, (structural_hash, source_sha256)) in release_progression_ir_artifacts()
@@ -678,7 +669,7 @@ fn build_historical_candidate_site_fixture(root: &Path) -> (PathBuf, String) {
             },
         });
         release_samples.push(release_sample);
-        candidate_samples.push(CandidateSampleInput {
+        run_samples.push(CandidateSampleInput {
             sample_id,
             source_relpath,
             source_sha256,
@@ -694,7 +685,7 @@ fn build_historical_candidate_site_fixture(root: &Path) -> (PathBuf, String) {
     drop(candidate_store);
 
     let action_manifest_sha256 =
-        candidate_action_manifest_sha256(&candidate_samples).expect("candidate action manifest");
+        candidate_action_manifest_sha256(&run_samples).expect("candidate action manifest");
     let mut candidate_run = CandidateRunInput {
         schema_version: 4,
         candidate_run_id: String::new(),
@@ -739,7 +730,7 @@ fn build_historical_candidate_site_fixture(root: &Path) -> (PathBuf, String) {
         yosys_script: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
         yosys_script_sha256: "1".repeat(64),
         candidate_run: Some(candidate_run),
-        samples: candidate_samples,
+        samples: run_samples,
     };
     fs::write(
         run_dir.join("manifest.json"),
@@ -824,7 +815,7 @@ fn build_historical_candidate_site_fixture(root: &Path) -> (PathBuf, String) {
     drop(store);
 
     let site_dir = root.join("site");
-    build_static_site_with_candidate_runs(
+    build_static_site_with_progression_runs(
         &BuildStaticSiteOptions {
             snapshot_dir,
             out_dir: site_dir.clone(),
@@ -847,14 +838,18 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     let catalog_bytes = fs::read(&catalog_path).expect("read candidate browser catalog");
     let mut catalog =
         decode_canonical_browser_catalog(&catalog_bytes).expect("decode candidate browser catalog");
-    assert_eq!(catalog.candidate_evidence.len(), 1);
-    assert_eq!(catalog.candidate_evidence[0].generation_id, generation_id);
+    assert_eq!(catalog.progression_evidence.len(), 1);
+    assert_eq!(catalog.progression_evidence[0].generation_id, generation_id);
     assert_eq!(
-        catalog.candidate_evidence[0].cohort_id,
+        catalog.progression_evidence[0].cohort_id,
         WHOLE_FUNCTION_PROGRESSION_COHORT_ID
     );
-    assert!(site_dir.join(&catalog.candidate_evidence[0].url).is_file());
-    let evidence_url = catalog.candidate_evidence[0].url.clone();
+    assert!(
+        site_dir
+            .join(&catalog.progression_evidence[0].url)
+            .is_file()
+    );
+    let evidence_url = catalog.progression_evidence[0].url.clone();
     let candidate = catalog
         .progression
         .cohorts
@@ -879,10 +874,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
         BrowserProgressionOrigin::CrateRelease => panic!("expected Git candidate"),
     }
 
-    let sample = candidate
-        .candidate_samples
-        .first_mut()
-        .expect("candidate sample");
+    let sample = candidate.run_samples.first_mut().expect("candidate sample");
     sample.g8r_nodes += 1.0;
     sample.g8r_product = sample.g8r_nodes * sample.g8r_levels;
     sample.g8r_product_loss = sample.g8r_product - sample.yosys_abc_product;
@@ -901,18 +893,33 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     fs::write(&catalog_path, &catalog_bytes).expect("restore candidate browser catalog");
     refresh_site_manifest_entry(&site_dir, "catalog.json");
     let evidence_path = site_dir.join(&evidence_url);
-    let mut evidence = decode_canonical_candidate_progression_evidence(
-        &fs::read(&evidence_path).expect("read candidate evidence"),
-    )
-    .expect("decode candidate evidence");
-    evidence.stats[0].and_nodes += 1.0;
-    let tampered_evidence_bytes =
-        encode_candidate_progression_evidence(&evidence).expect("encode tampered evidence");
+    let evidence_bytes = fs::read(&evidence_path).expect("read candidate evidence");
+    let mut noncanonical_evidence = evidence_bytes.clone();
+    noncanonical_evidence.extend_from_slice(&[0xf8, 0x07, 0x01]);
+    let noncanonical_error = decode_progression_run_evidence(&noncanonical_evidence)
+        .expect_err("unknown protobuf fields must not survive publication verification");
+    assert!(format!("{noncanonical_error:#}").contains("not canonically encoded"));
+
+    let mut wrong_graph = pb::FixedCorpusProgressionRunEvidence::decode(evidence_bytes.as_slice())
+        .expect("decode candidate action graph evidence");
+    let action_graph = wrong_graph.samples[0]
+        .action_graph
+        .as_mut()
+        .expect("candidate action graph");
+    action_graph.g8r_stats = action_graph.import_ir.clone();
+    let action_graph_error = decode_progression_run_evidence(&wrong_graph.encode_to_vec())
+        .expect_err("typed action graph must independently bind published action IDs");
+    assert!(format!("{action_graph_error:#}").contains("G8r stats action"));
+
+    let mut evidence = pb::FixedCorpusProgressionRunEvidence::decode(evidence_bytes.as_slice())
+        .expect("decode candidate evidence");
+    evidence.samples[0].g8r_nodes += 1.0;
+    let tampered_evidence_bytes = evidence.encode_to_vec();
     fs::write(&evidence_path, &tampered_evidence_bytes).expect("write tampered candidate evidence");
     let mut evidence_catalog =
         decode_canonical_browser_catalog(&catalog_bytes).expect("decode restored browser catalog");
     let evidence_ref = evidence_catalog
-        .candidate_evidence
+        .progression_evidence
         .iter_mut()
         .find(|candidate| candidate.url == evidence_url)
         .expect("candidate evidence catalog reference");
@@ -928,7 +935,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     let error = verify_static_site(&site_dir)
         .expect_err("candidate metrics must match their public projection digest");
     assert!(
-        format!("{error:#}").contains("metric projection digest"),
+        format!("{error:#}").contains("projection digest"),
         "unexpected error: {error:#}"
     );
     fs::remove_dir_all(root).expect("cleanup candidate site fixture");
@@ -947,7 +954,7 @@ fn candidate_preflight_rejects_malformed_commit_without_panicking() {
     .expect("write candidate manifest");
     write_candidate_run_marker(&run_dir, &manifest);
 
-    let error = preflight_candidate_run_dirs(&[run_dir])
+    let error = preflight_progression_run_dirs(&[run_dir])
         .expect_err("malformed commit must fail candidate preflight");
     assert!(
         error
@@ -969,7 +976,7 @@ fn candidate_preflight_requires_matching_durable_marker() {
     )
     .expect("write candidate manifest");
 
-    let missing_error = preflight_candidate_run_dirs(std::slice::from_ref(&run_dir))
+    let missing_error = preflight_progression_run_dirs(std::slice::from_ref(&run_dir))
         .expect_err("candidate manifest without marker must fail");
     assert!(
         format!("{missing_error:#}").contains("no durable workspace marker"),
@@ -978,13 +985,106 @@ fn candidate_preflight_requires_matching_durable_marker() {
 
     let other_manifest = candidate_manifest_input(&"7".repeat(40));
     write_candidate_run_marker(&run_dir, &other_manifest);
-    let mismatch_error = preflight_candidate_run_dirs(std::slice::from_ref(&run_dir))
+    let mismatch_error = preflight_progression_run_dirs(std::slice::from_ref(&run_dir))
         .expect_err("candidate manifest and marker identities must match");
     assert!(
         format!("{mismatch_error:#}").contains("identity does not match"),
         "unexpected error: {mismatch_error:#}"
     );
     fs::remove_dir_all(root).expect("cleanup candidate marker fixture");
+}
+
+fn write_release_preflight_manifest(
+    run_dir: &Path,
+    recipe_preset: &str,
+    sample_count: usize,
+    sample_status: &str,
+) {
+    let mut value =
+        serde_json::to_value(candidate_manifest_input(&"8".repeat(40))).expect("release fixture");
+    value["candidate_run"] = serde_json::Value::Null;
+    value["recipe_preset"] = serde_json::json!(recipe_preset);
+    value["scheduling_policy"] = serde_json::json!({
+        "policy_name": "release-progression-ir",
+        "expected_corpus_sample_count": RELEASE_PROGRESSION_IR_COUNT,
+        "expected_corpus_artifact_manifest_sha256":
+            RELEASE_PROGRESSION_ARTIFACT_MANIFEST_SHA256,
+    });
+    let samples = value["samples"]
+        .as_array_mut()
+        .expect("release fixture samples");
+    samples.truncate(sample_count);
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let sample = sample.as_object_mut().expect("release fixture sample");
+        let action_id = |offset: usize| format!("{:064x}", index + offset);
+        for (field, field_value) in [
+            ("driver_crate_version", serde_json::json!("0.68.0")),
+            ("stats_driver_crate_version", serde_json::json!("0.68.0")),
+            ("import_ir_status", serde_json::json!("done")),
+            ("g8r_aig_status", serde_json::json!("done")),
+            ("g8r_abc_aig_action_id", serde_json::json!(action_id(4001))),
+            ("g8r_abc_aig_status", serde_json::json!("done")),
+            ("g8r_stats_status", serde_json::json!("done")),
+            (
+                "combo_verilog_action_id",
+                serde_json::json!(action_id(5001)),
+            ),
+            ("combo_verilog_status", serde_json::json!("done")),
+            ("yosys_abc_aig_status", serde_json::json!("done")),
+            (
+                "yosys_abc_stats_action_id",
+                serde_json::json!(action_id(6001)),
+            ),
+            ("yosys_abc_stats_status", serde_json::json!("done")),
+            ("status", serde_json::json!(sample_status)),
+        ] {
+            sample.insert(field.to_string(), field_value);
+        }
+    }
+    fs::create_dir_all(run_dir).expect("create release fixture directory");
+    fs::write(
+        run_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&value).expect("serialize release fixture"),
+    )
+    .expect("write release fixture");
+}
+
+#[test]
+fn release_preflight_rejects_unmatched_and_incomplete_runs() {
+    let root = temp_root();
+    let run_dir = root.join("release");
+
+    write_release_preflight_manifest(
+        &run_dir,
+        "g8r-vs-yabc-aig-diff",
+        RELEASE_PROGRESSION_IR_COUNT,
+        "done",
+    );
+    let unmatched = preflight_progression_run_dirs(std::slice::from_ref(&run_dir))
+        .expect_err("unmatched release recipe must fail");
+    assert!(format!("{unmatched:#}").contains("unmatched G8r data is not comparable"));
+
+    write_release_preflight_manifest(
+        &run_dir,
+        "g8r-abc-vs-yabc-aig-diff",
+        RELEASE_PROGRESSION_IR_COUNT - 1,
+        "done",
+    );
+    let truncated = preflight_progression_run_dirs(std::slice::from_ref(&run_dir))
+        .expect_err("truncated release cohort must fail");
+    assert!(format!("{truncated:#}").contains("cohort-complete"));
+
+    write_release_preflight_manifest(
+        &run_dir,
+        "g8r-abc-vs-yabc-aig-diff",
+        RELEASE_PROGRESSION_IR_COUNT,
+        "pending",
+    );
+    let pending = preflight_progression_run_dirs(std::slice::from_ref(&run_dir))
+        .expect_err("incomplete release samples must fail");
+    assert!(format!("{pending:#}").contains("cohort-complete"));
+
+    fs::remove_dir_all(root).expect("cleanup release preflight fixture");
 }
 
 fn empty_versions_index_bytes() -> Vec<u8> {
@@ -1581,6 +1681,57 @@ fn mffc_progression_catalog_uses_the_pinned_structural_population() {
 }
 
 #[test]
+fn explicit_release_progression_generation_supersedes_snapshot_generation() {
+    let generation_id = "release-generation".to_string();
+    let generation = |label: &str, origin: BrowserProgressionOrigin| BrowserProgressionGeneration {
+        generation_id: generation_id.clone(),
+        origin,
+        display_label: label.to_string(),
+        event_time_utc: Some("2026-01-01T00:00:00Z".to_string()),
+        crate_version: Some("0.1.0".to_string()),
+        dso_version: "0.1.0".to_string(),
+        baseline_generation_id: None,
+        coverage: BrowserProgressionCoverage::CohortComplete,
+        observed_ir_count: 1,
+        cohort_ir_count: 1,
+        missing_cohort_ir_count: 0,
+        extra_ir_count: 0,
+        run_samples: Vec::new(),
+    };
+    let mut catalog = BrowserProgressionCatalog {
+        cohort_id: "test".to_string(),
+        display_label: "Test".to_string(),
+        artifact_kind: BrowserProgressionArtifactKind::Mffc,
+        dataset_key: "test-dataset".to_string(),
+        cohort_ir_count: 1,
+        cohort_ir_sha256: None,
+        cohort_artifact_manifest_sha256: "artifact-manifest".to_string(),
+        cohort_ir_hashes: vec!["hash".to_string()],
+        cohort_complete_generation_count: 1,
+        generations: vec![generation(
+            "snapshot",
+            BrowserProgressionOrigin::CrateRelease,
+        )],
+    };
+    let mut incoming_generation_ids = BTreeSet::new();
+    let explicit = generation("explicit", BrowserProgressionOrigin::CrateRelease);
+
+    merge_validated_progression_generation(&mut catalog, &mut incoming_generation_ids, explicit)
+        .expect("explicit release supersedes snapshot release");
+
+    assert_eq!(catalog.generations.len(), 1);
+    assert_eq!(catalog.generations[0].display_label, "explicit");
+    let duplicate = generation("duplicate", BrowserProgressionOrigin::CrateRelease);
+    let error = merge_validated_progression_generation(
+        &mut catalog,
+        &mut incoming_generation_ids,
+        duplicate,
+    )
+    .expect_err("duplicate explicit generation must still fail");
+    assert!(format!("{error:#}").contains("duplicate input generation"));
+}
+
+#[test]
 fn progression_catalog_uses_fixed_ir_structural_hash_population() {
     fn sample(
         crate_version: &str,
@@ -1683,7 +1834,7 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
     assert_eq!(generation("0.2.0").extra_ir_count, 1);
 
     let artifacts = release_progression_ir_artifacts().expect("fixed artifact manifest");
-    let candidate_samples = hashes
+    let run_samples = hashes
         .iter()
         .map(|structural_hash| {
             let baseline = dataset
@@ -1703,7 +1854,7 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
                 top_fn_name: baseline.ir_top.clone(),
             })
             .expect("candidate IR action ID");
-            BrowserCandidateProgressionSample {
+            BrowserProgressionSample {
                 fn_key: baseline.fn_key.clone(),
                 structural_hash: structural_hash.clone(),
                 source_sha256,
@@ -1742,7 +1893,7 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
         cohort_ir_count: RELEASE_PROGRESSION_IR_COUNT as u64,
         missing_cohort_ir_count: 0,
         extra_ir_count: 0,
-        candidate_samples,
+        run_samples,
     };
     let observation = RepositoryHeadObservationView {
         schema_version: 2,
@@ -1860,7 +2011,7 @@ global.document = {
 };
 const app = fs.readFileSync(0, 'utf8');
 const prefix = app.slice(0, app.indexOf('async function main()'));
-const api = new Function(prefix + '\nreturn {compareSamples,medianPairedProductLossChange,progressionSelection,releaseGenerations,releaseStats,renderGenerationPair};')();
+const api = new Function(prefix + '\nreturn {compareSamples,medianPairedProductLossChange,progressionSelection,progressionSvg,releaseGenerations,releaseStats,renderGenerationPair};')();
 const hash = value => value.repeat(64);
 const sample = (fn_key, hashValue, g8r_product_loss, g8r_product = 100 + g8r_product_loss, yosys_abc_product = 100) => ({
   fn_key,
@@ -1944,15 +2095,17 @@ if (rolling.length !== 2 || rolling.some(value => value.samples.length !== 1)
 }
 const candidateRows = api.releaseGenerations(
   {cohort_id: 'whole-functions-v1', artifact_kind: 'whole_function', cohort_ir_count: 1, cohort_ir_hashes: [hash('a')], generations: [
-    {...generation('release', '0.9.0'), event_time_utc: '2026-08-29T00:00:00Z', coverage: 'cohort_complete', observed_ir_count: 1, missing_cohort_ir_count: 0},
+    {...generation('release', '0.9.0'), event_time_utc: '2026-08-29T00:00:00Z', coverage: 'cohort_complete', observed_ir_count: 1, missing_cohort_ir_count: 0,
+      run_samples: [sample('embedded-release-a', 'a', 5, 105, 100)]},
     {generation_id: 'candidate', origin: {kind: 'git_revision', commit: hash('c')}, display_label: 'main@cccccccc',
       event_time_utc: '2026-09-07T19:26:18Z', dso_version: '0.9.0', baseline_generation_id: 'release',
       coverage: 'cohort_complete', observed_ir_count: 1, cohort_ir_count: 1, missing_cohort_ir_count: 0,
-      extra_ir_count: 0, candidate_samples: [sample('candidate-a', 'a', 2, 102, 100)]},
+      extra_ir_count: 0, run_samples: [sample('candidate-a', 'a', 2, 102, 100)]},
   ]},
   [{...sample('release-a', 'a', 0), crate_version: '1.0.0', dso_version: '0.9.0'}],
 );
-if (candidateRows.length !== 2 || candidateRows[1].display_label !== 'main@cccccccc'
+if (candidateRows.length !== 2 || candidateRows[0].samples[0].g8r_product !== 105
+    || candidateRows[1].display_label !== 'main@cccccccc'
     || candidateRows[1].baseline_generation_id !== 'release'
     || candidateRows[1].samples[0].g8r_product !== 102) {
   throw new Error(`typed Git candidate rows were not preserved: ${JSON.stringify(candidateRows)}`);
@@ -1994,6 +2147,14 @@ if (stats.g8r_total !== 155 || stats.yosys_total !== 150 || stats.total_loss !==
     || Math.abs(stats.aggregate_pct - (100 / 30)) > 1e-9
     || stats.gross_regression !== 10 || stats.gross_improvement !== 5) {
   throw new Error(`unexpected aggregate quality statistics: ${JSON.stringify(stats)}`);
+}
+const layeredSvg = api.progressionSvg([
+  {display_label: 'v1.0.0', origin: {kind: 'crate_release'}, event_time_utc: '2026-08-01T00:00:00Z', value: 1},
+  {display_label: 'main@cccccccc', origin: {kind: 'git_revision'}, event_time_utc: '2026-08-02T00:00:00Z', value: 1},
+], [{key: 'value', lineClass: 'line', dotClass: 'dot', title: row => row.display_label}], 'value', String, 'layering');
+if (layeredSvg.indexOf('<title>main@cccccccc</title>')
+    > layeredSvg.indexOf('<title>v1.0.0</title>')) {
+  throw new Error(`Git marker must be emitted before the release marker: ${layeredSvg}`);
 }
 "#;
     let mut child = match Command::new("node")
@@ -2878,7 +3039,7 @@ fn site_overwrite_preserves_existing_site_on_late_candidate_failure() {
     .expect("write candidate manifest");
     write_candidate_run_marker(&candidate_dir, &candidate_manifest);
 
-    let error = build_static_site_with_candidate_runs(
+    let error = build_static_site_with_progression_runs(
         &BuildStaticSiteOptions {
             snapshot_dir,
             out_dir: site_dir.clone(),
@@ -2890,7 +3051,7 @@ fn site_overwrite_preserves_existing_site_on_late_candidate_failure() {
     )
     .expect_err("candidate without the comparison dataset must fail after staging starts");
     assert!(
-        format!("{error:#}").contains("cannot add a candidate"),
+        format!("{error:#}").contains("cannot add progression runs"),
         "unexpected error: {error:#}"
     );
     assert_eq!(

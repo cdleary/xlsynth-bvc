@@ -56,7 +56,49 @@ while IFS=$'\t' read -r structural_hash source_sha256; do
 done < src/site_assets/mffc_progression_ir_artifacts.tsv
 ```
 
-Then evaluate a release or exact Git revision with `run-ir-dir-corpus`, `--recipe-preset g8r-abc-stats`, `--top-fn-policy infer-single-package`, and `--scheduling-policy mffc-progression-ir-v1`. Completed actions are cache-addressed and runs are resumable.
+Then evaluate releases with `--recipe-preset g8r-abc-vs-yabc-aig-diff` and exact Git
+revisions with `--recipe-preset g8r-abc-stats`. Both use
+`--top-fn-policy infer-single-package` and `--scheduling-policy mffc-progression-ir-v1`.
+The release recipe is intentionally matched: its G8r result passes through the same Yosys/ABC
+runtime and script as the Git path. Raw `g8r-vs-yabc-aig-diff` release results are not comparable
+and publication rejects them. Completed actions are cache-addressed and runs are resumable.
+
+## Publication workflow
+
+Treat computation, export finalization, static-site construction, and browser inspection as
+separate stages:
+
+1. Enqueue the exact fixed cohort and start workers against `OUTPUT_DIR/.bvc/`. Use
+   `show-corpus-progress --output-dir OUTPUT_DIR` to check counts, throughput, and failures; do not
+   infer compute progress from a site build.
+2. After workers are idle, rerun the exact `run-ir-dir-corpus` command once to refresh the public
+   manifest and exported stats. Require the full cohort to be `done` with zero failed, missing, or
+   extra samples. Do not merge or hand-edit JSON/JSONL files.
+3. Pass every completed release or Git output directory directly to `build-static-site` with a
+   repeated `--progression-run-dir DIR`. The renderer validates the operational manifest, fixed
+   cohort, complete action graph, and provenance-backed stats, then writes one typed
+   `data/progression-runs/<generation-id>/evidence.pb` record per generation. JSON is created only
+   as the final browser catalog/projection.
+4. Inspect the progression page with the intended cohort and explicit baseline/current generation
+   IDs. Confirm both labels, completeness, summed-product delta, distribution plot, and largest
+   per-artifact changes.
+
+`build-static-site` verifies its staged output before installing it. Do not immediately run a
+second full `verify-static-site` or `smoke-static-site` unless an independent audit is requested or
+the installed bytes changed; use a targeted browser check for the selected comparison instead.
+Report stage-specific ETAs: queue drain time is distinct from export refresh, site build, and
+browser validation.
+
+Example publication command:
+
+```bash
+cargo run --bin xlsynth_bvc -- \
+  build-static-site \
+  --snapshot-dir /path/to/current/snapshot \
+  --out-dir /tmp/xlsynth-bvc-progression-site \
+  --progression-run-dir /tmp/mffc/releases/0.70.0-g8r-abc \
+  --progression-run-dir /tmp/mffc/candidates/HEAD
+```
 
 ## Reproducing the manifest
 
@@ -104,6 +146,7 @@ jq -s -r --rawfile manifest "$manifest_out" '
     done
 ```
 
-The materialized directory contains 187 files. Hashing each file with its hash-only filename in sorted order produces `983fab9ccbfc6d6cb3ce112215730203b0c7731514281ebd4610a61cd82fc6a6`. Run the `g8r-vs-yabc-aig-diff` corpus recipe against that directory for every historical crate/DSO pair.
+The materialized directory contains 187 files. Hashing each file with its hash-only filename in sorted order produces `983fab9ccbfc6d6cb3ce112215730203b0c7731514281ebd4610a61cd82fc6a6`. Run the `g8r-abc-vs-yabc-aig-diff` corpus recipe against that directory for every historical
+crate/DSO pair that will be compared with direct G8r+ABC Git evaluations.
 
 Each checked-in named manifest is the benchmark identity. Do not replace it merely because a newer release adds or removes input functions; create and review a new cohort version when intentionally changing the benchmark.

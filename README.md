@@ -109,9 +109,12 @@ local IR corpora. It does not require global `--artifacts-via-sled`; instead it 
 self-contained workspace under `OUTPUT_DIR/.bvc/` and writes public manifests/exports directly into
 `OUTPUT_DIR/`.
 
-For the pinned release-progression cohort in enqueue mode, pass
-`--scheduling-policy release-progression-ir-v1` to apply the checked-in critical-path priority
-policy without changing action identities or QoR results.
+For a pinned progression cohort in enqueue mode, pass its checked-in scheduling policy. Release
+generations that will be compared with Git revisions must use
+`--recipe-preset g8r-abc-vs-yabc-aig-diff`; Git revisions use the direct
+`--recipe-preset g8r-abc-stats` path. Both measure post-ABC G8r with the same Yosys/ABC runtime and
+script. The policies validate the exact cohort and may prioritize known stragglers without changing
+action identities or QoR results.
 
 Enqueue mode:
 
@@ -177,25 +180,26 @@ planned/reused/new action counts.
 Candidate runs require the canonical public source-driver, released stats-driver, and Yosys/ABC
 runtime identifiers; incompatible CLI runtime overrides fail before any import or enqueue work.
 
-Once the candidate export is complete, add it to a local static render with the repeatable
-`--candidate-run-dir` option:
+Once release and/or Git exports are complete, add each run to a local static render with the
+repeatable `--progression-run-dir` option:
 
 ```bash
 cargo run --bin xlsynth_bvc -- \
   build-static-site \
   --snapshot-dir /path/to/current/snapshot \
   --out-dir /tmp/xlsynth-bvc-candidate-site \
-  --candidate-run-dir /tmp/xlsynth-bvc-mainline-candidate
+  --progression-run-dir /tmp/xlsynth-bvc-mffc-release-0.70.0 \
+  --progression-run-dir /tmp/xlsynth-bvc-mainline-candidate
 ```
 
-The renderer requires the snapshot to contain the candidate's captured release baseline and exact
-fixed cohort. It reconstructs the candidate and release action graphs, requires the same ABC,
-script, and released stats runtime, and reads candidate metrics only from bytes that match the
-canonical store provenance digest. It then places the Git revision chronologically by commit time
-and defaults its A/B controls to the captured release versus candidate. That pair reports the
-direct summed post-ABC G8r product change. Candidate manifests are atomically replaced, and both
-status refresh and site generation require their identity to match the durable workspace marker;
-additional candidate directories may be supplied by repeating the flag.
+The renderer reconstructs and validates every release and Git action graph, requires compatible
+cohort, DSO, ABC script/runtime, and stats runtime identities, and reads metrics only from bytes that
+match canonical store provenance. It persists typed `evidence.pb` for every admitted generation;
+browser JSON is produced only as the final static-site projection. Git revisions are placed
+chronologically by commit time, and the A/B controls can compare any two complete generations in
+the same cohort. Candidate manifests are atomically replaced, and both status refresh and site
+generation require their identity to match the durable workspace marker. The old
+`--candidate-run-dir` spelling remains a hidden compatibility alias.
 
 The enqueue workflow is intentionally explicit:
 

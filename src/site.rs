@@ -23,6 +23,7 @@ mod site_shards;
 use crate::analysis::decode_analysis_report;
 use crate::model::{
     ActionSpec, ArtifactType, DriverRuntimeSpec, G8rLoweringMode, ScriptRef, YosysRuntimeSpec,
+    YosysVerilogFrontend,
 };
 use crate::proto::v1 as pb;
 use crate::query::{VersionsSummaryIndexFile, validate_complete_versions_summary};
@@ -69,8 +70,8 @@ const MFFC_PROGRESSION_IR_SHA256: &str =
     "f80befb2248a9757b7512068a4818308ecff1e77bcd78701b1a67338f979e5f8";
 const MFFC_PROGRESSION_ARTIFACT_MANIFEST_SHA256: &str =
     "cfc36afcd8b178687690a03d6c8b555e9517e7606ae8062d502452cf29e8861c";
-const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 8;
-const CANDIDATE_PROGRESSION_EVIDENCE_SCHEMA_VERSION: u32 = 2;
+const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 9;
+const PROGRESSION_RUN_EVIDENCE_RECORD_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_SCHEMA_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_PREFIX_HEX_CHARS: u8 = 1;
 const STATIC_IR_SHARD_SCHEMA_VERSION: u32 = 1;
@@ -123,7 +124,7 @@ struct BrowserCatalog {
     base_url: String,
     datasets: Vec<BrowserDataset>,
     runs: Vec<BrowserRun>,
-    candidate_evidence: Vec<BrowserCandidateEvidenceRef>,
+    progression_evidence: Vec<BrowserProgressionEvidenceRef>,
     progression: BrowserProgressionIndex,
     releases: Vec<CrateReleaseStatusView>,
     repository_head_observation: Option<RepositoryHeadObservationView>,
@@ -147,7 +148,7 @@ struct BrowserDataset {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct BrowserCandidateEvidenceRef {
+struct BrowserProgressionEvidenceRef {
     cohort_id: String,
     generation_id: String,
     url: String,
@@ -446,7 +447,7 @@ enum BrowserProgressionOrigin {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct BrowserCandidateProgressionSample {
+struct BrowserProgressionSample {
     fn_key: String,
     structural_hash: String,
     source_sha256: String,
@@ -482,7 +483,7 @@ struct BrowserProgressionGeneration {
     missing_cohort_ir_count: u64,
     extra_ir_count: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    candidate_samples: Vec<BrowserCandidateProgressionSample>,
+    run_samples: Vec<BrowserProgressionSample>,
 }
 
 #[derive(Debug)]
@@ -521,17 +522,63 @@ struct CandidateSampleInput {
     yosys_abc_aig_action_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CandidateProgressionEvidence {
+#[derive(Debug, Clone, Deserialize)]
+struct ReleaseCorpusManifestInput {
     schema_version: u32,
-    manifest: CandidateCorpusManifestInput,
-    stats: Vec<CandidateStatsEvidence>,
+    recipe_preset: String,
+    fraig: bool,
+    dso_version: String,
+    driver_runtime: DriverRuntimeSpec,
+    stats_runtime: DriverRuntimeSpec,
+    yosys_runtime: YosysRuntimeSpec,
+    yosys_script: String,
+    yosys_script_sha256: String,
+    #[serde(default)]
+    scheduling_policy: Option<ProgressionSchedulingPolicyInput>,
+    #[serde(default)]
+    candidate_run: Option<serde_json::Value>,
+    samples: Vec<ReleaseSampleInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProgressionSchedulingPolicyInput {
+    policy_name: String,
+    expected_corpus_sample_count: u64,
+    expected_corpus_artifact_manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReleaseSampleInput {
+    sample_id: String,
+    source_relpath: String,
+    source_sha256: String,
+    top_fn_name: String,
+    fraig: bool,
+    dso_version: String,
+    driver_crate_version: String,
+    stats_driver_crate_version: String,
+    import_ir_action_id: String,
+    import_ir_status: String,
+    g8r_aig_action_id: String,
+    g8r_aig_status: String,
+    #[serde(default)]
+    g8r_abc_aig_action_id: Option<String>,
+    #[serde(default)]
+    g8r_abc_aig_status: Option<String>,
+    g8r_stats_action_id: String,
+    g8r_stats_status: String,
+    combo_verilog_action_id: String,
+    combo_verilog_status: String,
+    yosys_abc_aig_action_id: String,
+    yosys_abc_aig_status: String,
+    yosys_abc_stats_action_id: String,
+    yosys_abc_stats_status: String,
+    status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CandidateStatsEvidence {
+struct ProgressionStatsEvidence {
     sample_id: String,
     g8r_stats_action_id: String,
     source_output_bytes: u64,
@@ -541,8 +588,41 @@ struct CandidateStatsEvidence {
     depth: f64,
 }
 
+#[derive(Debug, Clone)]
+struct ProgressionSampleActionGraph {
+    import_ir: ActionSpec,
+    g8r_aig: ActionSpec,
+    g8r_abc_aig: ActionSpec,
+    g8r_stats: ActionSpec,
+    combo_verilog: Option<ActionSpec>,
+    yosys_abc_aig: Option<ActionSpec>,
+    yosys_abc_stats: Option<ActionSpec>,
+}
+
+#[derive(Debug, Clone)]
+struct ProgressionSampleSourceEvidence {
+    g8r: ProgressionStatsEvidence,
+    yosys_abc: Option<ProgressionStatsEvidence>,
+    action_graph: ProgressionSampleActionGraph,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProgressionRuntimeIdentity {
+    stats_runtime: DriverRuntimeSpec,
+    yosys_runtime: YosysRuntimeSpec,
+    yosys_script: String,
+    yosys_script_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProgressionRunEvidenceInput {
+    cohort_id: String,
+    generation: BrowserProgressionGeneration,
+    runtime_identity: ProgressionRuntimeIdentity,
+    sample_sources_by_g8r_stats_action: BTreeMap<String, ProgressionSampleSourceEvidence>,
+}
 #[derive(Debug, Serialize)]
-struct CandidateStatsMetricProjection {
+struct ProgressionStatsMetricProjection {
     and_nodes: f64,
     depth: f64,
 }
@@ -663,28 +743,718 @@ fn decode_canonical_browser_catalog(bytes: &[u8]) -> Result<BrowserCatalog> {
     Ok(catalog)
 }
 
-fn encode_candidate_progression_evidence(
-    evidence: &CandidateProgressionEvidence,
-) -> Result<Vec<u8>> {
-    serde_json::to_vec_pretty(evidence).context("serializing canonical candidate evidence")
+fn progression_run_evidence_to_proto(
+    input: &ProgressionRunEvidenceInput,
+) -> Result<pb::FixedCorpusProgressionRunEvidence> {
+    let generation = &input.generation;
+    let origin = match &generation.origin {
+        BrowserProgressionOrigin::CrateRelease => {
+            let crate_version = generation
+                .crate_version
+                .as_deref()
+                .context("release progression evidence has no crate version")?;
+            pb::fixed_corpus_progression_run_evidence::Origin::CrateRelease(
+                pb::FixedCorpusCrateReleaseOrigin {
+                    crate_version: Some(pb::CrateVersion {
+                        value: normalize_tag_version(crate_version).to_string(),
+                    }),
+                },
+            )
+        }
+        BrowserProgressionOrigin::GitRevision {
+            repository,
+            commit,
+            requested_ref,
+            baseline_crate_version,
+            baseline_release_commit,
+        } => pb::fixed_corpus_progression_run_evidence::Origin::GitRevision(
+            pb::FixedCorpusGitRevisionOrigin {
+                revision: Some(pb::DriverSourceRevision {
+                    repository: repository.clone(),
+                    commit: commit.clone(),
+                }),
+                requested_ref: requested_ref.clone(),
+                baseline_crate_version: Some(pb::CrateVersion {
+                    value: normalize_tag_version(baseline_crate_version).to_string(),
+                }),
+                baseline_release_commit: baseline_release_commit.clone(),
+            },
+        ),
+    };
+    let event_time = DateTime::parse_from_rfc3339(
+        generation
+            .event_time_utc
+            .as_deref()
+            .context("progression evidence has no event timestamp")?,
+    )
+    .context("parsing progression evidence event timestamp")?
+    .with_timezone(&Utc);
+    let mut sources = input.sample_sources_by_g8r_stats_action.clone();
+    let mut samples = Vec::with_capacity(generation.run_samples.len());
+    for sample in &generation.run_samples {
+        let source = sources
+            .remove(&sample.g8r_stats_action_id)
+            .with_context(|| {
+                format!(
+                    "progression sample {} has no source stats evidence",
+                    sample.g8r_stats_action_id
+                )
+            })?;
+        if source.g8r.g8r_stats_action_id != sample.g8r_stats_action_id {
+            bail!("progression sample source evidence has the wrong G8r stats action");
+        }
+        let (
+            yosys_abc_stats_output_bytes,
+            yosys_abc_stats_output_sha256,
+            yosys_abc_metric_projection_sha256,
+        ) = match source.yosys_abc {
+            Some(reference) => {
+                if reference.g8r_stats_action_id != sample.yosys_abc_stats_action_id {
+                    bail!("progression reference evidence has the wrong stats action");
+                }
+                (
+                    Some(reference.source_output_bytes),
+                    Some(crate::proto::digest_from_hex(
+                        &reference.source_output_sha256,
+                        "progression_sample.yosys_abc_stats_output_sha256",
+                    )?),
+                    Some(crate::proto::digest_from_hex(
+                        &reference.metric_projection_sha256,
+                        "progression_sample.yosys_abc_metric_projection_sha256",
+                    )?),
+                )
+            }
+            None => (None, None, None),
+        };
+        samples.push(pb::FixedCorpusProgressionSampleEvidence {
+            fn_key: sample.fn_key.clone(),
+            structural_hash: Some(crate::proto::digest_from_hex(
+                &sample.structural_hash,
+                "progression_sample.structural_hash",
+            )?),
+            source_sha256: Some(crate::proto::digest_from_hex(
+                &sample.source_sha256,
+                "progression_sample.source_sha256",
+            )?),
+            ir_node_count: sample.ir_node_count,
+            g8r_nodes: sample.g8r_nodes,
+            g8r_levels: sample.g8r_levels,
+            yosys_abc_nodes: sample.yosys_abc_nodes,
+            yosys_abc_levels: sample.yosys_abc_levels,
+            g8r_product: sample.g8r_product,
+            yosys_abc_product: sample.yosys_abc_product,
+            g8r_product_loss: sample.g8r_product_loss,
+            ir_action_id: Some(crate::proto::action_id_to_proto(
+                &sample.ir_action_id,
+                "progression_sample.ir_action_id",
+            )?),
+            g8r_stats_action_id: Some(crate::proto::action_id_to_proto(
+                &sample.g8r_stats_action_id,
+                "progression_sample.g8r_stats_action_id",
+            )?),
+            yosys_abc_stats_action_id: Some(crate::proto::action_id_to_proto(
+                &sample.yosys_abc_stats_action_id,
+                "progression_sample.yosys_abc_stats_action_id",
+            )?),
+            g8r_stats_output_bytes: source.g8r.source_output_bytes,
+            g8r_stats_output_sha256: Some(crate::proto::digest_from_hex(
+                &source.g8r.source_output_sha256,
+                "progression_sample.g8r_stats_output_sha256",
+            )?),
+            g8r_metric_projection_sha256: Some(crate::proto::digest_from_hex(
+                &source.g8r.metric_projection_sha256,
+                "progression_sample.g8r_metric_projection_sha256",
+            )?),
+            yosys_abc_stats_output_bytes,
+            yosys_abc_stats_output_sha256,
+            yosys_abc_metric_projection_sha256,
+            action_graph: Some(pb::FixedCorpusProgressionSampleActionGraph {
+                import_ir: Some(crate::proto::action_spec_to_proto(
+                    &source.action_graph.import_ir,
+                )?),
+                g8r_aig: Some(crate::proto::action_spec_to_proto(
+                    &source.action_graph.g8r_aig,
+                )?),
+                g8r_abc_aig: Some(crate::proto::action_spec_to_proto(
+                    &source.action_graph.g8r_abc_aig,
+                )?),
+                g8r_stats: Some(crate::proto::action_spec_to_proto(
+                    &source.action_graph.g8r_stats,
+                )?),
+                combo_verilog: source
+                    .action_graph
+                    .combo_verilog
+                    .as_ref()
+                    .map(crate::proto::action_spec_to_proto)
+                    .transpose()?,
+                yosys_abc_aig: source
+                    .action_graph
+                    .yosys_abc_aig
+                    .as_ref()
+                    .map(crate::proto::action_spec_to_proto)
+                    .transpose()?,
+                yosys_abc_stats: source
+                    .action_graph
+                    .yosys_abc_stats
+                    .as_ref()
+                    .map(crate::proto::action_spec_to_proto)
+                    .transpose()?,
+            }),
+        });
+    }
+    if !sources.is_empty() {
+        bail!("progression evidence contains source stats outside the generation");
+    }
+    Ok(pb::FixedCorpusProgressionRunEvidence {
+        record_version: PROGRESSION_RUN_EVIDENCE_RECORD_VERSION,
+        cohort_id: input.cohort_id.clone(),
+        cohort_artifact_manifest_sha256: Some(crate::proto::digest_from_hex(
+            progression_cohort(&input.cohort_id)?.expected_artifact_manifest_sha256,
+            "progression_evidence.cohort_artifact_manifest_sha256",
+        )?),
+        generation_id: Some(crate::proto::digest_from_hex(
+            &generation.generation_id,
+            "progression_evidence.generation_id",
+        )?),
+        origin: Some(origin),
+        event_time: Some(crate::proto::timestamp_to_proto(&event_time)),
+        dso_version: Some(pb::DsoVersion {
+            value: normalize_tag_version(&generation.dso_version).to_string(),
+        }),
+        baseline_generation_id: generation
+            .baseline_generation_id
+            .as_deref()
+            .map(|value| {
+                crate::proto::digest_from_hex(value, "progression_evidence.baseline_generation_id")
+            })
+            .transpose()?,
+        cohort_sample_count: generation.cohort_ir_count,
+        samples,
+    })
 }
 
-fn decode_canonical_candidate_progression_evidence(
+fn encode_progression_run_evidence(input: &ProgressionRunEvidenceInput) -> Result<Vec<u8>> {
+    Ok(progression_run_evidence_to_proto(input)?.encode_to_vec())
+}
+
+fn required_progression_action(value: &Option<pb::ActionSpec>, field: &str) -> Result<ActionSpec> {
+    crate::proto::action_spec_from_proto(
+        value
+            .as_ref()
+            .with_context(|| format!("progression action graph has no {field}"))?,
+    )
+    .with_context(|| format!("decoding progression action graph {field}"))
+}
+
+struct ProgressionActionGraphExpectation<'a> {
+    source_sha256: &'a str,
+    ir_action_id: &'a str,
+    g8r_stats_action_id: &'a str,
+    yosys_abc_stats_action_id: &'a str,
+    origin: &'a BrowserProgressionOrigin,
+    crate_version: Option<&'a str>,
+    dso_version: &'a str,
+}
+
+fn validate_progression_sample_action_graph(
+    sample: &pb::FixedCorpusProgressionSampleEvidence,
+    expected: ProgressionActionGraphExpectation<'_>,
+) -> Result<ProgressionRuntimeIdentity> {
+    let ProgressionActionGraphExpectation {
+        source_sha256,
+        ir_action_id,
+        g8r_stats_action_id,
+        yosys_abc_stats_action_id,
+        origin,
+        crate_version,
+        dso_version,
+    } = expected;
+    let graph = sample
+        .action_graph
+        .as_ref()
+        .context("progression sample has no typed action graph")?;
+    let import_ir = required_progression_action(&graph.import_ir, "import IR action")?;
+    let top_fn_name = match &import_ir {
+        ActionSpec::ImportIrPackageFile {
+            source_sha256: action_source,
+            top_fn_name: Some(top_fn_name),
+        } if action_source == source_sha256 && !top_fn_name.is_empty() => top_fn_name,
+        _ => bail!("progression import action does not match its source or top function"),
+    };
+    let computed_import_id = crate::executor::compute_action_id(&import_ir)?;
+    if computed_import_id != ir_action_id {
+        bail!("progression import action does not match its published action ID");
+    }
+
+    let g8r_aig = required_progression_action(&graph.g8r_aig, "G8r action")?;
+    let g8r_runtime = match &g8r_aig {
+        ActionSpec::DriverIrToG8rAig {
+            ir_action_id,
+            top_fn_name: Some(action_top),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+            execution_recipe_revision,
+            version,
+            runtime,
+        } if ir_action_id == &computed_import_id
+            && action_top == top_fn_name
+            && normalize_tag_version(version) == dso_version
+            && *execution_recipe_revision
+                == crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                    &runtime.driver_version,
+                ) =>
+        {
+            runtime
+        }
+        _ => bail!("progression G8r action does not match the fixed post-ABC recipe"),
+    };
+    let g8r_aig_id = crate::executor::compute_action_id(&g8r_aig)?;
+
+    let g8r_abc_aig = required_progression_action(&graph.g8r_abc_aig, "G8r ABC action")?;
+    let (yosys_script, yosys_runtime) = match &g8r_abc_aig {
+        ActionSpec::AigToYosysAbcAig {
+            aig_action_id,
+            yosys_script_ref,
+            runtime,
+        } if aig_action_id == &g8r_aig_id
+            && yosys_script_ref.path == crate::DEFAULT_YOSYS_FLOW_SCRIPT =>
+        {
+            (yosys_script_ref, runtime)
+        }
+        _ => bail!("progression G8r ABC action does not follow the published G8r action"),
+    };
+    let g8r_abc_aig_id = crate::executor::compute_action_id(&g8r_abc_aig)?;
+
+    let g8r_stats = required_progression_action(&graph.g8r_stats, "G8r stats action")?;
+    let stats_runtime = match &g8r_stats {
+        ActionSpec::DriverAigToStats {
+            aig_action_id,
+            version,
+            runtime,
+        } if aig_action_id == &g8r_abc_aig_id && normalize_tag_version(version) == dso_version => {
+            runtime
+        }
+        _ => bail!("progression G8r stats action does not follow the post-ABC artifact"),
+    };
+    if crate::executor::compute_action_id(&g8r_stats)? != g8r_stats_action_id {
+        bail!("progression G8r stats action does not match its published action ID");
+    }
+
+    let (expected_source_version, expected_stats_version) = match origin {
+        BrowserProgressionOrigin::CrateRelease => (
+            crate_version.context("release progression action graph has no crate version")?,
+            None,
+        ),
+        BrowserProgressionOrigin::GitRevision {
+            repository,
+            commit,
+            baseline_crate_version,
+            ..
+        } => {
+            let source = g8r_runtime
+                .source_revision
+                .as_ref()
+                .context("Git progression G8r action has no source revision")?;
+            if source.repository != *repository || source.commit != *commit {
+                bail!("Git progression G8r runtime does not match its source revision");
+            }
+            (
+                baseline_crate_version.as_str(),
+                Some(baseline_crate_version.as_str()),
+            )
+        }
+    };
+    if normalize_tag_version(&g8r_runtime.driver_version)
+        != normalize_tag_version(expected_source_version)
+        || stats_runtime.source_revision.is_some()
+        || normalize_tag_version(&stats_runtime.driver_version).is_empty()
+        || expected_stats_version.is_some_and(|expected| {
+            normalize_tag_version(&stats_runtime.driver_version) != normalize_tag_version(expected)
+        })
+    {
+        bail!("progression driver runtimes do not match the generation origin");
+    }
+
+    match origin {
+        BrowserProgressionOrigin::CrateRelease => {
+            if g8r_runtime.source_revision.is_some() {
+                bail!("release progression source driver must be a released runtime");
+            }
+            let combo_verilog = required_progression_action(
+                &graph.combo_verilog,
+                "release combinational Verilog action",
+            )?;
+            match &combo_verilog {
+                ActionSpec::IrFnToCombinationalVerilog {
+                    ir_action_id,
+                    top_fn_name: Some(action_top),
+                    use_system_verilog: false,
+                    version,
+                    runtime,
+                } if ir_action_id == &computed_import_id
+                    && action_top == top_fn_name
+                    && normalize_tag_version(version) == dso_version
+                    && runtime == g8r_runtime => {}
+                _ => bail!("release progression Verilog action does not match the fixed recipe"),
+            }
+            let combo_verilog_id = crate::executor::compute_action_id(&combo_verilog)?;
+            let yosys_abc_aig = required_progression_action(
+                &graph.yosys_abc_aig,
+                "release codegen Yosys/ABC action",
+            )?;
+            match &yosys_abc_aig {
+                ActionSpec::ComboVerilogToYosysAbcAig {
+                    verilog_action_id,
+                    verilog_top_module_name: Some(action_top),
+                    frontend: YosysVerilogFrontend::Builtin,
+                    yosys_script_ref,
+                    runtime,
+                } if verilog_action_id == &combo_verilog_id
+                    && action_top == top_fn_name
+                    && yosys_script_ref.path == yosys_script.path
+                    && yosys_script_ref.sha256 == yosys_script.sha256
+                    && runtime == yosys_runtime => {}
+                _ => bail!(
+                    "release progression reference ABC action does not match the fixed recipe"
+                ),
+            }
+            let yosys_abc_aig_id = crate::executor::compute_action_id(&yosys_abc_aig)?;
+            let yosys_abc_stats = required_progression_action(
+                &graph.yosys_abc_stats,
+                "release codegen Yosys/ABC stats action",
+            )?;
+            match &yosys_abc_stats {
+                ActionSpec::DriverAigToStats {
+                    aig_action_id,
+                    version,
+                    runtime,
+                } if aig_action_id == &yosys_abc_aig_id
+                    && normalize_tag_version(version) == dso_version
+                    && runtime == stats_runtime => {}
+                _ => bail!(
+                    "release progression reference stats action does not match the fixed recipe"
+                ),
+            }
+            if crate::executor::compute_action_id(&yosys_abc_stats)? != yosys_abc_stats_action_id {
+                bail!("release reference stats action does not match its published action ID");
+            }
+        }
+        BrowserProgressionOrigin::GitRevision { .. } => {
+            if graph.combo_verilog.is_some()
+                || graph.yosys_abc_aig.is_some()
+                || graph.yosys_abc_stats.is_some()
+            {
+                bail!("direct Git progression evidence contains an unexpected reference branch");
+            }
+        }
+    }
+    Ok(ProgressionRuntimeIdentity {
+        stats_runtime: stats_runtime.clone(),
+        yosys_runtime: yosys_runtime.clone(),
+        yosys_script: yosys_script.path.clone(),
+        yosys_script_sha256: yosys_script.sha256.clone(),
+    })
+}
+
+fn decode_progression_run_evidence(
     bytes: &[u8],
-) -> Result<CandidateProgressionEvidence> {
-    let value: serde_json::Value =
-        serde_json::from_slice(bytes).context("decoding candidate evidence JSON value")?;
-    let evidence: CandidateProgressionEvidence =
-        serde_json::from_value(value.clone()).context("decoding typed candidate evidence")?;
-    let projected =
-        serde_json::to_value(&evidence).context("projecting typed candidate evidence to JSON")?;
-    if value != projected {
-        bail!("candidate evidence contains values outside its typed public schema");
+) -> Result<(
+    String,
+    BrowserProgressionGeneration,
+    ProgressionRuntimeIdentity,
+)> {
+    let mut evidence = pb::FixedCorpusProgressionRunEvidence::decode(bytes)
+        .context("decoding fixed-corpus progression protobuf evidence")?;
+    if evidence.encode_to_vec() != bytes {
+        bail!("fixed-corpus progression protobuf evidence is not canonically encoded");
     }
-    if encode_candidate_progression_evidence(&evidence)? != bytes {
-        bail!("candidate evidence is not canonically encoded");
+    if evidence.record_version != PROGRESSION_RUN_EVIDENCE_RECORD_VERSION {
+        bail!(
+            "unsupported progression evidence record version: {}",
+            evidence.record_version
+        );
     }
-    Ok(evidence)
+    let cohort = progression_cohort(&evidence.cohort_id)?;
+    let cohort_digest = crate::proto::digest_to_hex(
+        evidence
+            .cohort_artifact_manifest_sha256
+            .as_ref()
+            .context("progression evidence has no cohort artifact manifest digest")?,
+        "progression_evidence.cohort_artifact_manifest_sha256",
+    )?;
+    if cohort_digest != cohort.expected_artifact_manifest_sha256
+        || evidence.cohort_sample_count != cohort.expected_count as u64
+    {
+        bail!("progression evidence does not match its registered fixed cohort");
+    }
+    let generation_id = crate::proto::digest_to_hex(
+        evidence
+            .generation_id
+            .as_ref()
+            .context("progression evidence has no generation ID")?,
+        "progression_evidence.generation_id",
+    )?;
+    let dso_version = evidence
+        .dso_version
+        .take()
+        .context("progression evidence has no DSO version")?
+        .value;
+    if dso_version.is_empty() || normalize_tag_version(&dso_version) != dso_version {
+        bail!("progression evidence DSO version is not canonical");
+    }
+    let event_time_utc = crate::proto::timestamp_from_proto(
+        &evidence.event_time,
+        "progression_evidence.event_time",
+    )?
+    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let baseline_generation_id = evidence
+        .baseline_generation_id
+        .as_ref()
+        .map(|value| {
+            crate::proto::digest_to_hex(value, "progression_evidence.baseline_generation_id")
+        })
+        .transpose()?;
+    let (origin, display_label, crate_version) = match evidence
+        .origin
+        .take()
+        .context("progression evidence has no generation origin")?
+    {
+        pb::fixed_corpus_progression_run_evidence::Origin::CrateRelease(release) => {
+            let version = release
+                .crate_version
+                .context("release progression evidence has no crate version")?
+                .value;
+            if version.is_empty() || normalize_tag_version(&version) != version {
+                bail!("release progression evidence crate version is not canonical");
+            }
+            if baseline_generation_id.is_some()
+                || generation_id
+                    != progression_generation_id(cohort.cohort_id, &version, &dso_version)
+            {
+                bail!("release progression evidence has an invalid generation identity");
+            }
+            (
+                BrowserProgressionOrigin::CrateRelease,
+                format!("v{version}"),
+                Some(version),
+            )
+        }
+        pb::fixed_corpus_progression_run_evidence::Origin::GitRevision(git) => {
+            let revision = git
+                .revision
+                .context("Git progression evidence has no source revision")?;
+            let baseline_crate_version = git
+                .baseline_crate_version
+                .context("Git progression evidence has no baseline crate version")?
+                .value;
+            if revision.repository != crate::XLSYNTH_CRATE_GIT_REPOSITORY
+                || !is_canonical_lower_hex(&revision.commit, 40)
+                || baseline_crate_version.is_empty()
+                || normalize_tag_version(&baseline_crate_version) != baseline_crate_version
+                || git
+                    .requested_ref
+                    .as_deref()
+                    .is_some_and(|value| value != "main")
+                || git
+                    .baseline_release_commit
+                    .as_deref()
+                    .is_some_and(|value| !is_canonical_lower_hex(value, 40))
+                || baseline_generation_id.is_none()
+            {
+                bail!("Git progression evidence has an invalid immutable identity");
+            }
+            let display_label = format!(
+                "{}@{}",
+                git.requested_ref.as_deref().unwrap_or("git"),
+                &revision.commit[..8]
+            );
+            (
+                BrowserProgressionOrigin::GitRevision {
+                    repository: revision.repository,
+                    commit: revision.commit,
+                    requested_ref: git.requested_ref,
+                    baseline_crate_version,
+                    baseline_release_commit: git.baseline_release_commit,
+                },
+                display_label,
+                None,
+            )
+        }
+    };
+    let mut seen = BTreeSet::new();
+    let mut run_samples = Vec::with_capacity(evidence.samples.len());
+    let mut runtime_identity = None;
+    for sample in evidence.samples {
+        let structural_hash = crate::proto::digest_to_hex(
+            sample
+                .structural_hash
+                .as_ref()
+                .context("progression sample has no structural hash")?,
+            "progression_sample.structural_hash",
+        )?;
+        if !seen.insert(structural_hash.clone()) {
+            bail!("progression evidence contains a duplicate structural hash");
+        }
+        let source_sha256 = crate::proto::digest_to_hex(
+            sample
+                .source_sha256
+                .as_ref()
+                .context("progression sample has no source digest")?,
+            "progression_sample.source_sha256",
+        )?;
+        let ir_action_id = crate::proto::action_id_to_hex(
+            sample
+                .ir_action_id
+                .as_ref()
+                .context("progression sample has no IR action ID")?,
+            "progression_sample.ir_action_id",
+        )?;
+        let g8r_stats_action_id = crate::proto::action_id_to_hex(
+            sample
+                .g8r_stats_action_id
+                .as_ref()
+                .context("progression sample has no G8r stats action ID")?,
+            "progression_sample.g8r_stats_action_id",
+        )?;
+        let yosys_abc_stats_action_id = crate::proto::action_id_to_hex(
+            sample
+                .yosys_abc_stats_action_id
+                .as_ref()
+                .context("progression sample has no reference stats action ID")?,
+            "progression_sample.yosys_abc_stats_action_id",
+        )?;
+        if sample.g8r_stats_output_bytes == 0 {
+            bail!("progression sample has an empty G8r stats output");
+        }
+        crate::proto::digest_to_hex(
+            sample
+                .g8r_stats_output_sha256
+                .as_ref()
+                .context("progression sample has no G8r stats output digest")?,
+            "progression_sample.g8r_stats_output_sha256",
+        )?;
+        let g8r_projection = crate::proto::digest_to_hex(
+            sample
+                .g8r_metric_projection_sha256
+                .as_ref()
+                .context("progression sample has no G8r metric projection digest")?,
+            "progression_sample.g8r_metric_projection_sha256",
+        )?;
+        if g8r_projection
+            != progression_stats_metric_projection_sha256(sample.g8r_nodes, sample.g8r_levels)?
+        {
+            bail!("progression sample G8r metrics disagree with their projection digest");
+        }
+        let release_origin = matches!(origin, BrowserProgressionOrigin::CrateRelease);
+        match (
+            sample.yosys_abc_stats_output_bytes,
+            sample.yosys_abc_stats_output_sha256.as_ref(),
+            sample.yosys_abc_metric_projection_sha256.as_ref(),
+        ) {
+            (None, None, None) if !release_origin => {}
+            (Some(bytes), Some(output_sha256), Some(projection_sha256))
+                if release_origin && bytes > 0 =>
+            {
+                crate::proto::digest_to_hex(
+                    output_sha256,
+                    "progression_sample.yosys_abc_stats_output_sha256",
+                )?;
+                let projection = crate::proto::digest_to_hex(
+                    projection_sha256,
+                    "progression_sample.yosys_abc_metric_projection_sha256",
+                )?;
+                if projection
+                    != progression_stats_metric_projection_sha256(
+                        sample.yosys_abc_nodes,
+                        sample.yosys_abc_levels,
+                    )?
+                {
+                    bail!(
+                        "progression sample reference metrics disagree with their projection digest"
+                    );
+                }
+            }
+            _ => bail!("progression sample has incomplete reference stats evidence"),
+        }
+        let sample_runtime_identity = validate_progression_sample_action_graph(
+            &sample,
+            ProgressionActionGraphExpectation {
+                source_sha256: &source_sha256,
+                ir_action_id: &ir_action_id,
+                g8r_stats_action_id: &g8r_stats_action_id,
+                yosys_abc_stats_action_id: &yosys_abc_stats_action_id,
+                origin: &origin,
+                crate_version: crate_version.as_deref(),
+                dso_version: &dso_version,
+            },
+        )?;
+        match &runtime_identity {
+            Some(expected) if expected != &sample_runtime_identity => {
+                bail!("progression evidence uses inconsistent stats or Yosys runtimes");
+            }
+            Some(_) => {}
+            None => runtime_identity = Some(sample_runtime_identity),
+        }
+        let metrics = [
+            sample.g8r_nodes,
+            sample.g8r_levels,
+            sample.yosys_abc_nodes,
+            sample.yosys_abc_levels,
+            sample.g8r_product,
+            sample.yosys_abc_product,
+            sample.g8r_product_loss,
+        ];
+        if sample.fn_key.is_empty()
+            || sample.ir_node_count == 0
+            || metrics.iter().any(|value| !value.is_finite())
+            || metrics[..6].iter().any(|value| *value < 0.0)
+            || sample.g8r_product != sample.g8r_nodes * sample.g8r_levels
+            || sample.yosys_abc_product != sample.yosys_abc_nodes * sample.yosys_abc_levels
+            || sample.g8r_product_loss != sample.g8r_product - sample.yosys_abc_product
+        {
+            bail!("progression sample contains invalid metrics");
+        }
+        run_samples.push(BrowserProgressionSample {
+            fn_key: sample.fn_key,
+            structural_hash,
+            source_sha256,
+            ir_node_count: sample.ir_node_count,
+            g8r_nodes: sample.g8r_nodes,
+            g8r_levels: sample.g8r_levels,
+            yosys_abc_nodes: sample.yosys_abc_nodes,
+            yosys_abc_levels: sample.yosys_abc_levels,
+            g8r_product: sample.g8r_product,
+            yosys_abc_product: sample.yosys_abc_product,
+            g8r_product_loss: sample.g8r_product_loss,
+            ir_action_id,
+            g8r_stats_action_id,
+            yosys_abc_stats_action_id,
+        });
+    }
+    if seen.len() != cohort.expected_count || run_samples.len() != cohort.expected_count {
+        bail!("progression evidence is not exactly cohort complete");
+    }
+    let runtime_identity =
+        runtime_identity.context("progression evidence contains no runtime identity")?;
+    Ok((
+        cohort.cohort_id.to_string(),
+        BrowserProgressionGeneration {
+            generation_id,
+            origin,
+            display_label,
+            event_time_utc: Some(event_time_utc),
+            crate_version,
+            dso_version,
+            baseline_generation_id,
+            coverage: BrowserProgressionCoverage::CohortComplete,
+            observed_ir_count: run_samples.len() as u64,
+            cohort_ir_count: cohort.expected_count as u64,
+            missing_cohort_ir_count: 0,
+            extra_ir_count: 0,
+            run_samples,
+        },
+        runtime_identity,
+    ))
 }
 
 fn progression_ir_sha256(structural_hashes: &[String]) -> Result<String> {
@@ -1016,7 +1786,7 @@ fn build_browser_progression_catalog_for_cohort(
             cohort_ir_count,
             missing_cohort_ir_count,
             extra_ir_count,
-            candidate_samples: Vec::new(),
+            run_samples: Vec::new(),
         });
     }
     generations.sort_by(progression_generation_cmp);
@@ -1393,6 +2163,63 @@ fn baseline_progression_samples<'a>(
     Ok(samples)
 }
 
+fn progression_baseline_samples(
+    dataset: &StdlibG8rVsYosysDataset,
+    release_catalog: &BrowserProgressionCatalog,
+    cohort: &ProgressionCohortDescriptor,
+    crate_version: &str,
+    dso_version: &str,
+) -> Result<BTreeMap<String, BrowserProgressionSample>> {
+    let crate_version = normalize_tag_version(crate_version);
+    let dso_version = normalize_tag_version(dso_version);
+    if let Some(generation) = release_catalog.generations.iter().find(|generation| {
+        generation.origin == BrowserProgressionOrigin::CrateRelease
+            && generation
+                .crate_version
+                .as_deref()
+                .map(normalize_tag_version)
+                == Some(crate_version)
+            && normalize_tag_version(&generation.dso_version) == dso_version
+            && !generation.run_samples.is_empty()
+    }) {
+        return generation
+            .run_samples
+            .iter()
+            .cloned()
+            .map(|sample| Ok((sample.structural_hash.clone(), sample)))
+            .collect();
+    }
+    let artifacts = progression_ir_artifacts(cohort)?;
+    baseline_progression_samples(dataset, cohort, crate_version, dso_version)?
+        .into_iter()
+        .map(|(structural_hash, sample)| {
+            let source_sha256 = artifacts
+                .get(&structural_hash)
+                .context("baseline sample is outside the fixed artifact manifest")?
+                .clone();
+            Ok((
+                structural_hash.clone(),
+                BrowserProgressionSample {
+                    fn_key: sample.fn_key.clone(),
+                    structural_hash,
+                    source_sha256,
+                    ir_node_count: sample.ir_node_count,
+                    g8r_nodes: sample.g8r_nodes,
+                    g8r_levels: sample.g8r_levels,
+                    yosys_abc_nodes: sample.yosys_abc_nodes,
+                    yosys_abc_levels: sample.yosys_abc_levels,
+                    g8r_product: sample.g8r_product,
+                    yosys_abc_product: sample.yosys_abc_product,
+                    g8r_product_loss: sample.g8r_product_loss,
+                    ir_action_id: sample.ir_action_id.clone(),
+                    g8r_stats_action_id: sample.g8r_stats_action_id.clone(),
+                    yosys_abc_stats_action_id: sample.yosys_abc_stats_action_id.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
 fn candidate_structural_hash(source_relpath: &str) -> Result<String> {
     let filename = Path::new(source_relpath)
         .file_name()
@@ -1489,8 +2316,9 @@ fn validate_candidate_progression_generation(
         bail!("candidate progression baseline identity or DSO does not match");
     }
     let artifacts = progression_ir_artifacts(cohort)?;
-    let baseline_samples = baseline_progression_samples(
+    let baseline_samples = progression_baseline_samples(
         dataset,
+        release_catalog,
         cohort,
         baseline_crate_version,
         &generation.dso_version,
@@ -1499,7 +2327,7 @@ fn validate_candidate_progression_generation(
         bail!("candidate progression baseline is not cohort complete");
     }
     let mut seen = BTreeSet::new();
-    for sample in &generation.candidate_samples {
+    for sample in &generation.run_samples {
         if !seen.insert(sample.structural_hash.clone()) {
             bail!("candidate progression generation contains a duplicate structural hash");
         }
@@ -1512,11 +2340,6 @@ fn validate_candidate_progression_generation(
         let baseline = baseline_samples
             .get(&sample.structural_hash)
             .context("candidate progression sample has no release baseline")?;
-        let expected_ir_action_id =
-            crate::executor::compute_action_id(&ActionSpec::ImportIrPackageFile {
-                source_sha256: sample.source_sha256.clone(),
-                top_fn_name: baseline.ir_top.clone(),
-            })?;
         for (field, action_id) in [
             ("IR action", &sample.ir_action_id),
             ("G8r stats action", &sample.g8r_stats_action_id),
@@ -1540,7 +2363,6 @@ fn validate_candidate_progression_generation(
             || sample.g8r_product != sample.g8r_nodes * sample.g8r_levels
             || sample.yosys_abc_product != sample.yosys_abc_nodes * sample.yosys_abc_levels
             || sample.g8r_product_loss != sample.g8r_product - sample.yosys_abc_product
-            || sample.ir_action_id != expected_ir_action_id
             || sample.yosys_abc_nodes != baseline.yosys_abc_nodes
             || sample.yosys_abc_levels != baseline.yosys_abc_levels
             || sample.yosys_abc_product != baseline.yosys_abc_product
@@ -1552,7 +2374,7 @@ fn validate_candidate_progression_generation(
     }
     let expected_hashes = artifacts.keys().cloned().collect::<BTreeSet<_>>();
     if seen != expected_hashes
-        || generation.candidate_samples.len() != cohort.expected_count
+        || generation.run_samples.len() != cohort.expected_count
         || generation.observed_ir_count != cohort.expected_count as u64
         || generation.cohort_ir_count != cohort.expected_count as u64
         || generation.missing_cohort_ir_count != 0
@@ -1573,24 +2395,43 @@ fn read_candidate_corpus_manifest(run_dir: &Path) -> Result<CandidateCorpusManif
     .with_context(|| format!("decoding candidate manifest {}", manifest_path.display()))
 }
 
-fn preflight_candidate_run_dirs(candidate_run_dirs: &[PathBuf]) -> Result<()> {
-    for run_dir in candidate_run_dirs {
+fn preflight_progression_run_dirs(progression_run_dirs: &[PathBuf]) -> Result<()> {
+    for run_dir in progression_run_dirs {
         let manifest = read_candidate_corpus_manifest(run_dir)?;
-        validate_candidate_corpus_manifest_input(&manifest)
-            .with_context(|| format!("validating candidate run {}", run_dir.display()))?;
-        crate::corpus::validate_candidate_run_marker_provenance(
-            run_dir,
-            manifest
-                .candidate_run
-                .as_ref()
-                .map(|candidate| candidate.candidate_run_id.as_str()),
-        )
-        .with_context(|| format!("validating candidate marker {}", run_dir.display()))?;
+        if let Some(candidate) = manifest.candidate_run.as_ref() {
+            validate_candidate_corpus_manifest_input(&manifest)
+                .with_context(|| format!("validating Git progression run {}", run_dir.display()))?;
+            crate::corpus::validate_candidate_run_marker_provenance(
+                run_dir,
+                Some(candidate.candidate_run_id.as_str()),
+            )
+            .with_context(|| format!("validating Git progression marker {}", run_dir.display()))?;
+        } else {
+            let release = read_release_corpus_manifest(run_dir)?;
+            let cohort = progression_cohort_for_release_manifest(&release)?;
+            if release.recipe_preset != "g8r-abc-vs-yabc-aig-diff"
+                || release.candidate_run.is_some()
+                || release.samples.len() != cohort.expected_count
+                || release.samples.iter().any(|sample| sample.status != "done")
+            {
+                bail!(
+                    "release progression run {} must be cohort-complete and use g8r-abc-vs-yabc-aig-diff; unmatched G8r data is not comparable to Git G8r+ABC runs",
+                    run_dir.display()
+                );
+            }
+            crate::corpus::validate_candidate_run_marker_provenance(run_dir, None).with_context(
+                || {
+                    format!(
+                        "validating release progression marker {}",
+                        run_dir.display()
+                    )
+                },
+            )?;
+        }
     }
     Ok(())
 }
-
-fn candidate_stats_metric(value: &serde_json::Value, key: &str) -> Result<f64> {
+fn progression_stats_metric(value: &serde_json::Value, key: &str) -> Result<f64> {
     let value = value
         .get(key)
         .or_else(|| {
@@ -1598,78 +2439,88 @@ fn candidate_stats_metric(value: &serde_json::Value, key: &str) -> Result<f64> {
                 .then(|| value.get("live_nodes"))
                 .flatten()
         })
-        .with_context(|| format!("candidate stats have no {key} metric"))?;
+        .with_context(|| format!("progression stats have no {key} metric"))?;
     match value {
         serde_json::Value::Number(number) => number
             .as_f64()
-            .with_context(|| format!("candidate {key} metric is not representable as f64")),
+            .with_context(|| format!("progression {key} metric is not representable as f64")),
         serde_json::Value::String(text) => text
             .parse::<f64>()
-            .with_context(|| format!("candidate {key} metric is not numeric")),
-        _ => bail!("candidate {key} metric is not numeric"),
+            .with_context(|| format!("progression {key} metric is not numeric")),
+        _ => bail!("progression {key} metric is not numeric"),
     }
 }
 
-fn candidate_stats_metric_projection_sha256(and_nodes: f64, depth: f64) -> Result<String> {
+fn progression_stats_metric_projection_sha256(and_nodes: f64, depth: f64) -> Result<String> {
     if !and_nodes.is_finite() || and_nodes < 0.0 || !depth.is_finite() || depth < 0.0 {
-        bail!("candidate stats metrics must be finite and nonnegative");
+        bail!("progression stats metrics must be finite and nonnegative");
     }
-    let projection = CandidateStatsMetricProjection { and_nodes, depth };
+    let projection = ProgressionStatsMetricProjection { and_nodes, depth };
     let encoded = serde_json::to_vec(&projection)
-        .context("serializing canonical candidate stats metric projection")?;
+        .context("serializing canonical progression stats metric projection")?;
     let mut hasher = Sha256::new();
-    hasher.update(b"xlsynth-bvc/candidate-stats-metric-projection/v1\0");
+    hasher.update(b"xlsynth-bvc/progression-stats-metric-projection/v1\0");
     hasher.update(encoded);
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn read_verified_candidate_stats_with_evidence(
+fn read_verified_progression_stats_with_evidence(
     run_dir: &Path,
     store: &ArtifactStore,
-    sample: &CandidateSampleInput,
+    sample_id: &str,
+    manifest_action_id: &str,
     expected_action: &ActionSpec,
-) -> Result<(serde_json::Value, CandidateStatsEvidence)> {
+    export_filename: &str,
+) -> Result<(serde_json::Value, ProgressionStatsEvidence)> {
     let expected_action_id = crate::executor::compute_action_id(expected_action)?;
-    if sample.g8r_stats_action_id != expected_action_id {
-        bail!("candidate sample stats action ID does not match its immutable action graph");
+    if manifest_action_id != expected_action_id {
+        bail!("progression stats action ID does not match its immutable action graph");
     }
     let provenance = store
         .load_provenance(&expected_action_id)
-        .with_context(|| format!("loading candidate stats provenance {expected_action_id}"))?;
+        .with_context(|| format!("loading progression stats provenance {expected_action_id}"))?;
     if provenance.action_id != expected_action_id
         || crate::executor::compute_action_id(&provenance.action)? != expected_action_id
         || provenance.output_artifact.action_id != expected_action_id
         || provenance.output_artifact.artifact_type != ArtifactType::AigStatsFile
         || provenance.output_artifact.relpath != crate::corpus::G8R_STATS_RELPATH
     {
-        bail!("candidate stats provenance does not match its expected action or output");
+        bail!("progression stats provenance does not match its expected action or output");
     }
     let output_file_path = crate::corpus::G8R_STATS_RELPATH
         .strip_prefix("payload/")
-        .context("candidate stats output is not rooted below payload")?;
+        .context("progression stats output is not rooted below payload")?;
     let declared_output = provenance
         .output_files
         .iter()
         .find(|file| file.path == output_file_path)
-        .context("candidate stats provenance does not declare its output bytes")?;
+        .context("progression stats provenance does not declare its output bytes")?;
     let stats_path = run_dir
         .join("artifacts")
-        .join(&sample.sample_id)
-        .join("g8r_stats.json");
-    let stats_bytes = fs::read(&stats_path)
-        .with_context(|| format!("reading exported candidate stats {}", stats_path.display()))?;
+        .join(sample_id)
+        .join(export_filename);
+    let stats_bytes = fs::read(&stats_path).with_context(|| {
+        format!(
+            "reading exported progression stats {}",
+            stats_path.display()
+        )
+    })?;
     if declared_output.bytes != stats_bytes.len() as u64
         || declared_output.sha256 != sha256_hex(&stats_bytes)
     {
-        bail!("exported candidate stats do not match their immutable provenance digest");
+        bail!("exported progression stats do not match their immutable provenance digest");
     }
-    let value = serde_json::from_slice(&stats_bytes)
-        .with_context(|| format!("decoding exported candidate stats {}", stats_path.display()))?;
-    let and_nodes = candidate_stats_metric(&value, "and_nodes")?;
-    let depth = candidate_stats_metric(&value, "depth")?;
-    let metric_projection_sha256 = candidate_stats_metric_projection_sha256(and_nodes, depth)?;
-    let evidence = CandidateStatsEvidence {
-        sample_id: sample.sample_id.clone(),
+    let value = serde_json::from_slice(&stats_bytes).with_context(|| {
+        format!(
+            "decoding exported progression stats {}",
+            stats_path.display()
+        )
+    })?;
+    let and_nodes = progression_stats_metric(&value, "and_nodes")?;
+    let depth = progression_stats_metric(&value, "depth")?;
+    let metric_projection_sha256 = progression_stats_metric_projection_sha256(and_nodes, depth)?;
+    let evidence = ProgressionStatsEvidence {
+        sample_id: sample_id.to_string(),
         g8r_stats_action_id: expected_action_id,
         source_output_bytes: declared_output.bytes,
         source_output_sha256: declared_output.sha256.clone(),
@@ -1680,6 +2531,21 @@ fn read_verified_candidate_stats_with_evidence(
     Ok((value, evidence))
 }
 
+fn read_verified_candidate_stats_with_evidence(
+    run_dir: &Path,
+    store: &ArtifactStore,
+    sample: &CandidateSampleInput,
+    expected_action: &ActionSpec,
+) -> Result<(serde_json::Value, ProgressionStatsEvidence)> {
+    read_verified_progression_stats_with_evidence(
+        run_dir,
+        store,
+        &sample.sample_id,
+        &sample.g8r_stats_action_id,
+        expected_action,
+        "g8r_stats.json",
+    )
+}
 fn candidate_progression_generation_from_manifest<F>(
     manifest: CandidateCorpusManifestInput,
     release_catalog: &BrowserProgressionCatalog,
@@ -1688,7 +2554,11 @@ fn candidate_progression_generation_from_manifest<F>(
     mut read_stats: F,
 ) -> Result<BrowserProgressionGeneration>
 where
-    F: FnMut(&CandidateSampleInput, &ActionSpec) -> Result<serde_json::Value>,
+    F: FnMut(
+        &CandidateSampleInput,
+        &ActionSpec,
+        ProgressionSampleActionGraph,
+    ) -> Result<serde_json::Value>,
 {
     validate_candidate_corpus_manifest_input(&manifest)?;
     let candidate_run = manifest
@@ -1720,8 +2590,9 @@ where
                     == normalize_tag_version(&candidate_run.dso_version)
         })
         .context("candidate's captured release baseline is absent from the progression dataset")?;
-    let baseline_samples = baseline_progression_samples(
+    let baseline_samples = progression_baseline_samples(
         dataset,
+        release_catalog,
         cohort,
         &candidate_run.baseline.crate_version,
         &candidate_run.dso_version,
@@ -1767,7 +2638,7 @@ where
             runtime: candidate_run.stats_runtime.clone(),
         };
         let mut baseline_stats_action_ids = BTreeSet::new();
-        for top_fn_name in [None, baseline.ir_top.clone()] {
+        for top_fn_name in [None, Some(sample.top_fn_name.clone())] {
             let baseline_g8r_action = ActionSpec::DriverIrToG8rAig {
                 ir_action_id: baseline.ir_action_id.clone(),
                 top_fn_name,
@@ -1798,7 +2669,7 @@ where
                 != normalize_tag_version(&candidate_run.dso_version)
             || &sample.source_sha256 != expected_source_sha256
             || sample.import_ir_action_id != import_action_id
-            || baseline.ir_top.as_deref() != Some(sample.top_fn_name.as_str())
+            || baseline.ir_action_id != import_action_id
             || sample.g8r_aig_action_id != candidate_g8r_action_id
             || sample.yosys_abc_aig_action_id != candidate_abc_action_id
             || !baseline_stats_action_ids.contains(&baseline.g8r_stats_action_id)
@@ -1807,11 +2678,23 @@ where
                 "candidate sample does not match its fixed IR, action graph, or common G8r+ABC release baseline"
             );
         }
-        let stats = read_stats(sample, &candidate_stats_action)?;
-        let g8r_nodes = candidate_stats_metric(&stats, "and_nodes")?;
-        let g8r_levels = candidate_stats_metric(&stats, "depth")?;
+        let stats = read_stats(
+            sample,
+            &candidate_stats_action,
+            ProgressionSampleActionGraph {
+                import_ir: import_action,
+                g8r_aig: candidate_g8r_action,
+                g8r_abc_aig: candidate_abc_action,
+                g8r_stats: candidate_stats_action.clone(),
+                combo_verilog: None,
+                yosys_abc_aig: None,
+                yosys_abc_stats: None,
+            },
+        )?;
+        let g8r_nodes = progression_stats_metric(&stats, "and_nodes")?;
+        let g8r_levels = progression_stats_metric(&stats, "depth")?;
         let g8r_product = g8r_nodes * g8r_levels;
-        let browser_sample = BrowserCandidateProgressionSample {
+        let browser_sample = BrowserProgressionSample {
             fn_key: baseline.fn_key.clone(),
             structural_hash: structural_hash.clone(),
             source_sha256: sample.source_sha256.clone(),
@@ -1863,7 +2746,7 @@ where
             .keys()
             .filter(|hash| !artifacts.contains_key(*hash))
             .count() as u64,
-        candidate_samples: samples.into_values().collect(),
+        run_samples: samples.into_values().collect(),
     };
     validate_candidate_progression_generation(
         &generation,
@@ -1879,122 +2762,509 @@ fn load_candidate_progression_generation_with_evidence(
     release_catalog: &BrowserProgressionCatalog,
     dataset: &StdlibG8rVsYosysDataset,
     repository_observation: Option<&RepositoryHeadObservationView>,
-) -> Result<(BrowserProgressionGeneration, CandidateProgressionEvidence)> {
+) -> Result<ProgressionRunEvidenceInput> {
     let manifest = read_candidate_corpus_manifest(run_dir)?;
-    let evidence_manifest = manifest.clone();
+    let cohort_id = progression_cohort_for_candidate(
+        manifest
+            .candidate_run
+            .as_ref()
+            .context("candidate corpus manifest has no typed candidate_run")?,
+    )?
+    .cohort_id
+    .to_string();
+    let runtime_identity = ProgressionRuntimeIdentity {
+        stats_runtime: manifest.stats_runtime.clone(),
+        yosys_runtime: manifest.yosys_runtime.clone(),
+        yosys_script: manifest.yosys_script.clone(),
+        yosys_script_sha256: manifest.yosys_script_sha256.clone(),
+    };
     let store = ArtifactStore::new_with_sled(
         run_dir.join(".bvc/bvc-artifacts"),
         run_dir.join(".bvc/artifacts.sled"),
     );
-    let mut stats_evidence = Vec::with_capacity(manifest.samples.len());
+    let mut sources = BTreeMap::new();
     let generation = candidate_progression_generation_from_manifest(
         manifest,
         release_catalog,
         dataset,
         repository_observation,
-        |sample, expected_action| {
+        |sample, expected_action, action_graph| {
             let (value, evidence) = read_verified_candidate_stats_with_evidence(
                 run_dir,
                 &store,
                 sample,
                 expected_action,
             )?;
-            stats_evidence.push(evidence);
+            if sources
+                .insert(
+                    evidence.g8r_stats_action_id.clone(),
+                    ProgressionSampleSourceEvidence {
+                        g8r: evidence,
+                        yosys_abc: None,
+                        action_graph,
+                    },
+                )
+                .is_some()
+            {
+                bail!("candidate evidence contains duplicate G8r stats action");
+            }
             Ok(value)
         },
     )?;
-    Ok((
+    Ok(ProgressionRunEvidenceInput {
+        cohort_id,
         generation,
-        CandidateProgressionEvidence {
-            schema_version: CANDIDATE_PROGRESSION_EVIDENCE_SCHEMA_VERSION,
-            manifest: evidence_manifest,
-            stats: stats_evidence,
-        },
-    ))
+        runtime_identity,
+        sample_sources_by_g8r_stats_action: sources,
+    })
+}
+fn read_release_corpus_manifest(run_dir: &Path) -> Result<ReleaseCorpusManifestInput> {
+    let path = run_dir.join("manifest.json");
+    serde_json::from_slice(
+        &fs::read(&path)
+            .with_context(|| format!("reading progression manifest {}", path.display()))?,
+    )
+    .with_context(|| format!("decoding progression manifest {}", path.display()))
 }
 
-fn candidate_progression_generation_from_evidence(
-    evidence: CandidateProgressionEvidence,
-    release_catalog: &BrowserProgressionCatalog,
+fn progression_cohort_for_release_manifest(
+    manifest: &ReleaseCorpusManifestInput,
+) -> Result<&'static ProgressionCohortDescriptor> {
+    let policy = manifest
+        .scheduling_policy
+        .as_ref()
+        .context("release progression run has no fixed-corpus scheduling policy")?;
+    PROGRESSION_COHORTS
+        .iter()
+        .find(|cohort| {
+            policy.expected_corpus_sample_count == cohort.expected_count as u64
+                && policy.expected_corpus_artifact_manifest_sha256
+                    == cohort.expected_artifact_manifest_sha256
+        })
+        .with_context(|| {
+            format!(
+                "release progression policy {:?} does not match a registered fixed cohort",
+                policy.policy_name
+            )
+        })
+}
+
+fn release_event_time_utc(
+    releases: &[CrateReleaseStatusView],
+    crate_version: &str,
+    dso_version: &str,
+) -> Result<String> {
+    let release = releases
+        .iter()
+        .find(|release| {
+            normalize_tag_version(&release.crate_version) == normalize_tag_version(crate_version)
+                && normalize_tag_version(&release.dso_version) == normalize_tag_version(dso_version)
+        })
+        .context("release progression run is absent from typed release metadata")?;
+    Ok(
+        parse_compat_release_datetime_utc(&release.crate_release_datetime)
+            .context("release progression metadata has an invalid timestamp")?
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+}
+
+fn validate_release_progression_driver_runtime(runtime: &DriverRuntimeSpec) -> Result<()> {
+    validate_candidate_driver_runtime(runtime, false)?;
+    let version = normalize_tag_version(&runtime.driver_version);
+    if version.is_empty()
+        || runtime.driver_version != version
+        || runtime.release_platform != crate::DEFAULT_RELEASE_PLATFORM
+        || runtime.docker_image != crate::runtime::default_driver_image(version)
+        || runtime.dockerfile != crate::DEFAULT_DOCKERFILE
+    {
+        bail!("release progression run does not use a canonical released driver runtime");
+    }
+    Ok(())
+}
+
+fn validate_release_progression_yosys_runtime(runtime: &YosysRuntimeSpec) -> Result<()> {
+    if runtime.docker_image != crate::DEFAULT_YOSYS_DOCKER_IMAGE
+        || runtime.dockerfile != crate::DEFAULT_YOSYS_DOCKERFILE
+        || !is_canonical_lower_hex(&runtime.docker_image_id, 64)
+        || !is_canonical_lower_hex(&runtime.dockerfile_sha256, 64)
+        || runtime.upstream_commit.as_deref() != Some(crate::DEFAULT_YOSYS_UPSTREAM_COMMIT)
+        || runtime.slang_commit.is_some()
+    {
+        bail!("release progression run does not use the canonical Yosys runtime");
+    }
+    Ok(())
+}
+
+fn load_release_progression_generation_with_evidence(
+    run_dir: &Path,
     dataset: &StdlibG8rVsYosysDataset,
-    repository_observation: Option<&RepositoryHeadObservationView>,
-) -> Result<BrowserProgressionGeneration> {
-    if evidence.schema_version != CANDIDATE_PROGRESSION_EVIDENCE_SCHEMA_VERSION {
+    releases: &[CrateReleaseStatusView],
+) -> Result<ProgressionRunEvidenceInput> {
+    let manifest = read_release_corpus_manifest(run_dir)?;
+    let cohort = progression_cohort_for_release_manifest(&manifest)?;
+    if manifest.schema_version != 5
+        || manifest.recipe_preset != "g8r-abc-vs-yabc-aig-diff"
+        || manifest.fraig
+        || manifest.candidate_run.is_some()
+        || manifest.driver_runtime.source_revision.is_some()
+        || manifest.stats_runtime.source_revision.is_some()
+        || manifest.yosys_script != crate::DEFAULT_YOSYS_FLOW_SCRIPT
+        || !is_canonical_lower_hex(&manifest.yosys_script_sha256, 64)
+        || manifest.samples.len() != cohort.expected_count
+    {
         bail!(
-            "unsupported candidate progression evidence schema version: {}",
-            evidence.schema_version
+            "release progression run must be a complete g8r-abc-vs-yabc-aig-diff fixed-cohort release evaluation"
         );
     }
-    if evidence.stats.len() != evidence.manifest.samples.len()
-        || !evidence
-            .stats
-            .iter()
-            .zip(&evidence.manifest.samples)
-            .all(|(stats, sample)| stats.sample_id == sample.sample_id)
-    {
-        bail!("candidate evidence stats do not exactly follow the manifest sample order");
+    let crate_version = normalize_tag_version(&manifest.driver_runtime.driver_version).to_string();
+    let stats_crate_version =
+        normalize_tag_version(&manifest.stats_runtime.driver_version).to_string();
+    let dso_version = normalize_tag_version(&manifest.dso_version).to_string();
+    if crate_version.is_empty() || stats_crate_version.is_empty() || dso_version.is_empty() {
+        bail!("release progression run has incompatible driver or DSO identities");
     }
-    let mut stats_by_sample = BTreeMap::new();
-    for stats in evidence.stats {
-        let sample_id = stats.sample_id.clone();
-        if stats_by_sample.insert(sample_id.clone(), stats).is_some() {
-            bail!("candidate evidence contains duplicate stats for {sample_id}");
+    validate_release_progression_driver_runtime(&manifest.driver_runtime)?;
+    validate_release_progression_driver_runtime(&manifest.stats_runtime)?;
+    validate_release_progression_yosys_runtime(&manifest.yosys_runtime)?;
+    let store = ArtifactStore::new_with_sled(
+        run_dir.join(".bvc/bvc-artifacts"),
+        run_dir.join(".bvc/artifacts.sled"),
+    );
+    let artifacts = progression_ir_artifacts(cohort)?;
+    let script_ref = ScriptRef {
+        path: manifest.yosys_script.clone(),
+        sha256: manifest.yosys_script_sha256.clone(),
+    };
+    let mut samples = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+    for sample in &manifest.samples {
+        let structural_hash = candidate_structural_hash(&sample.source_relpath)?;
+        let expected_source_sha256 = artifacts
+            .get(&structural_hash)
+            .context("release progression sample is outside the fixed cohort")?;
+        let metadata = dataset
+            .samples
+            .iter()
+            .find(|value| {
+                progression_sample_matches_kind(value, cohort.artifact_kind)
+                    && normalized_progression_ir_hash(value).as_deref()
+                        == Some(structural_hash.as_str())
+            })
+            .context("release progression sample has no structural metadata")?;
+        let import_action_id =
+            crate::executor::compute_action_id(&ActionSpec::ImportIrPackageFile {
+                source_sha256: sample.source_sha256.clone(),
+                top_fn_name: Some(sample.top_fn_name.clone()),
+            })?;
+        let g8r_aig_action = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: import_action_id.clone(),
+            top_fn_name: Some(sample.top_fn_name.clone()),
+            fraig: false,
+            lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+            execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+                &crate_version,
+            ),
+            version: sample.dso_version.clone(),
+            runtime: manifest.driver_runtime.clone(),
+        };
+        let g8r_aig_action_id = crate::executor::compute_action_id(&g8r_aig_action)?;
+        let g8r_abc_action = ActionSpec::AigToYosysAbcAig {
+            aig_action_id: g8r_aig_action_id.clone(),
+            yosys_script_ref: script_ref.clone(),
+            runtime: manifest.yosys_runtime.clone(),
+        };
+        let g8r_abc_action_id = crate::executor::compute_action_id(&g8r_abc_action)?;
+        let g8r_action = ActionSpec::DriverAigToStats {
+            aig_action_id: g8r_abc_action_id.clone(),
+            version: sample.dso_version.clone(),
+            runtime: manifest.stats_runtime.clone(),
+        };
+        let combo_action = ActionSpec::IrFnToCombinationalVerilog {
+            ir_action_id: import_action_id.clone(),
+            top_fn_name: Some(sample.top_fn_name.clone()),
+            use_system_verilog: false,
+            version: sample.dso_version.clone(),
+            runtime: manifest.driver_runtime.clone(),
+        };
+        let combo_action_id = crate::executor::compute_action_id(&combo_action)?;
+        let yosys_abc_action = ActionSpec::ComboVerilogToYosysAbcAig {
+            verilog_action_id: combo_action_id.clone(),
+            verilog_top_module_name: Some(sample.top_fn_name.clone()),
+            frontend: YosysVerilogFrontend::Builtin,
+            yosys_script_ref: script_ref.clone(),
+            runtime: manifest.yosys_runtime.clone(),
+        };
+        let yosys_abc_action_id = crate::executor::compute_action_id(&yosys_abc_action)?;
+        let reference_action = ActionSpec::DriverAigToStats {
+            aig_action_id: yosys_abc_action_id.clone(),
+            version: sample.dso_version.clone(),
+            runtime: manifest.stats_runtime.clone(),
+        };
+        if sample.status != "done"
+            || sample.import_ir_status != "done"
+            || sample.g8r_aig_status != "done"
+            || sample.g8r_abc_aig_status.as_deref() != Some("done")
+            || sample.g8r_stats_status != "done"
+            || sample.combo_verilog_status != "done"
+            || sample.yosys_abc_aig_status != "done"
+            || sample.yosys_abc_stats_status != "done"
+            || sample.sample_id != crate::corpus::sample_id_for_relpath(&sample.source_relpath)
+            || sample.fraig
+            || normalize_tag_version(&sample.dso_version) != dso_version
+            || normalize_tag_version(&sample.driver_crate_version) != crate_version
+            || normalize_tag_version(&sample.stats_driver_crate_version) != stats_crate_version
+            || &sample.source_sha256 != expected_source_sha256
+            || sample.import_ir_action_id != import_action_id
+            || sample.g8r_aig_action_id != g8r_aig_action_id
+            || sample.g8r_abc_aig_action_id.as_deref() != Some(g8r_abc_action_id.as_str())
+            || sample.g8r_stats_action_id != crate::executor::compute_action_id(&g8r_action)?
+            || sample.combo_verilog_action_id != combo_action_id
+            || sample.yosys_abc_aig_action_id != yosys_abc_action_id
+            || sample.yosys_abc_stats_action_id
+                != crate::executor::compute_action_id(&reference_action)?
+        {
+            bail!(
+                "release progression sample does not match its fixed IR, completion state, or matched-ABC action graph"
+            );
+        }
+        let (g8r_stats, g8r_source) = read_verified_progression_stats_with_evidence(
+            run_dir,
+            &store,
+            &sample.sample_id,
+            &sample.g8r_stats_action_id,
+            &g8r_action,
+            "g8r_stats.json",
+        )?;
+        let (reference_stats, reference_source) = read_verified_progression_stats_with_evidence(
+            run_dir,
+            &store,
+            &sample.sample_id,
+            &sample.yosys_abc_stats_action_id,
+            &reference_action,
+            "yosys_abc_stats.json",
+        )?;
+        let g8r_nodes = progression_stats_metric(&g8r_stats, "and_nodes")?;
+        let g8r_levels = progression_stats_metric(&g8r_stats, "depth")?;
+        let yosys_abc_nodes = progression_stats_metric(&reference_stats, "and_nodes")?;
+        let yosys_abc_levels = progression_stats_metric(&reference_stats, "depth")?;
+        let g8r_product = g8r_nodes * g8r_levels;
+        let yosys_abc_product = yosys_abc_nodes * yosys_abc_levels;
+        let browser_sample = BrowserProgressionSample {
+            fn_key: metadata.fn_key.clone(),
+            structural_hash: structural_hash.clone(),
+            source_sha256: sample.source_sha256.clone(),
+            ir_node_count: metadata.ir_node_count,
+            g8r_nodes,
+            g8r_levels,
+            yosys_abc_nodes,
+            yosys_abc_levels,
+            g8r_product,
+            yosys_abc_product,
+            g8r_product_loss: g8r_product - yosys_abc_product,
+            ir_action_id: import_action_id,
+            g8r_stats_action_id: sample.g8r_stats_action_id.clone(),
+            yosys_abc_stats_action_id: sample.yosys_abc_stats_action_id.clone(),
+        };
+        if samples
+            .insert(structural_hash.clone(), browser_sample)
+            .is_some()
+        {
+            bail!("release progression run contains duplicate structural hash {structural_hash}");
+        }
+        sources.insert(
+            sample.g8r_stats_action_id.clone(),
+            ProgressionSampleSourceEvidence {
+                g8r: g8r_source,
+                yosys_abc: Some(reference_source),
+                action_graph: ProgressionSampleActionGraph {
+                    import_ir: ActionSpec::ImportIrPackageFile {
+                        source_sha256: sample.source_sha256.clone(),
+                        top_fn_name: Some(sample.top_fn_name.clone()),
+                    },
+                    g8r_aig: g8r_aig_action,
+                    g8r_abc_aig: g8r_abc_action,
+                    g8r_stats: g8r_action,
+                    combo_verilog: Some(combo_action),
+                    yosys_abc_aig: Some(yosys_abc_action),
+                    yosys_abc_stats: Some(reference_action),
+                },
+            },
+        );
+    }
+    if samples.len() != cohort.expected_count || sources.len() != cohort.expected_count {
+        bail!("release progression run is not exactly cohort complete");
+    }
+    let generation = BrowserProgressionGeneration {
+        generation_id: progression_generation_id(cohort.cohort_id, &crate_version, &dso_version),
+        origin: BrowserProgressionOrigin::CrateRelease,
+        display_label: format!("v{crate_version}"),
+        event_time_utc: Some(release_event_time_utc(
+            releases,
+            &crate_version,
+            &dso_version,
+        )?),
+        crate_version: Some(crate_version),
+        dso_version,
+        baseline_generation_id: None,
+        coverage: BrowserProgressionCoverage::CohortComplete,
+        observed_ir_count: samples.len() as u64,
+        cohort_ir_count: cohort.expected_count as u64,
+        missing_cohort_ir_count: 0,
+        extra_ir_count: 0,
+        run_samples: samples.into_values().collect(),
+    };
+    Ok(ProgressionRunEvidenceInput {
+        cohort_id: cohort.cohort_id.to_string(),
+        generation,
+        runtime_identity: ProgressionRuntimeIdentity {
+            stats_runtime: manifest.stats_runtime,
+            yosys_runtime: manifest.yosys_runtime,
+            yosys_script: manifest.yosys_script,
+            yosys_script_sha256: manifest.yosys_script_sha256,
+        },
+        sample_sources_by_g8r_stats_action: sources,
+    })
+}
+
+fn validate_release_progression_generation(
+    generation: &BrowserProgressionGeneration,
+    release_catalog: &BrowserProgressionCatalog,
+    dataset: &StdlibG8rVsYosysDataset,
+    releases: &[CrateReleaseStatusView],
+) -> Result<()> {
+    let cohort = progression_cohort(&release_catalog.cohort_id)?;
+    let crate_version = generation
+        .crate_version
+        .as_deref()
+        .context("release progression generation has no crate version")?;
+    let expected_event_time =
+        release_event_time_utc(releases, crate_version, &generation.dso_version)?;
+    if generation.origin != BrowserProgressionOrigin::CrateRelease
+        || generation.generation_id
+            != progression_generation_id(
+                cohort.cohort_id,
+                normalize_tag_version(crate_version),
+                normalize_tag_version(&generation.dso_version),
+            )
+        || generation.display_label != format!("v{}", normalize_tag_version(crate_version))
+        || generation.event_time_utc.as_deref() != Some(expected_event_time.as_str())
+        || generation.baseline_generation_id.is_some()
+        || generation.coverage != BrowserProgressionCoverage::CohortComplete
+        || generation.observed_ir_count != cohort.expected_count as u64
+        || generation.cohort_ir_count != cohort.expected_count as u64
+        || generation.missing_cohort_ir_count != 0
+        || generation.extra_ir_count != 0
+    {
+        bail!("release progression generation has an invalid identity or coverage");
+    }
+    let artifacts = progression_ir_artifacts(cohort)?;
+    let mut seen = BTreeSet::new();
+    for sample in &generation.run_samples {
+        if !seen.insert(sample.structural_hash.clone()) {
+            bail!("release progression generation contains a duplicate structural hash");
+        }
+        let expected_source_sha256 = artifacts
+            .get(&sample.structural_hash)
+            .context("release progression sample is outside the fixed cohort")?;
+        let metadata = dataset
+            .samples
+            .iter()
+            .find(|value| {
+                progression_sample_matches_kind(value, cohort.artifact_kind)
+                    && normalized_progression_ir_hash(value).as_deref()
+                        == Some(sample.structural_hash.as_str())
+            })
+            .context("release progression sample has no structural metadata")?;
+        let metrics = [
+            sample.g8r_nodes,
+            sample.g8r_levels,
+            sample.yosys_abc_nodes,
+            sample.yosys_abc_levels,
+            sample.g8r_product,
+            sample.yosys_abc_product,
+            sample.g8r_product_loss,
+        ];
+        if &sample.source_sha256 != expected_source_sha256
+            || sample.ir_node_count != metadata.ir_node_count
+            || !is_canonical_lower_hex(&sample.g8r_stats_action_id, 64)
+            || !is_canonical_lower_hex(&sample.yosys_abc_stats_action_id, 64)
+            || metrics.iter().any(|value| !value.is_finite())
+            || metrics[..6].iter().any(|value| *value < 0.0)
+            || sample.g8r_product != sample.g8r_nodes * sample.g8r_levels
+            || sample.yosys_abc_product != sample.yosys_abc_nodes * sample.yosys_abc_levels
+            || sample.g8r_product_loss != sample.g8r_product - sample.yosys_abc_product
+        {
+            bail!("release progression sample disagrees with its fixed IR or metrics");
         }
     }
-    let generation = candidate_progression_generation_from_manifest(
-        evidence.manifest,
-        release_catalog,
-        dataset,
-        repository_observation,
-        |sample, expected_action| {
-            let stats = stats_by_sample.remove(&sample.sample_id).with_context(|| {
-                format!("candidate evidence has no stats for {}", sample.sample_id)
-            })?;
-            let expected_action_id = crate::executor::compute_action_id(expected_action)?;
-            let expected_metric_projection_sha256 =
-                candidate_stats_metric_projection_sha256(stats.and_nodes, stats.depth)?;
-            if stats.g8r_stats_action_id != sample.g8r_stats_action_id
-                || stats.g8r_stats_action_id != expected_action_id
-                || stats.source_output_bytes == 0
-                || !is_canonical_lower_hex(&stats.source_output_sha256, 64)
-                || !is_canonical_lower_hex(&stats.metric_projection_sha256, 64)
-                || stats.metric_projection_sha256 != expected_metric_projection_sha256
-            {
-                bail!(
-                    "candidate evidence stats do not match their action, source output, or metric projection digest"
-                );
-            }
-            Ok(serde_json::json!({"and_nodes": stats.and_nodes, "depth": stats.depth}))
-        },
-    )?;
-    if !stats_by_sample.is_empty() {
-        bail!("candidate evidence contains stats outside the candidate manifest");
+    if seen != artifacts.keys().cloned().collect()
+        || generation.run_samples.len() != cohort.expected_count
+    {
+        bail!("release progression generation does not contain the exact fixed cohort");
     }
-    Ok(generation)
+    Ok(())
+}
+
+fn merge_validated_progression_generation(
+    release_catalog: &mut BrowserProgressionCatalog,
+    incoming_generation_ids: &mut BTreeSet<String>,
+    generation: BrowserProgressionGeneration,
+) -> Result<()> {
+    if !incoming_generation_ids.insert(generation.generation_id.clone()) {
+        bail!("progression contains duplicate input generation identity");
+    }
+    let Some(existing) = release_catalog
+        .generations
+        .iter_mut()
+        .find(|existing| existing.generation_id == generation.generation_id)
+    else {
+        release_catalog.generations.push(generation);
+        return Ok(());
+    };
+    if !matches!(existing.origin, BrowserProgressionOrigin::CrateRelease)
+        || !matches!(generation.origin, BrowserProgressionOrigin::CrateRelease)
+    {
+        bail!("progression contains duplicate generation identity");
+    }
+    // A validated, cohort-complete run is the authoritative evidence for a release that may also
+    // be represented by the legacy snapshot projection. Keep one chronological point and let the
+    // explicit matched-ABC run supersede the snapshot-derived generation.
+    *existing = generation;
+    Ok(())
 }
 
 fn combine_progression_generations(
     mut release_catalog: BrowserProgressionCatalog,
-    candidates: Vec<BrowserProgressionGeneration>,
+    generations: Vec<BrowserProgressionGeneration>,
     dataset: &StdlibG8rVsYosysDataset,
+    releases: &[CrateReleaseStatusView],
     repository_observation: Option<&RepositoryHeadObservationView>,
 ) -> Result<BrowserProgressionCatalog> {
-    let mut generation_ids = release_catalog
-        .generations
-        .iter()
-        .map(|generation| generation.generation_id.clone())
-        .collect::<BTreeSet<_>>();
-    for candidate in candidates {
-        validate_candidate_progression_generation(
-            &candidate,
-            &release_catalog,
-            dataset,
-            repository_observation,
-        )?;
-        if !generation_ids.insert(candidate.generation_id.clone()) {
-            bail!("progression contains duplicate generation identity");
+    let mut incoming_generation_ids = BTreeSet::new();
+    for generation in generations {
+        match generation.origin {
+            BrowserProgressionOrigin::CrateRelease => {
+                validate_release_progression_generation(
+                    &generation,
+                    &release_catalog,
+                    dataset,
+                    releases,
+                )?;
+            }
+            BrowserProgressionOrigin::GitRevision { .. } => {
+                validate_candidate_progression_generation(
+                    &generation,
+                    &release_catalog,
+                    dataset,
+                    repository_observation,
+                )?;
+            }
         }
-        release_catalog.generations.push(candidate);
+        merge_validated_progression_generation(
+            &mut release_catalog,
+            &mut incoming_generation_ids,
+            generation,
+        )?;
     }
     release_catalog
         .generations
@@ -2006,7 +3276,6 @@ fn combine_progression_generations(
         .count() as u64;
     Ok(release_catalog)
 }
-
 fn empty_browser_progression_index() -> Result<BrowserProgressionIndex> {
     Ok(BrowserProgressionIndex {
         default_cohort_id: WHOLE_FUNCTION_PROGRESSION_COHORT_ID.to_string(),
@@ -2017,88 +3286,154 @@ fn empty_browser_progression_index() -> Result<BrowserProgressionIndex> {
     })
 }
 
-fn build_browser_progression_catalog_and_candidate_evidence_from_site(
+fn record_progression_runtime_identity(
+    identities: &mut BTreeMap<String, ProgressionRuntimeIdentity>,
+    cohort_id: &str,
+    identity: &ProgressionRuntimeIdentity,
+) -> Result<()> {
+    match identities.get(cohort_id) {
+        Some(expected) if expected != identity => bail!(
+            "progression generations for cohort {cohort_id} do not share common stats and Yosys runtimes"
+        ),
+        Some(_) => Ok(()),
+        None => {
+            identities.insert(cohort_id.to_string(), identity.clone());
+            Ok(())
+        }
+    }
+}
+
+fn build_browser_progression_catalog_and_progression_evidence_from_site(
     site_dir: &Path,
     datasets: &[BrowserDataset],
     releases: &[CrateReleaseStatusView],
     repository_observation: Option<&RepositoryHeadObservationView>,
-    candidate_run_dirs: &[PathBuf],
-) -> Result<(BrowserProgressionIndex, Vec<CandidateProgressionEvidence>)> {
+    progression_run_dirs: &[PathBuf],
+) -> Result<(BrowserProgressionIndex, Vec<ProgressionRunEvidenceInput>)> {
     let Some(dataset) = load_progression_comparison_dataset_from_site(site_dir, datasets)? else {
-        if !candidate_run_dirs.is_empty() {
-            bail!("cannot add a candidate without the fixed-IR release progression dataset");
+        if !progression_run_dirs.is_empty() {
+            bail!("cannot add progression runs without the fixed-IR comparison dataset");
         }
         return Ok((empty_browser_progression_index()?, Vec::new()));
     };
-    let release_catalogs = PROGRESSION_COHORTS
+    let base_catalogs = PROGRESSION_COHORTS
         .iter()
         .map(|cohort| build_browser_progression_catalog_for_cohort(&dataset, releases, cohort))
         .collect::<Result<Vec<_>>>()?;
-    let mut candidates_by_cohort = BTreeMap::<String, Vec<BrowserProgressionGeneration>>::new();
-    let mut evidence = Vec::with_capacity(candidate_run_dirs.len());
-    for run_dir in candidate_run_dirs {
-        let manifest = read_candidate_corpus_manifest(run_dir)?;
-        let candidate_run = manifest
+    let mut release_dirs = Vec::new();
+    let mut candidate_dirs = Vec::new();
+    for run_dir in progression_run_dirs {
+        if read_candidate_corpus_manifest(run_dir)?
             .candidate_run
-            .as_ref()
-            .context("candidate corpus manifest has no typed candidate_run")?;
-        let cohort = progression_cohort_for_candidate(candidate_run)?;
-        let release_catalog = release_catalogs
+            .is_some()
+        {
+            candidate_dirs.push(run_dir);
+        } else {
+            release_dirs.push(run_dir);
+        }
+    }
+    let mut evidence = Vec::with_capacity(progression_run_dirs.len());
+    let mut release_generations = BTreeMap::<String, Vec<BrowserProgressionGeneration>>::new();
+    for run_dir in release_dirs {
+        let input = load_release_progression_generation_with_evidence(run_dir, &dataset, releases)
+            .with_context(|| format!("loading release progression run {}", run_dir.display()))?;
+        release_generations
+            .entry(input.cohort_id.clone())
+            .or_default()
+            .push(input.generation.clone());
+        evidence.push(input);
+    }
+    let mut catalogs = base_catalogs
+        .into_iter()
+        .map(|catalog| {
+            let generations = release_generations
+                .remove(&catalog.cohort_id)
+                .unwrap_or_default();
+            combine_progression_generations(
+                catalog,
+                generations,
+                &dataset,
+                releases,
+                repository_observation,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !release_generations.is_empty() {
+        bail!("release generations remain outside the registered progression cohorts");
+    }
+    let mut candidate_generations = BTreeMap::<String, Vec<BrowserProgressionGeneration>>::new();
+    for run_dir in candidate_dirs {
+        let manifest = read_candidate_corpus_manifest(run_dir)?;
+        let cohort = progression_cohort_for_candidate(
+            manifest
+                .candidate_run
+                .as_ref()
+                .context("candidate corpus manifest has no typed candidate_run")?,
+        )?;
+        let release_catalog = catalogs
             .iter()
             .find(|catalog| catalog.cohort_id == cohort.cohort_id)
             .expect("registered cohort has a release catalog");
-        let (generation, candidate_evidence) = load_candidate_progression_generation_with_evidence(
+        let input = load_candidate_progression_generation_with_evidence(
             run_dir,
             release_catalog,
             &dataset,
             repository_observation,
         )
-        .with_context(|| format!("loading candidate run {}", run_dir.display()))?;
-        candidates_by_cohort
-            .entry(cohort.cohort_id.to_string())
+        .with_context(|| format!("loading Git progression run {}", run_dir.display()))?;
+        candidate_generations
+            .entry(input.cohort_id.clone())
             .or_default()
-            .push(generation);
-        evidence.push(candidate_evidence);
+            .push(input.generation.clone());
+        evidence.push(input);
     }
-    let cohorts = release_catalogs
+    catalogs = catalogs
         .into_iter()
-        .map(|release_catalog| {
-            let candidates = candidates_by_cohort
-                .remove(&release_catalog.cohort_id)
+        .map(|catalog| {
+            let generations = candidate_generations
+                .remove(&catalog.cohort_id)
                 .unwrap_or_default();
             combine_progression_generations(
-                release_catalog,
-                candidates,
+                catalog,
+                generations,
                 &dataset,
+                releases,
                 repository_observation,
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    if !candidates_by_cohort.is_empty() {
-        bail!("candidate generations remain outside the registered progression cohorts");
+    if !candidate_generations.is_empty() {
+        bail!("Git generations remain outside the registered progression cohorts");
+    }
+    let mut runtime_identities = BTreeMap::new();
+    for input in &evidence {
+        record_progression_runtime_identity(
+            &mut runtime_identities,
+            &input.cohort_id,
+            &input.runtime_identity,
+        )?;
     }
     Ok((
         BrowserProgressionIndex {
             default_cohort_id: WHOLE_FUNCTION_PROGRESSION_COHORT_ID.to_string(),
-            cohorts,
+            cohorts: catalogs,
         },
         evidence,
     ))
 }
-
 fn build_browser_progression_catalog_from_site(
     site_dir: &Path,
     datasets: &[BrowserDataset],
     releases: &[CrateReleaseStatusView],
     repository_observation: Option<&RepositoryHeadObservationView>,
-    candidate_run_dirs: &[PathBuf],
+    progression_run_dirs: &[PathBuf],
 ) -> Result<BrowserProgressionIndex> {
-    build_browser_progression_catalog_and_candidate_evidence_from_site(
+    build_browser_progression_catalog_and_progression_evidence_from_site(
         site_dir,
         datasets,
         releases,
         repository_observation,
-        candidate_run_dirs,
+        progression_run_dirs,
     )
     .map(|(catalog, _)| catalog)
 }
@@ -2420,21 +3755,24 @@ fn expected_catalog_site_relpaths(
     }
 
     if !catalog
-        .candidate_evidence
+        .progression_evidence
         .windows(2)
         .all(|pair| pair[0].generation_id < pair[1].generation_id)
     {
-        bail!("browser catalog candidate evidence is not strictly sorted by generation ID");
+        bail!("browser catalog progression evidence is not strictly sorted by generation ID");
     }
-    for evidence in &catalog.candidate_evidence {
+    for evidence in &catalog.progression_evidence {
         if !is_canonical_lower_hex(&evidence.generation_id, 64)
             || !is_canonical_lower_hex(&evidence.sha256, 64)
         {
-            bail!("browser catalog candidate evidence has an invalid identity or digest");
+            bail!("browser catalog progression evidence has an invalid identity or digest");
         }
-        let expected_url = format!("data/candidates/{}/evidence.json", evidence.generation_id);
+        let expected_url = format!(
+            "data/progression-runs/{}/evidence.pb",
+            evidence.generation_id
+        );
         if evidence.url != expected_url {
-            bail!("browser catalog candidate evidence URL is not canonical");
+            bail!("browser catalog progression evidence URL is not canonical");
         }
         insert_unique_site_relpath(&mut data, evidence.url.clone())?;
     }
@@ -2920,7 +4258,7 @@ pub(crate) fn build_static_site_with_protected_roots(
     options: &BuildStaticSiteOptions,
     protected_roots: &[(&str, &Path)],
 ) -> Result<BuildStaticSiteSummary> {
-    build_static_site_with_candidate_runs(options, protected_roots, &[])
+    build_static_site_with_progression_runs(options, protected_roots, &[])
 }
 
 fn unique_site_sibling_path(out_dir: &Path, role: &str) -> Result<PathBuf> {
@@ -3087,18 +4425,19 @@ fn sync_site_parent_directory(out_dir: &Path) -> Result<()> {
         .with_context(|| format!("syncing static site parent: {}", parent.display()))
 }
 
-pub(crate) fn build_static_site_with_candidate_runs(
+pub(crate) fn build_static_site_with_progression_runs(
     options: &BuildStaticSiteOptions,
     protected_roots: &[(&str, &Path)],
-    candidate_run_dirs: &[PathBuf],
+    progression_run_dirs: &[PathBuf],
 ) -> Result<BuildStaticSiteSummary> {
+    preflight_progression_run_dirs(progression_run_dirs)?;
     reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected_roots)?;
-    for candidate_run_dir in candidate_run_dirs {
-        reject_site_output_overlap(&options.out_dir, candidate_run_dir, &[]).with_context(
+    for progression_run_dir in progression_run_dirs {
+        reject_site_output_overlap(&options.out_dir, progression_run_dir, &[]).with_context(
             || {
                 format!(
-                    "static site output overlaps candidate run {}",
-                    candidate_run_dir.display()
+                    "static site output overlaps progression run {}",
+                    progression_run_dir.display()
                 )
             },
         )?;
@@ -3125,10 +4464,10 @@ pub(crate) fn build_static_site_with_candidate_runs(
         base_url: options.base_url.clone(),
         overwrite: false,
     };
-    let mut summary = match build_static_site_with_candidate_runs_in_place(
+    let mut summary = match build_static_site_with_progression_runs_in_place(
         &staging_options,
         protected_roots,
-        candidate_run_dirs,
+        progression_run_dirs,
     ) {
         Ok(summary) => summary,
         Err(error) => {
@@ -3245,27 +4584,26 @@ pub(crate) fn build_static_site_with_candidate_runs(
     Ok(summary)
 }
 
-fn build_static_site_with_candidate_runs_in_place(
+fn build_static_site_with_progression_runs_in_place(
     options: &BuildStaticSiteOptions,
     protected_roots: &[(&str, &Path)],
-    candidate_run_dirs: &[PathBuf],
+    progression_run_dirs: &[PathBuf],
 ) -> Result<BuildStaticSiteSummary> {
     verify_static_snapshot(&options.snapshot_dir).context("verifying source snapshot")?;
     let snapshot = load_static_snapshot_manifest(&options.snapshot_dir)?;
     let base_url = normalize_base_url(&options.base_url)?;
     let root_site_url = site_root_url("index.html")?;
     reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected_roots)?;
-    for candidate_run_dir in candidate_run_dirs {
-        reject_site_output_overlap(&options.out_dir, candidate_run_dir, &[]).with_context(
+    for progression_run_dir in progression_run_dirs {
+        reject_site_output_overlap(&options.out_dir, progression_run_dir, &[]).with_context(
             || {
                 format!(
-                    "static site output overlaps candidate run {}",
-                    candidate_run_dir.display()
+                    "static site output overlaps progression run {}",
+                    progression_run_dir.display()
                 )
             },
         )?;
     }
-    preflight_candidate_run_dirs(candidate_run_dirs)?;
     ensure_empty_output_dir(&options.out_dir, options.overwrite)?;
 
     let (css_name, js_name) = static_site_asset_names();
@@ -3350,29 +4688,22 @@ fn build_static_site_with_candidate_runs_in_place(
         run.findings = findings;
     }
     let versions = load_versions_report_from_site(&options.out_dir, &datasets)?;
-    let (progression, candidate_evidence_inputs) =
-        build_browser_progression_catalog_and_candidate_evidence_from_site(
+    let (progression, progression_evidence_inputs) =
+        build_browser_progression_catalog_and_progression_evidence_from_site(
             &options.out_dir,
             &datasets,
             &versions.releases,
             versions.repository_head_observation.as_ref(),
-            candidate_run_dirs,
+            progression_run_dirs,
         )?;
-    let mut candidate_evidence = Vec::with_capacity(candidate_evidence_inputs.len());
-    for evidence in candidate_evidence_inputs {
-        let candidate_run = evidence
-            .manifest
-            .candidate_run
-            .as_ref()
-            .context("candidate evidence has no candidate run identity")?;
-        let cohort_id = progression_cohort_for_candidate(candidate_run)?
-            .cohort_id
-            .to_string();
-        let generation_id = candidate_run.candidate_run_id.clone();
-        let url = format!("data/candidates/{generation_id}/evidence.json");
-        let bytes = encode_candidate_progression_evidence(&evidence)?;
+    let mut progression_evidence = Vec::with_capacity(progression_evidence_inputs.len());
+    for evidence in progression_evidence_inputs {
+        let cohort_id = evidence.cohort_id.clone();
+        let generation_id = evidence.generation.generation_id.clone();
+        let url = format!("data/progression-runs/{generation_id}/evidence.pb");
+        let bytes = encode_progression_run_evidence(&evidence)?;
         write_file(&options.out_dir, &url, &bytes)?;
-        candidate_evidence.push(BrowserCandidateEvidenceRef {
+        progression_evidence.push(BrowserProgressionEvidenceRef {
             cohort_id,
             generation_id,
             url,
@@ -3380,14 +4711,14 @@ fn build_static_site_with_candidate_runs_in_place(
             sha256: sha256_hex(&bytes),
         });
     }
-    candidate_evidence.sort_by(|a, b| a.generation_id.cmp(&b.generation_id));
+    progression_evidence.sort_by(|a, b| a.generation_id.cmp(&b.generation_id));
     let catalog = BrowserCatalog {
         schema_version: BROWSER_CATALOG_SCHEMA_VERSION,
         snapshot_id: snapshot.snapshot_id.clone(),
         base_url: base_url.clone(),
         datasets,
         runs,
-        candidate_evidence,
+        progression_evidence,
         progression,
         releases: versions.releases,
         repository_head_observation: versions.repository_head_observation,
@@ -3993,8 +5324,8 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         }
     }
 
-    let candidate_evidence_urls = catalog
-        .candidate_evidence
+    let progression_evidence_urls = catalog
+        .progression_evidence
         .iter()
         .map(|evidence| evidence.url.clone())
         .collect::<BTreeSet<_>>();
@@ -4003,7 +5334,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         .filter(|relpath| {
             relpath.starts_with("data/")
                 && relpath.ends_with(".json")
-                && !candidate_evidence_urls.contains(*relpath)
+                && !progression_evidence_urls.contains(*relpath)
         })
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -4070,82 +5401,92 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         catalog.repository_head_observation.as_ref(),
         &[],
     )?;
-    let expected_progression =
-        match load_progression_comparison_dataset_from_site(site_dir, &catalog.datasets)? {
-            Some(dataset) => {
-                let mut candidate_generations =
-                    BTreeMap::<String, Vec<BrowserProgressionGeneration>>::new();
-                for evidence_ref in &catalog.candidate_evidence {
-                    let bytes = fs::read(site_dir.join(&evidence_ref.url)).with_context(|| {
-                        format!("reading candidate evidence {}", evidence_ref.url)
-                    })?;
-                    if bytes.len() as u64 != evidence_ref.bytes
-                        || sha256_hex(&bytes) != evidence_ref.sha256
-                    {
-                        bail!(
-                            "browser catalog candidate evidence metadata mismatch: {}",
-                            evidence_ref.generation_id
-                        );
-                    }
-                    let evidence = decode_canonical_candidate_progression_evidence(&bytes)?;
-                    let candidate_run = evidence
-                        .manifest
-                        .candidate_run
-                        .as_ref()
-                        .context("candidate evidence has no candidate run identity")?;
-                    let cohort = progression_cohort_for_candidate(candidate_run)?;
-                    if candidate_run.candidate_run_id != evidence_ref.generation_id
-                        || cohort.cohort_id != evidence_ref.cohort_id
-                    {
-                        bail!("candidate evidence identity disagrees with its catalog reference");
-                    }
-                    let release_catalog = release_progression
-                        .cohorts
-                        .iter()
-                        .find(|value| value.cohort_id == evidence_ref.cohort_id)
-                        .context(
-                            "candidate evidence references an unavailable progression cohort",
-                        )?;
-                    let generation = candidate_progression_generation_from_evidence(
-                        evidence,
-                        release_catalog,
-                        &dataset,
-                        catalog.repository_head_observation.as_ref(),
-                    )?;
-                    if generation.generation_id != evidence_ref.generation_id {
-                        bail!("candidate evidence generated an unexpected progression identity");
-                    }
-                    candidate_generations
-                        .entry(evidence_ref.cohort_id.clone())
-                        .or_default()
-                        .push(generation);
+    let expected_progression = match load_progression_comparison_dataset_from_site(
+        site_dir,
+        &catalog.datasets,
+    )? {
+        Some(dataset) => {
+            let mut release_generations =
+                BTreeMap::<String, Vec<BrowserProgressionGeneration>>::new();
+            let mut git_generations = BTreeMap::<String, Vec<BrowserProgressionGeneration>>::new();
+            let mut runtime_identities = BTreeMap::new();
+            for evidence_ref in &catalog.progression_evidence {
+                let bytes = fs::read(site_dir.join(&evidence_ref.url)).with_context(|| {
+                    format!("reading progression evidence {}", evidence_ref.url)
+                })?;
+                if bytes.len() as u64 != evidence_ref.bytes
+                    || sha256_hex(&bytes) != evidence_ref.sha256
+                {
+                    bail!(
+                        "browser catalog progression evidence metadata mismatch: {}",
+                        evidence_ref.generation_id
+                    );
                 }
-                let cohorts = release_progression
-                    .cohorts
-                    .into_iter()
-                    .map(|release_catalog| {
-                        let candidates = candidate_generations
-                            .remove(&release_catalog.cohort_id)
-                            .unwrap_or_default();
-                        combine_progression_generations(
-                            release_catalog,
-                            candidates,
-                            &dataset,
-                            catalog.repository_head_observation.as_ref(),
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                if !candidate_generations.is_empty() {
-                    bail!("candidate evidence remains outside registered progression cohorts");
+                let (cohort_id, generation, runtime_identity) =
+                    decode_progression_run_evidence(&bytes)?;
+                if generation.generation_id != evidence_ref.generation_id
+                    || cohort_id != evidence_ref.cohort_id
+                {
+                    bail!(
+                        "progression protobuf evidence identity disagrees with its catalog reference"
+                    );
                 }
-                BrowserProgressionIndex {
-                    default_cohort_id: release_progression.default_cohort_id,
-                    cohorts,
-                }
+                record_progression_runtime_identity(
+                    &mut runtime_identities,
+                    &cohort_id,
+                    &runtime_identity,
+                )?;
+                let target = match generation.origin {
+                    BrowserProgressionOrigin::CrateRelease => &mut release_generations,
+                    BrowserProgressionOrigin::GitRevision { .. } => &mut git_generations,
+                };
+                target.entry(cohort_id).or_default().push(generation);
             }
-            None if catalog.candidate_evidence.is_empty() => release_progression,
-            None => bail!("candidate evidence exists without a release comparison dataset"),
-        };
+            let mut cohorts = release_progression
+                .cohorts
+                .into_iter()
+                .map(|release_catalog| {
+                    let generations = release_generations
+                        .remove(&release_catalog.cohort_id)
+                        .unwrap_or_default();
+                    combine_progression_generations(
+                        release_catalog,
+                        generations,
+                        &dataset,
+                        &catalog.releases,
+                        catalog.repository_head_observation.as_ref(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !release_generations.is_empty() {
+                bail!("release evidence remains outside registered progression cohorts");
+            }
+            cohorts = cohorts
+                .into_iter()
+                .map(|release_catalog| {
+                    let generations = git_generations
+                        .remove(&release_catalog.cohort_id)
+                        .unwrap_or_default();
+                    combine_progression_generations(
+                        release_catalog,
+                        generations,
+                        &dataset,
+                        &catalog.releases,
+                        catalog.repository_head_observation.as_ref(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !git_generations.is_empty() {
+                bail!("Git evidence remains outside registered progression cohorts");
+            }
+            BrowserProgressionIndex {
+                default_cohort_id: release_progression.default_cohort_id,
+                cohorts,
+            }
+        }
+        None if catalog.progression_evidence.is_empty() => release_progression,
+        None => bail!("progression evidence exists without a release comparison dataset"),
+    };
     if catalog.progression != expected_progression {
         bail!("browser release progression projection disagrees with source datasets");
     }

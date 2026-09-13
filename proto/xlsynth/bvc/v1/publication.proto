@@ -5,6 +5,7 @@ syntax = "proto3";
 package xlsynth.bvc.v1;
 
 import "google/protobuf/timestamp.proto";
+import "xlsynth/bvc/v1/action.proto";
 import "xlsynth/bvc/v1/campaign.proto";
 import "xlsynth/bvc/v1/common.proto";
 
@@ -45,6 +46,76 @@ message StaticSiteManifest {
   Sha256Digest source_snapshot_id = 2;
   string base_url = 3;
   repeated PublicationFile files = 4;
+}
+
+// Immutable public evidence for one evaluated generation in a fixed-corpus
+// progression cohort. Operational corpus JSON is admitted only at the run
+// workspace boundary; publication, verification, and archival use this typed
+// protobuf until the final browser JSON projection is produced.
+message FixedCorpusProgressionRunEvidence {
+  uint32 record_version = 1;
+  string cohort_id = 2;
+  Sha256Digest cohort_artifact_manifest_sha256 = 3;
+  Sha256Digest generation_id = 4;
+  oneof origin {
+    FixedCorpusCrateReleaseOrigin crate_release = 5;
+    FixedCorpusGitRevisionOrigin git_revision = 6;
+  }
+  google.protobuf.Timestamp event_time = 7;
+  DsoVersion dso_version = 8;
+  optional Sha256Digest baseline_generation_id = 9;
+  uint64 cohort_sample_count = 10;
+  repeated FixedCorpusProgressionSampleEvidence samples = 11;
+}
+
+message FixedCorpusCrateReleaseOrigin {
+  CrateVersion crate_version = 1;
+}
+
+message FixedCorpusGitRevisionOrigin {
+  DriverSourceRevision revision = 1;
+  optional string requested_ref = 2;
+  CrateVersion baseline_crate_version = 3;
+  optional string baseline_release_commit = 4;
+}
+
+message FixedCorpusProgressionSampleEvidence {
+  string fn_key = 1;
+  Sha256Digest structural_hash = 2;
+  Sha256Digest source_sha256 = 3;
+  uint64 ir_node_count = 4;
+  double g8r_nodes = 5;
+  double g8r_levels = 6;
+  double yosys_abc_nodes = 7;
+  double yosys_abc_levels = 8;
+  double g8r_product = 9;
+  double yosys_abc_product = 10;
+  double g8r_product_loss = 11;
+  ActionId ir_action_id = 12;
+  ActionId g8r_stats_action_id = 13;
+  ActionId yosys_abc_stats_action_id = 14;
+  uint64 g8r_stats_output_bytes = 15;
+  Sha256Digest g8r_stats_output_sha256 = 16;
+  Sha256Digest g8r_metric_projection_sha256 = 17;
+  optional uint64 yosys_abc_stats_output_bytes = 18;
+  optional Sha256Digest yosys_abc_stats_output_sha256 = 19;
+  optional Sha256Digest yosys_abc_metric_projection_sha256 = 20;
+  FixedCorpusProgressionSampleActionGraph action_graph = 21;
+}
+
+// Typed action graph for the stages computed by this generation. A matched
+// release owns both branches. A direct Git G8r+ABC evaluation owns only its
+// G8r branch; its codegen/Yosys reference metrics and action ID are bound to
+// baseline_generation_id and checked against that release generation during
+// site verification.
+message FixedCorpusProgressionSampleActionGraph {
+  ActionSpec import_ir = 1;
+  ActionSpec g8r_aig = 2;
+  ActionSpec g8r_abc_aig = 3;
+  ActionSpec g8r_stats = 4;
+  optional ActionSpec combo_verilog = 5;
+  optional ActionSpec yosys_abc_aig = 6;
+  optional ActionSpec yosys_abc_stats = 7;
 }
 
 // Public projection of a campaign run. Operational runtimes, local paths,
