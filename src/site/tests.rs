@@ -911,6 +911,72 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
         .expect_err("typed action graph must independently bind published action IDs");
     assert!(format!("{action_graph_error:#}").contains("G8r stats action"));
 
+    let mut custom_runtime =
+        pb::FixedCorpusProgressionRunEvidence::decode(evidence_bytes.as_slice())
+            .expect("decode candidate runtime evidence");
+    let sample = &mut custom_runtime.samples[0];
+    let custom_stats_action_id = {
+        let g8r_stats = sample
+            .action_graph
+            .as_mut()
+            .expect("candidate action graph")
+            .g8r_stats
+            .as_mut()
+            .expect("candidate G8r stats action");
+        let mut action = crate::proto::action_spec_from_proto(g8r_stats)
+            .expect("decode candidate G8r stats action");
+        match &mut action {
+            ActionSpec::DriverAigToStats { runtime, .. } => {
+                runtime.docker_image = "private.example/xlsynth-driver:custom".to_string();
+            }
+            _ => panic!("expected candidate G8r stats action"),
+        }
+        *g8r_stats =
+            crate::proto::action_spec_to_proto(&action).expect("encode custom stats runtime");
+        compute_action_id(&action).expect("custom stats action ID")
+    };
+    sample.g8r_stats_action_id = Some(
+        crate::proto::action_id_to_proto(
+            &custom_stats_action_id,
+            "progression_sample.g8r_stats_action_id",
+        )
+        .expect("encode custom stats action ID"),
+    );
+    let custom_runtime_bytes = custom_runtime.encode_to_vec();
+    let custom_runtime_error = decode_progression_run_evidence(&custom_runtime_bytes)
+        .expect_err("published evidence must reject a self-consistent custom runtime");
+    assert!(
+        format!("{custom_runtime_error:#}").contains("canonical released driver runtime"),
+        "unexpected error: {custom_runtime_error:#}"
+    );
+    fs::write(&evidence_path, &custom_runtime_bytes).expect("write custom-runtime evidence");
+    let mut custom_runtime_catalog =
+        decode_canonical_browser_catalog(&catalog_bytes).expect("decode restored browser catalog");
+    let custom_runtime_ref = custom_runtime_catalog
+        .progression_evidence
+        .iter_mut()
+        .find(|candidate| candidate.url == evidence_url)
+        .expect("candidate evidence catalog reference");
+    custom_runtime_ref.bytes = custom_runtime_bytes.len() as u64;
+    custom_runtime_ref.sha256 = sha256_hex(&custom_runtime_bytes);
+    fs::write(
+        &catalog_path,
+        encode_browser_catalog(&custom_runtime_catalog).expect("encode custom-runtime catalog"),
+    )
+    .expect("write custom-runtime catalog");
+    refresh_site_manifest_entry(&site_dir, "catalog.json");
+    refresh_site_manifest_entry(&site_dir, &evidence_url);
+    let custom_runtime_verification_error =
+        verify_static_site(&site_dir).expect_err("site verification must reject custom runtimes");
+    assert!(
+        format!("{custom_runtime_verification_error:#}")
+            .contains("canonical released driver runtime"),
+        "unexpected error: {custom_runtime_verification_error:#}"
+    );
+    fs::write(&evidence_path, &evidence_bytes).expect("restore candidate evidence");
+    fs::write(&catalog_path, &catalog_bytes).expect("restore candidate catalog");
+    refresh_site_manifest_entry(&site_dir, "catalog.json");
+    refresh_site_manifest_entry(&site_dir, &evidence_url);
     let mut evidence = pb::FixedCorpusProgressionRunEvidence::decode(evidence_bytes.as_slice())
         .expect("decode candidate evidence");
     evidence.samples[0].g8r_nodes += 1.0;

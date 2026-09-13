@@ -1074,12 +1074,16 @@ fn validate_progression_sample_action_graph(
     {
         bail!("progression driver runtimes do not match the generation origin");
     }
+    validate_release_progression_driver_runtime(stats_runtime)
+        .context("progression stats action does not use a canonical released driver runtime")?;
+    validate_release_progression_yosys_runtime(yosys_runtime)
+        .context("progression ABC action does not use the canonical Yosys runtime")?;
 
     match origin {
         BrowserProgressionOrigin::CrateRelease => {
-            if g8r_runtime.source_revision.is_some() {
-                bail!("release progression source driver must be a released runtime");
-            }
+            validate_release_progression_driver_runtime(g8r_runtime).context(
+                "release progression source action does not use a canonical released driver runtime",
+            )?;
             let combo_verilog = required_progression_action(
                 &graph.combo_verilog,
                 "release combinational Verilog action",
@@ -1139,7 +1143,12 @@ fn validate_progression_sample_action_graph(
                 bail!("release reference stats action does not match its published action ID");
             }
         }
-        BrowserProgressionOrigin::GitRevision { .. } => {
+        BrowserProgressionOrigin::GitRevision {
+            repository, commit, ..
+        } => {
+            validate_git_progression_driver_runtime(g8r_runtime, repository, commit).context(
+                "Git progression source action does not use the canonical source-build driver runtime",
+            )?;
             if graph.combo_verilog.is_some()
                 || graph.yosys_abc_aig.is_some()
                 || graph.yosys_abc_stats.is_some()
@@ -2024,18 +2033,13 @@ fn validate_candidate_corpus_manifest_input(manifest: &CandidateCorpusManifestIn
     {
         bail!("candidate corpus manifest does not use canonical public runtime identifiers");
     }
-    validate_candidate_driver_runtime(&candidate_run.driver_runtime, true)?;
-    validate_candidate_driver_runtime(&candidate_run.stats_runtime, false)?;
-    let source_revision = candidate_run
-        .driver_runtime
-        .source_revision
-        .as_ref()
-        .expect("validated source runtime");
-    if source_revision.repository != candidate_run.candidate.repository
-        || source_revision.commit != candidate_run.candidate.commit
-    {
-        bail!("candidate source runtime does not match its Git revision");
-    }
+    validate_git_progression_driver_runtime(
+        &candidate_run.driver_runtime,
+        &candidate_run.candidate.repository,
+        &candidate_run.candidate.commit,
+    )?;
+    validate_release_progression_driver_runtime(&candidate_run.stats_runtime)?;
+    validate_release_progression_yosys_runtime(&candidate_run.abc_runtime)?;
     for sample in &manifest.samples {
         crate::query::validate_safe_public_text(
             "candidate sample top function",
@@ -2878,6 +2882,29 @@ fn validate_release_progression_driver_runtime(runtime: &DriverRuntimeSpec) -> R
         || runtime.dockerfile != crate::DEFAULT_DOCKERFILE
     {
         bail!("release progression run does not use a canonical released driver runtime");
+    }
+    Ok(())
+}
+
+fn validate_git_progression_driver_runtime(
+    runtime: &DriverRuntimeSpec,
+    repository: &str,
+    commit: &str,
+) -> Result<()> {
+    validate_candidate_driver_runtime(runtime, true)?;
+    let source_revision = runtime
+        .source_revision
+        .as_ref()
+        .context("Git progression driver runtime has no source revision")?;
+    if source_revision.repository != repository
+        || source_revision.commit != commit
+        || runtime.release_platform != crate::DEFAULT_RELEASE_PLATFORM
+        || runtime.docker_image != crate::runtime::git_driver_image(commit)?
+        || runtime.dockerfile != crate::DEFAULT_GIT_DOCKERFILE
+        || runtime.dockerfile_sha256
+            != sha256_hex(include_bytes!("../docker/xlsynth-driver-git.Dockerfile"))
+    {
+        bail!("Git progression run does not use a canonical source-build driver runtime");
     }
     Ok(())
 }
