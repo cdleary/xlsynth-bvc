@@ -364,6 +364,24 @@ fn candidate_manifest_identity_binds_commit_timestamp() {
 }
 
 #[test]
+fn candidate_manifest_requires_canonical_commit_timestamp() {
+    let commit = "8".repeat(40);
+    let mut manifest = candidate_manifest_input(&commit);
+    let candidate_run = manifest.candidate_run.as_mut().expect("candidate run");
+    candidate_run.candidate_committed_at_utc = Some("2026-09-08T12:59:42-07:00".to_string());
+    candidate_run.candidate_run_id =
+        candidate_run_identity_sha256(candidate_run).expect("candidate run identity");
+
+    let error = validate_candidate_corpus_manifest_input(&manifest)
+        .expect_err("protobuf-bound commit timestamp must use canonical UTC spelling");
+    assert!(
+        error
+            .to_string()
+            .contains("commit timestamp is not canonical UTC")
+    );
+}
+
+#[test]
 fn candidate_manifest_identity_binds_action_graph() {
     let commit = "8".repeat(40);
     let mut manifest = candidate_manifest_input(&commit);
@@ -972,6 +990,51 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
         format!("{custom_runtime_verification_error:#}")
             .contains("canonical released driver runtime"),
         "unexpected error: {custom_runtime_verification_error:#}"
+    );
+    fs::write(&evidence_path, &evidence_bytes).expect("restore candidate evidence");
+    fs::write(&catalog_path, &catalog_bytes).expect("restore candidate catalog");
+    refresh_site_manifest_entry(&site_dir, "catalog.json");
+    refresh_site_manifest_entry(&site_dir, &evidence_url);
+
+    let mut historical_timestamp =
+        pb::FixedCorpusProgressionRunEvidence::decode(evidence_bytes.as_slice())
+            .expect("decode historical candidate timestamp evidence");
+    historical_timestamp
+        .event_time
+        .as_mut()
+        .expect("historical candidate event time")
+        .seconds += 1;
+    let historical_timestamp_bytes = historical_timestamp.encode_to_vec();
+    let timestamp_error = decode_progression_run_evidence(&historical_timestamp_bytes)
+        .expect_err("historical Git timestamp must remain bound to the generation ID");
+    assert!(
+        format!("{timestamp_error:#}").contains("invalid v4 generation identity"),
+        "unexpected error: {timestamp_error:#}"
+    );
+    fs::write(&evidence_path, &historical_timestamp_bytes)
+        .expect("write historical timestamp evidence");
+    let mut historical_timestamp_catalog =
+        decode_canonical_browser_catalog(&catalog_bytes).expect("decode restored browser catalog");
+    let historical_timestamp_ref = historical_timestamp_catalog
+        .progression_evidence
+        .iter_mut()
+        .find(|candidate| candidate.url == evidence_url)
+        .expect("candidate evidence catalog reference");
+    historical_timestamp_ref.bytes = historical_timestamp_bytes.len() as u64;
+    historical_timestamp_ref.sha256 = sha256_hex(&historical_timestamp_bytes);
+    fs::write(
+        &catalog_path,
+        encode_browser_catalog(&historical_timestamp_catalog)
+            .expect("encode historical timestamp catalog"),
+    )
+    .expect("write historical timestamp catalog");
+    refresh_site_manifest_entry(&site_dir, "catalog.json");
+    refresh_site_manifest_entry(&site_dir, &evidence_url);
+    let timestamp_verification_error = verify_static_site(&site_dir)
+        .expect_err("site verification must reject a changed historical Git timestamp");
+    assert!(
+        format!("{timestamp_verification_error:#}").contains("invalid v4 generation identity"),
+        "unexpected error: {timestamp_verification_error:#}"
     );
     fs::write(&evidence_path, &evidence_bytes).expect("restore candidate evidence");
     fs::write(&catalog_path, &catalog_bytes).expect("restore candidate catalog");

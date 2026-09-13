@@ -615,10 +615,26 @@ struct ProgressionRuntimeIdentity {
 }
 
 #[derive(Debug, Clone)]
+struct ProgressionGitIdentity {
+    baseline_release_tag: String,
+    baseline_commit: String,
+}
+
+#[derive(Debug)]
+struct ValidatedProgressionSampleActionGraph {
+    runtime_identity: ProgressionRuntimeIdentity,
+    source_runtime: DriverRuntimeSpec,
+    top_fn_name: String,
+    g8r_aig_action_id: String,
+    g8r_abc_aig_action_id: String,
+}
+
+#[derive(Debug, Clone)]
 struct ProgressionRunEvidenceInput {
     cohort_id: String,
     generation: BrowserProgressionGeneration,
     runtime_identity: ProgressionRuntimeIdentity,
+    git_identity: Option<ProgressionGitIdentity>,
     sample_sources_by_g8r_stats_action: BTreeMap<String, ProgressionSampleSourceEvidence>,
 }
 #[derive(Debug, Serialize)]
@@ -749,6 +765,9 @@ fn progression_run_evidence_to_proto(
     let generation = &input.generation;
     let origin = match &generation.origin {
         BrowserProgressionOrigin::CrateRelease => {
+            if input.git_identity.is_some() {
+                bail!("release progression evidence contains a Git candidate identity");
+            }
             let crate_version = generation
                 .crate_version
                 .as_deref()
@@ -767,19 +786,27 @@ fn progression_run_evidence_to_proto(
             requested_ref,
             baseline_crate_version,
             baseline_release_commit,
-        } => pb::fixed_corpus_progression_run_evidence::Origin::GitRevision(
-            pb::FixedCorpusGitRevisionOrigin {
-                revision: Some(pb::DriverSourceRevision {
-                    repository: repository.clone(),
-                    commit: commit.clone(),
-                }),
-                requested_ref: requested_ref.clone(),
-                baseline_crate_version: Some(pb::CrateVersion {
-                    value: normalize_tag_version(baseline_crate_version).to_string(),
-                }),
-                baseline_release_commit: baseline_release_commit.clone(),
-            },
-        ),
+        } => {
+            let identity = input
+                .git_identity
+                .as_ref()
+                .context("Git progression evidence has no v4 candidate identity")?;
+            pb::fixed_corpus_progression_run_evidence::Origin::GitRevision(
+                pb::FixedCorpusGitRevisionOrigin {
+                    revision: Some(pb::DriverSourceRevision {
+                        repository: repository.clone(),
+                        commit: commit.clone(),
+                    }),
+                    requested_ref: requested_ref.clone(),
+                    baseline_crate_version: Some(pb::CrateVersion {
+                        value: normalize_tag_version(baseline_crate_version).to_string(),
+                    }),
+                    baseline_release_commit: baseline_release_commit.clone(),
+                    identity_baseline_release_tag: identity.baseline_release_tag.clone(),
+                    identity_baseline_commit: identity.baseline_commit.clone(),
+                },
+            )
+        }
     };
     let event_time = DateTime::parse_from_rfc3339(
         generation
@@ -959,7 +986,7 @@ struct ProgressionActionGraphExpectation<'a> {
 fn validate_progression_sample_action_graph(
     sample: &pb::FixedCorpusProgressionSampleEvidence,
     expected: ProgressionActionGraphExpectation<'_>,
-) -> Result<ProgressionRuntimeIdentity> {
+) -> Result<ValidatedProgressionSampleActionGraph> {
     let ProgressionActionGraphExpectation {
         source_sha256,
         ir_action_id,
@@ -1157,11 +1184,17 @@ fn validate_progression_sample_action_graph(
             }
         }
     }
-    Ok(ProgressionRuntimeIdentity {
-        stats_runtime: stats_runtime.clone(),
-        yosys_runtime: yosys_runtime.clone(),
-        yosys_script: yosys_script.path.clone(),
-        yosys_script_sha256: yosys_script.sha256.clone(),
+    Ok(ValidatedProgressionSampleActionGraph {
+        runtime_identity: ProgressionRuntimeIdentity {
+            stats_runtime: stats_runtime.clone(),
+            yosys_runtime: yosys_runtime.clone(),
+            yosys_script: yosys_script.path.clone(),
+            yosys_script_sha256: yosys_script.sha256.clone(),
+        },
+        source_runtime: g8r_runtime.clone(),
+        top_fn_name: top_fn_name.clone(),
+        g8r_aig_action_id: g8r_aig_id,
+        g8r_abc_aig_action_id: g8r_abc_aig_id,
     })
 }
 
@@ -1223,7 +1256,7 @@ fn decode_progression_run_evidence(
             crate::proto::digest_to_hex(value, "progression_evidence.baseline_generation_id")
         })
         .transpose()?;
-    let (origin, display_label, crate_version) = match evidence
+    let (origin, display_label, crate_version, git_identity) = match evidence
         .origin
         .take()
         .context("progression evidence has no generation origin")?
@@ -1246,6 +1279,7 @@ fn decode_progression_run_evidence(
                 BrowserProgressionOrigin::CrateRelease,
                 format!("v{version}"),
                 Some(version),
+                None,
             )
         }
         pb::fixed_corpus_progression_run_evidence::Origin::GitRevision(git) => {
@@ -1260,6 +1294,9 @@ fn decode_progression_run_evidence(
                 || !is_canonical_lower_hex(&revision.commit, 40)
                 || baseline_crate_version.is_empty()
                 || normalize_tag_version(&baseline_crate_version) != baseline_crate_version
+                || normalize_tag_version(&git.identity_baseline_release_tag)
+                    != baseline_crate_version
+                || !is_canonical_lower_hex(&git.identity_baseline_commit, 40)
                 || git
                     .requested_ref
                     .as_deref()
@@ -1287,12 +1324,18 @@ fn decode_progression_run_evidence(
                 },
                 display_label,
                 None,
+                Some(ProgressionGitIdentity {
+                    baseline_release_tag: git.identity_baseline_release_tag,
+                    baseline_commit: git.identity_baseline_commit,
+                }),
             )
         }
     };
     let mut seen = BTreeSet::new();
     let mut run_samples = Vec::with_capacity(evidence.samples.len());
     let mut runtime_identity = None;
+    let mut source_runtime = None;
+    let mut candidate_action_samples = Vec::new();
     for sample in evidence.samples {
         let structural_hash = crate::proto::digest_to_hex(
             sample
@@ -1385,7 +1428,13 @@ fn decode_progression_run_evidence(
             }
             _ => bail!("progression sample has incomplete reference stats evidence"),
         }
-        let sample_runtime_identity = validate_progression_sample_action_graph(
+        let ValidatedProgressionSampleActionGraph {
+            runtime_identity: sample_runtime_identity,
+            source_runtime: sample_source_runtime,
+            top_fn_name,
+            g8r_aig_action_id,
+            g8r_abc_aig_action_id,
+        } = validate_progression_sample_action_graph(
             &sample,
             ProgressionActionGraphExpectation {
                 source_sha256: &source_sha256,
@@ -1403,6 +1452,27 @@ fn decode_progression_run_evidence(
             }
             Some(_) => {}
             None => runtime_identity = Some(sample_runtime_identity),
+        }
+        match &source_runtime {
+            Some(expected) if expected != &sample_source_runtime => {
+                bail!("progression evidence uses inconsistent source runtimes");
+            }
+            Some(_) => {}
+            None => source_runtime = Some(sample_source_runtime),
+        }
+        if git_identity.is_some() {
+            candidate_action_samples.push(CandidateSampleInput {
+                sample_id: String::new(),
+                source_relpath: format!("{structural_hash}.ir"),
+                source_sha256: source_sha256.clone(),
+                top_fn_name,
+                fraig: false,
+                dso_version: dso_version.clone(),
+                import_ir_action_id: ir_action_id.clone(),
+                g8r_aig_action_id,
+                g8r_stats_action_id: g8r_stats_action_id.clone(),
+                yosys_abc_aig_action_id: g8r_abc_aig_action_id,
+            });
         }
         let metrics = [
             sample.g8r_nodes,
@@ -1445,6 +1515,21 @@ fn decode_progression_run_evidence(
     }
     let runtime_identity =
         runtime_identity.context("progression evidence contains no runtime identity")?;
+    let source_runtime =
+        source_runtime.context("progression evidence contains no source runtime identity")?;
+    if let Some(git_identity) = &git_identity {
+        validate_git_progression_generation_id(
+            &generation_id,
+            &origin,
+            git_identity,
+            &event_time_utc,
+            &dso_version,
+            cohort,
+            &source_runtime,
+            &runtime_identity,
+            &candidate_action_samples,
+        )?;
+    }
     Ok((
         cohort.cohort_id.to_string(),
         BrowserProgressionGeneration {
@@ -1951,6 +2036,65 @@ fn candidate_run_identity_sha256(candidate_run: &CandidateRunInput) -> Result<St
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn validate_git_progression_generation_id(
+    generation_id: &str,
+    origin: &BrowserProgressionOrigin,
+    git_identity: &ProgressionGitIdentity,
+    event_time_utc: &str,
+    dso_version: &str,
+    cohort: &ProgressionCohortDescriptor,
+    source_runtime: &DriverRuntimeSpec,
+    runtime_identity: &ProgressionRuntimeIdentity,
+    action_samples: &[CandidateSampleInput],
+) -> Result<()> {
+    let BrowserProgressionOrigin::GitRevision {
+        repository,
+        commit,
+        requested_ref,
+        baseline_crate_version,
+        ..
+    } = origin
+    else {
+        bail!("Git progression identity is attached to a non-Git origin");
+    };
+    let candidate_run = CandidateRunInput {
+        schema_version: 4,
+        candidate_run_id: generation_id.to_string(),
+        requested_ref: requested_ref.clone(),
+        observed_at_utc: event_time_utc.to_string(),
+        candidate_committed_at_utc: Some(event_time_utc.to_string()),
+        candidate: CandidateGitRevisionInput {
+            kind: "git_revision".to_string(),
+            repository: repository.clone(),
+            commit: commit.clone(),
+        },
+        baseline: CandidateReleaseInput {
+            kind: "crate_release".to_string(),
+            crate_version: baseline_crate_version.clone(),
+            release_tag: git_identity.baseline_release_tag.clone(),
+            commit: git_identity.baseline_commit.clone(),
+        },
+        dso_version: dso_version.to_string(),
+        lowering_mode: "frontend_no_prep_rewrite".to_string(),
+        fraig: false,
+        execution_recipe_revision: crate::versioning::driver_ir2g8r_execution_recipe_revision(
+            &source_runtime.driver_version,
+        ),
+        driver_runtime: source_runtime.clone(),
+        abc_runtime: runtime_identity.yosys_runtime.clone(),
+        stats_runtime: runtime_identity.stats_runtime.clone(),
+        yosys_script: runtime_identity.yosys_script.clone(),
+        yosys_script_sha256: runtime_identity.yosys_script_sha256.clone(),
+        action_manifest_sha256: candidate_action_manifest_sha256(action_samples)?,
+        cohort_sample_count: cohort.expected_count as u64,
+        cohort_artifact_manifest_sha256: cohort.expected_artifact_manifest_sha256.to_string(),
+    };
+    if candidate_run_identity_sha256(&candidate_run)? != generation_id {
+        bail!("Git progression evidence has an invalid v4 generation identity");
+    }
+    Ok(())
+}
+
 fn validate_candidate_corpus_manifest_input(manifest: &CandidateCorpusManifestInput) -> Result<()> {
     let candidate_run = manifest
         .candidate_run
@@ -2063,13 +2207,15 @@ fn validate_candidate_corpus_manifest_input(manifest: &CandidateCorpusManifestIn
         &candidate_run.observed_at_utc,
         "candidate observation timestamp",
     )?;
-    canonical_rfc3339_utc(
-        candidate_run
-            .candidate_committed_at_utc
-            .as_deref()
-            .context("candidate corpus manifest has no commit timestamp")?,
-        "candidate commit timestamp",
-    )?;
+    let candidate_committed_at_utc = candidate_run
+        .candidate_committed_at_utc
+        .as_deref()
+        .context("candidate corpus manifest has no commit timestamp")?;
+    if canonical_rfc3339_utc(candidate_committed_at_utc, "candidate commit timestamp")?
+        != candidate_committed_at_utc
+    {
+        bail!("candidate corpus manifest commit timestamp is not canonical UTC");
+    }
     if candidate_run.candidate_run_id != candidate_run_identity_sha256(candidate_run)? {
         bail!("candidate corpus manifest has a mismatched candidate_run_id");
     }
@@ -2768,14 +2914,17 @@ fn load_candidate_progression_generation_with_evidence(
     repository_observation: Option<&RepositoryHeadObservationView>,
 ) -> Result<ProgressionRunEvidenceInput> {
     let manifest = read_candidate_corpus_manifest(run_dir)?;
-    let cohort_id = progression_cohort_for_candidate(
-        manifest
-            .candidate_run
-            .as_ref()
-            .context("candidate corpus manifest has no typed candidate_run")?,
-    )?
-    .cohort_id
-    .to_string();
+    let candidate_run = manifest
+        .candidate_run
+        .as_ref()
+        .context("candidate corpus manifest has no typed candidate_run")?;
+    let cohort_id = progression_cohort_for_candidate(candidate_run)?
+        .cohort_id
+        .to_string();
+    let git_identity = ProgressionGitIdentity {
+        baseline_release_tag: candidate_run.baseline.release_tag.clone(),
+        baseline_commit: candidate_run.baseline.commit.clone(),
+    };
     let runtime_identity = ProgressionRuntimeIdentity {
         stats_runtime: manifest.stats_runtime.clone(),
         yosys_runtime: manifest.yosys_runtime.clone(),
@@ -2819,6 +2968,7 @@ fn load_candidate_progression_generation_with_evidence(
         cohort_id,
         generation,
         runtime_identity,
+        git_identity: Some(git_identity),
         sample_sources_by_g8r_stats_action: sources,
     })
 }
@@ -3149,6 +3299,7 @@ fn load_release_progression_generation_with_evidence(
             yosys_script: manifest.yosys_script,
             yosys_script_sha256: manifest.yosys_script_sha256,
         },
+        git_identity: None,
         sample_sources_by_g8r_stats_action: sources,
     })
 }

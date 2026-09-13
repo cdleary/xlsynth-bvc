@@ -77,6 +77,10 @@ message FixedCorpusGitRevisionOrigin {
   optional string requested_ref = 2;
   CrateVersion baseline_crate_version = 3;
   optional string baseline_release_commit = 4;
+  // Exact fields from the v4 candidate-run identity. The optional commit
+  // above remains the independently observed browser projection.
+  string identity_baseline_release_tag = 5;
+  string identity_baseline_commit = 6;
 }
 
 message FixedCorpusProgressionSampleEvidence {
