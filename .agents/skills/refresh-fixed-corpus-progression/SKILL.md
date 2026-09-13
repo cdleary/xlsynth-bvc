@@ -85,4 +85,4 @@ Open `progression.html` with the intended `cohort`, `baseline`, and `current` ge
 - summed-product and distribution views use the same paired fixed-artifact population;
 - the largest-change heading states the baseline and current generations explicitly; and
 - every added generation has `data/progression-runs/<generation-id>/evidence.pb`, while
-  `data/catalog.json` is only the verified browser projection.
+  `catalog.json` is only the verified browser projection.
