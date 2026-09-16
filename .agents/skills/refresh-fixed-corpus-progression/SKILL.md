@@ -26,9 +26,9 @@ its `.bvc` store with a same-filesystem reflink/copy when practical.
 
 ## Compute and monitor
 
-Run `run-ir-dir-corpus` once to enqueue. Run long workers in `tmux` using the host-appropriate
-worker/persistent-runner configuration. For cdleary's 7950X host, also consult the
-`run-xlsynth-bvc-corpus-fast` skill.
+Run `run-ir-dir-corpus` once to enqueue. Run long workers in `tmux` using a
+worker/persistent-runner configuration measured for the current host. Keep operator- and
+host-specific tuning outside this repository.
 
 Use this command for truthful progress:
 

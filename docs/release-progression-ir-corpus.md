@@ -39,14 +39,14 @@ The two sets were identical. Requiring each indexed IR action to equal its sourc
 
 ## MFFC cohort origin
 
-`mffc-v1` was captured on 2026-09-04 from the structurally deduplicated canonical A/B corpus at `/tmp/xlsynth-reassoc-reuse-backtest.3IMB2v/canonical-corpus-manifest.json`. The source snapshot contained 34,076 unique structural functions: 33,172 whole-function/k=3 entries and 904 MFFCs. Only the 904 records whose manifest kind is `mffc` enter this cohort.
+`mffc-v1` was captured on 2026-09-04 from the structurally deduplicated canonical A/B corpus. The source snapshot contained 34,076 unique structural functions: 33,172 whole-function/k=3 entries and 904 MFFCs. Only the 904 records whose manifest kind is `mffc` enter this cohort.
 
 The checked-in source-lineage JSONL has raw SHA-256 `6b2f583fb147ad893dd0bedb778b8207ad49f3f550f4f73850dfea4cb0f36641`. The cohort identity is `f80befb2248a9757b7512068a4818308ecff1e77bcd78701b1a67338f979e5f8`; its exact-byte artifact-manifest identity is `cfc36afcd8b178687690a03d6c8b555e9517e7606ae8062d502452cf29e8861c`.
 
 To materialize a runnable directory from that retained corpus:
 
 ```bash
-source_root=/tmp/xlsynth-reassoc-reuse-backtest.3IMB2v/canonical-corpus
+source_root=/path/to/verified-canonical-corpus
 corpus_out=/tmp/xlsynth-bvc-mffc-progression-v1
 mkdir -p "$corpus_out"
 while IFS=$'\t' read -r structural_hash source_sha256; do
