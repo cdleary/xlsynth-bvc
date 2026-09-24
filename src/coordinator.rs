@@ -29,7 +29,7 @@ use crate::service::{
     populate_ir_fn_corpus_structural_index,
 };
 use crate::site::{
-    BuildStaticSiteOptions, build_static_site_with_protected_roots, verify_static_site,
+    BuildStaticSiteOptions, build_static_site_with_protected_roots_from_repo, verify_static_site,
 };
 use crate::snapshot::{
     BuildStaticSnapshotOptions, PUBLICATION_POLICY_VERSION, build_static_snapshot,
@@ -781,7 +781,7 @@ pub(crate) fn coordinate_release(
         pb::CoordinatorStage::SiteVerified,
         pb::CoordinatorStageStatus::FailedTransient,
         || {
-            build_static_site_with_protected_roots(
+            build_static_site_with_protected_roots_from_repo(
                 &BuildStaticSiteOptions {
                     snapshot_dir: snapshot_dir.clone(),
                     out_dir: site_dir.clone(),
@@ -796,6 +796,7 @@ pub(crate) fn coordinate_release(
                         store.artifact_backend_storage_path(),
                     ),
                 ],
+                repo_root,
             )?;
             let summary = verify_static_site(&site_dir)?;
             let text = format!(

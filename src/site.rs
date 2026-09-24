@@ -22,8 +22,8 @@ mod site_shards;
 
 use crate::analysis::decode_analysis_report;
 use crate::model::{
-    ActionSpec, ArtifactType, DriverRuntimeSpec, G8rLoweringMode, ScriptRef, YosysRuntimeSpec,
-    YosysVerilogFrontend,
+    ActionSpec, ArtifactType, DriverRuntimeSpec, G8rLoweringMode, ScriptRef, VersionCompatEntry,
+    YosysRuntimeSpec, YosysVerilogFrontend,
 };
 use crate::proto::v1 as pb;
 use crate::query::{VersionsSummaryIndexFile, validate_complete_versions_summary};
@@ -32,7 +32,9 @@ use crate::snapshot::{
 };
 use crate::store::ArtifactStore;
 use crate::versioning::{
-    cmp_dotted_numeric_version, normalize_tag_version, parse_compat_release_datetime_utc,
+    cmp_crate_versions_by_release_datetime, cmp_dotted_numeric_version, load_version_compat_map,
+    load_xlsynth_crate_repository_head_observation, normalize_tag_version,
+    parse_compat_release_datetime_utc, validate_repository_head_observation,
 };
 use crate::view::{
     CrateReleaseStatusView, RepositoryHeadObservationView, StdlibAigStatsPoint,
@@ -87,6 +89,12 @@ pub(crate) struct BuildStaticSiteOptions {
     pub(crate) out_dir: PathBuf,
     pub(crate) base_url: String,
     pub(crate) overwrite: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StaticSiteReleaseMetadata {
+    compat: BTreeMap<String, VersionCompatEntry>,
+    repository_head_observation: Option<RepositoryHeadObservationView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3647,6 +3655,159 @@ fn load_versions_report_from_site(
     Ok(versions.report)
 }
 
+fn load_static_site_release_metadata(repo_root: &Path) -> Result<StaticSiteReleaseMetadata> {
+    Ok(StaticSiteReleaseMetadata {
+        compat: load_version_compat_map(repo_root)
+            .context("loading checked-in release compatibility metadata for static site")?,
+        repository_head_observation: load_xlsynth_crate_repository_head_observation(repo_root)
+            .context("loading checked-in repository observation for static site")?,
+    })
+}
+
+fn validate_site_release_projection(
+    snapshot: &VersionCardsReport,
+    releases: &[CrateReleaseStatusView],
+    repository_head_observation: Option<&RepositoryHeadObservationView>,
+) -> Result<()> {
+    let mut release_utc_by_crate = BTreeMap::new();
+    let mut release_by_crate = BTreeMap::new();
+    for release in releases {
+        if release.crate_version.is_empty()
+            || normalize_tag_version(&release.crate_version) != release.crate_version
+            || release.dso_version.is_empty()
+            || normalize_tag_version(&release.dso_version) != release.dso_version
+        {
+            bail!("static-site release projection contains a non-canonical version");
+        }
+        let released_utc = parse_compat_release_datetime_utc(&release.crate_release_datetime)
+            .context("static-site release projection contains an invalid timestamp")?;
+        if release.processed != (release.materialized_actions > 0) {
+            bail!("static-site release projection has inconsistent processing counts");
+        }
+        if !matches!(
+            release.stdlib_enumeration_state.as_str(),
+            "unknown" | "not run" | "failed" | "partial" | "ok"
+        ) {
+            bail!("static-site release projection has an invalid enumeration state");
+        }
+        release_utc_by_crate.insert(release.crate_version.clone(), released_utc);
+        if release_by_crate
+            .insert(release.crate_version.as_str(), release)
+            .is_some()
+        {
+            bail!("static-site release projection contains a duplicate crate version");
+        }
+    }
+    if !releases.windows(2).all(|pair| {
+        cmp_crate_versions_by_release_datetime(
+            &pair[0].crate_version,
+            &pair[1].crate_version,
+            &release_utc_by_crate,
+        )
+        .is_lt()
+    }) {
+        bail!("static-site release projection is not sorted by publication time");
+    }
+    for source in &snapshot.releases {
+        if release_by_crate.get(source.crate_version.as_str()).copied() != Some(source) {
+            bail!("static-site release projection changed a snapshot release row");
+        }
+    }
+    for release in releases {
+        if snapshot
+            .releases
+            .iter()
+            .any(|source| source.crate_version == release.crate_version)
+        {
+            continue;
+        }
+        if release.processed
+            || release.materialized_actions != 0
+            || release.failed_actions != 0
+            || release.stdlib_enumeration_state != "not run"
+        {
+            bail!("static-site release projection invented processing state for a new release");
+        }
+    }
+    if let Some(observation) = repository_head_observation {
+        validate_repository_head_observation(observation)
+            .context("validating static-site repository observation")?;
+        let latest = releases
+            .first()
+            .context("static-site repository observation exists without release metadata")?;
+        if latest.crate_version != observation.latest_crate_version {
+            bail!("static-site repository observation does not name the latest release");
+        }
+    }
+    Ok(())
+}
+
+fn overlay_static_site_release_metadata(
+    mut snapshot: VersionCardsReport,
+    metadata: &StaticSiteReleaseMetadata,
+) -> Result<VersionCardsReport> {
+    let mut snapshot_by_crate = snapshot
+        .releases
+        .iter()
+        .map(|release| (release.crate_version.clone(), release.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut release_utc_by_crate = BTreeMap::new();
+    let mut releases = Vec::with_capacity(metadata.compat.len());
+    for (crate_version, entry) in &metadata.compat {
+        if crate_version.is_empty() || normalize_tag_version(crate_version) != crate_version {
+            bail!("checked-in compatibility map contains a non-canonical crate version");
+        }
+        let dso_version = normalize_tag_version(&entry.xlsynth_release_version).to_string();
+        if dso_version.is_empty() {
+            bail!("checked-in compatibility map contains an empty DSO version");
+        }
+        let released_utc = parse_compat_release_datetime_utc(&entry.crate_release_datetime)
+            .context("checked-in compatibility map contains an invalid release timestamp")?;
+        release_utc_by_crate.insert(crate_version.clone(), released_utc);
+        let release = match snapshot_by_crate.remove(crate_version) {
+            Some(release)
+                if release.dso_version == dso_version
+                    && release.crate_release_datetime == entry.crate_release_datetime =>
+            {
+                release
+            }
+            Some(_) => {
+                bail!(
+                    "checked-in release metadata conflicts with snapshot identity for crate v{crate_version}"
+                )
+            }
+            None => CrateReleaseStatusView {
+                crate_version: crate_version.clone(),
+                crate_release_datetime: entry.crate_release_datetime.clone(),
+                dso_version,
+                processed: false,
+                materialized_actions: 0,
+                failed_actions: 0,
+                stdlib_enumeration_state: "not run".to_string(),
+            },
+        };
+        releases.push(release);
+    }
+    if let Some((crate_version, _)) = snapshot_by_crate.first_key_value() {
+        bail!("snapshot release v{crate_version} is absent from checked-in release metadata");
+    }
+    releases.sort_by(|a, b| {
+        cmp_crate_versions_by_release_datetime(
+            &a.crate_version,
+            &b.crate_version,
+            &release_utc_by_crate,
+        )
+    });
+    validate_site_release_projection(
+        &snapshot,
+        &releases,
+        metadata.repository_head_observation.as_ref(),
+    )?;
+    snapshot.releases = releases;
+    snapshot.repository_head_observation = metadata.repository_head_observation.clone();
+    Ok(snapshot)
+}
+
 fn normalize_base_url(value: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() || !value.starts_with('/') {
@@ -4445,11 +4606,20 @@ pub(crate) fn build_static_site(
     build_static_site_with_protected_roots(options, &[])
 }
 
+#[cfg(test)]
 pub(crate) fn build_static_site_with_protected_roots(
     options: &BuildStaticSiteOptions,
     protected_roots: &[(&str, &Path)],
 ) -> Result<BuildStaticSiteSummary> {
     build_static_site_with_progression_runs(options, protected_roots, &[])
+}
+
+pub(crate) fn build_static_site_with_protected_roots_from_repo(
+    options: &BuildStaticSiteOptions,
+    protected_roots: &[(&str, &Path)],
+    repo_root: &Path,
+) -> Result<BuildStaticSiteSummary> {
+    build_static_site_with_progression_runs_from_repo(options, protected_roots, &[], repo_root)
 }
 
 fn unique_site_sibling_path(out_dir: &Path, role: &str) -> Result<PathBuf> {
@@ -4616,10 +4786,40 @@ fn sync_site_parent_directory(out_dir: &Path) -> Result<()> {
         .with_context(|| format!("syncing static site parent: {}", parent.display()))
 }
 
+#[cfg(test)]
 pub(crate) fn build_static_site_with_progression_runs(
     options: &BuildStaticSiteOptions,
     protected_roots: &[(&str, &Path)],
     progression_run_dirs: &[PathBuf],
+) -> Result<BuildStaticSiteSummary> {
+    build_static_site_with_progression_runs_and_release_metadata(
+        options,
+        protected_roots,
+        progression_run_dirs,
+        None,
+    )
+}
+
+pub(crate) fn build_static_site_with_progression_runs_from_repo(
+    options: &BuildStaticSiteOptions,
+    protected_roots: &[(&str, &Path)],
+    progression_run_dirs: &[PathBuf],
+    repo_root: &Path,
+) -> Result<BuildStaticSiteSummary> {
+    let release_metadata = load_static_site_release_metadata(repo_root)?;
+    build_static_site_with_progression_runs_and_release_metadata(
+        options,
+        protected_roots,
+        progression_run_dirs,
+        Some(&release_metadata),
+    )
+}
+
+fn build_static_site_with_progression_runs_and_release_metadata(
+    options: &BuildStaticSiteOptions,
+    protected_roots: &[(&str, &Path)],
+    progression_run_dirs: &[PathBuf],
+    release_metadata: Option<&StaticSiteReleaseMetadata>,
 ) -> Result<BuildStaticSiteSummary> {
     preflight_progression_run_dirs(progression_run_dirs)?;
     reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected_roots)?;
@@ -4659,6 +4859,7 @@ pub(crate) fn build_static_site_with_progression_runs(
         &staging_options,
         protected_roots,
         progression_run_dirs,
+        release_metadata,
     ) {
         Ok(summary) => summary,
         Err(error) => {
@@ -4779,6 +4980,7 @@ fn build_static_site_with_progression_runs_in_place(
     options: &BuildStaticSiteOptions,
     protected_roots: &[(&str, &Path)],
     progression_run_dirs: &[PathBuf],
+    release_metadata: Option<&StaticSiteReleaseMetadata>,
 ) -> Result<BuildStaticSiteSummary> {
     verify_static_snapshot(&options.snapshot_dir).context("verifying source snapshot")?;
     let snapshot = load_static_snapshot_manifest(&options.snapshot_dir)?;
@@ -4878,7 +5080,11 @@ fn build_static_site_with_progression_runs_in_place(
         run.findings_protobuf_url = Some(target_relpath);
         run.findings = findings;
     }
-    let versions = load_versions_report_from_site(&options.out_dir, &datasets)?;
+    let snapshot_versions = load_versions_report_from_site(&options.out_dir, &datasets)?;
+    let versions = match release_metadata {
+        Some(metadata) => overlay_static_site_release_metadata(snapshot_versions, metadata)?,
+        None => snapshot_versions,
+    };
     let (progression, progression_evidence_inputs) =
         build_browser_progression_catalog_and_progression_evidence_from_site(
             &options.out_dir,
@@ -5578,13 +5784,12 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     site_shards::verify_static_site_dataset_projection(site_dir, &catalog, &source_snapshot)
         .context("verifying static-site dataset projection against source snapshot")?;
     let versions = load_versions_report_from_site(site_dir, &catalog.datasets)?;
-    let expected_releases = versions.releases.as_slice();
-    let expected_observation = versions.repository_head_observation.as_ref();
-    if catalog.releases.as_slice() != expected_releases
-        || catalog.repository_head_observation.as_ref() != expected_observation
-    {
-        bail!("browser release processing projection disagrees with source dataset");
-    }
+    validate_site_release_projection(
+        &versions,
+        &catalog.releases,
+        catalog.repository_head_observation.as_ref(),
+    )
+    .context("validating browser release processing projection")?;
     let release_progression = build_browser_progression_catalog_from_site(
         site_dir,
         &catalog.datasets,
