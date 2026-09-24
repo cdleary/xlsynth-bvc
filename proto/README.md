@@ -121,6 +121,13 @@ graph, and immediately encoded as `FixedCorpusProgressionRunEvidence`. Release
 and Git generations use the same protobuf record; only the final browser
 catalog contains their JSON projection.
 
+When a static-site build overlays checked-in release metadata onto an older
+snapshot, it validates the compatibility-map JSON adapter and repository-head
+observation, then persists their exact source bytes, typed release rows,
+digests, and timestamps as `StaticSiteReleaseMetadataEvidence`. Verification
+reconstructs the browser release ledger from that protobuf plus snapshot-backed
+processing facts; the browser catalog is not accepted as source evidence.
+
 ## Regeneration and verification
 
 A schema change must pass:

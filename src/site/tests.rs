@@ -3002,10 +3002,21 @@ fn repository_release_metadata_extends_a_stale_snapshot() {
     .expect("build site with current repository metadata");
     verify_static_site(&site_dir).expect("verify overlaid site");
 
-    let catalog: BrowserCatalog = serde_json::from_slice(
+    let mut catalog: BrowserCatalog = serde_json::from_slice(
         &fs::read(site_dir.join("catalog.json")).expect("read browser catalog"),
     )
     .expect("decode browser catalog");
+    let evidence_ref = catalog
+        .release_metadata_evidence
+        .as_ref()
+        .expect("release metadata evidence reference");
+    let evidence_bytes =
+        fs::read(site_dir.join(&evidence_ref.url)).expect("read release metadata evidence");
+    assert_eq!(evidence_bytes.len() as u64, evidence_ref.bytes);
+    assert_eq!(sha256_hex(&evidence_bytes), evidence_ref.sha256);
+    let evidence = decode_static_site_release_metadata_evidence(&evidence_bytes)
+        .expect("decode release metadata evidence");
+    assert!(evidence.compat.contains_key(&current_latest.crate_version));
     assert_eq!(catalog.releases.first(), Some(&current_latest));
     assert_eq!(
         catalog.repository_head_observation,
@@ -3022,6 +3033,39 @@ fn repository_release_metadata_extends_a_stale_snapshot() {
         parse_compat_release_datetime_utc(&current_latest.crate_release_datetime)
             .expect("parse new release timestamp")
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    );
+
+    catalog.releases.insert(
+        0,
+        CrateReleaseStatusView {
+            crate_version: "999.0.0".to_string(),
+            crate_release_datetime: "2099-01-01 00:00:00 UTC".to_string(),
+            dso_version: "999.0.0".to_string(),
+            processed: false,
+            materialized_actions: 0,
+            failed_actions: 0,
+            stdlib_enumeration_state: "not run".to_string(),
+        },
+    );
+    let observation = catalog
+        .repository_head_observation
+        .as_mut()
+        .expect("catalog repository observation");
+    observation.latest_crate_version = "999.0.0".to_string();
+    observation.latest_release_tag = "v999.0.0".to_string();
+    let embedded_snapshot =
+        load_static_snapshot_manifest(&site_dir).expect("load embedded snapshot");
+    for (relpath, bytes) in
+        expected_fixed_site_files(&catalog, &embedded_snapshot).expect("render tampered files")
+    {
+        fs::write(site_dir.join(&relpath), bytes).expect("write tampered fixed site file");
+        refresh_site_manifest_entry(&site_dir, &relpath);
+    }
+    let error = verify_static_site(&site_dir)
+        .expect_err("invented release must disagree with protobuf evidence");
+    assert_eq!(
+        error.root_cause().to_string(),
+        "browser release processing projection disagrees with typed release metadata evidence"
     );
     fs::remove_dir_all(root).expect("cleanup");
 }
@@ -3159,7 +3203,7 @@ fn site_verifier_binds_release_catalog_to_versions_dataset() {
         verify_static_site(&site_dir).expect_err("catalog release rows must come from the dataset");
     assert_eq!(
         error.root_cause().to_string(),
-        "static-site release projection contains a duplicate crate version"
+        "browser release processing projection disagrees with typed release metadata evidence"
     );
 
     catalog.releases.clear();
@@ -3190,7 +3234,7 @@ fn site_verifier_binds_release_catalog_to_versions_dataset() {
         .expect_err("catalog repository observation must come from the dataset");
     assert_eq!(
         error.root_cause().to_string(),
-        "static-site release projection changed a snapshot release row"
+        "browser release processing projection disagrees with typed release metadata evidence"
     );
     fs::remove_dir_all(root).expect("cleanup");
 }

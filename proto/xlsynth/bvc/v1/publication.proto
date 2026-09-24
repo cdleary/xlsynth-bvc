@@ -48,6 +48,45 @@ message StaticSiteManifest {
   repeated PublicationFile files = 4;
 }
 
+// Immutable source evidence for release metadata overlaid while building a
+// static site from an older publication snapshot. The browser catalog is the
+// final JSON projection; verification reconstructs it from this protobuf and
+// the snapshot-backed processing rows.
+message StaticSiteReleaseMetadataEvidence {
+  uint32 record_version = 1;
+  Sha256Digest version_compat_sha256 = 2;
+  repeated StaticSiteCrateReleaseMetadata releases = 3;
+  optional StaticSiteRepositoryHeadObservation repository_head_observation = 4;
+  bytes version_compat_json = 5;
+}
+
+message StaticSiteCrateReleaseMetadata {
+  CrateVersion crate_version = 1;
+  DsoVersion dso_version = 2;
+  string crate_release_datetime = 3;
+  google.protobuf.Timestamp crate_released_at = 4;
+}
+
+message StaticSiteRepositoryHeadObservation {
+  uint32 schema_version = 1;
+  string repository = 2;
+  Sha256Digest version_compat_sha256 = 3;
+  google.protobuf.Timestamp observed_at = 4;
+  string head_ref = 5;
+  string head_commit = 6;
+  google.protobuf.Timestamp head_committed_at = 7;
+  CrateVersion latest_crate_version = 8;
+  string latest_release_tag = 9;
+  string latest_release_commit = 10;
+  google.protobuf.Timestamp latest_release_committed_at = 11;
+  string comparison_status = 12;
+  uint64 commits_ahead = 13;
+  uint64 commits_behind = 14;
+  string observed_at_utc = 15;
+  string head_committed_at_utc = 16;
+  string latest_release_committed_at_utc = 17;
+}
+
 // Immutable public evidence for one evaluated generation in a fixed-corpus
 // progression cohort. Operational corpus JSON is admitted only at the run
 // workspace boundary; publication, verification, and archival use this typed
