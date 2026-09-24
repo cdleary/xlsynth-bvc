@@ -996,6 +996,53 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     refresh_site_manifest_entry(&site_dir, "catalog.json");
     refresh_site_manifest_entry(&site_dir, &evidence_url);
 
+    let mut mislabeled_evidence =
+        pb::FixedCorpusProgressionRunEvidence::decode(evidence_bytes.as_slice())
+            .expect("decode candidate label evidence");
+    let mislabeled_fn_key = "misattributed/function".to_string();
+    mislabeled_evidence.samples[0].fn_key = mislabeled_fn_key.clone();
+    let mislabeled_evidence_bytes = mislabeled_evidence.encode_to_vec();
+    fs::write(&evidence_path, &mislabeled_evidence_bytes)
+        .expect("write mislabeled candidate evidence");
+    let mut mislabeled_catalog =
+        decode_canonical_browser_catalog(&catalog_bytes).expect("decode restored browser catalog");
+    {
+        let generation = mislabeled_catalog
+            .progression
+            .cohorts
+            .iter_mut()
+            .find(|cohort| cohort.cohort_id == WHOLE_FUNCTION_PROGRESSION_COHORT_ID)
+            .expect("whole-function progression cohort")
+            .generations
+            .iter_mut()
+            .find(|generation| generation.generation_id == generation_id)
+            .expect("candidate generation");
+        generation.run_samples[0].fn_key = mislabeled_fn_key;
+    }
+    let mislabeled_evidence_ref = mislabeled_catalog
+        .progression_evidence
+        .iter_mut()
+        .find(|candidate| candidate.url == evidence_url)
+        .expect("candidate evidence catalog reference");
+    mislabeled_evidence_ref.bytes = mislabeled_evidence_bytes.len() as u64;
+    mislabeled_evidence_ref.sha256 = sha256_hex(&mislabeled_evidence_bytes);
+    fs::write(
+        &catalog_path,
+        encode_browser_catalog(&mislabeled_catalog).expect("encode mislabeled candidate catalog"),
+    )
+    .expect("write mislabeled candidate catalog");
+    refresh_site_manifest_entry(&site_dir, "catalog.json");
+    refresh_site_manifest_entry(&site_dir, &evidence_url);
+    let mislabeled_error = verify_static_site(&site_dir)
+        .expect_err("candidate label must match independently validated baseline metadata");
+    assert!(
+        format!("{mislabeled_error:#}").contains("label, metrics, or baseline reference"),
+        "unexpected error: {mislabeled_error:#}"
+    );
+    fs::write(&evidence_path, &evidence_bytes).expect("restore candidate evidence");
+    fs::write(&catalog_path, &catalog_bytes).expect("restore candidate catalog");
+    refresh_site_manifest_entry(&site_dir, "catalog.json");
+    refresh_site_manifest_entry(&site_dir, &evidence_url);
     let mut historical_timestamp =
         pb::FixedCorpusProgressionRunEvidence::decode(evidence_bytes.as_slice())
             .expect("decode historical candidate timestamp evidence");

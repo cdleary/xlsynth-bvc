@@ -2508,7 +2508,8 @@ fn validate_candidate_progression_generation(
             sample.yosys_abc_product,
             sample.g8r_product_loss,
         ];
-        if metrics.iter().any(|value| !value.is_finite())
+        if sample.fn_key != baseline.fn_key
+            || metrics.iter().any(|value| !value.is_finite())
             || metrics[..6].iter().any(|value| *value < 0.0)
             || sample.g8r_product != sample.g8r_nodes * sample.g8r_levels
             || sample.yosys_abc_product != sample.yosys_abc_nodes * sample.yosys_abc_levels
@@ -2519,7 +2520,9 @@ fn validate_candidate_progression_generation(
             || sample.yosys_abc_stats_action_id != baseline.yosys_abc_stats_action_id
             || sample.ir_node_count != baseline.ir_node_count
         {
-            bail!("candidate progression sample disagrees with its metrics or baseline reference");
+            bail!(
+                "candidate progression sample disagrees with its label, metrics, or baseline reference"
+            );
         }
     }
     let expected_hashes = artifacts.keys().cloned().collect::<BTreeSet<_>>();
@@ -3362,7 +3365,8 @@ fn validate_release_progression_generation(
             sample.yosys_abc_product,
             sample.g8r_product_loss,
         ];
-        if &sample.source_sha256 != expected_source_sha256
+        if sample.fn_key != metadata.fn_key
+            || &sample.source_sha256 != expected_source_sha256
             || sample.ir_node_count != metadata.ir_node_count
             || !is_canonical_lower_hex(&sample.g8r_stats_action_id, 64)
             || !is_canonical_lower_hex(&sample.yosys_abc_stats_action_id, 64)
@@ -3372,7 +3376,7 @@ fn validate_release_progression_generation(
             || sample.yosys_abc_product != sample.yosys_abc_nodes * sample.yosys_abc_levels
             || sample.g8r_product_loss != sample.g8r_product - sample.yosys_abc_product
         {
-            bail!("release progression sample disagrees with its fixed IR or metrics");
+            bail!("release progression sample disagrees with its label, fixed IR, or metrics");
         }
     }
     if seen != artifacts.keys().cloned().collect()
