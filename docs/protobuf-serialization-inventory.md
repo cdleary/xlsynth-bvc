@@ -20,6 +20,7 @@ models from becoming canonical inside Rust.
 | `model.rs`: structural manifest/group/member/origin | sled web-index JSON | `structural_index.proto` | 3 |
 | `corpus.rs`: IR-directory manifest, sample record, joined row, summary | JSON/JSONL is both resume state and public export | `corpus.proto`; JSON/JSONL/CSV become projections | 3 |
 | `snapshot.rs`: static snapshot manifest and dataset entry | JSON snapshot authority | `publication.proto`; JSON becomes projection | 5 |
+| `site.rs`: fixed-corpus release/Git progression evidence | operational corpus JSON ingress and candidate-only JSON publication evidence | `publication.proto`: `FixedCorpusProgressionRunEvidence`; one protobuf record per admitted generation, with JSON only as the browser projection | 5 |
 
 ## Derived datasets and reports
 

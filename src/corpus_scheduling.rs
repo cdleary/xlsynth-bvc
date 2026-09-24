@@ -7,7 +7,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cli::CorpusSchedulingPolicyPreset;
-use crate::proto::{RELEASE_PROGRESSION_IR_SCHEDULING_POLICY, v1 as pb};
+use crate::proto::{
+    MFFC_PROGRESSION_IR_SCHEDULING_POLICY, RELEASE_PROGRESSION_IR_SCHEDULING_POLICY, v1 as pb,
+};
 
 const SCHEDULING_POLICY_SCHEMA_VERSION: u32 = 1;
 const SCHEDULING_POLICY_MARKER_SCHEMA_VERSION: u32 = 1;
@@ -102,9 +104,13 @@ pub(crate) fn resolve(
     let Some(preset) = preset else {
         return Ok(None);
     };
-    let policy_bytes = match preset {
-        CorpusSchedulingPolicyPreset::ReleaseProgressionIrV1 => {
-            RELEASE_PROGRESSION_IR_SCHEDULING_POLICY
+    let (policy_bytes, expected_policy_name) = match preset {
+        CorpusSchedulingPolicyPreset::ReleaseProgressionIrV1 => (
+            RELEASE_PROGRESSION_IR_SCHEDULING_POLICY,
+            "release-progression-ir",
+        ),
+        CorpusSchedulingPolicyPreset::MffcProgressionIrV1 => {
+            (MFFC_PROGRESSION_IR_SCHEDULING_POLICY, "mffc-progression-ir")
         }
     };
     let policy = pb::IrDirCorpusSchedulingPolicy::decode(policy_bytes)
@@ -117,7 +123,7 @@ pub(crate) fn resolve(
         );
     }
     validate_text(&policy.policy_name, "scheduling_policy.policy_name")?;
-    if policy.policy_name != "release-progression-ir" {
+    if policy.policy_name != expected_policy_name {
         bail!(
             "scheduling policy preset does not match embedded policy name {:?}",
             policy.policy_name
@@ -181,8 +187,8 @@ pub(crate) fn resolve(
         );
     }
 
-    if policy.priority_tiers.is_empty() {
-        bail!("scheduling_policy.priority_tiers must not be empty");
+    if policy.priority_tiers.is_empty() && policy.policy_name == "release-progression-ir" {
+        bail!("scheduling_policy.priority_tiers must not be empty for the straggler policy");
     }
     let corpus_hash_set: BTreeSet<_> = corpus_artifacts
         .into_iter()
@@ -380,6 +386,46 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    fn mffc_source_artifacts() -> Vec<CorpusSchedulingArtifact> {
+        include_str!("site_assets/mffc_progression_ir_artifacts.tsv")
+            .lines()
+            .map(|line| {
+                let (structural_hash, source_sha256) = line
+                    .split_once('\t')
+                    .expect("artifact manifest line must be tab-separated");
+                CorpusSchedulingArtifact {
+                    source_relpath: format!("{structural_hash}.ir"),
+                    source_sha256: source_sha256.to_string(),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mffc_progression_policy_matches_pinned_corpus() {
+        let source_artifacts = mffc_source_artifacts();
+        assert_eq!(source_artifacts.len(), 904);
+        let policy = resolve(
+            Some(CorpusSchedulingPolicyPreset::MffcProgressionIrV1),
+            &source_artifacts,
+        )
+        .expect("resolve MFFC policy")
+        .expect("selected MFFC policy");
+
+        assert_eq!(policy.record.policy_name, "mffc-progression-ir");
+        assert_eq!(policy.record.expected_corpus_sample_count, 904);
+        assert_eq!(
+            policy.record.expected_corpus_artifact_manifest_sha256,
+            "cfc36afcd8b178687690a03d6c8b555e9517e7606ae8062d502452cf29e8861c"
+        );
+        assert_eq!(prioritized_sample_count(Some(&policy.record)), 0);
+        assert_eq!(
+            priority_boost(Some(&policy), &source_artifacts[0].source_relpath)
+                .expect("default MFFC priority"),
+            0
+        );
     }
 
     #[test]

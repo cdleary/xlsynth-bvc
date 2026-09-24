@@ -281,9 +281,13 @@ pub enum TopCommand {
         snapshot_dir: PathBuf,
         #[arg(long, value_name = "DIR")]
         out_dir: PathBuf,
-        /// Completed fixed-IR Git candidate run to include in the progression view.
-        /// May be repeated to render more than one evaluated commit.
+        /// Completed fixed-IR release or Git run to include in progression.
+        /// May be repeated; all runs must match a registered cohort.
+        #[arg(long = "progression-run-dir", value_name = "DIR")]
+        progression_run_dirs: Vec<PathBuf>,
+        /// Deprecated spelling retained for existing Git-candidate workflows.
         #[arg(long = "candidate-run-dir", value_name = "DIR")]
+        #[arg(hide = true)]
         candidate_run_dirs: Vec<PathBuf>,
         #[arg(long, default_value = "/")]
         base_url: String,
@@ -516,6 +520,7 @@ pub enum CorpusTopFnPolicy {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CorpusSchedulingPolicyPreset {
     ReleaseProgressionIrV1,
+    MffcProgressionIrV1,
 }
 
 #[derive(Debug, Subcommand)]

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::model::{ArtifactRef, Provenance, QueueFailed};
-use crate::proto::{FILE_DESCRIPTOR_SET, PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256, v1 as pb};
+use crate::proto::{COMPATIBLE_PRIOR_SCHEMA_DESCRIPTOR_SHA256S, FILE_DESCRIPTOR_SET, v1 as pb};
 use crate::proto::{
     decode_queue_canceled, decode_queue_failed, decode_queue_item, decode_queue_running,
     encode_queue_failed,
@@ -354,8 +354,9 @@ fn ensure_store_format_marker(store_root: &Path) -> Result<()> {
         let digest = marker
             .schema_descriptor_sha256
             .context("store format marker missing schema_descriptor_sha256")?;
+        let prior_digest = hex::encode(&digest.value);
         if digest.value != descriptor_sha256
-            && hex::encode(&digest.value) != PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256
+            && !COMPATIBLE_PRIOR_SCHEMA_DESCRIPTOR_SHA256S.contains(&prior_digest.as_str())
         {
             bail!(
                 "store schema descriptor mismatch in {}; this binary requires a fresh or deliberately upgraded protobuf store",
@@ -3863,36 +3864,40 @@ mod tests {
 
     #[test]
     fn compatible_prior_store_schema_marker_is_upgraded() {
-        let root = make_test_root("xlsynth-bvc-store-compatible-schema");
-        std::fs::create_dir_all(&root).expect("create test root");
-        let prior_marker = pb::StoreFormat {
-            format_version: STORE_FORMAT_VERSION,
-            format_name: STORE_FORMAT_NAME.to_string(),
-            schema_descriptor_sha256: Some(pb::Sha256Digest {
-                value: hex::decode(PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256)
-                    .expect("decode prior descriptor digest"),
-            }),
-        };
-        std::fs::write(root.join(STORE_FORMAT_MARKER), prior_marker.encode_to_vec())
-            .expect("write prior schema marker");
+        for (index, prior_descriptor) in COMPATIBLE_PRIOR_SCHEMA_DESCRIPTOR_SHA256S
+            .iter()
+            .enumerate()
+        {
+            let root = make_test_root(&format!("xlsynth-bvc-store-compatible-schema-{index}"));
+            std::fs::create_dir_all(&root).expect("create test root");
+            let prior_marker = pb::StoreFormat {
+                format_version: STORE_FORMAT_VERSION,
+                format_name: STORE_FORMAT_NAME.to_string(),
+                schema_descriptor_sha256: Some(pb::Sha256Digest {
+                    value: hex::decode(prior_descriptor).expect("decode prior descriptor digest"),
+                }),
+            };
+            std::fs::write(root.join(STORE_FORMAT_MARKER), prior_marker.encode_to_vec())
+                .expect("write prior schema marker");
 
-        ensure_store_format_marker(&root).expect("upgrade compatible store schema marker");
-        let upgraded = pb::StoreFormat::decode(
-            std::fs::read(root.join(STORE_FORMAT_MARKER))
-                .expect("read upgraded marker")
-                .as_slice(),
-        )
-        .expect("decode upgraded marker");
-        assert_eq!(
-            upgraded
-                .schema_descriptor_sha256
-                .expect("upgraded descriptor digest")
-                .value,
-            Sha256::digest(FILE_DESCRIPTOR_SET).to_vec()
-        );
-        assert!(!root.join(STORE_FORMAT_MARKER_STAGING).exists());
-        ensure_store_format_marker(&root).expect("upgraded marker remains reusable");
-        std::fs::remove_dir_all(root).expect("cleanup");
+            ensure_store_format_marker(&root).expect("upgrade compatible store schema marker");
+            let upgraded = pb::StoreFormat::decode(
+                std::fs::read(root.join(STORE_FORMAT_MARKER))
+                    .expect("read upgraded marker")
+                    .as_slice(),
+            )
+            .expect("decode upgraded marker");
+            assert_eq!(
+                upgraded
+                    .schema_descriptor_sha256
+                    .expect("upgraded descriptor digest")
+                    .value,
+                Sha256::digest(FILE_DESCRIPTOR_SET).to_vec()
+            );
+            assert!(!root.join(STORE_FORMAT_MARKER_STAGING).exists());
+            ensure_store_format_marker(&root).expect("upgraded marker remains reusable");
+            std::fs::remove_dir_all(root).expect("cleanup");
+        }
     }
 
     #[test]
