@@ -3464,15 +3464,24 @@ fn empty_browser_progression_index() -> Result<BrowserProgressionIndex> {
     })
 }
 
-fn record_progression_runtime_identity(
+fn record_progression_comparison_runtime(
     identities: &mut BTreeMap<String, ProgressionRuntimeIdentity>,
     cohort_id: &str,
     identity: &ProgressionRuntimeIdentity,
 ) -> Result<()> {
     match identities.get(cohort_id) {
-        Some(expected) if expected != identity => bail!(
-            "progression generations for cohort {cohort_id} do not share common stats and Yosys runtimes"
-        ),
+        // Each release necessarily uses its own canonical released driver to read AIG stats. The
+        // action graph validates that runtime independently; cross-generation comparability only
+        // requires the shared downstream ABC implementation and script to remain fixed.
+        Some(expected)
+            if expected.yosys_runtime != identity.yosys_runtime
+                || expected.yosys_script != identity.yosys_script
+                || expected.yosys_script_sha256 != identity.yosys_script_sha256 =>
+        {
+            bail!(
+                "progression generations for cohort {cohort_id} do not share a common Yosys/ABC runtime and script"
+            )
+        }
         Some(_) => Ok(()),
         None => {
             identities.insert(cohort_id.to_string(), identity.clone());
@@ -3585,7 +3594,7 @@ fn build_browser_progression_catalog_and_progression_evidence_from_site(
     }
     let mut runtime_identities = BTreeMap::new();
     for input in &evidence {
-        record_progression_runtime_identity(
+        record_progression_comparison_runtime(
             &mut runtime_identities,
             &input.cohort_id,
             &input.runtime_identity,
@@ -5609,7 +5618,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
                         "progression protobuf evidence identity disagrees with its catalog reference"
                     );
                 }
-                record_progression_runtime_identity(
+                record_progression_comparison_runtime(
                     &mut runtime_identities,
                     &cohort_id,
                     &runtime_identity,

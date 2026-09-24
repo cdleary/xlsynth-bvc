@@ -1861,6 +1861,35 @@ fn explicit_release_progression_generation_supersedes_snapshot_generation() {
 }
 
 #[test]
+fn progression_comparison_allows_release_specific_stats_drivers() {
+    let manifest = candidate_manifest_input(&"8".repeat(40));
+    let first = ProgressionRuntimeIdentity {
+        stats_runtime: manifest.stats_runtime,
+        yosys_runtime: manifest.yosys_runtime,
+        yosys_script: manifest.yosys_script,
+        yosys_script_sha256: manifest.yosys_script_sha256,
+    };
+    let mut second = first.clone();
+    second.stats_runtime.driver_version = "0.66.0".to_string();
+    second.stats_runtime.docker_image = crate::runtime::default_driver_image("0.66.0");
+    validate_release_progression_driver_runtime(&first.stats_runtime)
+        .expect("first release stats runtime is canonical");
+    validate_release_progression_driver_runtime(&second.stats_runtime)
+        .expect("second release stats runtime is canonical");
+
+    let mut identities = BTreeMap::new();
+    record_progression_comparison_runtime(&mut identities, "test-cohort", &first)
+        .expect("record first release runtime");
+    record_progression_comparison_runtime(&mut identities, "test-cohort", &second)
+        .expect("release-specific stats drivers remain comparable");
+
+    second.yosys_runtime.docker_image_id = "f".repeat(64);
+    let error = record_progression_comparison_runtime(&mut identities, "test-cohort", &second)
+        .expect_err("a different ABC toolchain must remain incomparable");
+    assert!(format!("{error:#}").contains("common Yosys/ABC runtime and script"));
+}
+
+#[test]
 fn progression_catalog_uses_fixed_ir_structural_hash_population() {
     fn sample(
         crate_version: &str,
