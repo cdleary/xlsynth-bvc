@@ -1975,6 +1975,8 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
         samples.push(sample("0.1.0", hash, &format!("original-{index}")));
         samples.push(sample("0.2.0", hash, &format!("renamed-{index}")));
     }
+    samples[0].ir_top = Some("__mffc_generated_name_for_whole_function".to_string());
+    samples[1].ir_top = Some("__k3_cone_generated_name_for_whole_function".to_string());
     for (index, hash) in hashes[..hashes.len() - 1].iter().enumerate() {
         samples.push(sample("0.3.0", hash, &format!("partial-{index}")));
         samples.push(sample("0.4.0", hash, &format!("changed-{index}")));
@@ -2036,7 +2038,7 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
         generation("0.2.0").observed_ir_count,
         RELEASE_PROGRESSION_IR_COUNT as u64
     );
-    assert_eq!(generation("0.2.0").extra_ir_count, 1);
+    assert_eq!(generation("0.2.0").extra_ir_count, 0);
 
     let artifacts = release_progression_ir_artifacts().expect("fixed artifact manifest");
     let run_samples = hashes
@@ -2125,16 +2127,13 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
     assert_eq!(partial.extra_ir_count, 0);
 
     let incompatible = generation("0.4.0");
-    assert_eq!(
-        incompatible.coverage,
-        BrowserProgressionCoverage::Incompatible
-    );
+    assert_eq!(incompatible.coverage, BrowserProgressionCoverage::Partial);
     assert_eq!(
         incompatible.observed_ir_count,
         (RELEASE_PROGRESSION_IR_COUNT - 1) as u64
     );
     assert_eq!(incompatible.missing_cohort_ir_count, 1);
-    assert_eq!(incompatible.extra_ir_count, 1);
+    assert_eq!(incompatible.extra_ir_count, 0);
 
     let mut mixed_dso = dataset.clone();
     for sample in mixed_dso
@@ -2177,17 +2176,22 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
 
     let mut missing_hash = dataset.clone();
     missing_hash.samples[0].structural_hash = None;
-    let error = build_browser_progression_catalog(&missing_hash)
-        .expect_err("whole-function fixed IR must have a structural hash");
-    assert!(error.to_string().contains("has no valid structural hash"));
+    let missing_hash_catalog = build_browser_progression_catalog(&missing_hash)
+        .expect("samples without a cohort identity are outside the fixed universe");
+    assert_eq!(
+        missing_hash_catalog
+            .generations
+            .iter()
+            .find(|generation| generation.crate_version.as_deref() == Some("0.1.0"))
+            .expect("0.1.0 generation")
+            .coverage,
+        BrowserProgressionCoverage::Partial
+    );
 
     let mut generated_only = dataset.clone();
-    generated_only.samples.retain(|sample| {
-        sample
-            .ir_top
-            .as_deref()
-            .is_some_and(|top| top.starts_with("__k3_cone_"))
-    });
+    generated_only
+        .samples
+        .retain(|sample| sample.structural_hash.as_deref() == Some(extra_hash.as_str()));
     let unavailable = build_browser_progression_catalog(&generated_only)
         .expect("generated-only datasets keep the site publishable");
     assert_eq!(
@@ -2288,8 +2292,8 @@ const generation = (generation_id, dso_version) => ({
 const rolling = api.releaseGenerations(
   {cohort_id: 'whole-functions-v1', artifact_kind: 'whole_function', cohort_ir_count: 2, cohort_ir_hashes: [hash('a'), hash('b')], generations: [generation('new', '0.10.0'), generation('old', '0.9.0')]},
   [
-    {...sample('a', 'a', 0), crate_version: '1.0.0', dso_version: '0.9.0'},
-    {...sample('a', 'a', 0), crate_version: '1.0.0', dso_version: '0.10.0'},
+    {...sample('a', 'a', 0), ir_top: '__mffc_generated_name_for_whole_function', crate_version: '1.0.0', dso_version: '0.9.0'},
+    {...sample('a', 'a', 0), ir_top: '__k3_cone_generated_name_for_whole_function', crate_version: '1.0.0', dso_version: '0.10.0'},
     {...sample('unrelated-old', 'f', 999999), crate_version: '1.0.0', dso_version: '0.9.0'},
     {...sample('unrelated-new', 'f', -999999), crate_version: '1.0.0', dso_version: '0.10.0'},
   ],

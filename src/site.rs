@@ -1724,19 +1724,6 @@ fn normalized_progression_ir_hash(sample: &StdlibG8rVsYosysSample) -> Option<Str
         .then(|| value.to_ascii_lowercase())
 }
 
-fn progression_sample_matches_kind(
-    sample: &StdlibG8rVsYosysSample,
-    artifact_kind: BrowserProgressionArtifactKind,
-) -> bool {
-    let top = sample.ir_top.as_deref().unwrap_or_default();
-    match artifact_kind {
-        BrowserProgressionArtifactKind::WholeFunction => {
-            !top.starts_with("__k3_cone_") && !top.starts_with("__mffc_")
-        }
-        BrowserProgressionArtifactKind::Mffc => top.starts_with("__mffc_"),
-    }
-}
-
 fn empty_browser_progression_catalog_for(
     cohort: &ProgressionCohortDescriptor,
 ) -> Result<BrowserProgressionCatalog> {
@@ -1783,10 +1770,15 @@ fn build_browser_progression_catalog_for_cohort(
     releases: &[CrateReleaseStatusView],
     cohort: &ProgressionCohortDescriptor,
 ) -> Result<BrowserProgressionCatalog> {
+    let hashes = progression_ir_hashes(cohort)?;
+    let cohort_set = hashes.iter().cloned().collect::<BTreeSet<_>>();
     let fixed_samples = dataset
         .samples
         .iter()
-        .filter(|sample| progression_sample_matches_kind(sample, cohort.artifact_kind))
+        .filter(|sample| {
+            normalized_progression_ir_hash(sample)
+                .is_some_and(|structural_hash| cohort_set.contains(&structural_hash))
+        })
         .collect::<Vec<_>>();
     if fixed_samples.is_empty() {
         return empty_browser_progression_catalog_for(cohort);
@@ -1824,8 +1816,6 @@ fn build_browser_progression_catalog_for_cohort(
             },
         )
         .collect::<Vec<_>>();
-    let hashes = progression_ir_hashes(cohort)?;
-    let cohort_set = hashes.iter().cloned().collect::<BTreeSet<_>>();
     let cohort_ir_sha256 = Some(progression_ir_sha256(&hashes)?);
     let cohort_ir_count =
         u64::try_from(hashes.len()).context("fixed IR cohort size exceeds u64")?;
@@ -2291,8 +2281,7 @@ fn baseline_progression_samples<'a>(
     let dso_version = normalize_tag_version(dso_version);
     let mut samples = BTreeMap::new();
     for sample in dataset.samples.iter().filter(|sample| {
-        progression_sample_matches_kind(sample, cohort.artifact_kind)
-            && normalize_tag_version(&sample.crate_version) == crate_version
+        normalize_tag_version(&sample.crate_version) == crate_version
             && normalize_tag_version(&sample.dso_version) == dso_version
     }) {
         let structural_hash = normalized_progression_ir_hash(sample).with_context(|| {
@@ -3126,9 +3115,7 @@ fn load_release_progression_generation_with_evidence(
             .samples
             .iter()
             .find(|value| {
-                progression_sample_matches_kind(value, cohort.artifact_kind)
-                    && normalized_progression_ir_hash(value).as_deref()
-                        == Some(structural_hash.as_str())
+                normalized_progression_ir_hash(value).as_deref() == Some(structural_hash.as_str())
             })
             .context("release progression sample has no structural metadata")?;
         let import_action_id =
@@ -3351,9 +3338,8 @@ fn validate_release_progression_generation(
             .samples
             .iter()
             .find(|value| {
-                progression_sample_matches_kind(value, cohort.artifact_kind)
-                    && normalized_progression_ir_hash(value).as_deref()
-                        == Some(sample.structural_hash.as_str())
+                normalized_progression_ir_hash(value).as_deref()
+                    == Some(sample.structural_hash.as_str())
             })
             .context("release progression sample has no structural metadata")?;
         let metrics = [

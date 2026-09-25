@@ -330,15 +330,28 @@ Snapshot mode notes:
 ## Static Snapshot Build/Verify
 
 ```bash
-# Build snapshot from current web indices (rebuild indices first by default)
+# Reconstruct a fresh snapshot from the canonical store and current checked-in
+# release/corpus/recipe definitions (derived web indices rebuild by default)
 cargo run --bin xlsynth_bvc -- build-static-snapshot --out-dir /path/to/snapshot --overwrite
 
-# Optional fast path when indices are already fresh
+# Optional operator fast path only when every derived index is already current.
+# Do not use this after changing release metadata, cohorts, or recipes.
 cargo run --bin xlsynth_bvc -- build-static-snapshot --out-dir /path/to/snapshot --overwrite --skip-rebuild-web-indices
 
 # Verify manifest + dataset checksums
 cargo run --bin xlsynth_bvc -- verify-static-snapshot --snapshot-dir /path/to/snapshot
 ```
+
+The checked-in definitions determine the complete publication universe. Canonical protobuf/store
+records from earlier work may satisfy the same content-bound action identities, but neither a
+prior static snapshot nor a browser catalog determines which releases exist. Derived web indices
+are disposable and are rebuilt by the normal path. Removing reusable store results can make
+reconstruction slower; it must not change the logical snapshot.
+
+When release metadata, cohort definitions, or publication recipes change, build a fresh snapshot
+before running `build-static-site`. The site renderer is deliberately a snapshot-to-site projection:
+it does not read repository release metadata, acquire historical results, or overlay new releases
+onto an older snapshot.
 
 Make targets:
 - `make build-static-snapshot`

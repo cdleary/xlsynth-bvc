@@ -61,6 +61,14 @@ publication pipeline; emit JSON only for the final browser catalog and data proj
 
 ## Build the site
 
+When checked-in release metadata, cohort definitions, or publication recipes changed, first build
+a fresh static snapshot from the canonical artifact store. The current repository definitions
+determine the release universe. Prior snapshots and derived web indices are caches only: never
+overlay current release metadata onto an old snapshot in the site renderer. Reuse canonical store
+results through their content-bound action identities, but rebuild derived publication indices.
+Do not use `--skip-rebuild-web-indices` after release metadata, cohort definitions, or recipes
+change.
+
 Pass every completed release or Git workspace directly to one site build:
 
 ```bash
