@@ -22,20 +22,17 @@ mod site_shards;
 
 use crate::analysis::decode_analysis_report;
 use crate::model::{
-    ActionSpec, ArtifactType, DriverRuntimeSpec, G8rLoweringMode, ScriptRef, VersionCompatEntry,
-    YosysRuntimeSpec, YosysVerilogFrontend,
+    ActionSpec, ArtifactType, DriverRuntimeSpec, G8rLoweringMode, ScriptRef, YosysRuntimeSpec,
+    YosysVerilogFrontend,
 };
 use crate::proto::v1 as pb;
-use crate::proto::{digest_from_hex, digest_to_hex, timestamp_from_proto, timestamp_to_proto};
 use crate::query::{VersionsSummaryIndexFile, validate_complete_versions_summary};
 use crate::snapshot::{
     load_static_snapshot_manifest, should_include_snapshot_index_key, verify_static_snapshot,
 };
 use crate::store::ArtifactStore;
 use crate::versioning::{
-    cmp_crate_versions_by_release_datetime, cmp_dotted_numeric_version, load_version_compat_map,
-    load_xlsynth_crate_repository_head_observation, normalize_tag_version,
-    parse_compat_release_datetime_utc, validate_repository_head_observation,
+    cmp_dotted_numeric_version, normalize_tag_version, parse_compat_release_datetime_utc,
 };
 use crate::view::{
     CrateReleaseStatusView, RepositoryHeadObservationView, StdlibAigStatsPoint,
@@ -73,9 +70,7 @@ const MFFC_PROGRESSION_IR_SHA256: &str =
     "f80befb2248a9757b7512068a4818308ecff1e77bcd78701b1a67338f979e5f8";
 const MFFC_PROGRESSION_ARTIFACT_MANIFEST_SHA256: &str =
     "cfc36afcd8b178687690a03d6c8b555e9517e7606ae8062d502452cf29e8861c";
-const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 10;
-const STATIC_SITE_RELEASE_METADATA_EVIDENCE_RECORD_VERSION: u32 = 1;
-const STATIC_SITE_RELEASE_METADATA_EVIDENCE_URL: &str = "data/static-site-release-metadata.v1.pb";
+const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 9;
 const PROGRESSION_RUN_EVIDENCE_RECORD_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_SCHEMA_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_PREFIX_HEX_CHARS: u8 = 1;
@@ -92,14 +87,6 @@ pub(crate) struct BuildStaticSiteOptions {
     pub(crate) out_dir: PathBuf,
     pub(crate) base_url: String,
     pub(crate) overwrite: bool,
-}
-
-#[derive(Debug, Clone)]
-struct StaticSiteReleaseMetadata {
-    version_compat_sha256: String,
-    version_compat_json: Vec<u8>,
-    compat: BTreeMap<String, VersionCompatEntry>,
-    repository_head_observation: Option<RepositoryHeadObservationView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,8 +124,6 @@ struct BrowserCatalog {
     base_url: String,
     datasets: Vec<BrowserDataset>,
     runs: Vec<BrowserRun>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    release_metadata_evidence: Option<BrowserReleaseMetadataEvidenceRef>,
     progression_evidence: Vec<BrowserProgressionEvidenceRef>,
     progression: BrowserProgressionIndex,
     releases: Vec<CrateReleaseStatusView>,
@@ -156,14 +141,6 @@ struct BrowserProgressionIndex {
 #[serde(deny_unknown_fields)]
 struct BrowserDataset {
     logical_key: String,
-    url: String,
-    bytes: u64,
-    sha256: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct BrowserReleaseMetadataEvidenceRef {
     url: String,
     bytes: u64,
     sha256: String,
@@ -3670,439 +3647,6 @@ fn load_versions_report_from_site(
     Ok(versions.report)
 }
 
-fn load_static_site_release_metadata(repo_root: &Path) -> Result<StaticSiteReleaseMetadata> {
-    let compat_bytes = fs::read(repo_root.join(crate::VERSION_COMPAT_PATH))
-        .context("reading checked-in release compatibility metadata for static site")?;
-    Ok(StaticSiteReleaseMetadata {
-        version_compat_sha256: sha256_hex(&compat_bytes),
-        version_compat_json: compat_bytes,
-        compat: load_version_compat_map(repo_root)
-            .context("loading checked-in release compatibility metadata for static site")?,
-        repository_head_observation: load_xlsynth_crate_repository_head_observation(repo_root)
-            .context("loading checked-in repository observation for static site")?,
-    })
-}
-
-fn parse_static_site_utc_timestamp(value: &str, field: &str) -> Result<DateTime<Utc>> {
-    let parsed = DateTime::parse_from_rfc3339(value)
-        .with_context(|| format!("parsing {field} as RFC 3339"))?;
-    if parsed.offset().local_minus_utc() != 0 {
-        bail!("{field} is not a UTC timestamp");
-    }
-    Ok(parsed.with_timezone(&Utc))
-}
-
-fn version_compat_maps_match(
-    left: &BTreeMap<String, VersionCompatEntry>,
-    right: &BTreeMap<String, VersionCompatEntry>,
-) -> bool {
-    left.len() == right.len()
-        && left.iter().all(|(version, entry)| {
-            right.get(version).is_some_and(|other| {
-                entry.xlsynth_release_version == other.xlsynth_release_version
-                    && entry.crate_release_datetime == other.crate_release_datetime
-            })
-        })
-}
-
-fn encode_static_site_release_metadata_evidence(
-    metadata: &StaticSiteReleaseMetadata,
-) -> Result<Vec<u8>> {
-    if sha256_hex(&metadata.version_compat_json) != metadata.version_compat_sha256 {
-        bail!("release metadata compatibility-map bytes disagree with their digest");
-    }
-    let decoded_compat: BTreeMap<String, VersionCompatEntry> =
-        serde_json::from_slice(&metadata.version_compat_json)
-            .context("decoding release metadata compatibility-map evidence")?;
-    if !version_compat_maps_match(&decoded_compat, &metadata.compat) {
-        bail!("release metadata compatibility-map bytes disagree with typed entries");
-    }
-
-    let mut release_versions = metadata.compat.keys().cloned().collect::<Vec<_>>();
-    release_versions.sort_by(|left, right| cmp_dotted_numeric_version(left, right));
-    let releases = release_versions
-        .into_iter()
-        .map(|crate_version| {
-            let entry = metadata
-                .compat
-                .get(&crate_version)
-                .expect("release version came from compatibility map");
-            let dso_version = normalize_tag_version(&entry.xlsynth_release_version).to_string();
-            if crate_version.is_empty()
-                || normalize_tag_version(&crate_version) != crate_version
-                || dso_version.is_empty()
-            {
-                bail!("release metadata evidence contains a non-canonical version");
-            }
-            let released_at = parse_compat_release_datetime_utc(&entry.crate_release_datetime)
-                .context("release metadata evidence contains an invalid release timestamp")?;
-            Ok(pb::StaticSiteCrateReleaseMetadata {
-                crate_version: Some(pb::CrateVersion {
-                    value: crate_version,
-                }),
-                dso_version: Some(pb::DsoVersion { value: dso_version }),
-                crate_release_datetime: entry.crate_release_datetime.clone(),
-                crate_released_at: Some(timestamp_to_proto(&released_at)),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let repository_head_observation = metadata
-        .repository_head_observation
-        .as_ref()
-        .map(|observation| {
-            validate_repository_head_observation(observation)
-                .context("validating repository observation before evidence encoding")?;
-            if observation.version_compat_sha256 != metadata.version_compat_sha256 {
-                bail!("repository observation does not name the compatibility-map evidence");
-            }
-            Ok(pb::StaticSiteRepositoryHeadObservation {
-                schema_version: observation.schema_version,
-                repository: observation.repository.clone(),
-                version_compat_sha256: Some(digest_from_hex(
-                    &observation.version_compat_sha256,
-                    "static_site_release_metadata.repository_head_observation.version_compat_sha256",
-                )?),
-                observed_at: Some(timestamp_to_proto(&parse_static_site_utc_timestamp(
-                    &observation.observed_at_utc,
-                    "repository_head_observation.observed_at_utc",
-                )?)),
-                head_ref: observation.head_ref.clone(),
-                head_commit: observation.head_commit.clone(),
-                head_committed_at: Some(timestamp_to_proto(&parse_static_site_utc_timestamp(
-                    &observation.head_committed_at_utc,
-                    "repository_head_observation.head_committed_at_utc",
-                )?)),
-                latest_crate_version: Some(pb::CrateVersion {
-                    value: observation.latest_crate_version.clone(),
-                }),
-                latest_release_tag: observation.latest_release_tag.clone(),
-                latest_release_commit: observation.latest_release_commit.clone(),
-                latest_release_committed_at: Some(timestamp_to_proto(
-                    &parse_static_site_utc_timestamp(
-                        &observation.latest_release_committed_at_utc,
-                        "repository_head_observation.latest_release_committed_at_utc",
-                    )?,
-                )),
-                comparison_status: observation.comparison_status.clone(),
-                commits_ahead: observation.commits_ahead,
-                commits_behind: observation.commits_behind,
-                observed_at_utc: observation.observed_at_utc.clone(),
-                head_committed_at_utc: observation.head_committed_at_utc.clone(),
-                latest_release_committed_at_utc: observation
-                    .latest_release_committed_at_utc
-                    .clone(),
-            })
-        })
-        .transpose()?;
-    Ok(pb::StaticSiteReleaseMetadataEvidence {
-        record_version: STATIC_SITE_RELEASE_METADATA_EVIDENCE_RECORD_VERSION,
-        version_compat_sha256: Some(digest_from_hex(
-            &metadata.version_compat_sha256,
-            "static_site_release_metadata.version_compat_sha256",
-        )?),
-        releases,
-        repository_head_observation,
-        version_compat_json: metadata.version_compat_json.clone(),
-    }
-    .encode_to_vec())
-}
-
-fn decode_static_site_release_metadata_evidence(bytes: &[u8]) -> Result<StaticSiteReleaseMetadata> {
-    let evidence = pb::StaticSiteReleaseMetadataEvidence::decode(bytes)
-        .context("decoding static-site release metadata evidence")?;
-    if evidence.encode_to_vec() != bytes {
-        bail!("static-site release metadata evidence is not canonically encoded");
-    }
-    if evidence.record_version != STATIC_SITE_RELEASE_METADATA_EVIDENCE_RECORD_VERSION {
-        bail!("static-site release metadata evidence has an unsupported record version");
-    }
-    let version_compat_sha256 = digest_to_hex(
-        evidence
-            .version_compat_sha256
-            .as_ref()
-            .context("release metadata evidence has no compatibility-map digest")?,
-        "static_site_release_metadata.version_compat_sha256",
-    )?;
-    if sha256_hex(&evidence.version_compat_json) != version_compat_sha256 {
-        bail!("release metadata evidence compatibility-map digest mismatch");
-    }
-    let adapter_compat: BTreeMap<String, VersionCompatEntry> =
-        serde_json::from_slice(&evidence.version_compat_json)
-            .context("decoding compatibility-map JSON from release metadata evidence")?;
-    if !evidence.releases.windows(2).all(|pair| {
-        let left = pair[0].crate_version.as_ref().map(|value| &value.value);
-        let right = pair[1].crate_version.as_ref().map(|value| &value.value);
-        matches!((left, right), (Some(left), Some(right)) if cmp_dotted_numeric_version(left, right).is_lt())
-    }) {
-        bail!("release metadata evidence rows are not strictly version-sorted");
-    }
-    let mut compat = BTreeMap::new();
-    for release in &evidence.releases {
-        let crate_version = release
-            .crate_version
-            .as_ref()
-            .context("release metadata evidence row has no crate version")?
-            .value
-            .clone();
-        let dso_version = release
-            .dso_version
-            .as_ref()
-            .context("release metadata evidence row has no DSO version")?
-            .value
-            .clone();
-        if crate_version.is_empty()
-            || normalize_tag_version(&crate_version) != crate_version
-            || dso_version.is_empty()
-            || normalize_tag_version(&dso_version) != dso_version
-        {
-            bail!("release metadata evidence row contains a non-canonical version");
-        }
-        let adapter_entry = adapter_compat.get(&crate_version).with_context(|| {
-            format!("release metadata evidence crate v{crate_version} is absent from its JSON")
-        })?;
-        if normalize_tag_version(&adapter_entry.xlsynth_release_version) != dso_version
-            || adapter_entry.crate_release_datetime != release.crate_release_datetime
-        {
-            bail!("release metadata evidence row disagrees with its compatibility-map JSON");
-        }
-        let source_released_at = parse_compat_release_datetime_utc(&release.crate_release_datetime)
-            .context("release metadata evidence row has an invalid source timestamp")?;
-        let typed_released_at = timestamp_from_proto(
-            &release.crate_released_at,
-            "static_site_release_metadata.releases.crate_released_at",
-        )?;
-        if source_released_at != typed_released_at {
-            bail!("release metadata evidence row timestamp representations disagree");
-        }
-        if compat
-            .insert(crate_version, adapter_entry.clone())
-            .is_some()
-        {
-            bail!("release metadata evidence contains a duplicate crate version");
-        }
-    }
-    if !version_compat_maps_match(&compat, &adapter_compat) {
-        bail!("release metadata evidence rows do not exactly cover compatibility-map JSON");
-    }
-
-    let repository_head_observation = evidence
-        .repository_head_observation
-        .as_ref()
-        .map(|observation| {
-            let observation_digest = digest_to_hex(
-                observation
-                    .version_compat_sha256
-                    .as_ref()
-                    .context("repository observation evidence has no compatibility-map digest")?,
-                "static_site_release_metadata.repository_head_observation.version_compat_sha256",
-            )?;
-            if observation_digest != version_compat_sha256 {
-                bail!("repository observation evidence names a different compatibility map");
-            }
-            for (source, typed, field) in [
-                (
-                    &observation.observed_at_utc,
-                    &observation.observed_at,
-                    "observed_at",
-                ),
-                (
-                    &observation.head_committed_at_utc,
-                    &observation.head_committed_at,
-                    "head_committed_at",
-                ),
-                (
-                    &observation.latest_release_committed_at_utc,
-                    &observation.latest_release_committed_at,
-                    "latest_release_committed_at",
-                ),
-            ] {
-                if parse_static_site_utc_timestamp(source, field)?
-                    != timestamp_from_proto(typed, field)?
-                {
-                    bail!("repository observation timestamp representations disagree");
-                }
-            }
-            let view = RepositoryHeadObservationView {
-                schema_version: observation.schema_version,
-                repository: observation.repository.clone(),
-                version_compat_sha256: observation_digest,
-                observed_at_utc: observation.observed_at_utc.clone(),
-                head_ref: observation.head_ref.clone(),
-                head_commit: observation.head_commit.clone(),
-                head_committed_at_utc: observation.head_committed_at_utc.clone(),
-                latest_crate_version: observation
-                    .latest_crate_version
-                    .as_ref()
-                    .context("repository observation evidence has no latest crate version")?
-                    .value
-                    .clone(),
-                latest_release_tag: observation.latest_release_tag.clone(),
-                latest_release_commit: observation.latest_release_commit.clone(),
-                latest_release_committed_at_utc: observation
-                    .latest_release_committed_at_utc
-                    .clone(),
-                comparison_status: observation.comparison_status.clone(),
-                commits_ahead: observation.commits_ahead,
-                commits_behind: observation.commits_behind,
-            };
-            validate_repository_head_observation(&view)
-                .context("validating repository observation from release metadata evidence")?;
-            Ok(view)
-        })
-        .transpose()?;
-    Ok(StaticSiteReleaseMetadata {
-        version_compat_sha256,
-        version_compat_json: evidence.version_compat_json,
-        compat,
-        repository_head_observation,
-    })
-}
-
-fn validate_site_release_projection(
-    snapshot: &VersionCardsReport,
-    releases: &[CrateReleaseStatusView],
-    repository_head_observation: Option<&RepositoryHeadObservationView>,
-) -> Result<()> {
-    let mut release_utc_by_crate = BTreeMap::new();
-    let mut release_by_crate = BTreeMap::new();
-    for release in releases {
-        if release.crate_version.is_empty()
-            || normalize_tag_version(&release.crate_version) != release.crate_version
-            || release.dso_version.is_empty()
-            || normalize_tag_version(&release.dso_version) != release.dso_version
-        {
-            bail!("static-site release projection contains a non-canonical version");
-        }
-        let released_utc = parse_compat_release_datetime_utc(&release.crate_release_datetime)
-            .context("static-site release projection contains an invalid timestamp")?;
-        if release.processed != (release.materialized_actions > 0) {
-            bail!("static-site release projection has inconsistent processing counts");
-        }
-        if !matches!(
-            release.stdlib_enumeration_state.as_str(),
-            "unknown" | "not run" | "failed" | "partial" | "ok"
-        ) {
-            bail!("static-site release projection has an invalid enumeration state");
-        }
-        release_utc_by_crate.insert(release.crate_version.clone(), released_utc);
-        if release_by_crate
-            .insert(release.crate_version.as_str(), release)
-            .is_some()
-        {
-            bail!("static-site release projection contains a duplicate crate version");
-        }
-    }
-    if !releases.windows(2).all(|pair| {
-        cmp_crate_versions_by_release_datetime(
-            &pair[0].crate_version,
-            &pair[1].crate_version,
-            &release_utc_by_crate,
-        )
-        .is_lt()
-    }) {
-        bail!("static-site release projection is not sorted by publication time");
-    }
-    for source in &snapshot.releases {
-        if release_by_crate.get(source.crate_version.as_str()).copied() != Some(source) {
-            bail!("static-site release projection changed a snapshot release row");
-        }
-    }
-    for release in releases {
-        if snapshot
-            .releases
-            .iter()
-            .any(|source| source.crate_version == release.crate_version)
-        {
-            continue;
-        }
-        if release.processed
-            || release.materialized_actions != 0
-            || release.failed_actions != 0
-            || release.stdlib_enumeration_state != "not run"
-        {
-            bail!("static-site release projection invented processing state for a new release");
-        }
-    }
-    if let Some(observation) = repository_head_observation {
-        validate_repository_head_observation(observation)
-            .context("validating static-site repository observation")?;
-        let latest = releases
-            .first()
-            .context("static-site repository observation exists without release metadata")?;
-        if latest.crate_version != observation.latest_crate_version {
-            bail!("static-site repository observation does not name the latest release");
-        }
-    }
-    Ok(())
-}
-
-fn overlay_static_site_release_metadata(
-    mut snapshot: VersionCardsReport,
-    metadata: &StaticSiteReleaseMetadata,
-) -> Result<VersionCardsReport> {
-    let mut snapshot_by_crate = snapshot
-        .releases
-        .iter()
-        .map(|release| (release.crate_version.clone(), release.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let mut release_utc_by_crate = BTreeMap::new();
-    let mut releases = Vec::with_capacity(metadata.compat.len());
-    for (crate_version, entry) in &metadata.compat {
-        if crate_version.is_empty() || normalize_tag_version(crate_version) != crate_version {
-            bail!("checked-in compatibility map contains a non-canonical crate version");
-        }
-        let dso_version = normalize_tag_version(&entry.xlsynth_release_version).to_string();
-        if dso_version.is_empty() {
-            bail!("checked-in compatibility map contains an empty DSO version");
-        }
-        let released_utc = parse_compat_release_datetime_utc(&entry.crate_release_datetime)
-            .context("checked-in compatibility map contains an invalid release timestamp")?;
-        release_utc_by_crate.insert(crate_version.clone(), released_utc);
-        let release = match snapshot_by_crate.remove(crate_version) {
-            Some(release)
-                if release.dso_version == dso_version
-                    && release.crate_release_datetime == entry.crate_release_datetime =>
-            {
-                release
-            }
-            Some(_) => {
-                bail!(
-                    "checked-in release metadata conflicts with snapshot identity for crate v{crate_version}"
-                )
-            }
-            None => CrateReleaseStatusView {
-                crate_version: crate_version.clone(),
-                crate_release_datetime: entry.crate_release_datetime.clone(),
-                dso_version,
-                processed: false,
-                materialized_actions: 0,
-                failed_actions: 0,
-                stdlib_enumeration_state: "not run".to_string(),
-            },
-        };
-        releases.push(release);
-    }
-    if let Some((crate_version, _)) = snapshot_by_crate.first_key_value() {
-        bail!("snapshot release v{crate_version} is absent from checked-in release metadata");
-    }
-    releases.sort_by(|a, b| {
-        cmp_crate_versions_by_release_datetime(
-            &a.crate_version,
-            &b.crate_version,
-            &release_utc_by_crate,
-        )
-    });
-    validate_site_release_projection(
-        &snapshot,
-        &releases,
-        metadata.repository_head_observation.as_ref(),
-    )?;
-    snapshot.releases = releases;
-    snapshot.repository_head_observation = metadata.repository_head_observation.clone();
-    Ok(snapshot)
-}
-
 fn normalize_base_url(value: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() || !value.starts_with('/') {
@@ -4399,15 +3943,6 @@ fn expected_catalog_site_relpaths(
             );
         }
         insert_unique_site_relpath(&mut data, dataset.url.clone())?;
-    }
-
-    if let Some(evidence) = &catalog.release_metadata_evidence {
-        if evidence.url != STATIC_SITE_RELEASE_METADATA_EVIDENCE_URL
-            || !is_canonical_lower_hex(&evidence.sha256, 64)
-        {
-            bail!("browser catalog release metadata evidence reference is invalid");
-        }
-        insert_unique_site_relpath(&mut data, evidence.url.clone())?;
     }
 
     if !catalog
@@ -4910,20 +4445,11 @@ pub(crate) fn build_static_site(
     build_static_site_with_protected_roots(options, &[])
 }
 
-#[cfg(test)]
 pub(crate) fn build_static_site_with_protected_roots(
     options: &BuildStaticSiteOptions,
     protected_roots: &[(&str, &Path)],
 ) -> Result<BuildStaticSiteSummary> {
     build_static_site_with_progression_runs(options, protected_roots, &[])
-}
-
-pub(crate) fn build_static_site_with_protected_roots_from_repo(
-    options: &BuildStaticSiteOptions,
-    protected_roots: &[(&str, &Path)],
-    repo_root: &Path,
-) -> Result<BuildStaticSiteSummary> {
-    build_static_site_with_progression_runs_from_repo(options, protected_roots, &[], repo_root)
 }
 
 fn unique_site_sibling_path(out_dir: &Path, role: &str) -> Result<PathBuf> {
@@ -5090,40 +4616,10 @@ fn sync_site_parent_directory(out_dir: &Path) -> Result<()> {
         .with_context(|| format!("syncing static site parent: {}", parent.display()))
 }
 
-#[cfg(test)]
 pub(crate) fn build_static_site_with_progression_runs(
     options: &BuildStaticSiteOptions,
     protected_roots: &[(&str, &Path)],
     progression_run_dirs: &[PathBuf],
-) -> Result<BuildStaticSiteSummary> {
-    build_static_site_with_progression_runs_and_release_metadata(
-        options,
-        protected_roots,
-        progression_run_dirs,
-        None,
-    )
-}
-
-pub(crate) fn build_static_site_with_progression_runs_from_repo(
-    options: &BuildStaticSiteOptions,
-    protected_roots: &[(&str, &Path)],
-    progression_run_dirs: &[PathBuf],
-    repo_root: &Path,
-) -> Result<BuildStaticSiteSummary> {
-    let release_metadata = load_static_site_release_metadata(repo_root)?;
-    build_static_site_with_progression_runs_and_release_metadata(
-        options,
-        protected_roots,
-        progression_run_dirs,
-        Some(&release_metadata),
-    )
-}
-
-fn build_static_site_with_progression_runs_and_release_metadata(
-    options: &BuildStaticSiteOptions,
-    protected_roots: &[(&str, &Path)],
-    progression_run_dirs: &[PathBuf],
-    release_metadata: Option<&StaticSiteReleaseMetadata>,
 ) -> Result<BuildStaticSiteSummary> {
     preflight_progression_run_dirs(progression_run_dirs)?;
     reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected_roots)?;
@@ -5163,7 +4659,6 @@ fn build_static_site_with_progression_runs_and_release_metadata(
         &staging_options,
         protected_roots,
         progression_run_dirs,
-        release_metadata,
     ) {
         Ok(summary) => summary,
         Err(error) => {
@@ -5284,7 +4779,6 @@ fn build_static_site_with_progression_runs_in_place(
     options: &BuildStaticSiteOptions,
     protected_roots: &[(&str, &Path)],
     progression_run_dirs: &[PathBuf],
-    release_metadata: Option<&StaticSiteReleaseMetadata>,
 ) -> Result<BuildStaticSiteSummary> {
     verify_static_snapshot(&options.snapshot_dir).context("verifying source snapshot")?;
     let snapshot = load_static_snapshot_manifest(&options.snapshot_dir)?;
@@ -5384,26 +4878,7 @@ fn build_static_site_with_progression_runs_in_place(
         run.findings_protobuf_url = Some(target_relpath);
         run.findings = findings;
     }
-    let snapshot_versions = load_versions_report_from_site(&options.out_dir, &datasets)?;
-    let versions = match release_metadata {
-        Some(metadata) => overlay_static_site_release_metadata(snapshot_versions, metadata)?,
-        None => snapshot_versions,
-    };
-    let release_metadata_evidence = release_metadata
-        .map(|metadata| -> Result<BrowserReleaseMetadataEvidenceRef> {
-            let bytes = encode_static_site_release_metadata_evidence(metadata)?;
-            write_file(
-                &options.out_dir,
-                STATIC_SITE_RELEASE_METADATA_EVIDENCE_URL,
-                &bytes,
-            )?;
-            Ok(BrowserReleaseMetadataEvidenceRef {
-                url: STATIC_SITE_RELEASE_METADATA_EVIDENCE_URL.to_string(),
-                bytes: bytes.len() as u64,
-                sha256: sha256_hex(&bytes),
-            })
-        })
-        .transpose()?;
+    let versions = load_versions_report_from_site(&options.out_dir, &datasets)?;
     let (progression, progression_evidence_inputs) =
         build_browser_progression_catalog_and_progression_evidence_from_site(
             &options.out_dir,
@@ -5434,7 +4909,6 @@ fn build_static_site_with_progression_runs_in_place(
         base_url: base_url.clone(),
         datasets,
         runs,
-        release_metadata_evidence,
         progression_evidence,
         progression,
         releases: versions.releases,
@@ -6104,27 +5578,12 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     site_shards::verify_static_site_dataset_projection(site_dir, &catalog, &source_snapshot)
         .context("verifying static-site dataset projection against source snapshot")?;
     let versions = load_versions_report_from_site(site_dir, &catalog.datasets)?;
-    let expected_versions = match &catalog.release_metadata_evidence {
-        Some(evidence_ref) => {
-            let bytes = fs::read(site_dir.join(&evidence_ref.url)).with_context(|| {
-                format!("reading release metadata evidence {}", evidence_ref.url)
-            })?;
-            if bytes.len() as u64 != evidence_ref.bytes || sha256_hex(&bytes) != evidence_ref.sha256
-            {
-                bail!("browser catalog release metadata evidence reference mismatch");
-            }
-            let metadata = decode_static_site_release_metadata_evidence(&bytes)?;
-            overlay_static_site_release_metadata(versions.clone(), &metadata)
-                .context("reconstructing release metadata overlay from protobuf evidence")?
-        }
-        None => versions,
-    };
-    if catalog.releases != expected_versions.releases
-        || catalog.repository_head_observation != expected_versions.repository_head_observation
+    let expected_releases = versions.releases.as_slice();
+    let expected_observation = versions.repository_head_observation.as_ref();
+    if catalog.releases.as_slice() != expected_releases
+        || catalog.repository_head_observation.as_ref() != expected_observation
     {
-        bail!(
-            "browser release processing projection disagrees with typed release metadata evidence"
-        );
+        bail!("browser release processing projection disagrees with source dataset");
     }
     let release_progression = build_browser_progression_catalog_from_site(
         site_dir,

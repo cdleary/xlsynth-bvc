@@ -2894,183 +2894,6 @@ fn site_verifier_detects_tamper() {
 }
 
 #[test]
-fn repository_release_metadata_extends_a_stale_snapshot() {
-    let root = temp_root();
-    let store = ArtifactStore::new(root.join("store"));
-    store.ensure_layout().expect("store layout");
-
-    let current_index: VersionsSummaryIndexFile =
-        serde_json::from_slice(&empty_versions_index_bytes())
-            .expect("decode current versions fixture");
-    let current_latest = current_index
-        .report
-        .releases
-        .first()
-        .expect("current release ledger")
-        .clone();
-    let mut stale_index = current_index;
-    stale_index
-        .report
-        .releases
-        .retain(|release| release.crate_version != current_latest.crate_version);
-    let prior_latest = stale_index
-        .report
-        .releases
-        .first()
-        .expect("prior release remains")
-        .clone();
-
-    let mut stale_compat: serde_json::Value =
-        serde_json::from_str(&stale_index.version_compat_json)
-            .expect("decode embedded compatibility map");
-    stale_compat
-        .as_object_mut()
-        .expect("compatibility map object")
-        .remove(&current_latest.crate_version)
-        .expect("remove current release from stale fixture");
-    stale_index.version_compat_json =
-        serde_json::to_string(&stale_compat).expect("encode stale compatibility map");
-    let observation = stale_index
-        .report
-        .repository_head_observation
-        .as_mut()
-        .expect("repository observation");
-    observation.version_compat_sha256 = sha256_hex(stale_index.version_compat_json.as_bytes());
-    observation.latest_crate_version = prior_latest.crate_version.clone();
-    observation.latest_release_tag = format!("v{}", prior_latest.crate_version);
-    observation.latest_release_commit = observation.head_commit.clone();
-    observation.latest_release_committed_at_utc = observation.head_committed_at_utc.clone();
-    observation.comparison_status = "identical".to_string();
-    observation.commits_ahead = 0;
-    observation.commits_behind = 0;
-    validate_complete_versions_summary(&stale_index).expect("validate stale versions fixture");
-
-    let stale_repo_root = root.join("stale-repo");
-    for relpath in [
-        crate::DEFAULT_DOCKERFILE,
-        crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
-    ] {
-        let target = stale_repo_root.join(relpath);
-        fs::create_dir_all(target.parent().expect("repository input parent"))
-            .expect("create repository input parent");
-        fs::copy(test_repo_root().join(relpath), target).expect("copy repository input");
-    }
-    let compat_path = stale_repo_root.join(crate::VERSION_COMPAT_PATH);
-    fs::create_dir_all(compat_path.parent().expect("compatibility map parent"))
-        .expect("create compatibility map parent");
-    fs::write(&compat_path, stale_index.version_compat_json.as_bytes())
-        .expect("write stale compatibility map");
-    let observation_path = stale_repo_root.join(crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH);
-    fs::write(
-        observation_path,
-        serde_json::to_vec_pretty(
-            stale_index
-                .report
-                .repository_head_observation
-                .as_ref()
-                .expect("stale repository observation"),
-        )
-        .expect("encode stale repository observation"),
-    )
-    .expect("write stale repository observation");
-    rebuild_versions_cards_index(&store, &stale_repo_root)
-        .expect("build source-matched stale versions fixture");
-    let snapshot_dir = root.join("snapshot");
-    build_static_snapshot(
-        &store,
-        &stale_repo_root,
-        &BuildStaticSnapshotOptions {
-            out_dir: snapshot_dir.clone(),
-            overwrite: false,
-            skip_rebuild_web_indices: true,
-        },
-    )
-    .expect("build stale snapshot");
-
-    let site_dir = root.join("site");
-    build_static_site_with_progression_runs_from_repo(
-        &BuildStaticSiteOptions {
-            snapshot_dir,
-            out_dir: site_dir.clone(),
-            base_url: "/".to_string(),
-            overwrite: false,
-        },
-        &[],
-        &[],
-        &test_repo_root(),
-    )
-    .expect("build site with current repository metadata");
-    verify_static_site(&site_dir).expect("verify overlaid site");
-
-    let mut catalog: BrowserCatalog = serde_json::from_slice(
-        &fs::read(site_dir.join("catalog.json")).expect("read browser catalog"),
-    )
-    .expect("decode browser catalog");
-    let evidence_ref = catalog
-        .release_metadata_evidence
-        .as_ref()
-        .expect("release metadata evidence reference");
-    let evidence_bytes =
-        fs::read(site_dir.join(&evidence_ref.url)).expect("read release metadata evidence");
-    assert_eq!(evidence_bytes.len() as u64, evidence_ref.bytes);
-    assert_eq!(sha256_hex(&evidence_bytes), evidence_ref.sha256);
-    let evidence = decode_static_site_release_metadata_evidence(&evidence_bytes)
-        .expect("decode release metadata evidence");
-    assert!(evidence.compat.contains_key(&current_latest.crate_version));
-    assert_eq!(catalog.releases.first(), Some(&current_latest));
-    assert_eq!(
-        catalog.repository_head_observation,
-        load_xlsynth_crate_repository_head_observation(&test_repo_root())
-            .expect("load current repository observation")
-    );
-    assert_eq!(
-        release_event_time_utc(
-            &catalog.releases,
-            &current_latest.crate_version,
-            &current_latest.dso_version,
-        )
-        .expect("resolve new release event time"),
-        parse_compat_release_datetime_utc(&current_latest.crate_release_datetime)
-            .expect("parse new release timestamp")
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-    );
-
-    catalog.releases.insert(
-        0,
-        CrateReleaseStatusView {
-            crate_version: "999.0.0".to_string(),
-            crate_release_datetime: "2099-01-01 00:00:00 UTC".to_string(),
-            dso_version: "999.0.0".to_string(),
-            processed: false,
-            materialized_actions: 0,
-            failed_actions: 0,
-            stdlib_enumeration_state: "not run".to_string(),
-        },
-    );
-    let observation = catalog
-        .repository_head_observation
-        .as_mut()
-        .expect("catalog repository observation");
-    observation.latest_crate_version = "999.0.0".to_string();
-    observation.latest_release_tag = "v999.0.0".to_string();
-    let embedded_snapshot =
-        load_static_snapshot_manifest(&site_dir).expect("load embedded snapshot");
-    for (relpath, bytes) in
-        expected_fixed_site_files(&catalog, &embedded_snapshot).expect("render tampered files")
-    {
-        fs::write(site_dir.join(&relpath), bytes).expect("write tampered fixed site file");
-        refresh_site_manifest_entry(&site_dir, &relpath);
-    }
-    let error = verify_static_site(&site_dir)
-        .expect_err("invented release must disagree with protobuf evidence");
-    assert_eq!(
-        error.root_cause().to_string(),
-        "browser release processing projection disagrees with typed release metadata evidence"
-    );
-    fs::remove_dir_all(root).expect("cleanup");
-}
-
-#[test]
 fn site_verifier_rejects_self_consistent_script_and_unknown_catalog_field() {
     let root = temp_root();
     let store = ArtifactStore::new(root.join("store"));
@@ -3201,9 +3024,9 @@ fn site_verifier_binds_release_catalog_to_versions_dataset() {
 
     let error =
         verify_static_site(&site_dir).expect_err("catalog release rows must come from the dataset");
-    assert_eq!(
-        error.root_cause().to_string(),
-        "browser release processing projection disagrees with typed release metadata evidence"
+    assert!(
+        format!("{error:#}").contains("release processing projection disagrees"),
+        "unexpected error: {error:#}"
     );
 
     catalog.releases.clear();
@@ -3232,9 +3055,9 @@ fn site_verifier_binds_release_catalog_to_versions_dataset() {
 
     let error = verify_static_site(&site_dir)
         .expect_err("catalog repository observation must come from the dataset");
-    assert_eq!(
-        error.root_cause().to_string(),
-        "browser release processing projection disagrees with typed release metadata evidence"
+    assert!(
+        format!("{error:#}").contains("release processing projection disagrees"),
+        "unexpected error: {error:#}"
     );
     fs::remove_dir_all(root).expect("cleanup");
 }

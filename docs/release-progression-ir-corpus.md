@@ -74,12 +74,16 @@ separate stages:
 2. After workers are idle, rerun the exact `run-ir-dir-corpus` command once to refresh the public
    manifest and exported stats. Require the full cohort to be `done` with zero failed, missing, or
    extra samples. Do not merge or hand-edit JSON/JSONL files.
-3. Pass every completed release or Git output directory directly to `build-static-site` with a
+3. Reconstruct a fresh static snapshot from the canonical artifact store and current checked-in
+   definitions. A prior snapshot is publication output, not the authority for the current release
+   universe. Validated store results and derived indices may be reused only as caches for identical
+   inputs.
+4. Pass every completed release or Git output directory directly to `build-static-site` with a
    repeated `--progression-run-dir DIR`. The renderer validates the operational manifest, fixed
    cohort, complete action graph, and provenance-backed stats, then writes one typed
    `data/progression-runs/<generation-id>/evidence.pb` record per generation. JSON is created only
    as the final browser catalog/projection.
-4. Inspect the progression page with the intended cohort and explicit baseline/current generation
+5. Inspect the progression page with the intended cohort and explicit baseline/current generation
    IDs. Confirm both labels, completeness, summed-product delta, distribution plot, and largest
    per-artifact changes.
 
@@ -92,7 +96,12 @@ browser validation.
 Example publication command:
 
 ```bash
-cargo run --bin xlsynth_bvc -- \
+cargo run --release --bin xlsynth_bvc -- \
+  build-static-snapshot \
+  --out-dir /path/to/current/snapshot \
+  --overwrite
+
+cargo run --release --bin xlsynth_bvc -- \
   build-static-site \
   --snapshot-dir /path/to/current/snapshot \
   --out-dir /tmp/xlsynth-bvc-progression-site \

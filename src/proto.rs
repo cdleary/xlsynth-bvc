@@ -21,6 +21,11 @@ pub(crate) mod v1 {
 
 pub(crate) const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/xlsynth_bvc_descriptor.bin"));
+// Descriptor at 6c632b1, before the additive execution-recipe revision,
+// source-revision, corpus-scheduling, and fixed-corpus publication messages.
+// Historical publication stores using this descriptor remain wire-compatible.
+pub(crate) const PRE_EXECUTION_RECIPE_SCHEMA_DESCRIPTOR_SHA256: &str =
+    "244392f84e3e96954d4e7be053b3258ef6deba0f2aaa8928e9f8f878e7005399";
 // Descriptor set immediately before the wire-compatible optional
 // DriverRuntime.source_revision field was added.
 pub(crate) const PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256: &str =
@@ -30,15 +35,10 @@ pub(crate) const PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256: &str =
 // change any protobuf record persisted in an artifact store.
 pub(crate) const PRE_PROGRESSION_EVIDENCE_SCHEMA_DESCRIPTOR_SHA256: &str =
     "ced8e57a652e20d8fd25b36eeb7d9e5aa0436a5aa5bf06acb773fb856ba1a022";
-// Descriptor set immediately before static-site release metadata evidence was
-// added. This also added publication-only messages and did not change records
-// persisted in an artifact store.
-pub(crate) const PRE_STATIC_SITE_RELEASE_METADATA_SCHEMA_DESCRIPTOR_SHA256: &str =
-    "a3cb7fba40f06c82b69abe643f2c7f4daeac69afdf86849af8be131f4c81e0ec";
 pub(crate) const COMPATIBLE_PRIOR_SCHEMA_DESCRIPTOR_SHA256S: &[&str] = &[
+    PRE_EXECUTION_RECIPE_SCHEMA_DESCRIPTOR_SHA256,
     PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256,
     PRE_PROGRESSION_EVIDENCE_SCHEMA_DESCRIPTOR_SHA256,
-    PRE_STATIC_SITE_RELEASE_METADATA_SCHEMA_DESCRIPTOR_SHA256,
 ];
 pub(crate) const DEFAULT_RELEASE_CAMPAIGN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/release-qor-v1.pb"));

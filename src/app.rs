@@ -42,7 +42,7 @@ use crate::queue_progress::{WatchQueueOptions, watch_interval, watch_queue};
 use crate::runtime::*;
 use crate::service::*;
 use crate::site::{
-    BuildStaticSiteOptions, build_static_site_with_progression_runs_from_repo, smoke_static_site,
+    BuildStaticSiteOptions, build_static_site_with_progression_runs, smoke_static_site,
     verify_static_site,
 };
 use crate::sled_space::analyze_sled_space;
@@ -390,7 +390,7 @@ pub(crate) fn run() -> Result<()> {
             .chain(candidate_run_dirs)
             .cloned()
             .collect::<Vec<_>>();
-        let summary = build_static_site_with_progression_runs_from_repo(
+        let summary = build_static_site_with_progression_runs(
             &BuildStaticSiteOptions {
                 snapshot_dir: snapshot_dir.clone(),
                 out_dir: out_dir.clone(),
@@ -403,7 +403,6 @@ pub(crate) fn run() -> Result<()> {
                 ("artifact database", artifacts_via_sled.as_path()),
             ],
             &progression_run_dirs,
-            &repo_root,
         )?;
         println!(
             "{}",
