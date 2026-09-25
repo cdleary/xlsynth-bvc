@@ -76,8 +76,8 @@ separate stages:
    extra samples. Do not merge or hand-edit JSON/JSONL files.
 3. Reconstruct a fresh static snapshot from the canonical artifact store and current checked-in
    definitions. A prior snapshot is publication output, not the authority for the current release
-   universe. Validated store results and derived indices may be reused only as caches for identical
-   inputs.
+   universe. Content-bound canonical store results may be reused for identical action identities;
+   rebuild the derived publication indices.
 4. Pass every completed release or Git output directory directly to `build-static-site` with a
    repeated `--progression-run-dir DIR`. The renderer validates the operational manifest, fixed
    cohort, complete action graph, and provenance-backed stats, then writes one typed
