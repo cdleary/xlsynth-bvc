@@ -202,7 +202,12 @@ function vectorPlotSpec(rows, population, scale, revision) {
       name: style.label, x: [], y: [], text: [], customdata: [], connectgaps: false,
       hovertemplate: '%{text}<extra></extra>', line: {color: style.color, width: 1.3},
       opacity: kind === 'unchanged' ? .32 : .72,
-      marker: {color: style.color, symbol: [], size: [], angleref: 'previous'}};
+      marker: {color: style.color, symbol: [], size: [], angleref: kind === 'unchanged' ? 'up' : 'previous'}};
+    // Plotly suppresses any marker with angleref=previous when there is no
+    // preceding point. Keep baseline circles in their own unoriented trace.
+    const tails = {...trace, name: `${style.label} baseline`, mode: 'markers',
+      x: [], y: [], text: [], customdata: [],
+      marker: {color: style.color, symbol: 'circle-open', size: 5, angleref: 'up'}};
     for (const row of group) {
       if (kind === 'unchanged') {
         trace.x.push(transform(row.x1)); trace.y.push(transform(row.y1));
@@ -213,10 +218,13 @@ function vectorPlotSpec(rows, population, scale, revision) {
         trace.y.push(transform(row.y0), transform(row.y1), null);
         trace.text.push(vectorHover(row), vectorHover(row), '');
         trace.customdata.push(row.key, row.key, null);
-        trace.marker.symbol.push('circle-open', 'arrow', 'circle');
-        trace.marker.size.push(5, 10, 0);
+        trace.marker.symbol.push('circle', 'arrow', 'circle');
+        trace.marker.size.push(0, 10, 0);
+        tails.x.push(transform(row.x0)); tails.y.push(transform(row.y0));
+        tails.text.push(vectorHover(row)); tails.customdata.push(row.key);
       }
     }
+    if (tails.x.length) traces.push(tails);
     traces.push(trace);
   }
   const axis = (values, title) => {
