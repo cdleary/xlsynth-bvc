@@ -465,6 +465,13 @@ fn candidate_stats_are_read_from_digest_verified_provenance() {
 }
 
 fn build_historical_candidate_site_fixture(root: &Path) -> (PathBuf, String) {
+    build_historical_candidate_site_fixture_with_graph_le(root, false)
+}
+
+fn build_historical_candidate_site_fixture_with_graph_le(
+    root: &Path,
+    graph_le: bool,
+) -> (PathBuf, String) {
     let baseline_version = "0.66.0";
     let dso_version = "v0.54.7";
     let candidate_commit = "8".repeat(40);
@@ -603,6 +610,7 @@ fn build_historical_candidate_site_fixture(root: &Path) -> (PathBuf, String) {
         let stats_bytes = serde_json::to_vec(&json!({
             "and_nodes": candidate_nodes,
             "depth": candidate_depth,
+            "graph_logical_effort_worst_case_delay": graph_le.then_some(12.5 + index as f64),
         }))
         .expect("serialize candidate stats");
         candidate_store
@@ -845,6 +853,127 @@ fn build_historical_candidate_site_fixture(root: &Path) -> (PathBuf, String) {
     )
     .expect("build historical candidate site");
     (site_dir, generation_id)
+}
+
+#[test]
+fn progression_graph_le_is_validated_bound_and_preserved() {
+    assert_eq!(
+        progression_graph_le(
+            &json!({"and_nodes": 0, "depth": 0, "graph_logical_effort_worst_case_delay": -1})
+        )
+        .unwrap(),
+        None
+    );
+    assert!(
+        progression_graph_le(
+            &json!({"and_nodes": 1, "depth": 1, "graph_logical_effort_worst_case_delay": -1})
+        )
+        .is_err()
+    );
+    assert!(
+        progression_graph_le(
+            &json!({"and_nodes": 0, "depth": 0, "graph_logical_effort_worst_case_delay": -2})
+        )
+        .is_err()
+    );
+    assert_eq!(progression_graph_le(&json!({})).unwrap(), None);
+    assert_eq!(
+        progression_graph_le(&json!({"graph_logical_effort_worst_case_delay": null})).unwrap(),
+        None
+    );
+    for value in [json!(0), json!(12.5), json!("12.5")] {
+        assert!(
+            progression_graph_le(&json!({"graph_logical_effort_worst_case_delay": value}))
+                .unwrap()
+                .is_some()
+        );
+    }
+    for value in [
+        json!(-1),
+        json!("NaN"),
+        json!("inf"),
+        json!(true),
+        json!([]),
+    ] {
+        assert!(
+            progression_graph_le(&json!({"graph_logical_effort_worst_case_delay": value})).is_err()
+        );
+    }
+    let legacy = progression_stats_metric_projection_sha256(10.0, 2.0, None).unwrap();
+    let mut hasher = Sha256::new();
+    hasher.update(b"xlsynth-bvc/progression-stats-metric-projection/v1\0");
+    hasher.update(br#"{"and_nodes":10.0,"depth":2.0}"#);
+    assert_eq!(legacy, hex::encode(hasher.finalize()));
+    assert_ne!(
+        legacy,
+        progression_stats_metric_projection_sha256(10.0, 2.0, Some(0.0)).unwrap()
+    );
+    assert_ne!(
+        progression_stats_metric_projection_sha256(10.0, 2.0, Some(3.0)).unwrap(),
+        progression_stats_metric_projection_sha256(10.0, 2.0, Some(4.0)).unwrap()
+    );
+
+    let root = temp_root();
+    let (site_dir, generation_id) =
+        build_historical_candidate_site_fixture_with_graph_le(&root, true);
+    let evidence_bytes =
+        fs::read(site_dir.join(format!("data/progression-runs/{generation_id}/evidence.pb")))
+            .unwrap();
+    let (_, generation, runtime) = decode_progression_run_evidence(&evidence_bytes).unwrap();
+    let catalog =
+        decode_canonical_browser_catalog(&fs::read(site_dir.join("catalog.json")).unwrap())
+            .unwrap();
+    let published = catalog
+        .progression
+        .cohorts
+        .iter()
+        .flat_map(|cohort| &cohort.generations)
+        .find(|value| value.generation_id == generation_id)
+        .unwrap();
+    assert_eq!(published, &generation);
+    assert_eq!(
+        generation.run_samples[0].g8r_graph_logical_effort,
+        Some(12.5)
+    );
+    assert_eq!(
+        generation.run_samples[0].graph_le_estimator,
+        graph_le_estimator(&runtime.stats_runtime, Some(12.5)).unwrap()
+    );
+
+    let original =
+        pb::FixedCorpusProgressionRunEvidence::decode(evidence_bytes.as_slice()).unwrap();
+    for invalid in [Some(99.0), None, Some(f64::NAN), Some(-1.0)] {
+        let mut tampered = original.clone();
+        tampered.samples[0].g8r_graph_logical_effort = invalid;
+        assert!(decode_progression_run_evidence(&tampered.encode_to_vec()).is_err());
+    }
+    // LE-less records still verify using their original metric digest.
+    let mut legacy_evidence = original;
+    for sample in &mut legacy_evidence.samples {
+        sample.g8r_graph_logical_effort = None;
+        sample.g8r_metric_projection_sha256 = Some(
+            crate::proto::digest_from_hex(
+                &progression_stats_metric_projection_sha256(
+                    sample.g8r_nodes,
+                    sample.g8r_levels,
+                    None,
+                )
+                .unwrap(),
+                "legacy",
+            )
+            .unwrap(),
+        );
+    }
+    let (_, legacy_generation, _) =
+        decode_progression_run_evidence(&legacy_evidence.encode_to_vec()).unwrap();
+    assert!(
+        legacy_generation
+            .run_samples
+            .iter()
+            .all(|sample| sample.g8r_graph_logical_effort.is_none()
+                && sample.graph_le_estimator.is_none())
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -2068,6 +2197,9 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
                 ir_node_count: baseline.ir_node_count,
                 g8r_nodes: baseline.g8r_nodes,
                 g8r_levels: baseline.g8r_levels,
+                g8r_graph_logical_effort: None,
+                yosys_abc_graph_logical_effort: None,
+                graph_le_estimator: None,
                 yosys_abc_nodes: baseline.yosys_abc_nodes,
                 yosys_abc_levels: baseline.yosys_abc_levels,
                 g8r_product: baseline.g8r_product,
@@ -2208,6 +2340,30 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
     );
     assert_eq!(unavailable.cohort_complete_generation_count, 0);
     assert!(unavailable.generations.is_empty());
+}
+
+#[test]
+fn progression_vector_javascript_pairs_metrics_and_preserves_arrow_direction() {
+    let mut child = Command::new("node")
+        .arg("-e")
+        .arg(include_str!("../../testdata/progression_vectors_test.js"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("node is required for vector plot behavior tests");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(APP_JS.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

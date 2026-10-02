@@ -454,6 +454,12 @@ struct BrowserProgressionSample {
     ir_node_count: u64,
     g8r_nodes: f64,
     g8r_levels: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    g8r_graph_logical_effort: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    yosys_abc_graph_logical_effort: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    graph_le_estimator: Option<BrowserGraphLeEstimator>,
     yosys_abc_nodes: f64,
     yosys_abc_levels: f64,
     g8r_product: f64,
@@ -462,6 +468,32 @@ struct BrowserProgressionSample {
     ir_action_id: String,
     g8r_stats_action_id: String,
     yosys_abc_stats_action_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct BrowserGraphLeEstimator {
+    stats_driver_version: String,
+    // Includes the immutable image/cache identity; parameters are the
+    // aig-stats defaults of this exact runtime, as bound by the action graph.
+    runtime_sha256: String,
+}
+
+fn graph_le_estimator(
+    runtime: &DriverRuntimeSpec,
+    graph_le: Option<f64>,
+) -> Result<Option<BrowserGraphLeEstimator>> {
+    graph_le
+        .map(|_| {
+            Ok(BrowserGraphLeEstimator {
+                stats_driver_version: runtime.driver_version.clone(),
+                runtime_sha256: sha256_hex(
+                    &crate::proto::driver_runtime_to_proto(runtime, "graph_le.stats_runtime")?
+                        .encode_to_vec(),
+                ),
+            })
+        })
+        .transpose()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -586,6 +618,8 @@ struct ProgressionStatsEvidence {
     metric_projection_sha256: String,
     and_nodes: f64,
     depth: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    graph_logical_effort: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -866,6 +900,8 @@ fn progression_run_evidence_to_proto(
             ir_node_count: sample.ir_node_count,
             g8r_nodes: sample.g8r_nodes,
             g8r_levels: sample.g8r_levels,
+            g8r_graph_logical_effort: sample.g8r_graph_logical_effort,
+            yosys_abc_graph_logical_effort: sample.yosys_abc_graph_logical_effort,
             yosys_abc_nodes: sample.yosys_abc_nodes,
             yosys_abc_levels: sample.yosys_abc_levels,
             g8r_product: sample.g8r_product,
@@ -1337,6 +1373,8 @@ fn decode_progression_run_evidence(
     let mut source_runtime = None;
     let mut candidate_action_samples = Vec::new();
     for sample in evidence.samples {
+        validate_graph_le(sample.g8r_graph_logical_effort)?;
+        validate_graph_le(sample.yosys_abc_graph_logical_effort)?;
         let structural_hash = crate::proto::digest_to_hex(
             sample
                 .structural_hash
@@ -1393,7 +1431,11 @@ fn decode_progression_run_evidence(
             "progression_sample.g8r_metric_projection_sha256",
         )?;
         if g8r_projection
-            != progression_stats_metric_projection_sha256(sample.g8r_nodes, sample.g8r_levels)?
+            != progression_stats_metric_projection_sha256(
+                sample.g8r_nodes,
+                sample.g8r_levels,
+                sample.g8r_graph_logical_effort,
+            )?
         {
             bail!("progression sample G8r metrics disagree with their projection digest");
         }
@@ -1419,6 +1461,7 @@ fn decode_progression_run_evidence(
                     != progression_stats_metric_projection_sha256(
                         sample.yosys_abc_nodes,
                         sample.yosys_abc_levels,
+                        sample.yosys_abc_graph_logical_effort,
                     )?
                 {
                     bail!(
@@ -1445,6 +1488,10 @@ fn decode_progression_run_evidence(
                 crate_version: crate_version.as_deref(),
                 dso_version: &dso_version,
             },
+        )?;
+        let estimator = graph_le_estimator(
+            &sample_runtime_identity.stats_runtime,
+            sample.g8r_graph_logical_effort,
         )?;
         match &runtime_identity {
             Some(expected) if expected != &sample_runtime_identity => {
@@ -1500,6 +1547,9 @@ fn decode_progression_run_evidence(
             ir_node_count: sample.ir_node_count,
             g8r_nodes: sample.g8r_nodes,
             g8r_levels: sample.g8r_levels,
+            g8r_graph_logical_effort: sample.g8r_graph_logical_effort,
+            yosys_abc_graph_logical_effort: sample.yosys_abc_graph_logical_effort,
+            graph_le_estimator: estimator,
             yosys_abc_nodes: sample.yosys_abc_nodes,
             yosys_abc_levels: sample.yosys_abc_levels,
             g8r_product: sample.g8r_product,
@@ -2345,6 +2395,9 @@ fn progression_baseline_samples(
                     ir_node_count: sample.ir_node_count,
                     g8r_nodes: sample.g8r_nodes,
                     g8r_levels: sample.g8r_levels,
+                    g8r_graph_logical_effort: None,
+                    yosys_abc_graph_logical_effort: None,
+                    graph_le_estimator: None,
                     yosys_abc_nodes: sample.yosys_abc_nodes,
                     yosys_abc_levels: sample.yosys_abc_levels,
                     g8r_product: sample.g8r_product,
@@ -2467,6 +2520,8 @@ fn validate_candidate_progression_generation(
     }
     let mut seen = BTreeSet::new();
     for sample in &generation.run_samples {
+        validate_graph_le(sample.g8r_graph_logical_effort)?;
+        validate_graph_le(sample.yosys_abc_graph_logical_effort)?;
         if !seen.insert(sample.structural_hash.clone()) {
             bail!("candidate progression generation contains a duplicate structural hash");
         }
@@ -2505,6 +2560,7 @@ fn validate_candidate_progression_generation(
             || sample.g8r_product_loss != sample.g8r_product - sample.yosys_abc_product
             || sample.yosys_abc_nodes != baseline.yosys_abc_nodes
             || sample.yosys_abc_levels != baseline.yosys_abc_levels
+            || sample.yosys_abc_graph_logical_effort != baseline.yosys_abc_graph_logical_effort
             || sample.yosys_abc_product != baseline.yosys_abc_product
             || sample.yosys_abc_stats_action_id != baseline.yosys_abc_stats_action_id
             || sample.ir_node_count != baseline.ir_node_count
@@ -2593,16 +2649,60 @@ fn progression_stats_metric(value: &serde_json::Value, key: &str) -> Result<f64>
     }
 }
 
-fn progression_stats_metric_projection_sha256(and_nodes: f64, depth: f64) -> Result<String> {
+fn progression_graph_le(value: &serde_json::Value) -> Result<Option<f64>> {
+    let key = "graph_logical_effort_worst_case_delay";
+    if value.get(key).is_none_or(serde_json::Value::is_null) {
+        return Ok(None);
+    }
+    let delay = progression_stats_metric(value, key)?;
+    // aig-stats returns its initial -1 sentinel when no gate path exists.
+    // Admit that only for an empty AIG, as unavailable LE rather than a delay.
+    if delay == -1.0
+        && progression_stats_metric(value, "and_nodes")? == 0.0
+        && progression_stats_metric(value, "depth")? == 0.0
+    {
+        return Ok(None);
+    }
+    validate_graph_le(Some(delay))?;
+    Ok(Some(delay))
+}
+
+fn validate_graph_le(delay: Option<f64>) -> Result<()> {
+    if delay.is_some_and(|value| !value.is_finite() || value < 0.0) {
+        bail!("graph logical effort must be finite and nonnegative");
+    }
+    Ok(())
+}
+
+fn progression_stats_metric_projection_sha256(
+    and_nodes: f64,
+    depth: f64,
+    graph_le: Option<f64>,
+) -> Result<String> {
     if !and_nodes.is_finite() || and_nodes < 0.0 || !depth.is_finite() || depth < 0.0 {
         bail!("progression stats metrics must be finite and nonnegative");
     }
-    let projection = ProgressionStatsMetricProjection { and_nodes, depth };
-    let encoded = serde_json::to_vec(&projection)
-        .context("serializing canonical progression stats metric projection")?;
+    validate_graph_le(graph_le)?;
     let mut hasher = Sha256::new();
-    hasher.update(b"xlsynth-bvc/progression-stats-metric-projection/v1\0");
-    hasher.update(encoded);
+    if let Some(graph_logical_effort) = graph_le {
+        hasher.update(b"xlsynth-bvc/progression-stats-metric-projection/v2\0");
+        hasher.update(
+            pb::ProgressionAigStatsMetricProjection {
+                and_nodes,
+                depth,
+                graph_logical_effort,
+            }
+            .encode_to_vec(),
+        );
+    } else {
+        // Preserve the historical digest for evidence without LE.
+        let projection = ProgressionStatsMetricProjection { and_nodes, depth };
+        hasher.update(b"xlsynth-bvc/progression-stats-metric-projection/v1\0");
+        hasher.update(
+            serde_json::to_vec(&projection)
+                .context("serializing legacy progression stats metric projection")?,
+        );
+    }
     Ok(hex::encode(hasher.finalize()))
 }
 
@@ -2660,7 +2760,9 @@ fn read_verified_progression_stats_with_evidence(
     })?;
     let and_nodes = progression_stats_metric(&value, "and_nodes")?;
     let depth = progression_stats_metric(&value, "depth")?;
-    let metric_projection_sha256 = progression_stats_metric_projection_sha256(and_nodes, depth)?;
+    let graph_logical_effort = progression_graph_le(&value)?;
+    let metric_projection_sha256 =
+        progression_stats_metric_projection_sha256(and_nodes, depth, graph_logical_effort)?;
     let evidence = ProgressionStatsEvidence {
         sample_id: sample_id.to_string(),
         g8r_stats_action_id: expected_action_id,
@@ -2669,6 +2771,7 @@ fn read_verified_progression_stats_with_evidence(
         metric_projection_sha256,
         and_nodes,
         depth,
+        graph_logical_effort,
     };
     Ok((value, evidence))
 }
@@ -2835,6 +2938,7 @@ where
         )?;
         let g8r_nodes = progression_stats_metric(&stats, "and_nodes")?;
         let g8r_levels = progression_stats_metric(&stats, "depth")?;
+        let g8r_graph_logical_effort = progression_graph_le(&stats)?;
         let g8r_product = g8r_nodes * g8r_levels;
         let browser_sample = BrowserProgressionSample {
             fn_key: baseline.fn_key.clone(),
@@ -2843,6 +2947,12 @@ where
             ir_node_count: baseline.ir_node_count,
             g8r_nodes,
             g8r_levels,
+            g8r_graph_logical_effort,
+            yosys_abc_graph_logical_effort: baseline.yosys_abc_graph_logical_effort,
+            graph_le_estimator: graph_le_estimator(
+                &manifest.stats_runtime,
+                g8r_graph_logical_effort,
+            )?,
             yosys_abc_nodes: baseline.yosys_abc_nodes,
             yosys_abc_levels: baseline.yosys_abc_levels,
             g8r_product,
@@ -3212,6 +3322,7 @@ fn load_release_progression_generation_with_evidence(
         )?;
         let g8r_nodes = progression_stats_metric(&g8r_stats, "and_nodes")?;
         let g8r_levels = progression_stats_metric(&g8r_stats, "depth")?;
+        let g8r_graph_logical_effort = progression_graph_le(&g8r_stats)?;
         let yosys_abc_nodes = progression_stats_metric(&reference_stats, "and_nodes")?;
         let yosys_abc_levels = progression_stats_metric(&reference_stats, "depth")?;
         let g8r_product = g8r_nodes * g8r_levels;
@@ -3223,6 +3334,12 @@ fn load_release_progression_generation_with_evidence(
             ir_node_count: metadata.ir_node_count,
             g8r_nodes,
             g8r_levels,
+            g8r_graph_logical_effort,
+            yosys_abc_graph_logical_effort: progression_graph_le(&reference_stats)?,
+            graph_le_estimator: graph_le_estimator(
+                &manifest.stats_runtime,
+                g8r_graph_logical_effort,
+            )?,
             yosys_abc_nodes,
             yosys_abc_levels,
             g8r_product,
@@ -4012,7 +4129,25 @@ fn actual_site_relpaths(site_dir: &Path) -> Result<BTreeSet<String>> {
 
 fn progression_body(root_site_url: &str) -> String {
     format!(
-        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>Fixed-IR generation progression</h1><p class=\"meta\">Aggregate quality and per-artifact distributions for the same structural IR corpus across crate releases and evaluated Git revisions; lower means G8r is better</p><p id=\"error\" role=\"alert\"></p></header><main id=\"progression\" data-dataset-key=\"{}\"><div class=\"toolbar\"><label>Fixed cohort <select id=\"progression-cohort\" aria-label=\"Fixed artifact cohort\"></select></label><label>Baseline <select id=\"baseline-version\" aria-label=\"Baseline generation\"></select></label><label>Current <select id=\"current-version\" aria-label=\"Current generation\"></select></label><label><input id=\"include-incomplete\" type=\"checkbox\"> Include incomplete generations</label></div><p id=\"progression-status\" class=\"meta\" aria-live=\"polite\">Loading generation data…</p><section id=\"progression-summary\" class=\"grid\" aria-live=\"polite\"></section><h2>Quality versus distribution</h2><section id=\"progression-chart\" class=\"progression-chart\" aria-live=\"polite\"><p class=\"muted\">Loading generation data…</p></section><h2>Fixed-IR coverage</h2><section id=\"progression-inventory\" aria-live=\"polite\"></section><section id=\"progression-table\" aria-live=\"polite\"></section></main>",
+        r#"<header><p><a href="{root_site_url}">← Results</a></p><h1>Fixed-IR generation progression</h1><p class="meta">Follow the same functions across releases and tested Git revisions.</p><p id="error" role="alert"></p></header>
+<main id="progression" data-dataset-key="{}">
+<div class="toolbar"><label>Fixed cohort <select id="progression-cohort" aria-label="Fixed artifact cohort"></select></label><label>Baseline <select id="baseline-version" aria-label="Baseline generation"></select></label><label>Current <select id="current-version" aria-label="Current generation"></select></label><label><input id="include-incomplete" type="checkbox"> Include incomplete generations</label></div>
+<p id="progression-status" class="meta" aria-live="polite">Loading generation data…</p>
+<section id="progression-vectors" aria-labelledby="vector-title" hidden>
+<div class="vector-heading"><div><p class="science-label">Function movement / graph logical effort × AIG nodes</p><h2 id="vector-title">Where did the functions move?</h2></div><p id="vector-window" class="vector-window"></p></div>
+<p class="meta">Each arrow runs from baseline ○ to current ▶. Down and left is better; opposite directions are tradeoffs. Both measurements describe the same G8r+ABC AIG.</p>
+<dl id="vector-counts" class="vector-counts"></dl>
+<div class="toolbar vector-controls"><label>Axes <select id="vector-scale" aria-label="Vector axis scale"><option value="log">Log (zero-safe)</option><option value="linear">Linear</option></select></label><label>Show <select id="vector-filter" aria-label="Vector movement filter"><option value="all">All functions</option><option value="changed">Changed only</option><option value="improved">Improved</option><option value="regressed">Regressed</option><option value="tradeoff">Tradeoffs</option><option value="unchanged">Unchanged</option></select></label><label>Find function <input id="vector-search" type="search" placeholder="Name or structural hash" aria-label="Find vector function"></label></div>
+<p id="vector-warning" class="coverage-warning" hidden></p>
+<div class="vector-plot-panel"><div id="vector-plot" aria-label="Graph logical effort and AIG node count movement"></div></div>
+<p id="vector-status" class="meta" aria-live="polite"></p>
+<p class="meta vector-help">Drag to pan · scroll to zoom · click an endpoint to inspect. Counts cover all measured pairs; filters retain the same axes. LE changes within 1e−9 relative tolerance are treated as equal.</p>
+<section id="vector-detail" class="sample-detail" aria-live="polite"></section>
+<details class="vector-functions"><summary>Browse functions and exact changes</summary><div id="vector-table"></div></details>
+</section>
+<h2>Aggregate comparison</h2><section id="progression-summary" class="grid" aria-live="polite"></section>
+<h2>Quality versus distribution</h2><section id="progression-chart" class="progression-chart" aria-live="polite"><p class="muted">Loading generation data…</p></section>
+<h2>Fixed-IR coverage</h2><section id="progression-inventory" aria-live="polite"></section><section id="progression-table" aria-live="polite"></section></main>"#,
         crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
     )
 }
@@ -4187,12 +4322,12 @@ fn expected_fixed_site_files(
 
     files.insert(
         "progression.html".to_string(),
-        html_shell(
+        html_shell_with_plotly(
             "xlsynth-bvc generation progression",
             &root_site_url,
             &progression_body(&root_site_url),
             &css_name,
-            Some(&js_name),
+            &js_name,
         )
         .into_bytes(),
     );
@@ -4913,12 +5048,12 @@ fn build_static_site_with_progression_runs_in_place(
     write_file(
         &options.out_dir,
         "progression.html",
-        html_shell(
+        html_shell_with_plotly(
             "xlsynth-bvc generation progression",
             &root_site_url,
             &progression_body(&root_site_url),
             &css_name,
-            Some(&js_name),
+            &js_name,
         )
         .as_bytes(),
     )?;

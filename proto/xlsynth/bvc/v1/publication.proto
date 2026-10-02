@@ -105,6 +105,19 @@ message FixedCorpusProgressionSampleEvidence {
   optional Sha256Digest yosys_abc_stats_output_sha256 = 19;
   optional Sha256Digest yosys_abc_metric_projection_sha256 = 20;
   FixedCorpusProgressionSampleActionGraph action_graph = 21;
+  // FO4 delay measured by aig-stats on the same AIG as the node count.
+  // Absence denotes historical stats without graph logical effort, never zero.
+  optional double g8r_graph_logical_effort = 22;
+  optional double yosys_abc_graph_logical_effort = 23;
+}
+
+// Canonical v2 metric digest input when graph logical effort is available.
+// The estimator runtime is bound by the sample's stats action graph; the
+// execution recipe uses that runtime's aig-stats default LE parameters.
+message ProgressionAigStatsMetricProjection {
+  double and_nodes = 1;
+  double depth = 2;
+  double graph_logical_effort = 3;
 }
 
 // Typed action graph for the stages computed by this generation. A matched

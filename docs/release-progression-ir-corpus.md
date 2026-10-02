@@ -13,6 +13,34 @@ Each companion `*_artifacts.tsv` binds a structural hash to the SHA-256 of the e
 
 The MFFC cohort additionally retains its extraction lineage in `src/site_assets/mffc_progression_sources.jsonl`: source function/action identities, source structural hash, extracted top, originating crate versions, and occurrence count.
 
+## Graph logical-effort vector view
+
+The progression page also plots baseline-to-current arrows at `(graph LE, AIG AND nodes)`
+for each paired structural hash. Both coordinates come from the same post-ABC G8r AIG.
+Green means neither coordinate worsens and at least one improves; red is the reverse;
+amber marks tradeoffs; gray marks unchanged functions. LE comparisons use a relative
+tolerance of `1e-9` with a floor of one FO4. Node comparisons are exact.
+
+The default axes use `log10(1 + value)` with ticks labeled in original units, preserving
+zero-valued measurements. Linear axes, movement filters, function search, selected-sample
+evidence, and shareable query parameters are available. Counts describe all measured pairs;
+filtering preserves the plot's bounds.
+
+Publication admits optional `graph_logical_effort_worst_case_delay` from digest-verified
+`aig-stats` outputs into `FixedCorpusProgressionSampleEvidence`. Values must be finite and
+nonnegative. The estimator's `-1` no-path sentinel is admitted only with zero AND nodes
+and zero depth, and published as unavailable LE. Present LE uses a v2 metric digest over a
+typed protobuf; absent LE retains the historical v1 digest. Missing measurements are counted
+and excluded from arrows, never
+substituted with depth or zero. Republish completed runs with LE-bearing stats to expose them;
+missing stats can be recomputed from retained AIGs without repeating synthesis.
+
+The stats action graph binds the estimator runtime and its `aig-stats` default parameters.
+The browser derives a runtime fingerprint from that evidence and warns when a pair uses
+different or unidentified runtimes. Prefer the same stats runtime across the comparison:
+otherwise estimator changes can contribute to apparent movement. Selected-function details
+show both driver versions and fingerprints.
+
 ## Scheduling policy
 
 Cohort identity stays separate from operational scheduling. Both policies validate the complete exact-byte artifact manifest before enqueue:
