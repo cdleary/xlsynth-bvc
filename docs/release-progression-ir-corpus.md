@@ -13,6 +13,64 @@ Each companion `*_artifacts.tsv` binds a structural hash to the SHA-256 of the e
 
 The MFFC cohort additionally retains its extraction lineage in `src/site_assets/mffc_progression_sources.jsonl`: source function/action identities, source structural hash, extracted top, originating crate versions, and occurrence count.
 
+## Graph logical-effort vector view
+
+The progression page also plots baseline-to-current arrows at `(graph LE, AIG AND nodes)`
+for each paired structural hash. The AIG-stage selector chooses raw G8r (pre-ABC) or
+G8r+ABC. Both coordinates always come from the same stage's AIG; aggregate charts
+below the vector view continue to describe G8r+ABC.
+Green means neither coordinate worsens and at least one improves; red is the reverse;
+amber marks tradeoffs; gray marks unchanged functions. LE comparisons use a relative
+tolerance of `1e-9` with a floor of one FO4. Node comparisons are exact.
+
+The default axes use `log10(1 + value)` with ticks labeled in original units, preserving
+zero-valued measurements. Linear axes, movement filters, function search, selected-sample
+evidence, and shareable query parameters are available. Counts describe all measured pairs;
+filtering preserves the plot's bounds.
+
+Publication admits optional `graph_logical_effort_worst_case_delay` from digest-verified
+`aig-stats` outputs into `FixedCorpusProgressionSampleEvidence`. Values must be finite and
+nonnegative. The estimator's `-1` no-path sentinel is admitted only with zero AND nodes
+and zero depth, and published as unavailable LE. Present LE uses a v2 metric digest over a
+typed protobuf; absent LE retains the historical v1 digest. Missing measurements are counted
+and excluded from arrows, never
+substituted with depth or zero. Republish completed runs with LE-bearing stats to expose them;
+missing stats can be recomputed from retained AIGs without repeating synthesis.
+
+The stats action graph binds the estimator runtime and its `aig-stats` default parameters.
+The browser derives a runtime fingerprint from that evidence and warns when a pair uses
+different or unidentified runtimes. Prefer the same stats runtime across the comparison:
+otherwise estimator changes can contribute to apparent movement. Selected-function details
+show both driver versions and fingerprints.
+
+`g8r_abc_graph_logical_effort` retains protobuf tag 22 and explicitly names the
+post-ABC metric. Historical `g8r_nodes` and `g8r_levels` also describe post-ABC
+outputs. The optional `g8r_raw_stats` protobuf block independently binds pre-ABC
+nodes, depth, LE, stats action, output digest, and metric digest. Missing raw stats
+never fall back to post-ABC measurements.
+
+New matched-release and direct-Git corpus runs schedule both stats actions.
+
+Generated corpus workspaces and static publications are expected to be regenerated
+at the current commit; preserving old generated run formats is not a compatibility
+requirement. Retained canonical artifacts can still be reused by action identity.
+When reusing an older workspace, complete the explicit raw-stats backfill below
+before ordinary refresh or publication; ordinary refresh does not enqueue work.
+
+To backfill a completed older run without changing its captured estimator runtime:
+
+```bash
+xlsynth_bvc refresh-corpus-status --output-dir RUN_DIR --enqueue-raw-stats
+xlsynth_bvc --store-dir RUN_DIR/.bvc/bvc-artifacts \
+  --artifacts-via-sled RUN_DIR/.bvc/artifacts.sled run-workers --exit-when-idle
+xlsynth_bvc refresh-corpus-status --output-dir RUN_DIR
+```
+
+The first command validates retained prerequisite provenance and enqueues only
+raw stats; it does not repeat synthesis or ABC. The final refresh exports results
+from canonical protobuf provenance. Rebuild the static site with that run directory
+to publish the new measurements. Raw-stat completion is included in corpus progress.
+
 ## Scheduling policy
 
 Cohort identity stays separate from operational scheduling. Both policies validate the complete exact-byte artifact manifest before enqueue:

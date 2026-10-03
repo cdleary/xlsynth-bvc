@@ -148,8 +148,186 @@ function progressionInventory(metadata,generations){const kind=metadata.artifact
 
 function progressionOption(g){return `<option value='${g.generation_id}'>${esc(generationLabel(g))} · DSO v${esc(g.dso_version)} · ${esc(progressionCoverageLabel(g.coverage))} · ${g.samples.length.toLocaleString()} IR artifacts</option>`}
 function progressionSelection(candidates,oldBaseline='',oldCurrent=''){const ids=candidates.map(g=>g.generation_id);if(ids.length<2)return {baseline:'',current:ids.at(-1)||''};const allowed=new Set(ids),defaultCurrent=[...candidates].reverse().find(g=>generationIsGit(g))?.generation_id||ids.at(-1),current=allowed.has(oldCurrent)?oldCurrent:defaultCurrent,currentGeneration=candidates.find(g=>g.generation_id===current),capturedBaseline=currentGeneration?.baseline_generation_id;let baseline=allowed.has(oldBaseline)&&oldBaseline!==current?oldBaseline:allowed.has(capturedBaseline)&&capturedBaseline!==current?capturedBaseline:[...ids].reverse().find(id=>id!==current)||'';return {baseline,current}}
-function renderProgressionPair(generations,baselineId,currentId){renderGenerationPair(generations,baselineId,currentId)}
-function progressionUnavailable(root,message){root.querySelector('.toolbar').hidden=true;root.dataset.progressionRendered='unavailable';byId('progression-status').textContent=message;byId('progression-summary').innerHTML='';byId('progression-chart').innerHTML=`<p class=muted>${esc(message)}</p>`;byId('progression-inventory').innerHTML='';byId('progression-table').innerHTML=''}
-async function progression(catalog){const root=byId('progression');if(!root)return;const key=root.dataset.datasetKey,dataset=catalog.datasets.find(d=>d.logical_key===key),index=catalog.progression;if(!dataset||!index||!Array.isArray(index.cohorts)||!index.cohorts.length){progressionUnavailable(root,'Progression data is not available in this snapshot.');return}const ids=new Set(index.cohorts.map(cohort=>cohort.cohort_id));if(ids.size!==index.cohorts.length||!ids.has(index.default_cohort_id)||index.cohorts.some(cohort=>cohort.dataset_key!==key)){progressionUnavailable(root,'Progression cohort metadata is invalid.');return}const data=await loadSiteDataset(catalog,key),samples=data.dataset?.samples||[],cohortSelect=byId('progression-cohort'),baseline=byId('baseline-version'),current=byId('current-version'),includeIncomplete=byId('include-incomplete'),query=new URLSearchParams(location.search);cohortSelect.innerHTML=index.cohorts.map(cohort=>`<option value='${esc(cohort.cohort_id)}'>${esc(cohort.display_label)} · ${cohort.cohort_ir_count.toLocaleString()} artifacts</option>`).join('');cohortSelect.value=ids.has(query.get('cohort'))?query.get('cohort'):index.default_cohort_id;let generations=[],completeGenerations=[];const syncQuery=()=>{const url=new URL(location.href);url.searchParams.set('cohort',cohortSelect.value);if(baseline.value)url.searchParams.set('baseline',baseline.value);else url.searchParams.delete('baseline');if(current.value)url.searchParams.set('current',current.value);else url.searchParams.delete('current');if(includeIncomplete.checked)url.searchParams.set('include_incomplete','true');else url.searchParams.delete('include_incomplete');history.replaceState(null,'',url)};includeIncomplete.checked=query.get('include_incomplete')==='true';const render=()=>{const selectedBaseline=generations.find(g=>g.generation_id===baseline.value),selectedCurrent=generations.find(g=>g.generation_id===current.value);root.dataset.progressionBaselineVersion=selectedBaseline?generationLabel(selectedBaseline):'';root.dataset.progressionCurrentVersion=selectedCurrent?generationLabel(selectedCurrent):'';if(!baseline.value||!current.value){byId('progression-summary').innerHTML='<p class=muted>Select two available generations to compare.</p>';byId('progression-table').innerHTML='';syncQuery();return}renderProgressionPair(generations,baseline.value,current.value);syncQuery()};const populate=(requestedBaseline='',requestedCurrent='')=>{const candidates=includeIncomplete.checked?generations:completeGenerations,selection=progressionSelection(candidates,requestedBaseline||baseline.value,requestedCurrent||current.value),options=candidates.map(progressionOption).join('');baseline.innerHTML=options;current.innerHTML=options;baseline.value=selection.baseline;current.value=selection.current;render()};const selectCohort=(useQuery=false)=>{const metadata=index.cohorts.find(cohort=>cohort.cohort_id===cohortSelect.value);try{generations=releaseGenerations(metadata,samples)}catch(error){progressionUnavailable(root,`Progression data is ambiguous: ${error.message}`);return}completeGenerations=generations.filter(g=>g.coverage==='cohort_complete');const incompleteCount=generations.length-completeGenerations.length;byId('progression-inventory').innerHTML=progressionInventory(metadata,generations);byId('progression-chart').innerHTML=progressionChart(releaseStats(completeGenerations));root.dataset.progressionCohort=metadata.cohort_id;root.dataset.progressionRendered=completeGenerations.length>=2?'true':'insufficient';byId('progression-status').textContent=completeGenerations.length>=2?`${completeGenerations.length.toLocaleString()} cohort-complete generations plotted chronologically · ${metadata.cohort_ir_count.toLocaleString()} exact ${metadata.display_label.toLowerCase()} per point · ${incompleteCount.toLocaleString()} incomplete generation${incompleteCount===1?'':'s'} excluded by default`:`${metadata.display_label}: at least two cohort-complete generations are needed for a default comparison; ${completeGenerations.length.toLocaleString()} are available. Incomplete generations remain listed below and can be included explicitly.`;populate(useQuery?query.get('baseline')||'':'',useQuery?query.get('current')||'':'')};baseline.addEventListener('change',render);current.addEventListener('change',render);includeIncomplete.addEventListener('change',()=>populate());cohortSelect.addEventListener('change',()=>selectCohort(false));selectCohort(true)}
+const vectorKinds = {
+  improved: {label: 'Improved', color: '#5cdb9b'},
+  regressed: {label: 'Regressed', color: '#ff7990'},
+  tradeoff: {label: 'Tradeoff', color: '#e8bb62'},
+  unchanged: {label: 'Unchanged', color: '#8795a8'},
+};
+
+function progressionVectors(baseline, current, stage = 'abc') {
+  const before = indexSamples(baseline.samples, 'vector baseline');
+  const after = indexSamples(current.samples, 'vector current');
+  const result = {rows: [], paired: 0, missing: 0, added: 0, removed: 0, differentEstimators: 0,
+    counts: {improved: 0, regressed: 0, tradeoff: 0, unchanged: 0}};
+  const valid = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+  for (const [key, now] of after) {
+    const old = before.get(key);
+    if (!old) { result.added++; continue; }
+    result.paired++;
+    const metrics = sample => stage === 'raw'
+      ? [sample.g8r_raw_stats?.graph_logical_effort, sample.g8r_raw_stats?.and_nodes]
+      : [sample.g8r_abc_graph_logical_effort, sample.g8r_nodes];
+    const coords = [...metrics(old), ...metrics(now)];
+    if (!coords.every(valid)) { result.missing++; continue; }
+    const [x0, y0, x1, y1] = coords, dx = x1 - x0, dy = y1 - y0;
+    const leSign = Math.abs(dx) <= 1e-9 * Math.max(1, x0, x1) ? 0 : Math.sign(dx);
+    const nodeSign = Math.sign(dy);
+    const kind = leSign === 0 && nodeSign === 0 ? 'unchanged'
+      : leSign <= 0 && nodeSign <= 0 ? 'improved'
+      : leSign >= 0 && nodeSign >= 0 ? 'regressed' : 'tradeoff';
+    const relative = (a, b) => a === 0 ? (b === 0 ? 0 : Infinity) : 100 * Math.abs(b - a) / a;
+    const sameEstimator = !!old.graph_le_estimator?.runtime_sha256 &&
+      old.graph_le_estimator.runtime_sha256 === now.graph_le_estimator?.runtime_sha256;
+    if (!sameEstimator) result.differentEstimators++;
+    result.counts[kind]++;
+    result.rows.push({key, label: now.fn_key || old.fn_key || key, old, now, x0, y0, x1, y1,
+      dx, dy, kind, sameEstimator, magnitude: Math.max(relative(x0, x1), relative(y0, y1))});
+  }
+  result.removed = [...before.keys()].filter(key => !after.has(key)).length;
+  result.rows.sort((a, b) => (b.magnitude - a.magnitude) || a.key.localeCompare(b.key));
+  return result;
+}
+
+function vectorPercent(before, after) { return before === 0 ? (after === 0 ? '0%' : '— (baseline zero)') : percentage(100 * (after - before) / before); }
+function vectorHover(row) {
+  return `${esc(row.label)}<br>${vectorKinds[row.kind].label}<br>Graph LE: ${product(row.x0)} → ${product(row.x1)} FO4 (${vectorPercent(row.x0, row.x1)})<br>AIG nodes: ${product(row.y0)} → ${product(row.y1)} (${vectorPercent(row.y0, row.y1)})<br>${row.key.slice(0, 12)}`;
+}
+
+function vectorPlotSpec(rows, population, scale, revision) {
+  const transform = value => scale === 'linear' ? value : Math.log10(1 + value);
+  const traces = [];
+  // Unchanged points form a quiet background, with changed functions above them.
+  for (const kind of ['unchanged', 'tradeoff', 'improved', 'regressed']) {
+    const group = rows.filter(row => row.kind === kind), style = vectorKinds[kind];
+    if (!group.length) continue;
+    const trace = {type: 'scatter', mode: kind === 'unchanged' ? 'markers' : 'lines+markers',
+      name: style.label, x: [], y: [], text: [], customdata: [], connectgaps: false,
+      hovertemplate: '%{text}<extra></extra>', line: {color: style.color, width: 1.3},
+      opacity: kind === 'unchanged' ? .32 : .72,
+      marker: {color: style.color, symbol: [], size: [], angleref: kind === 'unchanged' ? 'up' : 'previous'}};
+    // Plotly suppresses any marker with angleref=previous when there is no
+    // preceding point. Keep baseline circles in their own unoriented trace.
+    const tails = {...trace, name: `${style.label} baseline`, mode: 'markers',
+      x: [], y: [], text: [], customdata: [],
+      marker: {color: style.color, symbol: 'circle-open', size: 5, angleref: 'up'}};
+    for (const row of group) {
+      if (kind === 'unchanged') {
+        trace.x.push(transform(row.x1)); trace.y.push(transform(row.y1));
+        trace.text.push(vectorHover(row)); trace.customdata.push(row.key);
+        trace.marker.symbol.push('circle'); trace.marker.size.push(5);
+      } else {
+        trace.x.push(transform(row.x0), transform(row.x1), null);
+        trace.y.push(transform(row.y0), transform(row.y1), null);
+        trace.text.push(vectorHover(row), vectorHover(row), '');
+        trace.customdata.push(row.key, row.key, null);
+        trace.marker.symbol.push('circle', 'arrow', 'circle');
+        trace.marker.size.push(0, 10, 0);
+        tails.x.push(transform(row.x0)); tails.y.push(transform(row.y0));
+        tails.text.push(vectorHover(row)); tails.customdata.push(row.key);
+      }
+    }
+    if (tails.x.length) traces.push(tails);
+    traces.push(trace);
+  }
+  const axis = (values, title) => {
+    const mapped = values.map(transform), min = Math.min(...mapped), max = Math.max(...mapped);
+    const pad = (max - min || 1) * .09;
+    const result = {title: {text: title}, gridcolor: '#29323f', zerolinecolor: '#465162',
+      range: values.length ? [Math.max(scale === 'linear' ? -Infinity : 0, min - pad), max + pad] : [0, 1]};
+    if (scale !== 'linear') {
+      const ticks = [0];
+      for (let power = 0; power <= Math.ceil(Math.log10(Math.max(1, ...values))); power++)
+        for (const multiplier of [1, 3]) ticks.push(multiplier * 10 ** power);
+      result.tickvals = ticks.map(transform); result.ticktext = ticks.map(product);
+    }
+    return result;
+  };
+  return {traces, layout: {
+    paper_bgcolor: '#11161d', plot_bgcolor: '#11161d', font: {color: '#c8d2df', family: 'system-ui'},
+    margin: {l: 88, r: 28, t: 30, b: 68}, height: 610, showlegend: false,
+    hovermode: 'closest', dragmode: 'pan', uirevision: revision,
+    xaxis: axis(population.flatMap(row => [row.x0, row.x1]), 'Graph logical effort · worst-case delay (FO4)'),
+    yaxis: axis(population.flatMap(row => [row.y0, row.y1]), 'AIG AND-node count'),
+    annotations: rows.length ? [] : [{text: population.length ? 'No functions match these filters' : 'No paired graph logical-effort measurements',
+      x: .5, y: .5, xref: 'paper', yref: 'paper', showarrow: false}],
+  }};
+}
+
+function renderProgressionVectors(generations, baselineId, currentId) {
+  const root = byId('progression-vectors');
+  if (!root) return;
+  const baseline = generations.find(g => g.generation_id === baselineId);
+  const current = generations.find(g => g.generation_id === currentId);
+  const plot = byId('vector-plot'), status = byId('vector-status'), detail = byId('vector-detail');
+  if (!baseline || !current) {
+    root.hidden = true;
+    root.dataset.rendered = 'unavailable';
+    root.dataset.plotRevision = String(Number(root.dataset.plotRevision || 0) + 1);
+    if (typeof Plotly !== 'undefined' && plot.data) Plotly.purge(plot);
+    return;
+  }
+  root.hidden = false;
+  const stage = byId('vector-stage'), scale = byId('vector-scale'), filter = byId('vector-filter'), search = byId('vector-search');
+  const query = new URLSearchParams(location.search);
+  if (!root.dataset.initialized) {
+    stage.value = query.get('vector_stage') === 'raw' ? 'raw' : 'abc';
+    scale.value = query.get('vector_scale') === 'linear' ? 'linear' : 'log';
+    filter.value = ['all', 'changed', ...Object.keys(vectorKinds)].includes(query.get('vector_filter')) ? query.get('vector_filter') : 'all';
+    search.value = query.get('vector_search') || '';
+    root.dataset.initialized = 'true';
+  }
+  const summary = progressionVectors(baseline, current, stage.value);
+  const stageLabel = stage.value === 'raw' ? 'G8r (pre-ABC)' : 'G8r+ABC';
+  byId('vector-window').textContent = `${generationLabel(baseline)} → ${generationLabel(current)} · ${stageLabel}`;
+  byId('vector-description').textContent = `Each arrow runs from baseline ○ to current ▶. Down and left is better; opposite directions are tradeoffs. Both measurements describe the same ${stageLabel} AIG.`;
+  byId('vector-counts').innerHTML = Object.entries(vectorKinds).map(([kind, style]) =>
+    `<div class='vector-count vector-${kind}'><dt>${style.label}</dt><dd>${summary.counts[kind].toLocaleString()}</dd></div>`).join('');
+  const warning = byId('vector-warning');
+  warning.hidden = summary.differentEstimators === 0;
+  warning.textContent = `${summary.differentEstimators.toLocaleString()} pairs use different or unidentified stats runtimes. Estimator changes may contribute to their movement; inspect the selected function for driver versions.`;
+  detail.innerHTML = '<p class=muted>Click an endpoint or a function below to inspect exact measurements and evidence.</p>';
+  const select = key => {
+    const row = summary.rows.find(value => value.key === key);
+    if (!row) return;
+    const driver = sample => sample.graph_le_estimator ? `v${esc(sample.graph_le_estimator.stats_driver_version)} · <code>${esc(sample.graph_le_estimator.runtime_sha256.slice(0, 12))}</code>` : 'unknown';
+    const evidence = generation => `${base}data/progression-runs/${encodeURIComponent(generation.generation_id)}/evidence.pb`;
+    detail.innerHTML = `<h3>${esc(row.label)}</h3><p><span class='vector-${row.kind}'>${vectorKinds[row.kind].label}</span> · <code>${esc(row.key)}</code></p><div class=table-wrap><table><thead><tr><th>Metric</th><th>${esc(generationLabel(baseline))}</th><th>${esc(generationLabel(current))}</th><th>Change</th></tr></thead><tbody><tr><td>Graph LE (FO4)</td><td>${row.x0}</td><td>${row.x1}</td><td>${vectorPercent(row.x0, row.x1)}</td></tr><tr><td>AIG AND nodes</td><td>${product(row.y0)}</td><td>${product(row.y1)}</td><td>${vectorPercent(row.y0, row.y1)}</td></tr><tr><td>Stats driver / runtime</td><td>${driver(row.old)}</td><td>${driver(row.now)}</td><td>${row.sameEstimator ? 'Same estimator runtime' : 'Different / unidentified runtimes'}</td></tr></tbody></table></div><p class=meta>LE uses the captured stats runtime’s default parameters. <a href='${evidence(baseline)}'>Baseline evidence</a> · <a href='${evidence(current)}'>Current evidence</a></p>`;
+    const url = new URL(location.href); url.searchParams.set('vector_sample', key); history.replaceState(null, '', url);
+  };
+  const draw = async () => {
+    const revision = String(Number(root.dataset.plotRevision || 0) + 1);
+    root.dataset.plotRevision = revision;
+    root.dataset.rendered = 'loading';
+    const needle = search.value.trim().toLowerCase();
+    const rows = summary.rows.filter(row => (filter.value === 'all' || (filter.value === 'changed' ? row.kind !== 'unchanged' : row.kind === filter.value)) &&
+      (!needle || row.label.toLowerCase().includes(needle) || row.key.includes(needle)));
+    status.textContent = `${rows.length.toLocaleString()} shown / ${summary.rows.length.toLocaleString()} measured pairs · ${summary.missing.toLocaleString()} missing / undefined graph LE · ${summary.added} current-only / ${summary.removed} baseline-only. ${scale.value === 'linear' ? 'Linear axes.' : 'Log₁₀(1 + value) axes; zero stays zero.'}`;
+    const url = new URL(location.href);
+    url.searchParams.set('vector_scale', scale.value); url.searchParams.set('vector_filter', filter.value);
+    url.searchParams.set('vector_stage', stage.value);
+    if (search.value) url.searchParams.set('vector_search', search.value); else url.searchParams.delete('vector_search');
+    history.replaceState(null, '', url);
+    byId('vector-table').innerHTML = `<h3>Functions · largest relative movement first</h3><p class=meta>${Math.min(25, rows.length)} of ${rows.length} matching functions. Search to find any function.</p><div class=table-wrap><table><thead><tr><th>Function</th><th>Direction</th><th>Graph LE (FO4)</th><th>AIG nodes</th></tr></thead><tbody>${rows.slice(0, 25).map(row => `<tr><td><button class=sample-link data-vector-key='${row.key}'>${esc(row.label)}</button><br><code>${row.key.slice(0, 12)}</code></td><td class='vector-${row.kind}'>${vectorKinds[row.kind].label}</td><td>${product(row.x0)} → ${product(row.x1)}</td><td>${product(row.y0)} → ${product(row.y1)}</td></tr>`).join('')}</tbody></table></div>`;
+    byId('vector-table').querySelectorAll('[data-vector-key]').forEach(button => button.addEventListener('click', () => select(button.dataset.vectorKey)));
+    if (typeof Plotly === 'undefined') { plot.textContent = 'The local plotting library could not be loaded.'; root.dataset.rendered = 'unavailable'; return; }
+    const spec = vectorPlotSpec(rows, summary.rows, scale.value, `${baselineId}:${currentId}:${stage.value}:${scale.value}`);
+    await Plotly.react(plot, spec.traces, spec.layout, {responsive: true, displaylogo: false, scrollZoom: true});
+    if (revision !== root.dataset.plotRevision) return;
+    plot.removeAllListeners('plotly_click');
+    plot.on('plotly_click', event => { const key = event.points?.[0]?.customdata; if (key) select(key); });
+    root.dataset.rendered = 'true';
+  };
+  const redraw = () => draw().catch(error => { root.dataset.rendered = 'unavailable'; status.textContent = `Vector view unavailable: ${error.message}`; });
+  scale.onchange = redraw; filter.onchange = redraw; search.oninput = redraw;
+  stage.onchange = () => renderProgressionVectors(generations, baselineId, currentId);
+  if (summary.rows.some(row => row.key === query.get('vector_sample'))) select(query.get('vector_sample'));
+  else { const url = new URL(location.href); url.searchParams.delete('vector_sample'); history.replaceState(null, '', url); }
+  redraw();
+}
+
+function renderProgressionPair(generations,baselineId,currentId){renderGenerationPair(generations,baselineId,currentId);renderProgressionVectors(generations,baselineId,currentId)}
+function progressionUnavailable(root,message){renderProgressionVectors([], '', '');root.querySelector('.toolbar').hidden=true;root.dataset.progressionRendered='unavailable';byId('progression-status').textContent=message;byId('progression-summary').innerHTML='';byId('progression-chart').innerHTML=`<p class=muted>${esc(message)}</p>`;byId('progression-inventory').innerHTML='';byId('progression-table').innerHTML=''}
+async function progression(catalog){const root=byId('progression');if(!root)return;const key=root.dataset.datasetKey,dataset=catalog.datasets.find(d=>d.logical_key===key),index=catalog.progression;if(!dataset||!index||!Array.isArray(index.cohorts)||!index.cohorts.length){progressionUnavailable(root,'Progression data is not available in this snapshot.');return}const ids=new Set(index.cohorts.map(cohort=>cohort.cohort_id));if(ids.size!==index.cohorts.length||!ids.has(index.default_cohort_id)||index.cohorts.some(cohort=>cohort.dataset_key!==key)){progressionUnavailable(root,'Progression cohort metadata is invalid.');return}const data=await loadSiteDataset(catalog,key),samples=data.dataset?.samples||[],cohortSelect=byId('progression-cohort'),baseline=byId('baseline-version'),current=byId('current-version'),includeIncomplete=byId('include-incomplete'),query=new URLSearchParams(location.search);cohortSelect.innerHTML=index.cohorts.map(cohort=>`<option value='${esc(cohort.cohort_id)}'>${esc(cohort.display_label)} · ${cohort.cohort_ir_count.toLocaleString()} artifacts</option>`).join('');cohortSelect.value=ids.has(query.get('cohort'))?query.get('cohort'):index.default_cohort_id;let generations=[],completeGenerations=[];const syncQuery=()=>{const url=new URL(location.href);url.searchParams.set('cohort',cohortSelect.value);if(baseline.value)url.searchParams.set('baseline',baseline.value);else url.searchParams.delete('baseline');if(current.value)url.searchParams.set('current',current.value);else url.searchParams.delete('current');if(includeIncomplete.checked)url.searchParams.set('include_incomplete','true');else url.searchParams.delete('include_incomplete');history.replaceState(null,'',url)};includeIncomplete.checked=query.get('include_incomplete')==='true';const render=()=>{const selectedBaseline=generations.find(g=>g.generation_id===baseline.value),selectedCurrent=generations.find(g=>g.generation_id===current.value);root.dataset.progressionBaselineVersion=selectedBaseline?generationLabel(selectedBaseline):'';root.dataset.progressionCurrentVersion=selectedCurrent?generationLabel(selectedCurrent):'';if(!baseline.value||!current.value){renderProgressionVectors([], '', '');byId('progression-summary').innerHTML='<p class=muted>Select two available generations to compare.</p>';byId('progression-table').innerHTML='';syncQuery();return}renderProgressionPair(generations,baseline.value,current.value);syncQuery()};const populate=(requestedBaseline='',requestedCurrent='')=>{const candidates=includeIncomplete.checked?generations:completeGenerations,selection=progressionSelection(candidates,requestedBaseline||baseline.value,requestedCurrent||current.value),options=candidates.map(progressionOption).join('');baseline.innerHTML=options;current.innerHTML=options;baseline.value=selection.baseline;current.value=selection.current;render()};const selectCohort=(useQuery=false)=>{const metadata=index.cohorts.find(cohort=>cohort.cohort_id===cohortSelect.value);try{generations=releaseGenerations(metadata,samples)}catch(error){progressionUnavailable(root,`Progression data is ambiguous: ${error.message}`);return}completeGenerations=generations.filter(g=>g.coverage==='cohort_complete');const incompleteCount=generations.length-completeGenerations.length;byId('progression-inventory').innerHTML=progressionInventory(metadata,generations);byId('progression-chart').innerHTML=progressionChart(releaseStats(completeGenerations));root.dataset.progressionCohort=metadata.cohort_id;root.dataset.progressionRendered=completeGenerations.length>=2?'true':'insufficient';byId('progression-status').textContent=completeGenerations.length>=2?`${completeGenerations.length.toLocaleString()} cohort-complete generations plotted chronologically · ${metadata.cohort_ir_count.toLocaleString()} exact ${metadata.display_label.toLowerCase()} per point · ${incompleteCount.toLocaleString()} incomplete generation${incompleteCount===1?'':'s'} excluded by default`:`${metadata.display_label}: at least two cohort-complete generations are needed for a default comparison; ${completeGenerations.length.toLocaleString()} are available. Incomplete generations remain listed below and can be included explicitly.`;populate(useQuery?query.get('baseline')||'':'',useQuery?query.get('current')||'':'')};baseline.addEventListener('change',render);current.addEventListener('change',render);includeIncomplete.addEventListener('change',()=>populate());cohortSelect.addEventListener('change',()=>selectCohort(false));selectCohort(true)}
 
 async function main(){const catalog=await fetch(base+'catalog.json').then(r=>{if(!r.ok)throw Error(`catalog ${r.status}`);return r.json()});await homepageOverview(catalog);await datasetExplorer(catalog);await progression(catalog);await mffcDiscrepancies(catalog);await comparisonPlots(catalog)}main().catch(e=>{const out=byId('error');if(out)out.textContent=e.stack||e});

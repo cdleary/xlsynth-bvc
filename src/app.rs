@@ -231,12 +231,18 @@ pub(crate) fn run() -> Result<()> {
         return Ok(());
     }
     if let TopCommand::RefreshCorpusStatus {
+        enqueue_raw_stats,
         output_dir,
         throughput_window_seconds,
         failed_sample_examples,
     } = &command
     {
-        let report = refresh_ir_dir_corpus_status(
+        let refresh = if *enqueue_raw_stats {
+            crate::corpus::backfill_ir_dir_corpus_raw_stats
+        } else {
+            refresh_ir_dir_corpus_status
+        };
+        let report = refresh(
             output_dir,
             *throughput_window_seconds,
             *failed_sample_examples,
