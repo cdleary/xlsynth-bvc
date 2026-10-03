@@ -49,8 +49,15 @@ outputs. The optional `g8r_raw_stats` protobuf block independently binds pre-ABC
 nodes, depth, LE, stats action, output digest, and metric digest. Missing raw stats
 never fall back to post-ABC measurements.
 
-New matched-release and direct-Git corpus runs schedule both stats actions. To
-backfill a completed older run without changing its captured estimator runtime:
+New matched-release and direct-Git corpus runs schedule both stats actions.
+
+Generated corpus workspaces and static publications are expected to be regenerated
+at the current commit; preserving old generated run formats is not a compatibility
+requirement. Retained canonical artifacts can still be reused by action identity.
+When reusing an older workspace, complete the explicit raw-stats backfill below
+before ordinary refresh or publication; ordinary refresh does not enqueue work.
+
+To backfill a completed older run without changing its captured estimator runtime:
 
 ```bash
 xlsynth_bvc refresh-corpus-status --output-dir RUN_DIR --enqueue-raw-stats
