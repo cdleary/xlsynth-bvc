@@ -192,6 +192,9 @@ pub enum TopCommand {
         failed_sample_examples: usize,
     },
     RefreshCorpusStatus {
+        /// Enqueue missing pre-ABC stats using this run's captured stats runtime.
+        #[arg(long)]
+        enqueue_raw_stats: bool,
         #[arg(long, value_name = "DIR")]
         output_dir: PathBuf,
         #[arg(long, default_value_t = 1800)]

@@ -40,6 +40,11 @@ pub(crate) const PRE_PROGRESSION_EVIDENCE_SCHEMA_DESCRIPTOR_SHA256: &str =
 pub(crate) const PRE_GRAPH_LE_SCHEMA_DESCRIPTOR_SHA256: &str =
     "a3cb7fba40f06c82b69abe643f2c7f4daeac69afdf86849af8be131f4c81e0ec";
 pub(crate) const COMPATIBLE_PRIOR_SCHEMA_DESCRIPTOR_SHA256S: &[&str] = &[
+    // Descriptor at 1137a75, before additive publication-only Git identity fields.
+    // Action, provenance, queue, and store messages are unchanged.
+    "c33dff22deb2c487638c01c63e1d2cdb233f36ccf5c0082b1d1724e935f94b16",
+    // Before the publication-only post-ABC rename and optional raw G8r stats.
+    "d5f88e9fafcc78b6185a6b91fd99376f1c7b0093f50c8dd98bbdb35126168b54",
     PRE_EXECUTION_RECIPE_SCHEMA_DESCRIPTOR_SHA256,
     PRE_SOURCE_REVISION_SCHEMA_DESCRIPTOR_SHA256,
     PRE_PROGRESSION_EVIDENCE_SCHEMA_DESCRIPTOR_SHA256,

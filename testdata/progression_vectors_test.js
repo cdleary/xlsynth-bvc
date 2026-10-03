@@ -7,7 +7,7 @@ const app = fs.readFileSync(0, 'utf8').split('async function main()')[0];
 const api = new Function(app + '\nreturn {progressionVectors, vectorPlotSpec};')();
 const hash = n => n.toString(16).padStart(64, '0');
 const sample = (n, le, nodes, runtime = 'same') => ({
-  structural_hash: hash(n), fn_key: `function-${n}`, g8r_graph_logical_effort: le,
+  structural_hash: hash(n), fn_key: `function-${n}`, g8r_abc_graph_logical_effort: le,
   g8r_nodes: nodes, graph_le_estimator: {runtime_sha256: runtime, stats_driver_version: 'test'},
 });
 const old = [sample(1, 10, 100), sample(2, 10, 100), sample(3, 10, 100),
@@ -32,6 +32,18 @@ assert.deepEqual(reverse.counts, {improved: 1, regressed: 2, tradeoff: 1, unchan
 const zeroToPositive = api.progressionVectors({samples: [sample(1, 0, 0)]}, {samples: [sample(1, 5, 10)]});
 assert.equal(zeroToPositive.rows[0].kind, 'regressed');
 assert.equal(zeroToPositive.rows[0].magnitude, Infinity);
+
+// Stage switching must select both coordinates together, without a post-ABC fallback.
+const stageOld = sample(1, 10, 100), stageNow = sample(1, 9, 90);
+stageOld.g8r_raw_stats = {and_nodes: 200, depth: 5, graph_logical_effort: 20};
+stageNow.g8r_raw_stats = {and_nodes: 220, depth: 6, graph_logical_effort: 22};
+const raw = api.progressionVectors({samples: [stageOld]}, {samples: [stageNow]}, 'raw');
+assert.equal(raw.rows[0].kind, 'regressed');
+assert.deepEqual([raw.rows[0].x0, raw.rows[0].y0, raw.rows[0].x1, raw.rows[0].y1], [20, 200, 22, 220]);
+assert.equal(api.progressionVectors({samples: [stageOld]}, {samples: [stageNow]}, 'abc').rows[0].kind, 'improved');
+delete stageNow.g8r_raw_stats;
+assert.equal(api.progressionVectors({samples: [stageOld]}, {samples: [stageNow]}, 'raw').missing, 1);
+assert.equal(api.progressionVectors({samples: [stageOld]}, {samples: [stageNow]}, 'abc').missing, 0);
 
 for (const scale of ['linear', 'log']) {
   const transform = x => scale === 'linear' ? x : Math.log10(1 + x);

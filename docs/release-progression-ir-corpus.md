@@ -16,7 +16,9 @@ The MFFC cohort additionally retains its extraction lineage in `src/site_assets/
 ## Graph logical-effort vector view
 
 The progression page also plots baseline-to-current arrows at `(graph LE, AIG AND nodes)`
-for each paired structural hash. Both coordinates come from the same post-ABC G8r AIG.
+for each paired structural hash. The AIG-stage selector chooses raw G8r (pre-ABC) or
+G8r+ABC. Both coordinates always come from the same stage's AIG; aggregate charts
+below the vector view continue to describe G8r+ABC.
 Green means neither coordinate worsens and at least one improves; red is the reverse;
 amber marks tradeoffs; gray marks unchanged functions. LE comparisons use a relative
 tolerance of `1e-9` with a floor of one FO4. Node comparisons are exact.
@@ -40,6 +42,27 @@ The browser derives a runtime fingerprint from that evidence and warns when a pa
 different or unidentified runtimes. Prefer the same stats runtime across the comparison:
 otherwise estimator changes can contribute to apparent movement. Selected-function details
 show both driver versions and fingerprints.
+
+`g8r_abc_graph_logical_effort` retains protobuf tag 22 and explicitly names the
+post-ABC metric. Historical `g8r_nodes` and `g8r_levels` also describe post-ABC
+outputs. The optional `g8r_raw_stats` protobuf block independently binds pre-ABC
+nodes, depth, LE, stats action, output digest, and metric digest. Missing raw stats
+never fall back to post-ABC measurements.
+
+New matched-release and direct-Git corpus runs schedule both stats actions. To
+backfill a completed older run without changing its captured estimator runtime:
+
+```bash
+xlsynth_bvc refresh-corpus-status --output-dir RUN_DIR --enqueue-raw-stats
+xlsynth_bvc --store-dir RUN_DIR/.bvc/bvc-artifacts \
+  --artifacts-via-sled RUN_DIR/.bvc/artifacts.sled run-workers --exit-when-idle
+xlsynth_bvc refresh-corpus-status --output-dir RUN_DIR
+```
+
+The first command validates retained prerequisite provenance and enqueues only
+raw stats; it does not repeat synthesis or ABC. The final refresh exports results
+from canonical protobuf provenance. Rebuild the static site with that run directory
+to publish the new measurements. Raw-stat completion is included in corpus progress.
 
 ## Scheduling policy
 

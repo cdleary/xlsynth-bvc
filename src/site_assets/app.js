@@ -155,7 +155,7 @@ const vectorKinds = {
   unchanged: {label: 'Unchanged', color: '#8795a8'},
 };
 
-function progressionVectors(baseline, current) {
+function progressionVectors(baseline, current, stage = 'abc') {
   const before = indexSamples(baseline.samples, 'vector baseline');
   const after = indexSamples(current.samples, 'vector current');
   const result = {rows: [], paired: 0, missing: 0, added: 0, removed: 0, differentEstimators: 0,
@@ -165,7 +165,10 @@ function progressionVectors(baseline, current) {
     const old = before.get(key);
     if (!old) { result.added++; continue; }
     result.paired++;
-    const coords = [old.g8r_graph_logical_effort, old.g8r_nodes, now.g8r_graph_logical_effort, now.g8r_nodes];
+    const metrics = sample => stage === 'raw'
+      ? [sample.g8r_raw_stats?.graph_logical_effort, sample.g8r_raw_stats?.and_nodes]
+      : [sample.g8r_abc_graph_logical_effort, sample.g8r_nodes];
+    const coords = [...metrics(old), ...metrics(now)];
     if (!coords.every(valid)) { result.missing++; continue; }
     const [x0, y0, x1, y1] = coords, dx = x1 - x0, dy = y1 - y0;
     const leSign = Math.abs(dx) <= 1e-9 * Math.max(1, x0, x1) ? 0 : Math.sign(dx);
@@ -265,16 +268,19 @@ function renderProgressionVectors(generations, baselineId, currentId) {
     return;
   }
   root.hidden = false;
-  const summary = progressionVectors(baseline, current);
-  const scale = byId('vector-scale'), filter = byId('vector-filter'), search = byId('vector-search');
+  const stage = byId('vector-stage'), scale = byId('vector-scale'), filter = byId('vector-filter'), search = byId('vector-search');
   const query = new URLSearchParams(location.search);
   if (!root.dataset.initialized) {
+    stage.value = query.get('vector_stage') === 'raw' ? 'raw' : 'abc';
     scale.value = query.get('vector_scale') === 'linear' ? 'linear' : 'log';
     filter.value = ['all', 'changed', ...Object.keys(vectorKinds)].includes(query.get('vector_filter')) ? query.get('vector_filter') : 'all';
     search.value = query.get('vector_search') || '';
     root.dataset.initialized = 'true';
   }
-  byId('vector-window').textContent = `${generationLabel(baseline)} → ${generationLabel(current)} · G8r+ABC`;
+  const summary = progressionVectors(baseline, current, stage.value);
+  const stageLabel = stage.value === 'raw' ? 'G8r (pre-ABC)' : 'G8r+ABC';
+  byId('vector-window').textContent = `${generationLabel(baseline)} → ${generationLabel(current)} · ${stageLabel}`;
+  byId('vector-description').textContent = `Each arrow runs from baseline ○ to current ▶. Down and left is better; opposite directions are tradeoffs. Both measurements describe the same ${stageLabel} AIG.`;
   byId('vector-counts').innerHTML = Object.entries(vectorKinds).map(([kind, style]) =>
     `<div class='vector-count vector-${kind}'><dt>${style.label}</dt><dd>${summary.counts[kind].toLocaleString()}</dd></div>`).join('');
   const warning = byId('vector-warning');
@@ -299,12 +305,13 @@ function renderProgressionVectors(generations, baselineId, currentId) {
     status.textContent = `${rows.length.toLocaleString()} shown / ${summary.rows.length.toLocaleString()} measured pairs · ${summary.missing.toLocaleString()} missing / undefined graph LE · ${summary.added} current-only / ${summary.removed} baseline-only. ${scale.value === 'linear' ? 'Linear axes.' : 'Log₁₀(1 + value) axes; zero stays zero.'}`;
     const url = new URL(location.href);
     url.searchParams.set('vector_scale', scale.value); url.searchParams.set('vector_filter', filter.value);
+    url.searchParams.set('vector_stage', stage.value);
     if (search.value) url.searchParams.set('vector_search', search.value); else url.searchParams.delete('vector_search');
     history.replaceState(null, '', url);
     byId('vector-table').innerHTML = `<h3>Functions · largest relative movement first</h3><p class=meta>${Math.min(25, rows.length)} of ${rows.length} matching functions. Search to find any function.</p><div class=table-wrap><table><thead><tr><th>Function</th><th>Direction</th><th>Graph LE (FO4)</th><th>AIG nodes</th></tr></thead><tbody>${rows.slice(0, 25).map(row => `<tr><td><button class=sample-link data-vector-key='${row.key}'>${esc(row.label)}</button><br><code>${row.key.slice(0, 12)}</code></td><td class='vector-${row.kind}'>${vectorKinds[row.kind].label}</td><td>${product(row.x0)} → ${product(row.x1)}</td><td>${product(row.y0)} → ${product(row.y1)}</td></tr>`).join('')}</tbody></table></div>`;
     byId('vector-table').querySelectorAll('[data-vector-key]').forEach(button => button.addEventListener('click', () => select(button.dataset.vectorKey)));
     if (typeof Plotly === 'undefined') { plot.textContent = 'The local plotting library could not be loaded.'; root.dataset.rendered = 'unavailable'; return; }
-    const spec = vectorPlotSpec(rows, summary.rows, scale.value, `${baselineId}:${currentId}:${scale.value}`);
+    const spec = vectorPlotSpec(rows, summary.rows, scale.value, `${baselineId}:${currentId}:${stage.value}:${scale.value}`);
     await Plotly.react(plot, spec.traces, spec.layout, {responsive: true, displaylogo: false, scrollZoom: true});
     if (revision !== root.dataset.plotRevision) return;
     plot.removeAllListeners('plotly_click');
@@ -313,6 +320,7 @@ function renderProgressionVectors(generations, baselineId, currentId) {
   };
   const redraw = () => draw().catch(error => { root.dataset.rendered = 'unavailable'; status.textContent = `Vector view unavailable: ${error.message}`; });
   scale.onchange = redraw; filter.onchange = redraw; search.oninput = redraw;
+  stage.onchange = () => renderProgressionVectors(generations, baselineId, currentId);
   if (summary.rows.some(row => row.key === query.get('vector_sample'))) select(query.get('vector_sample'));
   else { const url = new URL(location.href); url.searchParams.delete('vector_sample'); history.replaceState(null, '', url); }
   redraw();

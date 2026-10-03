@@ -320,6 +320,10 @@ struct IrDirCorpusSampleRecord {
     g8r_abc_aig_status: Option<String>,
     g8r_stats_action_id: String,
     g8r_stats_status: String,
+    #[serde(default)]
+    g8r_raw_stats_action_id: Option<String>,
+    #[serde(default)]
+    g8r_raw_stats_status: Option<String>,
     combo_verilog_action_id: String,
     combo_verilog_status: String,
     yosys_abc_aig_action_id: String,
@@ -447,6 +451,7 @@ struct CorpusActionPlan {
     g8r_aig_action: ActionSpec,
     g8r_abc_aig_action: Option<ActionSpec>,
     g8r_stats_action: ActionSpec,
+    g8r_raw_stats_action: Option<ActionSpec>,
     combo_verilog_action: ActionSpec,
     yosys_abc_aig_action: ActionSpec,
     yosys_abc_stats_action: ActionSpec,
@@ -469,7 +474,7 @@ struct ExecutionCounters {
 
 impl CorpusActionPlan {
     fn planned_actions(&self) -> Vec<&ActionSpec> {
-        if self.recipe_preset == CorpusRecipePreset::G8rAbcStats {
+        let mut actions = if self.recipe_preset == CorpusRecipePreset::G8rAbcStats {
             vec![
                 &self.g8r_aig_action,
                 &self.yosys_abc_aig_action,
@@ -488,7 +493,11 @@ impl CorpusActionPlan {
                 &self.aig_stat_diff_action,
             ]);
             actions
+        };
+        if let Some(raw) = &self.g8r_raw_stats_action {
+            actions.push(raw);
         }
+        actions
     }
 
     fn is_g8r_abc_stats(&self) -> bool {
@@ -1500,6 +1509,7 @@ pub(crate) fn show_ir_dir_corpus_progress(
     build_ir_dir_corpus_status_report(
         output_dir,
         false,
+        false,
         throughput_window_seconds,
         failed_sample_examples,
     )
@@ -1513,6 +1523,21 @@ pub(crate) fn refresh_ir_dir_corpus_status(
     build_ir_dir_corpus_status_report(
         output_dir,
         true,
+        false,
+        throughput_window_seconds,
+        failed_sample_examples,
+    )
+}
+
+pub(crate) fn backfill_ir_dir_corpus_raw_stats(
+    output_dir: &Path,
+    throughput_window_seconds: i64,
+    failed_sample_examples: usize,
+) -> Result<IrDirCorpusStatusReport> {
+    build_ir_dir_corpus_status_report(
+        output_dir,
+        true,
+        true,
         throughput_window_seconds,
         failed_sample_examples,
     )
@@ -1521,6 +1546,7 @@ pub(crate) fn refresh_ir_dir_corpus_status(
 fn build_ir_dir_corpus_status_report(
     output_dir: &Path,
     refresh_public_outputs: bool,
+    enqueue_raw_stats: bool,
     throughput_window_seconds: i64,
     failed_sample_examples: usize,
 ) -> Result<IrDirCorpusStatusReport> {
@@ -1568,6 +1594,9 @@ fn build_ir_dir_corpus_status_report(
         workspace_store_dir.clone(),
         workspace_artifacts_via_sled.clone(),
     );
+    if enqueue_raw_stats {
+        store.ensure_layout()?;
+    }
     let status_query_mode = match store.load_failed_action_records() {
         Ok(_) => CorpusStatusQueryMode::LiveStore,
         Err(err) => {
@@ -1592,6 +1621,41 @@ fn build_ir_dir_corpus_status_report(
         sha256: manifest.yosys_script_sha256.clone(),
     };
     let samples = sample_specs_from_manifest(&manifest);
+    if enqueue_raw_stats {
+        // Validate the complete backfill before mutating the queue. Existing
+        // synthesis and post-ABC identities must remain exactly as captured.
+        let mut raw_actions = Vec::new();
+        for (sample, persisted) in samples.iter().zip(&manifest.samples) {
+            let plan = build_action_plan(
+                sample,
+                recipe_preset,
+                manifest.fraig,
+                &manifest.dso_version,
+                &manifest.driver_runtime,
+                &manifest.stats_runtime,
+                &manifest.yosys_runtime,
+                &yosys_script_ref,
+            )?;
+            if plan.g8r_aig_action_id != persisted.g8r_aig_action_id
+                || plan.g8r_stats_action_id != persisted.g8r_stats_action_id
+            {
+                bail!("raw stats backfill does not match the captured action graph");
+            }
+            for id in [&plan.g8r_aig_action_id, &plan.g8r_stats_action_id] {
+                let provenance = store.load_provenance(id)?;
+                if provenance.action_id != *id || compute_action_id(&provenance.action)? != *id {
+                    bail!("raw stats backfill has invalid prerequisite provenance");
+                }
+            }
+            raw_actions.push(
+                plan.g8r_raw_stats_action
+                    .context("raw stats backfill requires a post-ABC recipe")?,
+            );
+        }
+        for action in raw_actions {
+            enqueue_action_with_priority(&store, action, 0)?;
+        }
+    }
     let run_errors = BTreeMap::new();
     let mut sample_records = Vec::with_capacity(samples.len());
     let mut unique_action_ids = BTreeSet::new();
@@ -1951,9 +2015,16 @@ fn collect_sample_completion_times(
         } else {
             &sample.aig_stat_diff_action_id
         };
-        if let Some(completed_utc) =
+        if let Some(mut completed_utc) =
             action_completion_utc(store, terminal_action_id, status_query_mode)?
         {
+            if let Some(raw_id) = &sample.g8r_raw_stats_action_id {
+                if let Some(raw_completed) =
+                    action_completion_utc(store, raw_id, status_query_mode)?
+                {
+                    completed_utc = completed_utc.max(raw_completed);
+                }
+            }
             out.push(completed_utc);
         }
     }
@@ -2051,6 +2122,7 @@ fn ready_output_counts(sample_records: &[IrDirCorpusSampleRecord]) -> BTreeMap<S
         "input_ir",
         "g8r_aig",
         "g8r_stats",
+        "g8r_raw_stats",
         "combo_verilog",
         "yosys_abc_aig",
         "yosys_abc_stats",
@@ -2065,6 +2137,13 @@ fn ready_output_counts(sample_records: &[IrDirCorpusSampleRecord]) -> BTreeMap<S
             ("input_ir", sample.import_ir_status.as_str()),
             ("g8r_aig", sample.g8r_aig_status.as_str()),
             ("g8r_stats", sample.g8r_stats_status.as_str()),
+            (
+                "g8r_raw_stats",
+                sample
+                    .g8r_raw_stats_status
+                    .as_deref()
+                    .unwrap_or("not_planned"),
+            ),
             ("combo_verilog", sample.combo_verilog_status.as_str()),
             ("yosys_abc_aig", sample.yosys_abc_aig_status.as_str()),
             ("yosys_abc_stats", sample.yosys_abc_stats_status.as_str()),
@@ -2341,6 +2420,12 @@ fn build_action_plan(
         runtime: stats_runtime.clone(),
     };
     let g8r_stats_action_id = compute_action_id(&g8r_stats_action)?;
+    let g8r_raw_stats_action =
+        (is_g8r_abc_stats || matched_abc).then(|| ActionSpec::DriverAigToStats {
+            aig_action_id: g8r_aig_action_id.clone(),
+            version: version.to_string(),
+            runtime: stats_runtime.clone(),
+        });
     let yosys_abc_stats_action = ActionSpec::DriverAigToStats {
         aig_action_id: yosys_abc_aig_action_id.clone(),
         version: version.to_string(),
@@ -2360,6 +2445,7 @@ fn build_action_plan(
         g8r_aig_action,
         g8r_abc_aig_action,
         g8r_stats_action,
+        g8r_raw_stats_action,
         combo_verilog_action,
         yosys_abc_aig_action,
         yosys_abc_stats_action,
@@ -2561,6 +2647,12 @@ fn build_sample_record(
         .as_deref()
         .map(|id| action_status_label(store, id));
     let g8r_stats_status = action_status_label(store, &plan.g8r_stats_action_id);
+    let g8r_raw_stats_status = plan.g8r_raw_stats_action.as_ref().map(|action| {
+        action_status_label(
+            store,
+            &compute_action_id(action).expect("valid raw stats action"),
+        )
+    });
     let combo_verilog_status = if plan.is_g8r_abc_stats() {
         "not_planned".to_string()
     } else {
@@ -2596,6 +2688,14 @@ fn build_sample_record(
             .or_else(|| action_error_summary(store, &plan.g8r_aig_action_id))
     }
     .or_else(|| {
+        plan.g8r_raw_stats_action.as_ref().and_then(|action| {
+            action_error_summary(
+                store,
+                &compute_action_id(action).expect("valid raw stats action"),
+            )
+        })
+    })
+    .or_else(|| {
         run_errors
             .get(&sample.sample_id)
             .map(|error| summarize_error(error))
@@ -2615,6 +2715,7 @@ fn build_sample_record(
         g8r_aig_status,
         g8r_abc_aig_status,
         g8r_stats_status,
+        g8r_raw_stats_status,
         combo_verilog_status,
         yosys_abc_aig_status,
         yosys_abc_stats_status,
@@ -2661,6 +2762,16 @@ fn build_sample_record_from_queue_state(
         &plan.g8r_stats_action_id,
         &persisted_sample.g8r_stats_status,
     );
+    let g8r_raw_stats_status = plan.g8r_raw_stats_action.as_ref().map(|action| {
+        queue_or_persisted_action_status_label(
+            store,
+            &compute_action_id(action).expect("valid raw stats action"),
+            persisted_sample
+                .g8r_raw_stats_status
+                .as_deref()
+                .unwrap_or("missing"),
+        )
+    });
     let combo_verilog_status = if plan.is_g8r_abc_stats() {
         "not_planned".to_string()
     } else {
@@ -2731,7 +2842,17 @@ fn build_sample_record_from_queue_state(
             .or_else(|| queue_files_action_error_summary(store, &plan.g8r_aig_action_id))
     }
     .or_else(|| {
-        if summarize_sample_status(&statuses, false) == "failed" {
+        plan.g8r_raw_stats_action.as_ref().and_then(|action| {
+            queue_files_action_error_summary(
+                store,
+                &compute_action_id(action).expect("valid raw stats action"),
+            )
+        })
+    })
+    .or_else(|| {
+        if summarize_sample_status_with_raw(&statuses, g8r_raw_stats_status.as_deref(), false)
+            == "failed"
+        {
             persisted_sample.error.clone()
         } else {
             None
@@ -2752,6 +2873,7 @@ fn build_sample_record_from_queue_state(
         g8r_aig_status,
         g8r_abc_aig_status,
         g8r_stats_status,
+        g8r_raw_stats_status,
         combo_verilog_status,
         yosys_abc_aig_status,
         yosys_abc_stats_status,
@@ -2774,6 +2896,7 @@ fn build_sample_record_with_statuses(
     g8r_aig_status: String,
     g8r_abc_aig_status: Option<String>,
     g8r_stats_status: String,
+    g8r_raw_stats_status: Option<String>,
     combo_verilog_status: String,
     yosys_abc_aig_status: String,
     yosys_abc_stats_status: String,
@@ -2799,7 +2922,11 @@ fn build_sample_record_with_statuses(
     if let Some(status) = &g8r_abc_aig_status {
         statuses.push(status);
     }
-    let overall_status = summarize_sample_status(&statuses, terminal_error.is_some());
+    let overall_status = summarize_sample_status_with_raw(
+        &statuses,
+        g8r_raw_stats_status.as_deref(),
+        terminal_error.is_some(),
+    );
 
     IrDirCorpusSampleRecord {
         sample_id: sample.sample_id.clone(),
@@ -2832,6 +2959,11 @@ fn build_sample_record_with_statuses(
         g8r_stats_action_id: plan.g8r_stats_action_id.clone(),
         g8r_stats_status,
         combo_verilog_action_id: plan.combo_verilog_action_id.clone(),
+        g8r_raw_stats_action_id: plan
+            .g8r_raw_stats_action
+            .as_ref()
+            .map(|action| compute_action_id(action).expect("valid raw stats action")),
+        g8r_raw_stats_status,
         combo_verilog_status,
         yosys_abc_aig_action_id: plan.yosys_abc_aig_action_id.clone(),
         yosys_abc_aig_status,
@@ -2897,6 +3029,12 @@ fn corpus_sample_action_statuses(sample: &IrDirCorpusSampleRecord) -> Vec<(&str,
     if let (Some(id), Some(status)) = (&sample.g8r_abc_aig_action_id, &sample.g8r_abc_aig_status) {
         actions.push((id, status));
     }
+    if let (Some(id), Some(status)) = (
+        &sample.g8r_raw_stats_action_id,
+        &sample.g8r_raw_stats_status,
+    ) {
+        actions.push((id, status));
+    }
     actions
         .into_iter()
         .filter(|(_, status)| status.as_str() != "not_planned")
@@ -2936,6 +3074,18 @@ fn queue_files_action_error_summary(store: &ArtifactStore, action_id: &str) -> O
         return Some(summarize_error(&canceled.reason));
     }
     None
+}
+
+fn summarize_sample_status_with_raw(
+    statuses: &[&str],
+    raw: Option<&str>,
+    has_error: bool,
+) -> String {
+    let primary = summarize_sample_status(statuses, has_error);
+    match raw {
+        None | Some("done") => primary,
+        Some(raw_status) => summarize_sample_status(&[raw_status, primary.as_str()], has_error),
+    }
 }
 
 fn summarize_sample_status(statuses: &[&str], has_error: bool) -> String {
@@ -3175,6 +3325,17 @@ fn export_leaf_artifacts(
             },
             &sample_dir.join("g8r_stats.json"),
         )?;
+        if let Some(action_id) = &sample.g8r_raw_stats_action_id {
+            copy_artifact_if_present(
+                store,
+                &ArtifactRef {
+                    action_id: action_id.clone(),
+                    artifact_type: ArtifactType::AigStatsFile,
+                    relpath: G8R_STATS_RELPATH.to_string(),
+                },
+                &sample_dir.join("g8r_raw_stats.json"),
+            )?;
+        }
         if sample.combo_verilog_status != "not_planned" {
             copy_artifact_if_present(
                 store,
@@ -3598,6 +3759,14 @@ mod tests {
                 .map(|_| "pending".to_string()),
             g8r_stats_action_id: plan.g8r_stats_action_id.clone(),
             g8r_stats_status: "pending".to_string(),
+            g8r_raw_stats_action_id: plan
+                .g8r_raw_stats_action
+                .as_ref()
+                .map(|action| compute_action_id(action).expect("valid raw stats action")),
+            g8r_raw_stats_status: plan
+                .g8r_raw_stats_action
+                .as_ref()
+                .map(|_| "pending".to_string()),
             combo_verilog_action_id: plan.combo_verilog_action_id.clone(),
             combo_verilog_status: "pending".to_string(),
             yosys_abc_aig_action_id: plan.yosys_abc_aig_action_id.clone(),
@@ -4080,7 +4249,11 @@ mod tests {
             &sample_yosys_script_ref(),
         )
         .expect("build action plan");
-        assert_eq!(plan.planned_actions().len(), 3);
+        assert_eq!(plan.planned_actions().len(), 4);
+        assert!(
+            matches!(&plan.g8r_raw_stats_action, Some(ActionSpec::DriverAigToStats { aig_action_id, runtime, .. })
+            if aig_action_id == &plan.g8r_aig_action_id && runtime == &stats_runtime)
+        );
         let ActionSpec::DriverIrToG8rAig {
             fraig,
             lowering_mode,
@@ -4112,7 +4285,7 @@ mod tests {
         let priorities = checked_enqueue_plan_priorities(&plan, 0).expect("priorities");
         assert_eq!(
             enqueue_plan(&store, &plan, &priorities).expect("enqueue"),
-            3
+            4
         );
         assert_eq!(
             enqueue_plan(&store, &plan, &priorities).expect("idempotent enqueue"),
@@ -4136,6 +4309,30 @@ mod tests {
         assert_eq!(record.yosys_abc_stats_status, "not_planned");
         assert_eq!(record.aig_stat_diff_status, "not_planned");
         assert_eq!(plan.g8r_stats_action_id, plan.yosys_abc_stats_action_id);
+        for raw_status in ["pending", "failed", "done"] {
+            let complete_except_raw = build_sample_record_with_statuses(
+                &sample,
+                &plan,
+                "g8r-abc-stats",
+                CorpusTopFnPolicy::FromFilename,
+                false,
+                "v0.39.0",
+                &driver_runtime,
+                &stats_runtime,
+                &sample_yosys_script_ref(),
+                "done".into(),
+                "done".into(),
+                None,
+                "done".into(),
+                Some(raw_status.into()),
+                "not_planned".into(),
+                "done".into(),
+                "not_planned".into(),
+                "not_planned".into(),
+                None,
+            );
+            assert_eq!(complete_except_raw.status, raw_status);
+        }
 
         stage_provenance_record(
             &store,
@@ -4164,7 +4361,7 @@ mod tests {
             record.driver_source_commit.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
         );
-        assert_eq!(corpus_sample_action_statuses(&record).len(), 4);
+        assert_eq!(corpus_sample_action_statuses(&record).len(), 5);
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -4229,7 +4426,7 @@ mod tests {
         )
         .expect("build candidate record")
         .expect("candidate record");
-        let first = finalize_candidate_run_record(Some(first), 3)
+        let first = finalize_candidate_run_record(Some(first), 4)
             .expect("finalize candidate record")
             .expect("finalized candidate record");
         assert_eq!(
@@ -4589,8 +4786,8 @@ mod tests {
         .expect("run release baseline chain");
         assert_eq!(source_summary.completed_samples, 1);
         assert_eq!(release_summary.completed_samples, 1);
-        assert_eq!(source_summary.executed_actions, 3);
-        assert_eq!(release_summary.executed_actions, 3);
+        assert_eq!(source_summary.executed_actions, 4);
+        assert_eq!(release_summary.executed_actions, 4);
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -4619,7 +4816,11 @@ mod tests {
         };
         let plan = build(false).expect("matched action plan");
         let g8r_abc_id = plan.g8r_abc_aig_action_id.as_ref().expect("G8r ABC action");
-        assert_eq!(plan.planned_actions().len(), 7);
+        assert_eq!(plan.planned_actions().len(), 8);
+        assert!(
+            matches!(&plan.g8r_raw_stats_action, Some(ActionSpec::DriverAigToStats { aig_action_id, .. })
+            if aig_action_id == &plan.g8r_aig_action_id)
+        );
         assert!(matches!(
             &plan.g8r_aig_action,
             ActionSpec::DriverIrToG8rAig {
@@ -4661,7 +4862,9 @@ mod tests {
         let manifest = read_status_manifest(&output_dir);
         let rows = read_samples_jsonl(&output_dir);
         assert_eq!(summary.recipe_preset, "g8r-abc-vs-yabc-aig-diff");
-        assert_eq!(summary.enqueued_actions, 7);
+        assert_eq!(summary.enqueued_actions, 8);
+        assert_eq!(rows[0].g8r_raw_stats_status.as_deref(), Some("pending"));
+        assert!(rows[0].g8r_raw_stats_action_id.is_some());
         assert_eq!(manifest.yosys_script, "flows/yosys_to_aig.ys");
         assert_eq!(rows.len(), 1);
         let abc_id = rows[0]
@@ -4688,6 +4891,85 @@ mod tests {
             Some(abc_id)
         );
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn raw_stats_backfill_preserves_pinned_actions_and_is_idempotent() {
+        let (root, output_dir, _) =
+            run_enqueue_corpus_for_recipe(CorpusRecipePreset::G8rAbcVsYabcAigDiff, None);
+        let before = read_status_manifest(&output_dir);
+        let samples = sample_specs_from_manifest(&before);
+        let plan = build_action_plan(
+            &samples[0],
+            CorpusRecipePreset::G8rAbcVsYabcAigDiff,
+            before.fraig,
+            &before.dso_version,
+            &before.driver_runtime,
+            &before.stats_runtime,
+            &before.yosys_runtime,
+            &crate::model::ScriptRef {
+                path: before.yosys_script.clone(),
+                sha256: before.yosys_script_sha256.clone(),
+            },
+        )
+        .unwrap();
+        let (_, store_dir, sled) = corpus_workspace_paths(&output_dir);
+        let store = ArtifactStore::new_with_sled(store_dir, sled);
+        let raw = plan.g8r_raw_stats_action.as_ref().unwrap();
+        let raw_id = compute_action_id(raw).unwrap();
+        fs::remove_file(store.pending_queue_path(&raw_id)).unwrap();
+        for (action, id, kind, relpath) in [
+            (
+                &plan.g8r_aig_action,
+                &plan.g8r_aig_action_id,
+                ArtifactType::AigFile,
+                G8R_AIG_RELPATH,
+            ),
+            (
+                &plan.g8r_stats_action,
+                &plan.g8r_stats_action_id,
+                ArtifactType::AigStatsFile,
+                G8R_STATS_RELPATH,
+            ),
+        ] {
+            stage_provenance_record(
+                &store,
+                action.clone(),
+                ArtifactRef {
+                    action_id: id.clone(),
+                    artifact_type: kind,
+                    relpath: relpath.into(),
+                },
+                Utc::now(),
+                json!({}),
+                vec![(relpath.into(), b"{}".to_vec())],
+            );
+        }
+        drop(store);
+        for _ in 0..2 {
+            let report = backfill_ir_dir_corpus_raw_stats(&output_dir, 300, 10).unwrap();
+            assert_eq!(report.sample_counts.get("pending"), Some(&1));
+            let after = read_status_manifest(&output_dir);
+            assert_eq!(after.driver_runtime, before.driver_runtime);
+            assert_eq!(after.stats_runtime, before.stats_runtime);
+            assert_eq!(
+                after.samples[0].g8r_aig_action_id,
+                before.samples[0].g8r_aig_action_id
+            );
+            assert_eq!(
+                after.samples[0].g8r_stats_action_id,
+                before.samples[0].g8r_stats_action_id
+            );
+            assert_eq!(
+                after.samples[0].g8r_raw_stats_action_id.as_deref(),
+                Some(raw_id.as_str())
+            );
+            assert_eq!(
+                after.samples[0].g8r_raw_stats_status.as_deref(),
+                Some("pending")
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4766,6 +5048,8 @@ mod tests {
             .expect("write pending sample stale file");
 
         let pending_sample = IrDirCorpusSampleRecord {
+            g8r_raw_stats_action_id: None,
+            g8r_raw_stats_status: None,
             sample_id: "pending-sample".to_string(),
             logical_name: "pending.ir".to_string(),
             source_relpath: "pending.ir".to_string(),

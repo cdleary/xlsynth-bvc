@@ -455,7 +455,9 @@ struct BrowserProgressionSample {
     g8r_nodes: f64,
     g8r_levels: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    g8r_graph_logical_effort: Option<f64>,
+    g8r_abc_graph_logical_effort: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    g8r_raw_stats: Option<BrowserRawG8rStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     yosys_abc_graph_logical_effort: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -477,6 +479,14 @@ struct BrowserGraphLeEstimator {
     // Includes the immutable image/cache identity; parameters are the
     // aig-stats defaults of this exact runtime, as bound by the action graph.
     runtime_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct BrowserRawG8rStats {
+    and_nodes: f64,
+    depth: f64,
+    graph_logical_effort: Option<f64>,
 }
 
 fn graph_le_estimator(
@@ -542,6 +552,10 @@ struct CandidateCorpusManifestInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CandidateSampleInput {
+    #[serde(default)]
+    g8r_raw_stats_action_id: Option<String>,
+    #[serde(default)]
+    g8r_raw_stats_status: Option<String>,
     sample_id: String,
     source_relpath: String,
     source_sha256: String,
@@ -581,6 +595,10 @@ struct ProgressionSchedulingPolicyInput {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ReleaseSampleInput {
+    #[serde(default)]
+    g8r_raw_stats_action_id: Option<String>,
+    #[serde(default)]
+    g8r_raw_stats_status: Option<String>,
     sample_id: String,
     source_relpath: String,
     source_sha256: String,
@@ -635,6 +653,7 @@ struct ProgressionSampleActionGraph {
 
 #[derive(Debug, Clone)]
 struct ProgressionSampleSourceEvidence {
+    g8r_raw_stats: Option<pb::ProgressionRawG8rStatsEvidence>,
     g8r: ProgressionStatsEvidence,
     yosys_abc: Option<ProgressionStatsEvidence>,
     action_graph: ProgressionSampleActionGraph,
@@ -900,7 +919,8 @@ fn progression_run_evidence_to_proto(
             ir_node_count: sample.ir_node_count,
             g8r_nodes: sample.g8r_nodes,
             g8r_levels: sample.g8r_levels,
-            g8r_graph_logical_effort: sample.g8r_graph_logical_effort,
+            g8r_abc_graph_logical_effort: sample.g8r_abc_graph_logical_effort,
+            g8r_raw_stats: source.g8r_raw_stats,
             yosys_abc_graph_logical_effort: sample.yosys_abc_graph_logical_effort,
             yosys_abc_nodes: sample.yosys_abc_nodes,
             yosys_abc_levels: sample.yosys_abc_levels,
@@ -1373,7 +1393,7 @@ fn decode_progression_run_evidence(
     let mut source_runtime = None;
     let mut candidate_action_samples = Vec::new();
     for sample in evidence.samples {
-        validate_graph_le(sample.g8r_graph_logical_effort)?;
+        validate_graph_le(sample.g8r_abc_graph_logical_effort)?;
         validate_graph_le(sample.yosys_abc_graph_logical_effort)?;
         let structural_hash = crate::proto::digest_to_hex(
             sample
@@ -1434,7 +1454,7 @@ fn decode_progression_run_evidence(
             != progression_stats_metric_projection_sha256(
                 sample.g8r_nodes,
                 sample.g8r_levels,
-                sample.g8r_graph_logical_effort,
+                sample.g8r_abc_graph_logical_effort,
             )?
         {
             bail!("progression sample G8r metrics disagree with their projection digest");
@@ -1489,9 +1509,29 @@ fn decode_progression_run_evidence(
                 dso_version: &dso_version,
             },
         )?;
+        let raw_stats = sample
+            .g8r_raw_stats
+            .as_ref()
+            .map(|raw| {
+                let post_action = required_progression_action(
+                    &sample
+                        .action_graph
+                        .as_ref()
+                        .context("missing action graph")?
+                        .g8r_stats,
+                    "post-ABC stats",
+                )?;
+                decode_raw_g8r_stats(
+                    raw,
+                    &raw_g8r_stats_action(&post_action, &g8r_aig_action_id)?,
+                )
+            })
+            .transpose()?;
         let estimator = graph_le_estimator(
             &sample_runtime_identity.stats_runtime,
-            sample.g8r_graph_logical_effort,
+            sample
+                .g8r_abc_graph_logical_effort
+                .or(raw_stats.as_ref().and_then(|raw| raw.graph_logical_effort)),
         )?;
         match &runtime_identity {
             Some(expected) if expected != &sample_runtime_identity => {
@@ -1509,6 +1549,8 @@ fn decode_progression_run_evidence(
         }
         if git_identity.is_some() {
             candidate_action_samples.push(CandidateSampleInput {
+                g8r_raw_stats_action_id: None,
+                g8r_raw_stats_status: None,
                 sample_id: String::new(),
                 source_relpath: format!("{structural_hash}.ir"),
                 source_sha256: source_sha256.clone(),
@@ -1547,7 +1589,8 @@ fn decode_progression_run_evidence(
             ir_node_count: sample.ir_node_count,
             g8r_nodes: sample.g8r_nodes,
             g8r_levels: sample.g8r_levels,
-            g8r_graph_logical_effort: sample.g8r_graph_logical_effort,
+            g8r_abc_graph_logical_effort: sample.g8r_abc_graph_logical_effort,
+            g8r_raw_stats: raw_stats,
             yosys_abc_graph_logical_effort: sample.yosys_abc_graph_logical_effort,
             graph_le_estimator: estimator,
             yosys_abc_nodes: sample.yosys_abc_nodes,
@@ -2395,7 +2438,8 @@ fn progression_baseline_samples(
                     ir_node_count: sample.ir_node_count,
                     g8r_nodes: sample.g8r_nodes,
                     g8r_levels: sample.g8r_levels,
-                    g8r_graph_logical_effort: None,
+                    g8r_abc_graph_logical_effort: None,
+                    g8r_raw_stats: None,
                     yosys_abc_graph_logical_effort: None,
                     graph_le_estimator: None,
                     yosys_abc_nodes: sample.yosys_abc_nodes,
@@ -2520,7 +2564,7 @@ fn validate_candidate_progression_generation(
     }
     let mut seen = BTreeSet::new();
     for sample in &generation.run_samples {
-        validate_graph_le(sample.g8r_graph_logical_effort)?;
+        validate_graph_le(sample.g8r_abc_graph_logical_effort)?;
         validate_graph_le(sample.yosys_abc_graph_logical_effort)?;
         if !seen.insert(sample.structural_hash.clone()) {
             bail!("candidate progression generation contains a duplicate structural hash");
@@ -2704,6 +2748,104 @@ fn progression_stats_metric_projection_sha256(
         );
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn raw_g8r_stats_action(post_abc: &ActionSpec, raw_aig_id: &str) -> Result<ActionSpec> {
+    let ActionSpec::DriverAigToStats {
+        version, runtime, ..
+    } = post_abc
+    else {
+        bail!("expected post-ABC stats action");
+    };
+    Ok(ActionSpec::DriverAigToStats {
+        aig_action_id: raw_aig_id.to_string(),
+        version: version.clone(),
+        runtime: runtime.clone(),
+    })
+}
+
+fn decode_raw_g8r_stats(
+    raw: &pb::ProgressionRawG8rStatsEvidence,
+    expected: &ActionSpec,
+) -> Result<BrowserRawG8rStats> {
+    let action = required_progression_action(&raw.stats_action, "raw G8r stats")?;
+    let id = crate::proto::action_id_to_hex(
+        raw.stats_action_id
+            .as_ref()
+            .context("missing raw stats action ID")?,
+        "raw.stats_action_id",
+    )?;
+    if crate::executor::compute_action_id(&action)? != id
+        || id != crate::executor::compute_action_id(expected)?
+        || raw.output_bytes == 0
+    {
+        bail!("raw G8r stats do not match their pre-ABC action and runtime");
+    }
+    crate::proto::digest_to_hex(
+        raw.output_sha256
+            .as_ref()
+            .context("missing raw stats output digest")?,
+        "raw.output_sha256",
+    )?;
+    let digest = crate::proto::digest_to_hex(
+        raw.metric_projection_sha256
+            .as_ref()
+            .context("missing raw metric digest")?,
+        "raw.metric_projection_sha256",
+    )?;
+    if digest
+        != progression_stats_metric_projection_sha256(
+            raw.and_nodes,
+            raw.depth,
+            raw.graph_logical_effort,
+        )?
+    {
+        bail!("raw G8r stats disagree with their metric digest");
+    }
+    Ok(BrowserRawG8rStats {
+        and_nodes: raw.and_nodes,
+        depth: raw.depth,
+        graph_logical_effort: raw.graph_logical_effort,
+    })
+}
+
+fn read_optional_raw_g8r_stats(
+    run_dir: &Path,
+    store: &ArtifactStore,
+    sample_id: &str,
+    action_id: Option<&str>,
+    status: Option<&str>,
+    expected: &ActionSpec,
+) -> Result<Option<pb::ProgressionRawG8rStatsEvidence>> {
+    let id = match (action_id, status) {
+        (None, None) => return Ok(None),
+        (Some(id), Some("done")) => id,
+        _ => bail!("raw G8r stats are incomplete"),
+    };
+    let (_, stats) = read_verified_progression_stats_with_evidence(
+        run_dir,
+        store,
+        sample_id,
+        id,
+        expected,
+        "g8r_raw_stats.json",
+    )?;
+    Ok(Some(pb::ProgressionRawG8rStatsEvidence {
+        and_nodes: stats.and_nodes,
+        depth: stats.depth,
+        graph_logical_effort: stats.graph_logical_effort,
+        stats_action: Some(crate::proto::action_spec_to_proto(expected)?),
+        stats_action_id: Some(crate::proto::action_id_to_proto(id, "raw.stats_action_id")?),
+        output_bytes: stats.source_output_bytes,
+        output_sha256: Some(crate::proto::digest_from_hex(
+            &stats.source_output_sha256,
+            "raw.output_sha256",
+        )?),
+        metric_projection_sha256: Some(crate::proto::digest_from_hex(
+            &stats.metric_projection_sha256,
+            "raw.metric_projection_sha256",
+        )?),
+    }))
 }
 
 fn read_verified_progression_stats_with_evidence(
@@ -2938,7 +3080,7 @@ where
         )?;
         let g8r_nodes = progression_stats_metric(&stats, "and_nodes")?;
         let g8r_levels = progression_stats_metric(&stats, "depth")?;
-        let g8r_graph_logical_effort = progression_graph_le(&stats)?;
+        let g8r_abc_graph_logical_effort = progression_graph_le(&stats)?;
         let g8r_product = g8r_nodes * g8r_levels;
         let browser_sample = BrowserProgressionSample {
             fn_key: baseline.fn_key.clone(),
@@ -2947,11 +3089,12 @@ where
             ir_node_count: baseline.ir_node_count,
             g8r_nodes,
             g8r_levels,
-            g8r_graph_logical_effort,
+            g8r_abc_graph_logical_effort,
+            g8r_raw_stats: None,
             yosys_abc_graph_logical_effort: baseline.yosys_abc_graph_logical_effort,
             graph_le_estimator: graph_le_estimator(
                 &manifest.stats_runtime,
-                g8r_graph_logical_effort,
+                g8r_abc_graph_logical_effort,
             )?,
             yosys_abc_nodes: baseline.yosys_abc_nodes,
             yosys_abc_levels: baseline.yosys_abc_levels,
@@ -3038,12 +3181,20 @@ fn load_candidate_progression_generation_with_evidence(
         run_dir.join(".bvc/artifacts.sled"),
     );
     let mut sources = BTreeMap::new();
-    let generation = candidate_progression_generation_from_manifest(
+    let mut generation = candidate_progression_generation_from_manifest(
         manifest,
         release_catalog,
         dataset,
         repository_observation,
         |sample, expected_action, action_graph| {
+            let raw = read_optional_raw_g8r_stats(
+                run_dir,
+                &store,
+                &sample.sample_id,
+                sample.g8r_raw_stats_action_id.as_deref(),
+                sample.g8r_raw_stats_status.as_deref(),
+                &raw_g8r_stats_action(expected_action, &sample.g8r_aig_action_id)?,
+            )?;
             let (value, evidence) = read_verified_candidate_stats_with_evidence(
                 run_dir,
                 &store,
@@ -3054,6 +3205,7 @@ fn load_candidate_progression_generation_with_evidence(
                 .insert(
                     evidence.g8r_stats_action_id.clone(),
                     ProgressionSampleSourceEvidence {
+                        g8r_raw_stats: raw,
                         g8r: evidence,
                         yosys_abc: None,
                         action_graph,
@@ -3066,6 +3218,22 @@ fn load_candidate_progression_generation_with_evidence(
             Ok(value)
         },
     )?;
+    for sample in &mut generation.run_samples {
+        let source = &sources[&sample.g8r_stats_action_id];
+        if let Some(raw) = &source.g8r_raw_stats {
+            let aig_id = crate::executor::compute_action_id(&source.action_graph.g8r_aig)?;
+            sample.g8r_raw_stats = Some(decode_raw_g8r_stats(
+                raw,
+                &raw_g8r_stats_action(&source.action_graph.g8r_stats, &aig_id)?,
+            )?);
+            sample.graph_le_estimator = graph_le_estimator(
+                &runtime_identity.stats_runtime,
+                sample
+                    .g8r_abc_graph_logical_effort
+                    .or(raw.graph_logical_effort),
+            )?;
+        }
+    }
     Ok(ProgressionRunEvidenceInput {
         cohort_id,
         generation,
@@ -3322,7 +3490,20 @@ fn load_release_progression_generation_with_evidence(
         )?;
         let g8r_nodes = progression_stats_metric(&g8r_stats, "and_nodes")?;
         let g8r_levels = progression_stats_metric(&g8r_stats, "depth")?;
-        let g8r_graph_logical_effort = progression_graph_le(&g8r_stats)?;
+        let g8r_abc_graph_logical_effort = progression_graph_le(&g8r_stats)?;
+        let raw_action = raw_g8r_stats_action(&g8r_action, &g8r_aig_action_id)?;
+        let raw = read_optional_raw_g8r_stats(
+            run_dir,
+            &store,
+            &sample.sample_id,
+            sample.g8r_raw_stats_action_id.as_deref(),
+            sample.g8r_raw_stats_status.as_deref(),
+            &raw_action,
+        )?;
+        let raw_stats = raw
+            .as_ref()
+            .map(|raw| decode_raw_g8r_stats(raw, &raw_action))
+            .transpose()?;
         let yosys_abc_nodes = progression_stats_metric(&reference_stats, "and_nodes")?;
         let yosys_abc_levels = progression_stats_metric(&reference_stats, "depth")?;
         let g8r_product = g8r_nodes * g8r_levels;
@@ -3334,11 +3515,13 @@ fn load_release_progression_generation_with_evidence(
             ir_node_count: metadata.ir_node_count,
             g8r_nodes,
             g8r_levels,
-            g8r_graph_logical_effort,
+            g8r_abc_graph_logical_effort,
+            g8r_raw_stats: raw_stats,
             yosys_abc_graph_logical_effort: progression_graph_le(&reference_stats)?,
             graph_le_estimator: graph_le_estimator(
                 &manifest.stats_runtime,
-                g8r_graph_logical_effort,
+                g8r_abc_graph_logical_effort
+                    .or(raw.as_ref().and_then(|raw| raw.graph_logical_effort)),
             )?,
             yosys_abc_nodes,
             yosys_abc_levels,
@@ -3358,6 +3541,7 @@ fn load_release_progression_generation_with_evidence(
         sources.insert(
             sample.g8r_stats_action_id.clone(),
             ProgressionSampleSourceEvidence {
+                g8r_raw_stats: raw,
                 g8r: g8r_source,
                 yosys_abc: Some(reference_source),
                 action_graph: ProgressionSampleActionGraph {
@@ -4135,9 +4319,9 @@ fn progression_body(root_site_url: &str) -> String {
 <p id="progression-status" class="meta" aria-live="polite">Loading generation data…</p>
 <section id="progression-vectors" aria-labelledby="vector-title" hidden>
 <div class="vector-heading"><div><p class="science-label">Function movement / graph logical effort × AIG nodes</p><h2 id="vector-title">Where did the functions move?</h2></div><p id="vector-window" class="vector-window"></p></div>
-<p class="meta">Each arrow runs from baseline ○ to current ▶. Down and left is better; opposite directions are tradeoffs. Both measurements describe the same G8r+ABC AIG.</p>
+<p id="vector-description" class="meta">Each arrow runs from baseline ○ to current ▶. Down and left is better; opposite directions are tradeoffs. Both measurements describe the same selected-stage AIG.</p>
 <dl id="vector-counts" class="vector-counts"></dl>
-<div class="toolbar vector-controls"><label>Axes <select id="vector-scale" aria-label="Vector axis scale"><option value="log">Log (zero-safe)</option><option value="linear">Linear</option></select></label><label>Show <select id="vector-filter" aria-label="Vector movement filter"><option value="all">All functions</option><option value="changed">Changed only</option><option value="improved">Improved</option><option value="regressed">Regressed</option><option value="tradeoff">Tradeoffs</option><option value="unchanged">Unchanged</option></select></label><label>Find function <input id="vector-search" type="search" placeholder="Name or structural hash" aria-label="Find vector function"></label></div>
+<div class="toolbar vector-controls"><label>AIG stage <select id="vector-stage" aria-label="Vector AIG stage"><option value="abc">G8r+ABC</option><option value="raw">G8r (pre-ABC)</option></select></label><label>Axes <select id="vector-scale" aria-label="Vector axis scale"><option value="log">Log (zero-safe)</option><option value="linear">Linear</option></select></label><label>Show <select id="vector-filter" aria-label="Vector movement filter"><option value="all">All functions</option><option value="changed">Changed only</option><option value="improved">Improved</option><option value="regressed">Regressed</option><option value="tradeoff">Tradeoffs</option><option value="unchanged">Unchanged</option></select></label><label>Find function <input id="vector-search" type="search" placeholder="Name or structural hash" aria-label="Find vector function"></label></div>
 <p id="vector-warning" class="coverage-warning" hidden></p>
 <div class="vector-plot-panel"><div id="vector-plot" aria-label="Graph logical effort and AIG node count movement"></div></div>
 <p id="vector-status" class="meta" aria-live="polite"></p>

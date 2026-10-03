@@ -79,6 +79,8 @@ fn candidate_manifest_input(commit: &str) -> CandidateCorpusManifestInput {
         .map(|(index, (structural_hash, source_sha256))| {
             let source_relpath = format!("{structural_hash}.ir");
             CandidateSampleInput {
+                g8r_raw_stats_action_id: None,
+                g8r_raw_stats_status: None,
                 sample_id: crate::corpus::sample_id_for_relpath(&source_relpath),
                 source_relpath,
                 source_sha256,
@@ -410,6 +412,8 @@ fn candidate_stats_are_read_from_digest_verified_provenance() {
     };
     let action_id = compute_action_id(&expected_action).expect("stats action ID");
     let sample = CandidateSampleInput {
+        g8r_raw_stats_action_id: None,
+        g8r_raw_stats_status: None,
         sample_id: "sample".to_string(),
         source_relpath: "sample.ir".to_string(),
         source_sha256: "1".repeat(64),
@@ -638,6 +642,32 @@ fn build_historical_candidate_site_fixture_with_graph_le(
         let stats_dir = run_dir.join("artifacts").join(&sample_id);
         fs::create_dir_all(&stats_dir).expect("create candidate stats directory");
         fs::write(stats_dir.join("g8r_stats.json"), &stats_bytes).expect("write candidate stats");
+        let raw_stats_id = if graph_le {
+            let raw_action = ActionSpec::DriverAigToStats {
+                aig_action_id: candidate_g8r_action_id.clone(),
+                version: dso_version.to_string(),
+                runtime: stats_runtime.clone(),
+            };
+            let raw_id = compute_action_id(&raw_action).unwrap();
+            let raw_bytes = serde_json::to_vec(&json!({"and_nodes": candidate_nodes + 100,
+                "depth": candidate_depth + 2, "graph_logical_effort_worst_case_delay": 32.5 + index as f64})).unwrap();
+            let mut raw_provenance = candidate_store
+                .load_provenance(&candidate_stats_action_id)
+                .unwrap();
+            raw_provenance.action = raw_action;
+            raw_provenance.action_id = raw_id.clone();
+            raw_provenance.output_artifact.action_id = raw_id.clone();
+            raw_provenance.output_files = vec![OutputFile {
+                path: "stats.json".into(),
+                bytes: raw_bytes.len() as u64,
+                sha256: sha256_hex(&raw_bytes),
+            }];
+            candidate_store.write_provenance(&raw_provenance).unwrap();
+            fs::write(stats_dir.join("g8r_raw_stats.json"), raw_bytes).unwrap();
+            Some(raw_id)
+        } else {
+            None
+        };
 
         let baseline_g8r_nodes = (24 + index as u64) as f64;
         let baseline_g8r_levels = 4.0;
@@ -696,6 +726,8 @@ fn build_historical_candidate_site_fixture_with_graph_le(
         });
         release_samples.push(release_sample);
         run_samples.push(CandidateSampleInput {
+            g8r_raw_stats_status: raw_stats_id.as_ref().map(|_| "done".into()),
+            g8r_raw_stats_action_id: raw_stats_id,
             sample_id,
             source_relpath,
             source_sha256,
@@ -932,8 +964,16 @@ fn progression_graph_le_is_validated_bound_and_preserved() {
         .unwrap();
     assert_eq!(published, &generation);
     assert_eq!(
-        generation.run_samples[0].g8r_graph_logical_effort,
+        generation.run_samples[0].g8r_abc_graph_logical_effort,
         Some(12.5)
+    );
+    assert_eq!(
+        generation.run_samples[0].g8r_raw_stats,
+        Some(BrowserRawG8rStats {
+            and_nodes: 120.0,
+            depth: 5.0,
+            graph_logical_effort: Some(32.5),
+        })
     );
     assert_eq!(
         generation.run_samples[0].graph_le_estimator,
@@ -942,15 +982,29 @@ fn progression_graph_le_is_validated_bound_and_preserved() {
 
     let original =
         pb::FixedCorpusProgressionRunEvidence::decode(evidence_bytes.as_slice()).unwrap();
+    for mode in 0..5 {
+        let mut tampered = original.clone();
+        let sample = &mut tampered.samples[0];
+        let raw = sample.g8r_raw_stats.as_mut().unwrap();
+        match mode {
+            0 => raw.and_nodes += 1.0,
+            1 => raw.graph_logical_effort = Some(-1.0),
+            2 => raw.graph_logical_effort = None,
+            3 => raw.stats_action = sample.action_graph.as_ref().unwrap().g8r_stats.clone(),
+            _ => raw.output_bytes = 0,
+        }
+        assert!(decode_progression_run_evidence(&tampered.encode_to_vec()).is_err());
+    }
     for invalid in [Some(99.0), None, Some(f64::NAN), Some(-1.0)] {
         let mut tampered = original.clone();
-        tampered.samples[0].g8r_graph_logical_effort = invalid;
+        tampered.samples[0].g8r_abc_graph_logical_effort = invalid;
         assert!(decode_progression_run_evidence(&tampered.encode_to_vec()).is_err());
     }
     // LE-less records still verify using their original metric digest.
     let mut legacy_evidence = original;
     for sample in &mut legacy_evidence.samples {
-        sample.g8r_graph_logical_effort = None;
+        sample.g8r_raw_stats = None;
+        sample.g8r_abc_graph_logical_effort = None;
         sample.g8r_metric_projection_sha256 = Some(
             crate::proto::digest_from_hex(
                 &progression_stats_metric_projection_sha256(
@@ -970,7 +1024,7 @@ fn progression_graph_le_is_validated_bound_and_preserved() {
         legacy_generation
             .run_samples
             .iter()
-            .all(|sample| sample.g8r_graph_logical_effort.is_none()
+            .all(|sample| sample.g8r_abc_graph_logical_effort.is_none()
                 && sample.graph_le_estimator.is_none())
     );
     fs::remove_dir_all(root).unwrap();
@@ -2197,7 +2251,8 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
                 ir_node_count: baseline.ir_node_count,
                 g8r_nodes: baseline.g8r_nodes,
                 g8r_levels: baseline.g8r_levels,
-                g8r_graph_logical_effort: None,
+                g8r_abc_graph_logical_effort: None,
+                g8r_raw_stats: None,
                 yosys_abc_graph_logical_effort: None,
                 graph_le_estimator: None,
                 yosys_abc_nodes: baseline.yosys_abc_nodes,
