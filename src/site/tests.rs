@@ -3074,6 +3074,26 @@ fn public_site_never_contains_private_executor_error_text() {
 }
 
 #[test]
+fn browser_catalog_uses_compact_canonical_json() {
+    let root = temp_root();
+    let (site_dir, _) = build_historical_candidate_site_fixture_with_graph_le(&root, true);
+    let bytes = fs::read(site_dir.join("catalog.json")).expect("read generated catalog");
+    let catalog: BrowserCatalog = serde_json::from_slice(&bytes).expect("decode typed catalog");
+    let compact = serde_json::to_vec(&catalog).expect("encode compact catalog");
+    let pretty = serde_json::to_vec_pretty(&catalog).expect("encode pretty catalog");
+
+    assert_eq!(bytes, compact);
+    assert!(compact.len() < pretty.len());
+    let round_trip = decode_canonical_browser_catalog(&bytes).expect("decode canonical catalog");
+    assert_eq!(
+        serde_json::to_value(&round_trip).expect("project round-trip catalog"),
+        serde_json::from_slice::<serde_json::Value>(&pretty).expect("decode pretty catalog")
+    );
+    assert!(decode_canonical_browser_catalog(&pretty).is_err());
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
 fn site_verifier_detects_tamper() {
     let root = temp_root();
     let store = ArtifactStore::new(root.join("store"));

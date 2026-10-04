@@ -793,7 +793,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn encode_browser_catalog(catalog: &BrowserCatalog) -> Result<Vec<u8>> {
-    serde_json::to_vec_pretty(catalog).context("serializing canonical browser catalog")
+    // Full progression history can exceed static-host file limits when pretty-printed.
+    serde_json::to_vec(catalog).context("serializing canonical browser catalog")
 }
 
 fn decode_canonical_browser_catalog(bytes: &[u8]) -> Result<BrowserCatalog> {
