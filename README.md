@@ -325,6 +325,40 @@ the cached release assets/protos, so workers do not repeatedly hit GitHub during
 Optional queue policy toggle:
 - `BVC_QUEUE_ONLY_PREVIOUS_LOSS_K_CONES=1`: only enqueue suggested `IrFnToKBoolConeCorpus` actions when the source opt-IR structural hash has previously produced a positive k-cone loss sample. Suggestions are still recorded in provenance; this only filters queue insertion. The policy is honored by `drain-queue`, the embedded web runner, `enqueue-crate-version` recursive suggestion enqueue, and queue repair/reenqueue paths.
 
+## Published-site navigation
+
+The published results should form one coherent site, not a collection of overlapping viewers.
+Navigation follows the questions a reader is investigating, not the builders, storage formats,
+or evaluation runs that produced the data. These principles are the intended navigation contract:
+
+- **One overview.** `/` shows the latest evaluated release, all versions with available results,
+  evaluation coverage, and progression on fixed input cohorts. Older results belong in this same
+  release index, not behind a separate historical homepage.
+- **Distinct purposes for detail views.** Release/comparison views answer how a selected version
+  performs; progression views answer what changed across versions; input details expose the
+  measurements, source IR, and evidence. A separate view must answer a distinct question, not
+  repeat an existing view over another data source. Use version, baseline, cohort, and input-kind
+  controls within a canonical view where the analysis is the same.
+- **Consistent navigation.** Keep Latest, All versions, and Progression as the primary entry
+  points. Readers should be able to move from overview to comparison to individual input and
+  back without losing context. Home and “Results” links return to `/`; comparison links preserve
+  the selected release, baseline, and cohort when applicable.
+- **Preserve results, not redundant pages.** Consolidation must retain older and partially
+  evaluated releases, distinct raw/post-ABC comparisons, diagnostics, and evidence. Duplicate
+  landing pages such as `/history/` should redirect to `/`. Their useful detail views should be
+  linked directly from the relevant release or analysis, without requiring an intermediate
+  historical overview.
+- **Make comparison scope explicit.** Identify the metric, units, synthesis stage, reference,
+  input population, and coverage. Fixed-cohort trends compare the same inputs; partial coverage
+  must not masquerade as a quality change. Keep incompatible comparisons distinguishable without
+  making the reader navigate separate sites.
+- **Use descriptive language.** Titles name the analysis, and explanatory text states the
+  methodology or interpretation. Avoid slogans, duplicate summaries, and navigation labels that
+  require knowledge of the implementation.
+
+Snapshot and full-corpus evidence may retain separate validated storage roots. That internal
+separation does not justify competing homepages or redundant user-facing workflows.
+
 ## Web UI
 
 ```bash
