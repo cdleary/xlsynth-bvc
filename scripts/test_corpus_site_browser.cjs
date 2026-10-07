@@ -141,5 +141,5 @@ Promise.race([main(), timeout, new Promise((_,reject)=>chrome.once('error',rejec
   .catch(error=>{console.error(error);process.exitCode=1})
   .finally(async()=>{
     if (chrome.exitCode===null && chrome.pid) {const closed=once(chrome,'exit');chrome.kill();await closed;}
-    fs.rmSync(profile,{recursive:true,force:true,maxRetries:3});
+    await fs.promises.rm(profile,{recursive:true,force:true,maxRetries:10,retryDelay:200});
   });

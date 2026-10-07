@@ -58,4 +58,4 @@ async function main(){
   console.log(JSON.stringify({versions:data.versions.map(v=>v.crate_version),cohorts:data.trends.map(t=>({id:t.id,count:t.count,releases:t.points.length})),desktop:true,mobile:true,links:true,pointNavigation:true,errors},null,2));
 }
 const timer=setTimeout(()=>{console.error('Dashboard browser test timed out');chrome.kill('SIGKILL');process.exitCode=1},180000);
-main().catch(e=>{console.error(e);process.exitCode=1}).finally(async()=>{clearTimeout(timer);const exited=once(chrome,'exit');chrome.kill('SIGTERM');await exited;fs.rmSync(profile,{recursive:true,force:true})});
+main().catch(e=>{console.error(e);process.exitCode=1}).finally(async()=>{clearTimeout(timer);const exited=once(chrome,'exit');chrome.kill('SIGTERM');await exited;await fs.promises.rm(profile,{recursive:true,force:true,maxRetries:10,retryDelay:200})});
