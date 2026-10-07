@@ -215,8 +215,12 @@ fn point(
     Ok(result)
 }
 
-fn progression_url(cohort: &str, generation: &str) -> String {
-    format!("history/progression.html?cohort={cohort}&current={generation}")
+fn progression_url(cohort: &str, generation: &str, complete: bool) -> String {
+    let mut url = format!("history/progression.html?cohort={cohort}&current={generation}");
+    if !complete {
+        url.push_str("&include_incomplete=true");
+    }
+    url
 }
 
 fn projection(out: &Path) -> Result<Vec<u8>> {
@@ -326,7 +330,7 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
                 measured: g.observed_ir_count.saturating_sub(g.extra_ir_count),
                 total: g.cohort_ir_count,
                 complete,
-                url: progression_url(&cohort.cohort_id, &g.generation_id),
+                url: progression_url(&cohort.cohort_id, &g.generation_id, complete),
             });
             if !complete {
                 continue;
@@ -351,7 +355,7 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
                 &version,
                 format!(
                     "{}&baseline={first_id}",
-                    progression_url(&cohort.cohort_id, &g.generation_id)
+                    progression_url(&cohort.cohort_id, &g.generation_id, true)
                 ),
                 first,
                 &now,
@@ -553,6 +557,17 @@ pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn progression_links_explicitly_include_partial_generations() {
+        assert_eq!(
+            progression_url("whole-functions-v1", "release-partial", false),
+            "history/progression.html?cohort=whole-functions-v1&current=release-partial&include_incomplete=true"
+        );
+        assert_eq!(
+            progression_url("whole-functions-v1", "release-complete", true),
+            "history/progression.html?cohort=whole-functions-v1&current=release-complete"
+        );
+    }
     #[test]
     fn child_navigation_is_scoped_and_relative() {
         let original = br#"<!doctype html><html><head></head><body><a href="../../">Results</a></body></html>"#;

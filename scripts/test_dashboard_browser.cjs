@@ -58,12 +58,14 @@ async function main(){
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1180,deviceScaleFactor:1,mobile:false});
   const historical=data.trends.find(t=>t.id!=='full-corpus'&&t.points.length>1);
   if(historical){
-    const target=new URL(historical.points.at(-1).url,url);
-    await send('Page.navigate',{url:target.href});
-    await waitFor("document.getElementById('progression')?.dataset.progressionRendered==='true'");
-    assert.equal(await evaluate("document.getElementById('progression-cohort').value"),historical.id);
-    assert.equal(await evaluate("document.getElementById('current-version').value"),target.searchParams.get('current'));
-    assert.equal(await evaluate("document.getElementById('baseline-version').value"),target.searchParams.get('baseline'));
+    for(const point of [historical.points[0],historical.points.at(-1)]){
+      const target=new URL(point.url,url);
+      await send('Page.navigate',{url:target.href});
+      await waitFor("document.getElementById('progression')?.dataset.progressionRendered==='true'");
+      assert.equal(await evaluate("document.getElementById('progression-cohort').value"),historical.id);
+      assert.equal(await evaluate("document.getElementById('current-version').value"),target.searchParams.get('current'));
+      assert.equal(await evaluate("document.getElementById('baseline-version').value"),target.searchParams.get('baseline'));
+    }
     await shot('progression-navigation');
     await evaluate("document.querySelector('.bvc-navigation-home').click()");await ready();
     assert.equal(await evaluate('location.pathname'),new URL('index.html',url).pathname);

@@ -2399,6 +2399,32 @@ fn progression_page_controls_match_golden() {
 }
 
 #[test]
+fn progression_navigation_preserves_requested_generations() {
+    let mut child = Command::new("node")
+        .arg("-e")
+        .arg(include_str!(
+            "../../testdata/progression_navigation_test.js"
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("node is required for progression navigation tests");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(APP_JS.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn progression_overview_javascript_preserves_cost_population_and_reference() {
     let mut child = Command::new("node")
         .arg("-e")
@@ -2486,8 +2512,12 @@ const duplicate = api.progressionSelection(
   'after',
   'after',
 );
-if (duplicate.baseline !== 'before' || duplicate.current !== 'after') {
-  throw new Error(`duplicate selections must be separated: ${JSON.stringify(duplicate)}`);
+if (duplicate.baseline !== 'after' || duplicate.current !== 'after') {
+  throw new Error(`explicit selections must be preserved: ${JSON.stringify(duplicate)}`);
+}
+const explicitOnly = api.progressionSelection([{generation_id: 'only'}], 'only', 'only');
+if (explicitOnly.baseline !== 'only' || explicitOnly.current !== 'only') {
+  throw new Error(`an explicit reference point must preserve self-comparison: ${JSON.stringify(explicitOnly)}`);
 }
 const candidateSelection = api.progressionSelection([
   {generation_id: 'release'},
