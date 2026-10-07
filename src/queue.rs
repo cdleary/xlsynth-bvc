@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::model::{
@@ -22,9 +23,41 @@ use crate::proto::{
 };
 use crate::store::ArtifactStore;
 
-static CLAIM_SCAN_CURSOR: AtomicUsize = AtomicUsize::new(0);
-static COMPATIBLE_CLAIM_SCAN_CURSOR: AtomicUsize = AtomicUsize::new(0);
 static QUEUE_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A scheduling hint, never an authority for queue state or lease ownership. Share one sorted
+/// enumeration across workers instead of walking the entire tree for every claim and batch.
+/// Pending writes in this process invalidate it; reconciliation discovers external writers and
+/// drops stale paths. Claims still reread records and take the existing per-action lease lock.
+#[derive(Debug, Default)]
+pub(crate) struct PendingPathCache {
+    snapshot: Mutex<Option<(Instant, Arc<Vec<PathBuf>>)>>,
+    claim_cursor: AtomicUsize,
+    compatible_cursor: AtomicUsize,
+}
+
+impl PendingPathCache {
+    const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+    fn paths(&self, root: &Path) -> Result<Arc<Vec<PathBuf>>> {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        if let Some((loaded, paths)) = snapshot.as_ref()
+            && loaded.elapsed() < Self::REFRESH_INTERVAL
+            && !paths.is_empty()
+        {
+            return Ok(paths.clone());
+        }
+        let mut paths = list_queue_files(root)?;
+        paths.sort_unstable();
+        let paths = Arc::new(paths);
+        *snapshot = Some((Instant::now(), paths.clone()));
+        Ok(paths)
+    }
+
+    fn invalidate(&self) {
+        *self.snapshot.lock().unwrap() = None;
+    }
+}
 
 // Queue selection is deliberately approximate and rotates through the pending tree. Reading and
 // decoding thousands of queue records per claim costs more than executing a tiny generated cone.
@@ -99,7 +132,11 @@ fn new_queue_lease_token(action_id: &str, worker_id: &str) -> String {
 }
 
 fn write_bytes_atomic(store: &ArtifactStore, path: &Path, contents: &[u8]) -> Result<()> {
-    store.write_record_atomic("queue", path, contents)
+    store.write_record_atomic("queue", path, contents)?;
+    if path.starts_with(store.queue_pending_dir()) {
+        store.pending_path_cache.invalidate();
+    }
+    Ok(())
 }
 
 fn is_action_id(value: &str) -> bool {
@@ -714,14 +751,16 @@ pub(crate) fn claim_next_pending_item(
         }
     }
 
-    let mut pending = list_queue_files(&store.queue_pending_dir())?;
-    pending.sort();
+    let pending = store.pending_path_cache.paths(&store.queue_pending_dir())?;
     if pending.is_empty() {
         return Ok(None);
     }
     let total_pending = pending.len();
-    let start_offset =
-        CLAIM_SCAN_CURSOR.fetch_add(MAX_PENDING_SCAN_PER_CLAIM, Ordering::Relaxed) % total_pending;
+    let start_offset = store
+        .pending_path_cache
+        .claim_cursor
+        .fetch_add(MAX_PENDING_SCAN_PER_CLAIM, Ordering::Relaxed)
+        % total_pending;
     let mut scanned = 0_usize;
     let mut ready_candidates: Vec<ReadyCandidate> = Vec::new();
     for i in 0..total_pending {
@@ -840,14 +879,15 @@ pub(crate) fn claim_compatible_pending_items(
         }
     }
 
-    let mut pending = list_queue_files(&store.queue_pending_dir())?;
-    pending.sort();
+    let pending = store.pending_path_cache.paths(&store.queue_pending_dir())?;
     if pending.is_empty() {
         return Ok(Vec::new());
     }
 
     let total_pending = pending.len();
-    let start_offset = COMPATIBLE_CLAIM_SCAN_CURSOR
+    let start_offset = store
+        .pending_path_cache
+        .compatible_cursor
         .fetch_add(MAX_PENDING_SCAN_PER_COMPATIBLE_CLAIM, Ordering::Relaxed)
         % total_pending;
     let scan_count = total_pending.min(MAX_PENDING_SCAN_PER_COMPATIBLE_CLAIM);
@@ -945,7 +985,9 @@ pub(crate) fn action_scheduler_priority(action: &ActionSpec) -> u8 {
             top_fn_name: Some(top_fn_name),
             ..
         } if top_fn_name.starts_with("__mffc_") => 3,
-        ActionSpec::IrFnToCombinationalVerilog { .. } => 5,
+        // Start both comparison branches at the same priority. Always preferring raw G8r
+        // can leave the codegen/Yosys branch waiting behind almost the entire corpus.
+        ActionSpec::IrFnToCombinationalVerilog { .. } => 4,
         ActionSpec::DriverIrAigEquiv { .. } => 6,
         ActionSpec::DriverIrToOpt { .. } => 7,
         ActionSpec::DriverDslxFnToIr { .. } => 8,
@@ -2152,6 +2194,153 @@ mod tests {
     }
 
     #[test]
+    fn pending_path_cache_shares_snapshots_and_reconciles_external_changes() {
+        let (store, root) = make_test_store();
+        let queue_dir = store.queue_pending_dir();
+        let first = queue_dir.join("first.pb");
+        fs::write(&first, []).unwrap();
+        let initial = store.pending_path_cache.paths(&queue_dir).unwrap();
+        let reused = store.pending_path_cache.paths(&queue_dir).unwrap();
+        assert!(Arc::ptr_eq(&initial, &reused));
+        assert_eq!(&**initial, &[first.clone()]);
+
+        // Simulate another process modifying the filesystem without cache invalidation.
+        let second = queue_dir.join("second.pb");
+        fs::write(&second, []).unwrap();
+        fs::remove_file(&first).unwrap();
+        store
+            .pending_path_cache
+            .snapshot
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .0 = Instant::now() - PendingPathCache::REFRESH_INTERVAL;
+        let refreshed = store.pending_path_cache.paths(&queue_dir).unwrap();
+        assert!(!Arc::ptr_eq(&initial, &refreshed));
+        assert_eq!(&**refreshed, &[second]);
+        // An in-flight reader retains a valid immutable snapshot; paths are only hints.
+        assert_eq!(&**initial, &[first]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_writes_invalidate_shared_snapshot_and_stale_paths_cannot_be_claimed() {
+        let (store, root) = make_test_store();
+        let first = enqueue_action(&store, terminal_test_action()).unwrap();
+        let initial = store
+            .pending_path_cache
+            .paths(&store.queue_pending_dir())
+            .unwrap();
+        let other = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+            version: "v0.37.1".to_owned(),
+            discovery_runtime: None,
+            stdlib_tarball_sha256: "22".repeat(32),
+        };
+        let second = enqueue_action_with_priority(&store, other, 10).unwrap();
+        let refreshed = store
+            .pending_path_cache
+            .paths(&store.queue_pending_dir())
+            .unwrap();
+        assert!(!Arc::ptr_eq(&initial, &refreshed));
+        assert_eq!(refreshed.len(), 2);
+        let claimed = claim_next_pending_item(&store, "cache-test", 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.action_id(), second);
+        let next = claim_next_pending_item(&store, "cache-test", 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.action_id(), first);
+        assert!(
+            claim_next_pending_item(&store, "cache-test", 60)
+                .unwrap()
+                .is_none()
+        );
+        // A rollback must be visible immediately, even before the five-second reconciliation.
+        assert!(requeue_running_lease_if_current(&store, &claimed).unwrap());
+        let retry = claim_next_pending_item(&store, "cache-test", 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.action_id(), second);
+        assert_ne!(retry.running.lease_token, claimed.running.lease_token);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_pending_snapshot_preserves_exclusive_claims() {
+        let (store, root) = make_test_store();
+        let store = Arc::new(store);
+        let mut expected = HashSet::new();
+        for i in 0..24 {
+            expected.insert(
+                enqueue_action(
+                    &store,
+                    ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+                        version: format!("v0.37.{i}"),
+                        discovery_runtime: None,
+                        stdlib_tarball_sha256: format!("{i:064x}"),
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        let initial = store
+            .pending_path_cache
+            .paths(&store.queue_pending_dir())
+            .unwrap();
+        let workers: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                thread::spawn(move || {
+                    let mut ids = Vec::new();
+                    while let Some(claimed) =
+                        claim_next_pending_item(&store, &format!("cache-worker-{i}"), 60).unwrap()
+                    {
+                        ids.push(claimed.action_id().to_owned());
+                    }
+                    ids
+                })
+            })
+            .collect();
+        let ids: Vec<_> = workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect();
+        assert_eq!(ids.len(), expected.len());
+        assert_eq!(ids.into_iter().collect::<HashSet<_>>(), expected);
+        assert_eq!(initial.len(), 24);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual read-only queue enumeration microbenchmark; set BVC_QUEUE_BENCH_DIR"]
+    fn benchmark_pending_path_cache() {
+        let root =
+            PathBuf::from(std::env::var_os("BVC_QUEUE_BENCH_DIR").expect("queue benchmark input"));
+        let repetitions = 12;
+        let start = Instant::now();
+        let mut count = 0;
+        for _ in 0..repetitions {
+            let mut paths = list_queue_files(&root).unwrap();
+            paths.sort_unstable();
+            count = std::hint::black_box(paths).len();
+        }
+        let uncached = start.elapsed();
+        let cache = PendingPathCache::default();
+        let start = Instant::now();
+        for _ in 0..repetitions {
+            std::hint::black_box(cache.paths(&root).unwrap());
+        }
+        let cached = start.elapsed();
+        eprintln!(
+            "queue enumeration: paths={count} repetitions={repetitions} uncached_ms={} shared_snapshot_including_cold_ms={}",
+            uncached.as_millis(),
+            cached.as_millis()
+        );
+    }
+
+    #[test]
     fn queue_state_key_roundtrip_covers_all_known_states() {
         let keys = [
             "pending",
@@ -2717,6 +2906,19 @@ mod tests {
             version: "v0.35.0".to_string(),
             runtime: runtime.clone(),
         };
+        let g8r = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: "1".repeat(64),
+            top_fn_name: Some("__top".to_string()),
+            fraig: false,
+            lowering_mode: crate::model::G8rLoweringMode::default(),
+            execution_recipe_revision: 0,
+            version: "v0.35.0".to_string(),
+            runtime: runtime.clone(),
+        };
+        assert_eq!(
+            action_scheduler_priority(&g8r),
+            action_scheduler_priority(&combo)
+        );
         let ir_aig_equiv = ActionSpec::DriverIrAigEquiv {
             ir_action_id: "9".repeat(64),
             aig_action_id: "a".repeat(64),

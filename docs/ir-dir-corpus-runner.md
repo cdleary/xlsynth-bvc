@@ -233,6 +233,11 @@ its captured release. `--candidate-run-dir` remains a hidden compatibility alias
 
 ## Scheduling Policies
 
+For complete full-corpus backfills that are not restricted to the registered progression
+cohorts, use the standalone [`--corpus-run-dir` site workflow](complete-corpus-site.md).
+It directly admits matching finalized release workspaces and automatically shards all
+publication evidence, metrics, and IR; no manual merge or file-splitting scripts are needed.
+
 `--scheduling-policy release-progression-ir-v1` and `--scheduling-policy mffc-progression-ir-v1` select the compiled policies in `campaigns/`. Each is intentionally opt-in and only accepts the
 exact fixed progression corpus named by its policy's sample count and artifact-manifest
 digest. The manifest binds each structural-hash filename to the SHA-256 of its IR bytes. Scheduling
@@ -296,6 +301,59 @@ cargo run --bin xlsynth_bvc -- \
 
 The corpus command is idempotent for a stable input/output/config tuple, so the rerun refresh step
 does not invent a second store model or a separate export path.
+
+### Worker throughput and stop/resume
+
+`run-workers` shares a sorted pending-path snapshot across its threads, reconciling external queue
+changes on the next claim after its five-second lifetime and invalidating it on local pending writes. This is
+only a scheduling hint: every candidate is reread and every claim still uses the per-action
+transition lock and lease token. Idle checks stop at the first queue record instead of counting
+the whole tree. The Sled backend memoizes validated provenance, bounded by entry count and encoded
+bytes; each lookup still checks the current database row, so replacements, deletions, and corrupt
+rows cannot be hidden by the cache. Neither cache changes the durable store format or action IDs.
+
+Raw G8r lowering and ordinary combinational codegen have equal scheduling priority, preventing a
+blanket preference for one side of a comparison. Explicit queue priorities and leaf-first
+scheduling still apply; MFFC codegen retains its existing higher priority. This improves the
+opportunity to produce paired results early, not a guarantee of equal completion rates.
+Stage bonuses are also persisted in queue priorities at enqueue time. Existing records retain
+their captured priorities on worker-only resume; rerunning the exact corpus enqueue command
+promotes ordinary codegen to the new stage bonus without changing action IDs or recomputing outputs.
+Fresh queues use the balanced bonuses immediately.
+
+For `run-workers`, send SIGTERM or SIGINT to the **worker process**, not its whole process group,
+to stop after its currently claimed batches. Workers stop claiming, finish and finalize in-flight
+work, join, and flush the store. A stop can therefore take as long as the active batch. The summary
+reports `exit_reason: "shutdown_requested"` and the CLI exits nonzero so shell pipelines do not
+mistake a partial drain for corpus completion. These handlers do not apply to `drain-queue` or
+embedded/web runners, and cannot be added retroactively to an already-running older binary.
+
+To upgrade a running campaign:
+
+1. Build a separate candidate binary and test it; leave the pinned active binary untouched.
+2. Verify unchanged action identities, runtimes, recipe, inputs, and store descriptor compatibility.
+3. Stop or gate any parent/continuation scripts so an interruption cannot advance the campaign.
+4. Request shutdown and wait for the old worker PID to exit before opening the same Sled store.
+5. Pin the new binary consistently for drain, final export, and later releases. Resume the same
+   store/database and retain the campaign's worker settings; do not create a new corpus workspace.
+6. Check forward progress and zero failures, then perform the normal final export/completion gates.
+
+For older workers without graceful signal handling, an interruption is recoverable rather than
+graceful: completed content-addressed artifacts remain reusable, and normal lease reclamation
+requeues abandoned local leases after the old PID exits. In-flight work may be repeated. Never
+delete queue files, rewrite the store marker, or bypass binary-digest checks to force an upgrade.
+
+Read-only component benchmarks are available as ignored release-mode tests:
+
+```bash
+BVC_QUEUE_BENCH_DIR=OUTPUT_DIR/.bvc/bvc-artifacts/queue/pending \
+  cargo test --release benchmark_pending_path_cache -- --ignored --nocapture
+cargo test --release benchmark_validated_provenance_cache -- --ignored --nocapture
+```
+
+These measure enumeration and hot-row validation, not end-to-end synthesis throughput. Compare
+multi-minute action rates after warm-up with the same worker/pool settings and note changes in
+the action mix before attributing a campaign-wide speedup.
 
 ## Inline Workflow
 

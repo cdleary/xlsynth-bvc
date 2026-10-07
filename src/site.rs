@@ -17,6 +17,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
+#[path = "site_corpus.rs"]
+pub(crate) mod site_corpus;
 #[path = "site_shards.rs"]
 mod site_shards;
 
@@ -50,7 +52,11 @@ const PLOTLY_NOTICE: &[u8] =
     include_bytes!("../third_party/plotly/plotly-2.35.2.min.js.LICENSE.txt");
 
 const STYLE_CSS: &str = include_str!("site_assets/style.css");
-const APP_JS: &str = include_str!("site_assets/app.js");
+const APP_JS: &str = concat!(
+    include_str!("site_assets/progression_overview.js"),
+    "\n",
+    include_str!("site_assets/app.js")
+);
 const RELEASE_PROGRESSION_IR_HASHES: &str =
     include_str!("site_assets/release_progression_ir_hashes.txt");
 const RELEASE_PROGRESSION_IR_ARTIFACTS: &str =
@@ -4318,6 +4324,14 @@ fn progression_body(root_site_url: &str) -> String {
 <main id="progression" data-dataset-key="{}">
 <div class="toolbar"><label>Fixed cohort <select id="progression-cohort" aria-label="Fixed artifact cohort"></select></label><label>Baseline <select id="baseline-version" aria-label="Baseline generation"></select></label><label>Current <select id="current-version" aria-label="Current generation"></select></label><label><input id="include-incomplete" type="checkbox"> Include incomplete generations</label></div>
 <p id="progression-status" class="meta" aria-live="polite">Loading generation data…</p>
+<section id="progression-overview" aria-labelledby="progression-overview-title">
+<h2 id="progression-overview-title">Did the releases improve?</h2>
+<p class="meta">Cost = AIG AND nodes × depth after ABC. Lower is better. Graph logical effort is shown separately below.</p>
+<div class="toolbar"><label>Compare cost with <select id="progression-reference" aria-label="Cost comparison reference"><option value="baseline">Selected baseline generation</option><option value="yosys">Each generation’s Yosys/ABC reference</option></select></label></div>
+<section id="progression-summary" class="grid" aria-live="polite"></section>
+<section id="progression-chart" class="progression-chart" aria-live="polite"><p class="muted">Loading generation data…</p></section>
+<article class="progression-chart-panel contribution-panel"><h3>Which functions account for it?</h3><p id="progression-contribution-context" class="meta"></p><div class="toolbar"><label>Change units <select id="progression-change-units" aria-label="Per-function change units"><option value="absolute">Absolute cost — contribution to total</option><option value="percent">Percent — relative impact</option></select></label></div><div id="progression-contributions" class="progression-plot" aria-label="Sorted per-function cost changes"></div><p id="progression-contribution-status" class="meta"></p><div id="progression-function-detail" aria-live="polite"></div><details><summary>Exact per-function costs</summary><section id="progression-table"></section></details></article>
+</section>
 <section id="progression-vectors" aria-labelledby="vector-title" hidden>
 <div class="vector-heading"><div><p class="science-label">Function movement / graph logical effort × AIG nodes</p><h2 id="vector-title">Where did the functions move?</h2></div><p id="vector-window" class="vector-window"></p></div>
 <p id="vector-description" class="meta">Each arrow runs from baseline ○ to current ▶. Down and left is better; opposite directions are tradeoffs. Both measurements describe the same selected-stage AIG.</p>
@@ -4330,9 +4344,7 @@ fn progression_body(root_site_url: &str) -> String {
 <section id="vector-detail" class="sample-detail" aria-live="polite"></section>
 <details class="vector-functions"><summary>Browse functions and exact changes</summary><div id="vector-table"></div></details>
 </section>
-<h2>Aggregate comparison</h2><section id="progression-summary" class="grid" aria-live="polite"></section>
-<h2>Quality versus distribution</h2><section id="progression-chart" class="progression-chart" aria-live="polite"><p class="muted">Loading generation data…</p></section>
-<h2>Fixed-IR coverage</h2><section id="progression-inventory" aria-live="polite"></section><section id="progression-table" aria-live="polite"></section></main>"#,
+<h2>Fixed-IR coverage</h2><section id="progression-inventory" aria-live="polite"></section></main>"#,
         crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
     )
 }
@@ -4939,6 +4951,19 @@ pub(crate) fn build_static_site_with_progression_runs(
             },
         )?;
     }
+    build_static_site_atomically(options, |staging_options| {
+        build_static_site_with_progression_runs_in_place(
+            staging_options,
+            protected_roots,
+            progression_run_dirs,
+        )
+    })
+}
+
+fn build_static_site_atomically(
+    options: &BuildStaticSiteOptions,
+    build: impl FnOnce(&BuildStaticSiteOptions) -> Result<BuildStaticSiteSummary>,
+) -> Result<BuildStaticSiteSummary> {
     if options.out_dir.exists() {
         if !options.overwrite {
             bail!(
@@ -4961,11 +4986,7 @@ pub(crate) fn build_static_site_with_progression_runs(
         base_url: options.base_url.clone(),
         overwrite: false,
     };
-    let mut summary = match build_static_site_with_progression_runs_in_place(
-        &staging_options,
-        protected_roots,
-        progression_run_dirs,
-    ) {
+    let mut summary = match build(&staging_options) {
         Ok(summary) => summary,
         Err(error) => {
             if staging_dir.exists() {
@@ -5672,6 +5693,7 @@ fn analysis_to_browser(report: &pb::AnalysisReport) -> Result<(String, Vec<Brows
 }
 
 pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSummary> {
+    site_corpus::verify_hosting_budget(site_dir)?;
     let manifest_path = site_dir.join(STATIC_SITE_MANIFEST_FILENAME);
     let manifest_bytes = fs::read(&manifest_path)
         .with_context(|| format!("reading site manifest: {}", manifest_path.display()))?;
@@ -5762,6 +5784,16 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
                 bail!("broken static link in {relpath}: {url} -> {local}");
             }
         }
+    }
+    if declared.contains_key(site_corpus::MANIFEST) {
+        site_corpus::verify_projection(site_dir, &manifest)?;
+        return Ok(VerifyStaticSiteSummary {
+            site_dir: site_dir.display().to_string(),
+            snapshot_id,
+            base_url,
+            file_count: manifest.files.len(),
+            total_bytes,
+        });
     }
     let catalog_bytes =
         fs::read(site_dir.join("catalog.json")).context("reading browser catalog")?;
@@ -6242,61 +6274,66 @@ pub(crate) fn smoke_static_site(
         bail!("browser smoke timeout must be nonzero");
     }
     let verified = verify_static_site(site_dir)?;
-    let catalog = decode_canonical_browser_catalog(
-        &fs::read(site_dir.join("catalog.json")).context("reading browser smoke catalog")?,
-    )?;
-    let progression_catalog = catalog
-        .progression
-        .cohorts
-        .iter()
-        .find(|cohort| cohort.cohort_id == catalog.progression.default_cohort_id)
-        .context("browser catalog has no default progression cohort")?;
-    let complete_generations = progression_catalog
-        .generations
-        .iter()
-        .filter(|generation| generation.coverage == BrowserProgressionCoverage::CohortComplete)
-        .collect::<Vec<_>>();
-    let progression_markers = if complete_generations.len() >= 2 {
-        let current = complete_generations
-            .iter()
-            .rev()
-            .find(|generation| {
-                matches!(
-                    generation.origin,
-                    BrowserProgressionOrigin::GitRevision { .. }
-                )
-            })
-            .copied()
-            .unwrap_or_else(|| complete_generations.last().expect("nonempty generations"));
-        let baseline = current
-            .baseline_generation_id
-            .as_ref()
-            .and_then(|id| {
-                complete_generations
-                    .iter()
-                    .find(|generation| generation.generation_id == *id)
-                    .copied()
-            })
-            .unwrap_or(complete_generations[complete_generations.len() - 2]);
-        vec![
-            ("data-progression-rendered=\"true\"".to_string(), 1),
-            (
-                format!(
-                    "data-progression-baseline-version=\"{}\"",
-                    baseline.display_label
-                ),
-                1,
-            ),
-            (
-                format!(
-                    "data-progression-current-version=\"{}\"",
-                    current.display_label
-                ),
-                1,
-            ),
-        ]
+    let corpus_mode = site_dir.join(site_corpus::MANIFEST).is_file();
+    let progression_markers = if corpus_mode {
+        vec![("data-rendered=\"true\"".to_string(), 1)]
     } else {
-        Vec::new()
+        let catalog = decode_canonical_browser_catalog(
+            &fs::read(site_dir.join("catalog.json")).context("reading browser smoke catalog")?,
+        )?;
+        let progression_catalog = catalog
+            .progression
+            .cohorts
+            .iter()
+            .find(|cohort| cohort.cohort_id == catalog.progression.default_cohort_id)
+            .context("browser catalog has no default progression cohort")?;
+        let complete_generations = progression_catalog
+            .generations
+            .iter()
+            .filter(|generation| generation.coverage == BrowserProgressionCoverage::CohortComplete)
+            .collect::<Vec<_>>();
+        if complete_generations.len() >= 2 {
+            let current = complete_generations
+                .iter()
+                .rev()
+                .find(|generation| {
+                    matches!(
+                        generation.origin,
+                        BrowserProgressionOrigin::GitRevision { .. }
+                    )
+                })
+                .copied()
+                .unwrap_or_else(|| complete_generations.last().expect("nonempty generations"));
+            let baseline = current
+                .baseline_generation_id
+                .as_ref()
+                .and_then(|id| {
+                    complete_generations
+                        .iter()
+                        .find(|generation| generation.generation_id == *id)
+                        .copied()
+                })
+                .unwrap_or(complete_generations[complete_generations.len() - 2]);
+            vec![
+                ("data-progression-rendered=\"true\"".to_string(), 1),
+                (
+                    format!(
+                        "data-progression-baseline-version=\"{}\"",
+                        baseline.display_label
+                    ),
+                    1,
+                ),
+                (
+                    format!(
+                        "data-progression-current-version=\"{}\"",
+                        current.display_label
+                    ),
+                    1,
+                ),
+            ]
+        } else {
+            Vec::new()
+        }
     };
     let browser = browser_path(explicit_browser)?;
     let nonce = SystemTime::now()
@@ -6330,28 +6367,36 @@ pub(crate) fn smoke_static_site(
     fs::create_dir_all(&profile_dir).context("creating temporary Chrome profile")?;
     let origin = format!("http://{address}");
     let timeout = Duration::from_secs(timeout_seconds);
-    let pages = vec![
-        ("", "xlsynth-bvc results", Vec::new()),
-        ("runs.html", "Campaign runs", Vec::new()),
-        (
-            "progression.html",
-            "Fixed-IR generation progression",
+    let pages = if corpus_mode {
+        vec![(
+            "",
+            "Complete inputs. Comparable results.",
             progression_markers,
-        ),
-        ("releases.html", "Crate release processing", Vec::new()),
-        ("mffc-discrepancies.html", "MFFC discrepancies", Vec::new()),
-        (
-            "ir-fn-corpus-g8r-vs-yosys-abc/",
-            "IR corpus: G8r vs Yosys/ABC",
-            vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
-        ),
-        (
-            "ir-fn-g8r-abc-vs-codegen-yosys-abc/",
-            "IR corpus: G8r+ABC vs codegen+Yosys/ABC",
-            vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
-        ),
-        ("dataset.html", "Dataset explorer", Vec::new()),
-    ];
+        )]
+    } else {
+        vec![
+            ("", "xlsynth-bvc results", Vec::new()),
+            ("runs.html", "Campaign runs", Vec::new()),
+            (
+                "progression.html",
+                "Fixed-IR generation progression",
+                progression_markers,
+            ),
+            ("releases.html", "Crate release processing", Vec::new()),
+            ("mffc-discrepancies.html", "MFFC discrepancies", Vec::new()),
+            (
+                "ir-fn-corpus-g8r-vs-yosys-abc/",
+                "IR corpus: G8r vs Yosys/ABC",
+                vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
+            ),
+            (
+                "ir-fn-g8r-abc-vs-codegen-yosys-abc/",
+                "IR corpus: G8r+ABC vs codegen+Yosys/ABC",
+                vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
+            ),
+            ("dataset.html", "Dataset explorer", Vec::new()),
+        ]
+    };
     let result = pages
         .iter()
         .try_for_each(|(path, expected, rendered_markers)| {

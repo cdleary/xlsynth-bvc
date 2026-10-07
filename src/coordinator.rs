@@ -624,6 +624,7 @@ pub(crate) fn coordinate_release(
                 DEFAULT_WEB_RUNNER_DRAIN_BATCH_SIZE,
                 true,
                 true,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )?;
             let text = format!(
                 "workers={} drained_actions={} exit={}",

@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+package xlsynth.bvc.corpus_site.v1;
+
+import "xlsynth/bvc/v1/action.proto";
+import "xlsynth/bvc/v1/publication.proto";
+
+// Publication-only boundary, compiled separately from the artifact-store
+// descriptor. Adding a renderer must not migrate an active evaluation store.
+message InputIdentity {
+  string source_relpath = 1;
+  bytes source_sha256 = 2;
+  string top_fn_name = 3;
+}
+
+message CohortIdentity { repeated InputIdentity inputs = 1; }
+
+message Stats {
+  uint64 and_nodes = 1;
+  uint64 depth = 2;
+  optional double graph_logical_effort = 3;
+  uint64 output_bytes = 4;
+  bytes output_sha256 = 5;
+  xlsynth.bvc.v1.ActionSpec action = 6;
+}
+
+message Sample {
+  InputIdentity input = 1;
+  string sample_id = 2;
+  string input_ir = 3;
+  Stats g8r_abc = 4;
+  Stats yosys_abc = 5;
+  Stats g8r_raw = 6;
+  // Import, G8r lowering, G8r ABC, codegen, Yosys ABC, final comparison.
+  repeated xlsynth.bvc.v1.ActionSpec actions = 7;
+}
+
+message EvidenceShard { repeated Sample samples = 1; }
+
+message Shard {
+  uint64 sample_count = 1;
+  xlsynth.bvc.v1.PublicationFile evidence = 2;
+  xlsynth.bvc.v1.PublicationFile metrics = 3;
+  xlsynth.bvc.v1.PublicationFile ir = 4;
+}
+
+message Generation {
+  string crate_version = 1;
+  string dso_version = 2;
+  bytes cohort_sha256 = 3;
+  uint64 sample_count = 4;
+  repeated Shard shards = 5;
+}
+
+message CorpusSite {
+  uint32 record_version = 1;
+  repeated Generation generations = 2;
+  uint64 shard_target_bytes = 3;
+}

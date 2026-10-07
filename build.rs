@@ -31,6 +31,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         &["proto"],
     )?;
 
+    let mut corpus_site = prost_build::Config::new();
+    corpus_site.protoc_executable(&protoc);
+    corpus_site.extern_path(".xlsynth.bvc.v1", "crate::proto::v1");
+    corpus_site.compile_protos(&["proto/xlsynth/bvc/corpus_site/v1/site.proto"], &["proto"])?;
+    println!("cargo:rerun-if-changed=proto/xlsynth/bvc/corpus_site/v1/site.proto");
+
     let campaign_text = fs::read("campaigns/release-qor-v1.textproto")?;
     let mut child = Command::new(&protoc)
         .args([
