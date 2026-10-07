@@ -398,7 +398,31 @@ pub(crate) fn run() -> Result<()> {
             ("private store", store_dir.as_path()),
             ("artifact database", artifacts_via_sled.as_path()),
         ];
+        if snapshot_dir.is_some() && !corpus_run_dirs.is_empty() {
+            let progression = progression_run_dirs
+                .iter()
+                .chain(candidate_run_dirs)
+                .cloned()
+                .collect::<Vec<_>>();
+            let summary = crate::site::site_dashboard::build(
+                &BuildStaticSiteOptions {
+                    snapshot_dir: snapshot_dir.clone().expect("checked snapshot"),
+                    out_dir: out_dir.clone(),
+                    base_url: base_url.clone(),
+                    overwrite: *overwrite,
+                },
+                &protected_roots,
+                &progression,
+                corpus_run_dirs,
+                *corpus_shard_bytes,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            return Ok(());
+        }
         if !corpus_run_dirs.is_empty() {
+            if !progression_run_dirs.is_empty() || !candidate_run_dirs.is_empty() {
+                bail!("--progression-run-dir requires --snapshot-dir");
+            }
             let summary = crate::site::site_corpus::build(
                 &BuildStaticSiteOptions {
                     snapshot_dir: std::path::PathBuf::new(),

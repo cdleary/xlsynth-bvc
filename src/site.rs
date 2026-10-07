@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 #[path = "site_corpus.rs"]
 pub(crate) mod site_corpus;
+#[path = "site_dashboard.rs"]
+pub(crate) mod site_dashboard;
 #[path = "site_shards.rs"]
 mod site_shards;
 
@@ -4746,7 +4748,9 @@ fn verify_exact_fixed_site_files(
     catalog: &BrowserCatalog,
     snapshot: &crate::snapshot::StaticSnapshotManifest,
 ) -> Result<()> {
+    let navigation = site_dashboard::child_navigation(site_dir)?;
     for (relpath, expected) in expected_fixed_site_files(catalog, snapshot)? {
+        let expected = site_dashboard::child_asset(navigation, &relpath, &expected)?;
         let actual = fs::read(site_dir.join(&relpath))
             .with_context(|| format!("reading fixed generated site file: {relpath}"))?;
         if actual != expected {
@@ -5748,7 +5752,10 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         ) {
             let text = std::str::from_utf8(&bytes)
                 .with_context(|| format!("site text file is not UTF-8: {relpath}"))?;
-            if relpath != trusted_plotly_relpath && text.contains("/api/") {
+            if relpath != trusted_plotly_relpath
+                && bytes.as_slice() != PLOTLY_JS
+                && text.contains("/api/")
+            {
                 bail!("static site file contains forbidden /api/ request path: {relpath}");
             }
         }
@@ -5763,6 +5770,18 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         bail!("site file closure mismatch; undeclared={undeclared:?} missing={missing:?}");
     }
 
+    if declared.contains_key(site_dashboard::MANIFEST) {
+        site_dashboard::verify_projection(site_dir, &manifest)?;
+        return Ok(VerifyStaticSiteSummary {
+            site_dir: site_dir.display().to_string(),
+            snapshot_id,
+            base_url,
+            file_count: manifest.files.len(),
+            total_bytes,
+        });
+    }
+
+    let navigation = site_dashboard::child_navigation(site_dir)?;
     let attr_re = Regex::new(r#"(?:href|src)=\"([^\"]+)\""#).expect("valid regex");
     for relpath in declared.keys().filter(|path| path.ends_with(".html")) {
         let html = fs::read_to_string(site_dir.join(relpath))?;
@@ -5777,6 +5796,9 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         for captures in attr_re.captures_iter(&html) {
             let url = &captures[1];
             if url.starts_with("http:") || url.starts_with("https:") || url.starts_with('#') {
+                continue;
+            }
+            if navigation.is_some() && site_dashboard::child_parent_link(relpath, url)? {
                 continue;
             }
             let local = resolve_site_link(relpath, url)?;
@@ -5804,7 +5826,11 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     {
         bail!("browser catalog does not match protobuf site manifest");
     }
-    let (expected_relpaths, _catalog_data_relpaths) = expected_catalog_site_relpaths(&catalog)?;
+    let (mut expected_relpaths, _catalog_data_relpaths) = expected_catalog_site_relpaths(&catalog)?;
+    if navigation.is_some() {
+        expected_relpaths.insert(site_dashboard::NAV_CSS_PATH.into());
+        site_dashboard::verify_child_navigation_asset(site_dir)?;
+    }
     if declared_relpaths != expected_relpaths {
         let unexpected = declared_relpaths
             .difference(&expected_relpaths)
@@ -6275,7 +6301,8 @@ pub(crate) fn smoke_static_site(
     }
     let verified = verify_static_site(site_dir)?;
     let corpus_mode = site_dir.join(site_corpus::MANIFEST).is_file();
-    let progression_markers = if corpus_mode {
+    let dashboard_mode = site_dir.join(site_dashboard::MANIFEST).is_file();
+    let progression_markers = if corpus_mode || dashboard_mode {
         vec![("data-rendered=\"true\"".to_string(), 1)]
     } else {
         let catalog = decode_canonical_browser_catalog(
@@ -6367,12 +6394,10 @@ pub(crate) fn smoke_static_site(
     fs::create_dir_all(&profile_dir).context("creating temporary Chrome profile")?;
     let origin = format!("http://{address}");
     let timeout = Duration::from_secs(timeout_seconds);
-    let pages = if corpus_mode {
-        vec![(
-            "",
-            "Complete inputs. Comparable results.",
-            progression_markers,
-        )]
+    let pages = if dashboard_mode {
+        vec![("", "Synthesis quality by release", progression_markers)]
+    } else if corpus_mode {
+        vec![("", "IR corpus synthesis results", progression_markers)]
     } else {
         vec![
             ("", "xlsynth-bvc results", Vec::new()),

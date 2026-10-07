@@ -374,7 +374,7 @@ fn hosting_budget_rejects_large_files_and_symlinks() {
 }
 
 #[test]
-fn corpus_site_cli_requires_exactly_one_source_mode() {
+fn corpus_site_cli_supports_composed_and_standalone_sources() {
     use crate::cli::Cli;
     use clap::Parser;
     let parse = |args: &[&str]| {
@@ -387,8 +387,101 @@ fn corpus_site_cli_requires_exactly_one_source_mode() {
     assert!(parse(&[]).is_err());
     assert!(parse(&["--snapshot-dir", "snapshot"]).is_ok());
     assert!(parse(&["--corpus-run-dir", "a", "--corpus-run-dir", "b"]).is_ok());
-    assert!(parse(&["--corpus-run-dir", "a", "--snapshot-dir", "snapshot"]).is_err());
-    assert!(parse(&["--corpus-run-dir", "a", "--progression-run-dir", "b"]).is_err());
+    assert!(parse(&["--corpus-run-dir", "a", "--snapshot-dir", "snapshot"]).is_ok());
+    assert!(
+        parse(&[
+            "--corpus-run-dir",
+            "a",
+            "--snapshot-dir",
+            "snapshot",
+            "--progression-run-dir",
+            "b"
+        ])
+        .is_ok()
+    );
+}
+
+#[test]
+fn dashboard_composes_verifies_and_publishes_all_versions() {
+    let root = Fixture::new();
+    super::super::tests::build_historical_candidate_site_fixture(&root.0);
+    let run = fixture_run(&root.0, "0.74.0", 2);
+    let options = BuildStaticSiteOptions {
+        snapshot_dir: root.0.join("snapshot"),
+        out_dir: root.0.join("dashboard"),
+        base_url: "/nested/".into(),
+        overwrite: false,
+    };
+    let summary = super::super::site_dashboard::build(
+        &options,
+        &[],
+        &[root.0.join("candidate")],
+        &[run],
+        100_000,
+    )
+    .unwrap();
+    let data: serde_json::Value =
+        serde_json::from_slice(&fs::read(options.out_dir.join("dashboard.json")).unwrap()).unwrap();
+    assert_eq!(
+        data["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["crate_version"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["0.66.0", "0.74.0"]
+    );
+    assert_eq!(data["versions"][1]["full_count"], 2);
+    assert_eq!(data["trends"][0]["count"], 2);
+    assert_eq!(data["trends"][0]["points"][0]["equal"], 2);
+    let published =
+        crate::publish::publish_static_site(&options.out_dir, &root.0.join("publication")).unwrap();
+    assert_eq!(published.snapshot_id, summary.snapshot_id);
+    assert_eq!(
+        crate::publish::verify_published_site(&root.0.join("publication"))
+            .unwrap()
+            .site_id,
+        published.site_id
+    );
+    // A rehashed child page cannot restore a competing overview or change its
+    // redirect. Navigation is reconstructed from the composition, not trusted HTML.
+    let child = options.out_dir.join("history");
+    let original_page = fs::read(child.join("index.html")).unwrap();
+    let original_manifest = fs::read(child.join(STATIC_SITE_MANIFEST_FILENAME)).unwrap();
+    fs::write(child.join("index.html"), br#"<!doctype html><html><head><meta name="bvc-site-root" content="./"></head><body><h1>Another homepage</h1></body></html>"#).unwrap();
+    let mut child_manifest = pb::StaticSiteManifest::decode(original_manifest.as_slice()).unwrap();
+    *child_manifest
+        .files
+        .iter_mut()
+        .find(|f| f.logical_key == "index.html")
+        .unwrap() = publication_file(&child, "index.html").unwrap();
+    fs::write(
+        child.join(STATIC_SITE_MANIFEST_FILENAME),
+        child_manifest.encode_to_vec(),
+    )
+    .unwrap();
+    assert!(verify_static_site(&child).is_err());
+    fs::write(child.join("index.html"), original_page).unwrap();
+    fs::write(child.join(STATIC_SITE_MANIFEST_FILENAME), original_manifest).unwrap();
+    // Rehashing modified browser data must not detach it from the child evidence.
+    fs::write(options.out_dir.join("dashboard.json"), b"{}").unwrap();
+    let mut manifest = pb::StaticSiteManifest::decode(
+        fs::read(options.out_dir.join(STATIC_SITE_MANIFEST_FILENAME))
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    *manifest
+        .files
+        .iter_mut()
+        .find(|f| f.logical_key == "dashboard.json")
+        .unwrap() = publication_file(&options.out_dir, "dashboard.json").unwrap();
+    fs::write(
+        options.out_dir.join(STATIC_SITE_MANIFEST_FILENAME),
+        manifest.encode_to_vec(),
+    )
+    .unwrap();
+    assert!(verify_static_site(&options.out_dir).is_err());
 }
 
 #[test]

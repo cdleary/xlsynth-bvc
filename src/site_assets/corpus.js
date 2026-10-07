@@ -22,7 +22,8 @@
       better:s.better+Number(r.change<0),worse:s.worse+Number(r.change>0),unchanged:s.unchanged+Number(r.change===0)}),
       {count:0,cost:0,reference:0,better:0,worse:0,unchanged:0});
   }
-  if (typeof module !== 'undefined') module.exports = {kind,pairRows,filterRows,summarize};
+  const lossRows = rows => rows.filter(r => Number.isFinite(r.ir_node_count) && r.ir_node_count > 0 && Number.isFinite(r.change) && r.change > 0);
+  if (typeof module !== 'undefined') module.exports = {kind,pairRows,filterRows,summarize,lossRows};
   if (typeof document === 'undefined') return;
   const byId = id => document.getElementById(id), fmt = n => n.toLocaleString(undefined,{maximumFractionDigits:3});
   const load = async url => {const r=await fetch(url);if(!r.ok)throw Error(`${url}: HTTP ${r.status}`);return r.json()};
@@ -34,16 +35,18 @@
   }
   async function selectSample(row) {
     const token=++state.selected;
-    byId('selected').textContent=`${row.top_fn_name} · ${row.source_relpath} · selected ${fmt(row.cost)} / reference ${fmt(row.reference_cost)} · Δ ${fmt(row.change)}`;
+    byId('selected').textContent=`${row.top_fn_name} · ${row.source_relpath} · ${fmt(row.ir_node_count)} IR nodes · selected ${fmt(row.cost)} / reference ${fmt(row.reference_cost)} · Δ ${fmt(row.change)}`;
     byId('ir').hidden=false; byId('ir').textContent='Loading verified IR…';
     try {const data=await load(row.ir_url);if(token===state.selected){if(typeof data[row.sample_id]!=='string')throw Error('IR is missing');byId('ir').textContent=data[row.sample_id]}}
     catch(e){if(token===state.selected)byId('ir').textContent=e.message}
   }
-  async function scatter(name, rows, x, y, xLabel, yLabel, logarithmic, diagonal) {
+  async function scatter(name, rows, x, y, xLabel, yLabel, logarithmic, diagonal, hovertemplate=null) {
     const valid=rows.filter(r=>Number.isFinite(x(r))&&Number.isFinite(y(r))&&(!logarithmic||(x(r)>0&&y(r)>0)));
-    const traces=[{type:'scattergl',mode:'markers',x:valid.map(x),y:valid.map(y),customdata:valid.map(r=>r.sample_id),marker:{size:5,color:valid.map(color),opacity:.72},hovertemplate:diagonal?'Reference: %{x}<br>Selected: %{y}<extra></extra>':'Δ nodes: %{x}<br>Δ depth: %{y}<extra></extra>'}];
+    const traces=[{type:'scattergl',mode:'markers',x:valid.map(x),y:valid.map(y),customdata:valid.map(r=>r.sample_id),marker:{size:5,color:valid.map(color),opacity:.72},hovertemplate:hovertemplate||(diagonal?'Reference: %{x}<br>Selected: %{y}<extra></extra>':'Δ nodes: %{x}<br>Δ depth: %{y}<extra></extra>')}];
     if(diagonal&&valid.length){let lo=Infinity,hi=-Infinity;for(const r of valid){lo=Math.min(lo,x(r),y(r));hi=Math.max(hi,x(r),y(r))}traces.push({type:'scatter',mode:'lines',x:[lo,hi],y:[lo,hi],line:{color:'#83eeb5',dash:'dot',width:1},hoverinfo:'skip'})}
     const l=layout(xLabel,yLabel,logarithmic);l.title={text:`${valid.length.toLocaleString()} plotted inputs`,font:{size:12},x:.98,xanchor:'right'};
+    if(name==='loss'){l.xaxis.dtick='D2';l.xaxis.tickformat='~s';l.yaxis.dtick=1;l.yaxis.tickformat='~s'}
+    if(name==='loss'&&!valid.length)l.annotations=[{xref:'paper',yref:'paper',x:.5,y:.5,text:'No positive product losses in this filter',showarrow:false}];
     await Plotly.react(name,traces,l,{responsive:true,displayModeBar:false});
     const el=byId(name);el.removeAllListeners?.('plotly_click');el.on('plotly_click',e=>{const row=state.rows.find(r=>r.sample_id===e.points?.[0]?.customdata);if(row)void selectSample(row)});
   }
@@ -78,6 +81,7 @@
       const tr=document.createElement('tr'),first=document.createElement('td'),button=document.createElement('button');button.textContent=row.top_fn_name;button.addEventListener('click',()=>void selectSample(row));first.append(button);tr.append(first);
       for(const n of [row.cost,row.reference_cost,row.change]){const td=document.createElement('td');td.textContent=fmt(n);tr.append(td)}body.append(tr);
     }
+    await scatter('loss',lossRows(rows),r=>r.ir_node_count,r=>r.change,'IR node count (log scale)',`Product loss vs ${reference} (log scale)`,true,false,'IR nodes: %{x}<br>Positive product loss: %{y}<extra></extra>');
     await scatter('product',rows,r=>r.reference_cost,r=>r.cost,`${reference} nodes × depth`,`v${version} nodes × depth`,true,true);
     await scatter('le',rows,r=>r.reference_le,r=>r.g8r_le,`${reference} graph LE`,`v${version} graph LE`,false,true);
     await scatter('nodes',rows,r=>r.reference_nodes,r=>r.g8r_nodes,`${reference} AND nodes`,`v${version} AND nodes`,true,true);

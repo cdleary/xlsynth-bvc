@@ -58,3 +58,11 @@ message CorpusSite {
   repeated Generation generations = 2;
   uint64 shard_target_bytes = 3;
 }
+
+// Composition binds two independently verified sites without merging their
+// populations or modifying the evaluation-store descriptor.
+message DashboardSite {
+  uint32 record_version = 1;
+  xlsynth.bvc.v1.PublicationFile history_manifest = 2;
+  xlsynth.bvc.v1.PublicationFile corpus_manifest = 3;
+}

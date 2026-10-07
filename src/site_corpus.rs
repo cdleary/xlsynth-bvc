@@ -5,7 +5,7 @@
 
 use super::*;
 
-mod wire {
+pub(super) mod wire {
     include!(concat!(env!("OUT_DIR"), "/xlsynth.bvc.corpus_site.v1.rs"));
 }
 
@@ -607,7 +607,7 @@ pub(crate) fn build(
     build_static_site_atomically(options, |staging| build_in_place(staging, runs, target))
 }
 
-fn build_in_place(
+pub(super) fn build_in_place(
     options: &BuildStaticSiteOptions,
     runs: &[PathBuf],
     target: usize,
@@ -712,9 +712,16 @@ pub(super) fn verify_projection(site_dir: &Path, manifest: &pb::StaticSiteManife
         bail!("invalid corpus site protobuf identity");
     }
     let mut expected = BTreeSet::from([MANIFEST.to_string(), "catalog.json".to_string()]);
+    let navigation = site_dashboard::child_navigation(site_dir)?;
+    if navigation.is_some() {
+        expected.insert(site_dashboard::NAV_CSS_PATH.into());
+        site_dashboard::verify_child_navigation_asset(site_dir)?;
+    }
     for (name, contents) in fixed_files() {
         expected.insert(name.to_string());
-        if fs::read(site_dir.join(name))? != contents {
+        if fs::read(site_dir.join(name))?
+            != site_dashboard::child_asset(navigation, name, contents)?
+        {
             bail!("corpus static asset differs from its compiled template");
         }
     }
