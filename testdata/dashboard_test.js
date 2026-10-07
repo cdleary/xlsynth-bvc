@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: Apache-2.0
+'use strict';
+const assert=require('node:assert/strict');
+const {change,headline,trendSpec,resultHref}=require('../src/site_assets/dashboard.js');
+assert.equal(change(100,80),-20);
+assert.equal(change(0,0),null);
+assert.equal(headline(0),'Unchanged total cost');
+assert.equal(headline(-20),'20% lower cost');
+const spec=trendSpec({points:[{version:'0.1.0',cost:100,url:'first'},{version:'0.2.0',cost:80,url:'second'}]});
+assert.deepEqual(spec.data[0].y,[0,-20]);
+assert.deepEqual(spec.data[0].customdata,['first','second']);
+assert.deepEqual(spec.layout.xaxis.ticktext,['v0.1.0','v0.2.0']);
+assert.ok(spec.layout.yaxis.range[0]<-20&&spec.layout.yaxis.range[1]>0);
+const zero=trendSpec({points:[{version:'0.1.0',cost:0,url:'first'}]});
+assert.deepEqual(zero.data[0].y,[null]);
+assert.equal(zero.layout.annotations.length,1);
+assert.equal(resultHref({crate_version:'0.74.0',full_count:5}),'corpus/?release=0.74.0');
+assert.equal(resultHref({crate_version:'0.66.0',full_count:0,cohorts:[{url:'fixed'}]}),'fixed');
+assert.equal(resultHref({crate_version:'0.1.0',full_count:0,cohorts:[],historical_abc_count:0,historical_raw_count:2}),'history/ir-fn-corpus-g8r-vs-yosys-abc/?crate_version=0.1.0');
+assert.equal(resultHref({crate_version:'0.1.0',full_count:0,cohorts:[],historical_abc_count:0,historical_raw_count:0}),'history/dataset.html');

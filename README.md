@@ -216,8 +216,11 @@ provenance, shards evidence/metrics/IR automatically, and verifies the staged si
 installing it. Only selected releases' metrics load in the browser; source IR loads on click.
 Keep the output outside the checkout and input workspaces, as in the sibling directory above.
 See [complete corpus publication](docs/complete-corpus-site.md) for finalization, local
-preview, verification, and hosting limits. This is a standalone corpus explorer, not the
-snapshot site's campaign/progression pages. Building does not deploy or restart evaluations.
+preview, verification, and hosting limits. Add `--snapshot-dir snapshots/current` and repeat
+`--progression-run-dir` for historical fixed-cohort runs to build the **all-versions dashboard**:
+latest results, a large fixed-population progression chart, and an index of every evaluated
+release. Historical pages and full-corpus explorers retain separate, verified evidence roots.
+Building does not deploy or restart evaluations.
 
 The enqueue workflow is intentionally explicit:
 

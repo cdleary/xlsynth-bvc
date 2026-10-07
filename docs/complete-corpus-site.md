@@ -35,8 +35,40 @@ IR content hashes. All included releases must contain exactly the same relative 
 bytes, and top functions, and use the same stats estimator and Yosys/ABC runtime/script. Each
 generation has one lowering runtime; its own DSO is recorded and bound to its action graph.
 
-`--snapshot-dir`, `--progression-run-dir`, and `--candidate-run-dir` cannot be combined with this
-mode. The normal snapshot-based site remains available separately.
+## All-versions dashboard
+
+Supply a historical snapshot **and** the completed full-corpus runs in the same command to build
+the project dashboard. Include the registered fixed-cohort runs for the historical progression:
+
+```bash
+cargo run --release --bin xlsynth_bvc -- build-static-site \
+  --snapshot-dir snapshots/current \
+  --progression-run-dir runs/fixed-cohort-older \
+  --progression-run-dir runs/fixed-cohort-newer \
+  --corpus-run-dir runs/full-corpus-older \
+  --corpus-run-dir runs/full-corpus-newer \
+  --out-dir ../bvc-site
+```
+
+The root dashboard shows the latest evaluated version, all versions with historical synthesis
+measurements or fixed-cohort results, and a large selectable fixed-population progression chart. `history/`
+retains the snapshot's historical explorers, datasets, and progression (including Git candidates);
+`corpus/` contains the completed full-corpus explorer. Dashboard release trends exclude Git
+candidates and incomplete cohorts; those remain available in detailed progression.
+
+Each trend is the change in summed post-ABC AND-nodes × depth versus its first complete release.
+Partial historical populations are explicitly labeled and never mixed into that sum. Raw G8r
+historical comparisons remain accessible but are not treated as post-ABC measurements. Counts
+across full-corpus, historical pairs, and fixed cohorts may overlap and must not be added together.
+
+This is native composition, not a merge of operational JSON: `dashboard.pb` binds the two verified
+child manifests. Verification checks both children, exact file closure and templates, and regenerates
+`dashboard.json` from verified evidence. The entire composition installs atomically and shares one
+hosting budget. Only the small summary loads on the splash page, not every release's sample shards.
+
+Snapshot-only and corpus-only builds remain available. `--progression-run-dir` requires a snapshot.
+Use a current snapshot when release metadata, recipes, or cohort definitions change; the dashboard
+does not discover run directories or backfill missing evaluations automatically.
 
 ## Preview and inspect
 
@@ -69,6 +101,9 @@ node scripts/test_corpus_site_browser.cjs http://127.0.0.1:8000/ ../bvc-screensh
 ```
 
 It uses a disposable headless Chrome profile (`BVC_CHROME` can select the executable).
+For a composed site, use the `corpus/` URL for this test and run
+`node scripts/test_dashboard_browser.cjs http://127.0.0.1:8000/ ../bvc-screenshots`
+to check the dashboard's cohorts, all-version links, and mobile layout.
 
 ## Automatic size bounds
 

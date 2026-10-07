@@ -280,17 +280,12 @@ pub enum TopCommand {
         snapshot_dir: PathBuf,
     },
     BuildStaticSite {
-        #[arg(
-            long,
-            value_name = "DIR",
-            required_unless_present = "corpus_run_dirs",
-            conflicts_with = "corpus_run_dirs"
-        )]
+        #[arg(long, value_name = "DIR", required_unless_present = "corpus_run_dirs")]
         snapshot_dir: Option<PathBuf>,
         #[arg(long, value_name = "DIR")]
         out_dir: PathBuf,
         /// Complete frozen-corpus release runs to render directly (repeatable).
-        #[arg(long = "corpus-run-dir", value_name = "DIR", conflicts_with_all = ["progression_run_dirs", "candidate_run_dirs"])]
+        #[arg(long = "corpus-run-dir", value_name = "DIR")]
         corpus_run_dirs: Vec<PathBuf>,
         /// Byte target for corpus evidence, metric, and IR shards (at most 16 MiB).
         #[arg(long, default_value_t = 2 * 1024 * 1024)]

@@ -5,7 +5,7 @@
 
 use super::*;
 
-mod wire {
+pub(super) mod wire {
     include!(concat!(env!("OUT_DIR"), "/xlsynth.bvc.corpus_site.v1.rs"));
 }
 
@@ -607,7 +607,7 @@ pub(crate) fn build(
     build_static_site_atomically(options, |staging| build_in_place(staging, runs, target))
 }
 
-fn build_in_place(
+pub(super) fn build_in_place(
     options: &BuildStaticSiteOptions,
     runs: &[PathBuf],
     target: usize,

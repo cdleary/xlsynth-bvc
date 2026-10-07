@@ -468,7 +468,7 @@ fn candidate_stats_are_read_from_digest_verified_provenance() {
     fs::remove_dir_all(root).expect("cleanup candidate fixture");
 }
 
-fn build_historical_candidate_site_fixture(root: &Path) -> (PathBuf, String) {
+pub(super) fn build_historical_candidate_site_fixture(root: &Path) -> (PathBuf, String) {
     build_historical_candidate_site_fixture_with_graph_le(root, false)
 }
 

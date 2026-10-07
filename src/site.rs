@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 #[path = "site_corpus.rs"]
 pub(crate) mod site_corpus;
+#[path = "site_dashboard.rs"]
+pub(crate) mod site_dashboard;
 #[path = "site_shards.rs"]
 mod site_shards;
 
@@ -5748,7 +5750,10 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         ) {
             let text = std::str::from_utf8(&bytes)
                 .with_context(|| format!("site text file is not UTF-8: {relpath}"))?;
-            if relpath != trusted_plotly_relpath && text.contains("/api/") {
+            if relpath != trusted_plotly_relpath
+                && bytes.as_slice() != PLOTLY_JS
+                && text.contains("/api/")
+            {
                 bail!("static site file contains forbidden /api/ request path: {relpath}");
             }
         }
@@ -5761,6 +5766,17 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         let undeclared = found.difference(&declared_relpaths).collect::<Vec<_>>();
         let missing = declared_relpaths.difference(&found).collect::<Vec<_>>();
         bail!("site file closure mismatch; undeclared={undeclared:?} missing={missing:?}");
+    }
+
+    if declared.contains_key(site_dashboard::MANIFEST) {
+        site_dashboard::verify_projection(site_dir, &manifest)?;
+        return Ok(VerifyStaticSiteSummary {
+            site_dir: site_dir.display().to_string(),
+            snapshot_id,
+            base_url,
+            file_count: manifest.files.len(),
+            total_bytes,
+        });
     }
 
     let attr_re = Regex::new(r#"(?:href|src)=\"([^\"]+)\""#).expect("valid regex");
@@ -6275,7 +6291,8 @@ pub(crate) fn smoke_static_site(
     }
     let verified = verify_static_site(site_dir)?;
     let corpus_mode = site_dir.join(site_corpus::MANIFEST).is_file();
-    let progression_markers = if corpus_mode {
+    let dashboard_mode = site_dir.join(site_dashboard::MANIFEST).is_file();
+    let progression_markers = if corpus_mode || dashboard_mode {
         vec![("data-rendered=\"true\"".to_string(), 1)]
     } else {
         let catalog = decode_canonical_browser_catalog(
@@ -6367,7 +6384,9 @@ pub(crate) fn smoke_static_site(
     fs::create_dir_all(&profile_dir).context("creating temporary Chrome profile")?;
     let origin = format!("http://{address}");
     let timeout = Duration::from_secs(timeout_seconds);
-    let pages = if corpus_mode {
+    let pages = if dashboard_mode {
+        vec![("", "Synthesis, over time.", progression_markers)]
+    } else if corpus_mode {
         vec![(
             "",
             "Complete inputs. Comparable results.",
