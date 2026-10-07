@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 'use strict';
 const assert=require('node:assert/strict');
-const {change,headline,trendSpec,resultHref}=require('../src/site_assets/dashboard.js');
+const {change,headline,trendSpec,resultHref,measurementLinks}=require('../src/site_assets/dashboard.js');
 assert.equal(change(100,80),-20);
 assert.equal(change(0,0),null);
 assert.equal(headline(0),'Unchanged total cost');
@@ -18,3 +18,12 @@ assert.equal(resultHref({crate_version:'0.74.0',full_count:5}),'corpus/?release=
 assert.equal(resultHref({crate_version:'0.66.0',full_count:0,cohorts:[{url:'fixed'}]}),'fixed');
 assert.equal(resultHref({crate_version:'0.1.0',full_count:0,cohorts:[],historical_abc_count:0,historical_raw_count:2}),'history/ir-fn-corpus-g8r-vs-yosys-abc/?crate_version=0.1.0');
 assert.equal(resultHref({crate_version:'0.1.0',full_count:0,cohorts:[],historical_abc_count:0,historical_raw_count:0}),'history/dataset.html');
+const coverage={crate_version:'0.74.0',historical_abc_count:0,historical_abc_measurements:0,historical_raw_count:0,historical_raw_measurements:0};
+assert.deepEqual(measurementLinks(coverage),[]);
+const abcPair={count:2,label:'post-ABC pairs',href:'history/ir-fn-g8r-abc-vs-codegen-yosys-abc/?crate_version=0.74.0'};
+const rawPair={count:3,label:'raw G8r pairs',href:'history/ir-fn-corpus-g8r-vs-yosys-abc/?crate_version=0.74.0'};
+const abcOneSided={count:5,label:'post-ABC one-sided measurements',href:'history/dataset.html'};
+const rawOneSided={count:7,label:'raw-path one-sided measurements',href:'history/dataset.html'};
+assert.deepEqual(measurementLinks({...coverage,historical_abc_count:2,historical_abc_measurements:4,historical_raw_count:3,historical_raw_measurements:6}),[abcPair,rawPair]);
+assert.deepEqual(measurementLinks({...coverage,historical_abc_measurements:5,historical_raw_measurements:7}),[abcOneSided,rawOneSided]);
+assert.deepEqual(measurementLinks({...coverage,historical_abc_count:2,historical_abc_measurements:9,historical_raw_count:3,historical_raw_measurements:13}),[abcPair,abcOneSided,rawPair,rawOneSided]);

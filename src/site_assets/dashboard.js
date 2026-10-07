@@ -14,7 +14,20 @@
         annotations:finite.length?[]:[{xref:'paper',yref:'paper',x:.5,y:.5,text:'Percentage undefined: first release has zero cost',showarrow:false}]}};
   }
   const resultHref = version => version.full_count ? `corpus/?release=${version.crate_version}` : version.cohorts[0]?.url || (version.historical_abc_count || version.historical_raw_count ? `history/${version.historical_abc_count?'ir-fn-g8r-abc-vs-codegen-yosys-abc':'ir-fn-corpus-g8r-vs-yosys-abc'}/?crate_version=${version.crate_version}` : 'history/dataset.html');
-  if(typeof module!=='undefined')module.exports={change,headline,trendSpec,resultHref};
+  function measurementLinks(version) {
+    const links=[];
+    for(const [pairs,measurements,path,pairLabel,measurementLabel] of [
+      [version.historical_abc_count,version.historical_abc_measurements,'ir-fn-g8r-abc-vs-codegen-yosys-abc','post-ABC pairs','post-ABC one-sided measurements'],
+      [version.historical_raw_count,version.historical_raw_measurements,'ir-fn-corpus-g8r-vs-yosys-abc','raw G8r pairs','raw-path one-sided measurements'],
+    ]) {
+      if(pairs)links.push({count:pairs,label:pairLabel,href:`history/${path}/?crate_version=${version.crate_version}`});
+      // Each paired sample accounts for one G8r and one Yosys measurement.
+      const oneSided=measurements-2*pairs;
+      if(oneSided>0)links.push({count:oneSided,label:measurementLabel,href:'history/dataset.html'});
+    }
+    return links;
+  }
+  if(typeof module!=='undefined')module.exports={change,headline,trendSpec,resultHref,measurementLinks};
   if(typeof document==='undefined')return;
   const el=id=>document.getElementById(id), fmt=n=>n.toLocaleString();
   function link(text,href){const a=document.createElement('a');a.textContent=text;a.href=href;return a}
@@ -37,9 +50,7 @@
       if(version.full_count){const badge=document.createElement('span');badge.className='badge';badge.textContent='COMPLETE';corpus.append(badge,`${fmt(version.full_count)} inputs`)}else{corpus.textContent='Not included';corpus.className='equal'}
       for(const c of version.cohorts){coverage.append(link(`${c.label}: ${fmt(c.measured)} / ${fmt(c.total)}`,c.url));if(!c.complete){const small=document.createElement('small');small.textContent='Partial · excluded from trend';coverage.append(small)}}
       if(!version.cohorts.length){coverage.textContent='No fixed-cohort results';coverage.className='equal'}
-      for(const [count,path,label] of [[version.historical_abc_count,'ir-fn-g8r-abc-vs-codegen-yosys-abc','post-ABC pairs'],[version.historical_raw_count,'ir-fn-corpus-g8r-vs-yosys-abc','raw G8r pairs']])if(count)other.append(link(`${fmt(count)} ${label}`,`history/${path}/?crate_version=${version.crate_version}`));
-      if(!version.historical_abc_count&&version.historical_abc_measurements)other.append(link(`${fmt(version.historical_abc_measurements)} post-ABC one-sided measurements`,'history/dataset.html'));
-      if(!version.historical_raw_count&&version.historical_raw_measurements)other.append(link(`${fmt(version.historical_raw_measurements)} raw-path one-sided measurements`,'history/dataset.html'));
+      for(const {count,label,href} of measurementLinks(version))other.append(link(`${fmt(count)} ${label}`,href));
       if(!other.childNodes.length)other.textContent='—';
       tr.append(release,corpus,coverage,other);el('version-rows').append(tr);
     }
