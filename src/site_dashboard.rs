@@ -9,6 +9,123 @@ pub(super) const MANIFEST: &str = "dashboard.pb";
 const HTML: &str = include_str!("site_assets/dashboard.html");
 const JS: &str = include_str!("site_assets/dashboard.js");
 const CSS: &str = include_str!("site_assets/dashboard.css");
+pub(super) const NAV_CSS_PATH: &str = "assets/navigation.css";
+const NAV_CSS: &[u8] = include_bytes!("site_assets/navigation.css");
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ChildNavigation {
+    PreviousVersions,
+    Corpus,
+}
+
+// The existing composition protobuf supplies the navigation context. Standalone
+// builds have no parent composition and retain their standalone presentation.
+pub(super) fn child_navigation(site_dir: &Path) -> Result<Option<ChildNavigation>> {
+    let Some(parent) = site_dir.parent() else {
+        return Ok(None);
+    };
+    let (name, kind) = match site_dir.file_name().and_then(|n| n.to_str()) {
+        Some("history") => ("history", ChildNavigation::PreviousVersions),
+        Some("corpus") => ("corpus", ChildNavigation::Corpus),
+        _ => return Ok(None),
+    };
+    let path = parent.join(MANIFEST);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    let composition = wire::DashboardSite::decode(bytes.as_slice())?;
+    if composition.record_version != 1 || composition.encode_to_vec() != bytes {
+        bail!("invalid parent dashboard navigation context");
+    }
+    let file = match kind {
+        ChildNavigation::PreviousVersions => composition.history_manifest,
+        ChildNavigation::Corpus => composition.corpus_manifest,
+    }
+    .context("missing dashboard child manifest")?;
+    if file.relpath.as_ref().map(|p| p.value.as_str())
+        != Some(format!("{name}/{STATIC_SITE_MANIFEST_FILENAME}").as_str())
+    {
+        bail!("unexpected dashboard child navigation path");
+    }
+    Ok(Some(kind))
+}
+
+pub(super) fn child_parent_link(page: &str, url: &str) -> Result<bool> {
+    let root = site_root_url(page)?;
+    Ok([
+        format!("{root}../index.html"),
+        format!("{root}../index.html#latest"),
+        format!("{root}../index.html#versions"),
+        format!("{root}../history/progression.html"),
+    ]
+    .iter()
+    .any(|link| link == url))
+}
+
+pub(super) fn child_asset(
+    kind: Option<ChildNavigation>,
+    path: &str,
+    bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let Some(kind) = kind else {
+        return Ok(bytes.to_vec());
+    };
+    if !path.ends_with(".html") {
+        return Ok(bytes.to_vec());
+    }
+    let root = site_root_url(path)?;
+    let home = format!("{root}../index.html");
+    if kind == ChildNavigation::PreviousVersions && path == "index.html" {
+        return Ok(format!(r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="bvc-site-root" content="./"><meta http-equiv="refresh" content="0;url={home}"><title>Results dashboard</title></head><body><p><a href="{home}">Open the results dashboard</a></p></body></html>"#).into_bytes());
+    }
+    let nav = format!(
+        r#"<nav class="bvc-navigation" aria-label="Primary navigation"><a class="bvc-navigation-home" href="{home}">Results</a><a href="{home}#latest">Latest</a><a href="{home}#versions">All versions</a><a href="{root}../history/progression.html">Progression</a></nav>"#
+    );
+    let html = std::str::from_utf8(bytes)?
+        .replace(&format!(r#"href="{root}""#), &format!(r#"href="{home}""#));
+    Ok(html
+        .replacen(
+            "</head>",
+            &format!(r#"<link rel="stylesheet" href="{root}{NAV_CSS_PATH}"></head>"#),
+            1,
+        )
+        .replacen("<body>", &format!("<body>{nav}"), 1)
+        .into_bytes())
+}
+
+pub(super) fn verify_child_navigation_asset(site_dir: &Path) -> Result<()> {
+    if fs::read(site_dir.join(NAV_CSS_PATH))? != NAV_CSS {
+        bail!("dashboard navigation stylesheet differs from its template");
+    }
+    Ok(())
+}
+
+fn install_child_navigation(root: &Path, kind: ChildNavigation) -> Result<()> {
+    let mut manifest = pb::StaticSiteManifest::decode(
+        fs::read(root.join(STATIC_SITE_MANIFEST_FILENAME))?.as_slice(),
+    )?;
+    for file in &manifest.files {
+        let path = &file.relpath.as_ref().context("child file path")?.value;
+        if path.ends_with(".html") {
+            write_file(
+                root,
+                path,
+                &child_asset(Some(kind), path, &fs::read(root.join(path))?)?,
+            )?;
+        }
+    }
+    write_file(root, NAV_CSS_PATH, NAV_CSS)?;
+    manifest.files = actual_site_relpaths(root)?
+        .iter()
+        .map(|path| publication_file(root, path))
+        .collect::<Result<_>>()?;
+    write_file(
+        root,
+        STATIC_SITE_MANIFEST_FILENAME,
+        &manifest.encode_to_vec(),
+    )
+}
 
 fn fixed_files() -> [(&'static str, &'static [u8]); 3] {
     [
@@ -327,6 +444,11 @@ pub(crate) fn build(
             progression,
         )?;
         site_corpus::build_in_place(&child("corpus"), corpus, target)?;
+        install_child_navigation(
+            &staging.out_dir.join("history"),
+            ChildNavigation::PreviousVersions,
+        )?;
+        install_child_navigation(&staging.out_dir.join("corpus"), ChildNavigation::Corpus)?;
         finish(&staging.out_dir, &base_url)
     })
 }
@@ -431,6 +553,33 @@ pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn child_navigation_is_scoped_and_relative() {
+        let original = br#"<!doctype html><html><head></head><body><a href="../../">Results</a></body></html>"#;
+        assert_eq!(
+            child_asset(None, "runs/example/index.html", original).unwrap(),
+            original
+        );
+        assert_eq!(
+            child_asset(Some(ChildNavigation::Corpus), "data/metrics.json", b"{}").unwrap(),
+            b"{}"
+        );
+        let rendered = child_asset(
+            Some(ChildNavigation::PreviousVersions),
+            "runs/example/index.html",
+            original,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(rendered).unwrap(),
+            r#"<!doctype html><html><head><link rel="stylesheet" href="../../assets/navigation.css"></head><body><nav class="bvc-navigation" aria-label="Primary navigation"><a class="bvc-navigation-home" href="../../../index.html">Results</a><a href="../../../index.html#latest">Latest</a><a href="../../../index.html#versions">All versions</a><a href="../../../history/progression.html">Progression</a></nav><a href="../../../index.html">Results</a></body></html>"#
+        );
+        assert!(
+            child_parent_link("runs/example/index.html", "../../../index.html#versions").unwrap()
+        );
+        assert!(!child_parent_link("runs/example/index.html", "../../../../index.html").unwrap());
+        assert!(!child_parent_link("index.html", "https://example.invalid/").unwrap());
+    }
     #[test]
     fn dashboard_browser_semantics() {
         let output = Command::new("node")

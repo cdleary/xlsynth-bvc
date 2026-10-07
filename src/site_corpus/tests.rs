@@ -443,6 +443,26 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
             .site_id,
         published.site_id
     );
+    // A rehashed child page cannot restore a competing overview or change its
+    // redirect. Navigation is reconstructed from the composition, not trusted HTML.
+    let child = options.out_dir.join("history");
+    let original_page = fs::read(child.join("index.html")).unwrap();
+    let original_manifest = fs::read(child.join(STATIC_SITE_MANIFEST_FILENAME)).unwrap();
+    fs::write(child.join("index.html"), br#"<!doctype html><html><head><meta name="bvc-site-root" content="./"></head><body><h1>Another homepage</h1></body></html>"#).unwrap();
+    let mut child_manifest = pb::StaticSiteManifest::decode(original_manifest.as_slice()).unwrap();
+    *child_manifest
+        .files
+        .iter_mut()
+        .find(|f| f.logical_key == "index.html")
+        .unwrap() = publication_file(&child, "index.html").unwrap();
+    fs::write(
+        child.join(STATIC_SITE_MANIFEST_FILENAME),
+        child_manifest.encode_to_vec(),
+    )
+    .unwrap();
+    assert!(verify_static_site(&child).is_err());
+    fs::write(child.join("index.html"), original_page).unwrap();
+    fs::write(child.join(STATIC_SITE_MANIFEST_FILENAME), original_manifest).unwrap();
     // Rehashing modified browser data must not detach it from the child evidence.
     fs::write(options.out_dir.join("dashboard.json"), b"{}").unwrap();
     let mut manifest = pb::StaticSiteManifest::decode(

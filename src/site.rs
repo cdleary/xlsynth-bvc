@@ -4748,7 +4748,9 @@ fn verify_exact_fixed_site_files(
     catalog: &BrowserCatalog,
     snapshot: &crate::snapshot::StaticSnapshotManifest,
 ) -> Result<()> {
+    let navigation = site_dashboard::child_navigation(site_dir)?;
     for (relpath, expected) in expected_fixed_site_files(catalog, snapshot)? {
+        let expected = site_dashboard::child_asset(navigation, &relpath, &expected)?;
         let actual = fs::read(site_dir.join(&relpath))
             .with_context(|| format!("reading fixed generated site file: {relpath}"))?;
         if actual != expected {
@@ -5779,6 +5781,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         });
     }
 
+    let navigation = site_dashboard::child_navigation(site_dir)?;
     let attr_re = Regex::new(r#"(?:href|src)=\"([^\"]+)\""#).expect("valid regex");
     for relpath in declared.keys().filter(|path| path.ends_with(".html")) {
         let html = fs::read_to_string(site_dir.join(relpath))?;
@@ -5793,6 +5796,9 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         for captures in attr_re.captures_iter(&html) {
             let url = &captures[1];
             if url.starts_with("http:") || url.starts_with("https:") || url.starts_with('#') {
+                continue;
+            }
+            if navigation.is_some() && site_dashboard::child_parent_link(relpath, url)? {
                 continue;
             }
             let local = resolve_site_link(relpath, url)?;
@@ -5820,7 +5826,11 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
     {
         bail!("browser catalog does not match protobuf site manifest");
     }
-    let (expected_relpaths, _catalog_data_relpaths) = expected_catalog_site_relpaths(&catalog)?;
+    let (mut expected_relpaths, _catalog_data_relpaths) = expected_catalog_site_relpaths(&catalog)?;
+    if navigation.is_some() {
+        expected_relpaths.insert(site_dashboard::NAV_CSS_PATH.into());
+        site_dashboard::verify_child_navigation_asset(site_dir)?;
+    }
     if declared_relpaths != expected_relpaths {
         let unexpected = declared_relpaths
             .difference(&expected_relpaths)

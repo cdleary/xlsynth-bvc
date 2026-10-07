@@ -51,9 +51,13 @@ cargo run --release --bin xlsynth_bvc -- build-static-site \
 ```
 
 The root dashboard shows the latest evaluated version, all versions with historical synthesis
-measurements or fixed-cohort results, and a large selectable fixed-population progression chart. `history/`
-retains the snapshot's historical explorers, datasets, and progression (including Git candidates);
-`corpus/` contains the completed full-corpus explorer. Dashboard release trends exclude Git
+measurements or fixed-cohort results, and a large selectable fixed-population progression chart.
+`/` is the only overview: `/history/` and `/history/index.html` redirect to it. Previous-version
+comparisons, datasets, diagnostics, and progression (including Git candidates) remain detail views
+under `history/`; `corpus/` contains the completed full-corpus comparison view. Both sets of detail
+pages share Results, Latest, All versions, and Progression navigation. “Results” returns directly
+to the dashboard, including from nested campaign pages. These directories are evidence-layout
+boundaries, not separate sites. Dashboard release trends exclude Git
 candidates and incomplete cohorts; those remain available in detailed progression.
 
 Each trend is the change in summed post-ABC AND-nodes × depth versus its first complete release.
@@ -62,7 +66,9 @@ historical comparisons remain accessible but are not treated as post-ABC measure
 across full-corpus, historical pairs, and fixed cohorts may overlap and must not be added together.
 
 This is native composition, not a merge of operational JSON: `dashboard.pb` binds the two verified
-child manifests. Verification checks both children, exact file closure and templates, and regenerates
+child manifests. That composition also determines the detail-page navigation and the old overview
+redirect; standalone builders retain their standalone presentation. Verification checks both
+children, exact file closure and templates (including navigation and redirects), and regenerates
 `dashboard.json` from verified evidence. The entire composition installs atomically and shares one
 hosting budget. Only the small summary loads on the splash page, not every release's sample shards.
 
