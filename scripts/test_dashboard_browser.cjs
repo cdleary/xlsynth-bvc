@@ -39,6 +39,16 @@ async function main(){
   await new Promise(r=>setTimeout(r,500));
   assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true);await shot('dashboard-mobile');
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1180,deviceScaleFactor:1,mobile:false});
+  const historical=data.trends.find(t=>t.id!=='full-corpus'&&t.points.length>1);
+  if(historical){
+    const target=new URL(historical.points.at(-1).url,url);
+    await send('Page.navigate',{url:target.href});
+    await waitFor("document.getElementById('progression')?.dataset.progressionRendered==='true'");
+    assert.equal(await evaluate("document.getElementById('progression-cohort').value"),historical.id);
+    assert.equal(await evaluate("document.getElementById('current-version').value"),target.searchParams.get('current'));
+    assert.equal(await evaluate("document.getElementById('baseline-version').value"),target.searchParams.get('baseline'));
+    await send('Page.navigate',{url:url.href});await ready();
+  }
   const trend=data.trends.find(t=>t.id==='full-corpus'),last=trend.points.at(-1);
   await evaluate(`document.getElementById('cohort').value='full-corpus';document.getElementById('cohort').dispatchEvent(new Event('change'))`);await ready();await shot('dashboard-full-corpus');
   await evaluate(`document.getElementById('trend').emit('plotly_click',{points:[{customdata:${JSON.stringify(last.url)}}]})`);
