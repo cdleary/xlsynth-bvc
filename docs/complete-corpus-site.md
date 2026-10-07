@@ -15,14 +15,18 @@ failed or missing. Then use the current website binary:
 cargo run --release --bin xlsynth_bvc -- build-static-site \
   --corpus-run-dir runs/release-newer \
   --corpus-run-dir runs/release-older \
-  --out-dir site
+  --out-dir ../bvc-site
 ```
 
 The command validates, converts the operational ingress to typed protobuf evidence, generates
-the browser projection, verifies the entire output, and atomically installs `site`. It does not
+the browser projection, verifies the entire output, and atomically installs `../bvc-site`. It does not
 enqueue work, refresh exports, migrate the evaluation store, or deploy. Stores must be idle:
 their canonical sled databases cannot be opened while a worker owns them. Use `--overwrite` to
 atomically replace an earlier site; a rejected build leaves the earlier site intact.
+
+Run these examples from the checkout. Output and publication directories must be outside the
+checkout, input workspaces, and private stores (and must not be their ancestors). The sibling
+directories used here keep generated public files separate from source and evaluation data.
 
 Inputs must use `g8r-abc-vs-yabc-aig-diff`, with no fraiging or Git-candidate override. All samples
 must have complete import, lowering, ABC, codegen, reference, raw/post-ABC stats, and diff actions.
@@ -37,7 +41,7 @@ mode. The normal snapshot-based site remains available separately.
 ## Preview and inspect
 
 ```bash
-python3 -m http.server 8000 --bind 127.0.0.1 --directory site
+python3 -m http.server 8000 --bind 127.0.0.1 --directory ../bvc-site
 ```
 
 Open `http://127.0.0.1:8000/`. Choose the release, compare its G8r+ABC result with either its
@@ -49,8 +53,8 @@ effort is omitted only from that plot. Input-kind labels follow corpus top-funct
 For an explicit independent audit or after copying the site:
 
 ```bash
-xlsynth_bvc verify-static-site --site-dir site
-xlsynth_bvc smoke-static-site --site-dir site
+xlsynth_bvc verify-static-site --site-dir ../bvc-site
+xlsynth_bvc smoke-static-site --site-dir ../bvc-site
 ```
 
 The build already performs the complete static verification. Browser smoke is separate and
@@ -61,7 +65,7 @@ The optional integration test checks every included release's plot population, p
 rapid filter changes, source-IR selection, and mobile sizing. With a local server running:
 
 ```bash
-node scripts/test_corpus_site_browser.cjs http://127.0.0.1:8000/ screenshots
+node scripts/test_corpus_site_browser.cjs http://127.0.0.1:8000/ ../bvc-screenshots
 ```
 
 It uses a disposable headless Chrome profile (`BVC_CHROME` can select the executable).
@@ -91,8 +95,8 @@ fingerprint; adding this website format does not make a pinned backfill binary i
 ## Publish separately
 
 ```bash
-xlsynth_bvc publish-static-site --site-dir site --publish-root publication
-xlsynth_bvc verify-published-site --publish-root publication
+xlsynth_bvc publish-static-site --site-dir ../bvc-site --publish-root ../bvc-publication
+xlsynth_bvc verify-published-site --publish-root ../bvc-publication
 ```
 
 These commands stage an immutable local publication and pointer; uploading it remains an

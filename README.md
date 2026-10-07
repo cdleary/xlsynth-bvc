@@ -208,12 +208,13 @@ whole functions, MFFCs, and cones), no snapshot or operator-side merge script is
 cargo run --release --bin xlsynth_bvc -- build-static-site \
   --corpus-run-dir runs/release-newer \
   --corpus-run-dir runs/release-older \
-  --out-dir site
+  --out-dir ../bvc-site
 ```
 
 This mode keeps every input, validates the exact paired population and canonical action
 provenance, shards evidence/metrics/IR automatically, and verifies the staged site before
 installing it. Only selected releases' metrics load in the browser; source IR loads on click.
+Keep the output outside the checkout and input workspaces, as in the sibling directory above.
 See [complete corpus publication](docs/complete-corpus-site.md) for finalization, local
 preview, verification, and hosting limits. This is a standalone corpus explorer, not the
 snapshot site's campaign/progression pages. Building does not deploy or restart evaluations.

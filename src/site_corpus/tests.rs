@@ -277,6 +277,46 @@ fn failed_build_preserves_previous_site_and_rejects_unsafe_inputs() {
 }
 
 #[test]
+fn corpus_build_and_publication_allow_siblings_but_protect_the_checkout() {
+    let root = Fixture::new();
+    let checkout = root.0.join("checkout");
+    let run = fixture_run(&checkout, "0.74.0", 1);
+    let protected = [("resource checkout", checkout.as_path())];
+    let mut options = root.options();
+    options.out_dir = checkout.join("site");
+    assert!(build(&options, &protected, std::slice::from_ref(&run), 100_000).is_err());
+    assert!(!options.out_dir.exists());
+
+    options.out_dir = checkout.join("../bvc-site");
+    let summary = build(&options, &protected, &[run], 100_000).unwrap();
+    let unsafe_publication = checkout.join("publication");
+    assert!(
+        crate::publish::publish_static_site_with_protected_roots(
+            &options.out_dir,
+            &unsafe_publication,
+            &protected
+        )
+        .is_err()
+    );
+    assert!(!unsafe_publication.exists());
+
+    let publication = checkout.join("../bvc-publication");
+    let published = crate::publish::publish_static_site_with_protected_roots(
+        &options.out_dir,
+        &publication,
+        &protected,
+    )
+    .unwrap();
+    assert_eq!(published.snapshot_id, summary.snapshot_id);
+    assert_eq!(
+        crate::publish::verify_published_site(&publication)
+            .unwrap()
+            .site_id,
+        published.site_id
+    );
+}
+
+#[test]
 fn verifier_rejects_projection_tampering_even_with_updated_file_hashes() {
     let root = Fixture::new();
     let a = fixture_run(&root.0, "0.74.0", 1);
