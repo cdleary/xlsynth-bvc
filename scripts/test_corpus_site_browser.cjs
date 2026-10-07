@@ -68,8 +68,9 @@ const shot = async name => {
 const control = async (id, value) => evaluate(`document.getElementById(${JSON.stringify(id)}).value=${JSON.stringify(value)};document.getElementById(${JSON.stringify(id)}).dispatchEvent(new Event('change'))`);
 const ready = () => waitFor("document.getElementById('corpus-site')?.dataset.rendered==='true'");
 async function checkPlots(rows) {
-  const lengths = await evaluate("Object.fromEntries(['product','le','nodes','delta'].map(id=>[id,document.getElementById(id).data[0].x.length]))");
+  const lengths = await evaluate("Object.fromEntries(['loss','product','le','nodes','delta'].map(id=>[id,document.getElementById(id).data[0].x.length]))");
   assert.deepEqual(lengths, {
+    loss:rows.filter(r=>r.ir_node_count>0&&r.change>0).length,
     product:rows.filter(r=>r.cost>0 && r.reference_cost>0).length,
     le:rows.filter(r=>Number.isFinite(r.g8r_le) && Number.isFinite(r.reference_le)).length,
     nodes:rows.filter(r=>r.g8r_nodes>0 && r.reference_nodes>0).length,
@@ -77,6 +78,10 @@ async function checkPlots(rows) {
   });
   assert.equal(await evaluate("Number(document.getElementById('corpus-site').dataset.sampleCount)"), rows.length);
   assert.deepEqual(await evaluate("document.getElementById('delta').data[0].x"), rows.map(r=>r.g8r_nodes-r.reference_nodes));
+  const losses=rows.filter(r=>r.ir_node_count>0&&r.change>0);
+  assert.deepEqual(await evaluate("document.getElementById('loss').data[0].x"),losses.map(r=>r.ir_node_count));
+  assert.deepEqual(await evaluate("document.getElementById('loss').data[0].y"),losses.map(r=>r.change));
+  assert.deepEqual(await evaluate("['xaxis','yaxis'].map(axis=>document.getElementById('loss').layout[axis].type)"),['log','log']);
 }
 
 async function main() {
@@ -116,13 +121,16 @@ async function main() {
   await checkPlots(filterRows(paired, {kind:'whole',max:null,losses:false}));
   await control('kind', 'all');
   await ready();
-  const sample = paired[0], generation = catalog.generations.at(-1);
+  const sample = paired.find(r=>r.ir_node_count>0&&r.change>0)||paired[0], generation = catalog.generations.at(-1);
   const index = allRows.get(newest).findIndex(row=>row.sample_id===sample.sample_id);
   let offset = 0;
   const shard = generation.shards.find(s=>{offset+=s.sample_count;return index<offset});
   const expectedIr = (await load(shard.ir))[sample.sample_id];
-  await evaluate(`document.getElementById('delta').emit('plotly_click',{points:[{customdata:${JSON.stringify(sample.sample_id)}}]})`);
+  const selectionPlot=sample.ir_node_count>0&&sample.change>0?'loss':'delta';
+  await evaluate(`document.getElementById(${JSON.stringify(selectionPlot)}).emit('plotly_click',{points:[{customdata:${JSON.stringify(sample.sample_id)}}]})`);
   await waitFor(`document.getElementById('ir').textContent===${JSON.stringify(expectedIr)}`);
+  await evaluate("document.getElementById('loss').scrollIntoView({block:'center'})");
+  await shot('corpus-loss-vs-ir');
   await send('Emulation.setDeviceMetricsOverride', {width:390,height:1100,deviceScaleFactor:1,mobile:true});
   await evaluate("document.getElementById('ir').hidden=true;window.scrollTo(0,0);window.dispatchEvent(new Event('resize'))");
   await new Promise(resolve=>setTimeout(resolve,1000));

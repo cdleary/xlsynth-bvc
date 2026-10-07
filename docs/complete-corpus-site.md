@@ -81,6 +81,10 @@ matched codegen+Yosys/ABC reference or another release's G8r+ABC result, and fil
 IR size, or positive product loss. Click a point/outlier to load its source IR. The cards include
 zero-cost inputs; logarithmic plots explicitly omit zero-valued points. Undefined graph logical
 effort is omitted only from that plot. Input-kind labels follow corpus top-function conventions.
+The leading full-width **Product loss vs IR size** plot puts small, high-loss inputs in the upper
+left. Both axes are logarithmic, and it includes every positive product-cost delta under the
+selected comparison (including node/depth tradeoffs). Nonpositive losses or IR sizes are omitted
+only from that plot; summaries still include them. Clicking a loss point loads the verified IR.
 
 For an explicit independent audit or after copying the site:
 

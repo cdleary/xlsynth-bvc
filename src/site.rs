@@ -6385,13 +6385,9 @@ pub(crate) fn smoke_static_site(
     let origin = format!("http://{address}");
     let timeout = Duration::from_secs(timeout_seconds);
     let pages = if dashboard_mode {
-        vec![("", "Synthesis, over time.", progression_markers)]
+        vec![("", "Synthesis quality by release", progression_markers)]
     } else if corpus_mode {
-        vec![(
-            "",
-            "Complete inputs. Comparable results.",
-            progression_markers,
-        )]
+        vec![("", "IR corpus synthesis results", progression_markers)]
     } else {
         vec![
             ("", "xlsynth-bvc results", Vec::new()),
