@@ -385,12 +385,34 @@ pub(crate) fn run() -> Result<()> {
     if let TopCommand::BuildStaticSite {
         snapshot_dir,
         out_dir,
+        corpus_run_dirs,
+        corpus_shard_bytes,
         progression_run_dirs,
         candidate_run_dirs,
         base_url,
         overwrite,
     } = &command
     {
+        let protected_roots = [
+            ("resource checkout", repo_root.as_path()),
+            ("private store", store_dir.as_path()),
+            ("artifact database", artifacts_via_sled.as_path()),
+        ];
+        if !corpus_run_dirs.is_empty() {
+            let summary = crate::site::site_corpus::build(
+                &BuildStaticSiteOptions {
+                    snapshot_dir: std::path::PathBuf::new(),
+                    out_dir: out_dir.clone(),
+                    base_url: base_url.clone(),
+                    overwrite: *overwrite,
+                },
+                &protected_roots,
+                corpus_run_dirs,
+                *corpus_shard_bytes,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            return Ok(());
+        }
         let progression_run_dirs = progression_run_dirs
             .iter()
             .chain(candidate_run_dirs)
@@ -398,7 +420,7 @@ pub(crate) fn run() -> Result<()> {
             .collect::<Vec<_>>();
         let summary = build_static_site_with_progression_runs(
             &BuildStaticSiteOptions {
-                snapshot_dir: snapshot_dir.clone(),
+                snapshot_dir: snapshot_dir.clone().context("--snapshot-dir is required")?,
                 out_dir: out_dir.clone(),
                 base_url: base_url.clone(),
                 overwrite: *overwrite,
@@ -657,6 +679,8 @@ pub(crate) fn run() -> Result<()> {
             no_reclaim_expired,
         } => {
             let worker_id = qualified_worker_id(worker_id.as_deref())?;
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let _signals = crate::ops::WorkerShutdownSignals::install(&shutdown)?;
             let summary = run_workers(
                 Arc::new(store),
                 repo_root.clone(),
@@ -667,11 +691,18 @@ pub(crate) fn run() -> Result<()> {
                 batch_size,
                 !no_reclaim_expired,
                 exit_when_idle,
+                shutdown,
             )?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&summary).expect("serializing run-workers summary")
             );
+            if summary.exit_reason == "shutdown_requested" {
+                // Do not let a set -e pipeline interpret an intentional partial drain as complete.
+                bail!(
+                    "worker shutdown requested; completed work is durable and the queue is resumable"
+                );
+            }
         }
         TopCommand::ServeWeb {
             bind,

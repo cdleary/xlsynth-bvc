@@ -1738,7 +1738,6 @@ fn site_build_and_verify_supports_subdirectory_base() {
         progression_html
             .contains(crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME)
     );
-    assert!(progression_html.contains("Quality versus distribution"));
     assert!(progression_html.contains("id=\"progression-cohort\""));
     assert!(progression_html.contains("id=\"include-incomplete\""));
     assert!(progression_html.contains("id=\"progression-inventory\""));
@@ -1750,16 +1749,10 @@ fn site_build_and_verify_supports_subdirectory_base() {
     assert!(index_html.contains("Processing status"));
     assert!(APP_JS.contains("Progression data is not available in this snapshot."));
     assert!(APP_JS.contains("at least two cohort-complete generations are needed"));
-    assert!(APP_JS.contains("Aggregate quality"));
     assert!(APP_JS.contains("sample.structural_hash"));
     assert!(APP_JS.contains("contains duplicate fixed IR"));
     assert!(APP_JS.contains("query.get('all_versions')==='true'"));
-    assert!(APP_JS.contains("Median paired per-artifact change"));
-    assert!(APP_JS.contains("Current-only and baseline-only"));
-    assert!(APP_JS.contains("Largest per-artifact changes: ${comparisonHeading}"));
-    assert!(APP_JS.contains("Change<br>${esc(currentLabel)} − ${esc(baselineLabel)}"));
     assert!(APP_JS.contains("completeGenerations=generations.filter"));
-    assert!(APP_JS.contains("Incomplete generations are never selected by default or plotted"));
     assert!(APP_JS.contains("Incomplete fixed-IR warning"));
     assert!(!APP_JS.contains("Degraded runs are never selected by default or plotted"));
     assert!(!APP_JS.contains("Selected campaign generation is unavailable"));
@@ -2398,6 +2391,38 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
 }
 
 #[test]
+fn progression_page_controls_match_golden() {
+    assert_eq!(
+        progression_body("./"),
+        include_str!("../../testdata/progression_body.html").trim_end()
+    );
+}
+
+#[test]
+fn progression_overview_javascript_preserves_cost_population_and_reference() {
+    let mut child = Command::new("node")
+        .arg("-e")
+        .arg(include_str!("../../testdata/progression_overview_test.js"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("node is required for cost overview behavior tests");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(APP_JS.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn progression_vector_javascript_pairs_metrics_and_preserves_arrow_direction() {
     let mut child = Command::new("node")
         .arg("-e")
@@ -2431,7 +2456,7 @@ global.document = {
 };
 const app = fs.readFileSync(0, 'utf8');
 const prefix = app.slice(0, app.indexOf('async function main()'));
-const api = new Function(prefix + '\nreturn {compareSamples,medianPairedProductLossChange,progressionSelection,progressionSvg,releaseGenerations,releaseStats,renderGenerationPair};')();
+const api = new Function(prefix + '\nreturn {compareSamples,medianPairedProductLossChange,progressionSelection,releaseGenerations,releaseStats};')();
 const hash = value => value.repeat(64);
 const sample = (fn_key, hashValue, g8r_product_loss, g8r_product = 100 + g8r_product_loss, yosys_abc_product = 100) => ({
   fn_key,
@@ -2530,35 +2555,6 @@ if (candidateRows.length !== 2 || candidateRows[0].samples[0].g8r_product !== 10
     || candidateRows[1].samples[0].g8r_product !== 102) {
   throw new Error(`typed Git candidate rows were not preserved: ${JSON.stringify(candidateRows)}`);
 }
-const rendered = {
-  'progression-summary': {innerHTML: ''},
-  'progression-table': {innerHTML: ''},
-};
-global.document.getElementById = id => rendered[id] || null;
-api.renderGenerationPair([
-  {
-    generation_id: 'release', origin: {kind: 'crate_release'}, display_label: 'v1.0.0',
-    event_time_utc: '2026-08-01T00:00:00Z', dso_version: '0.9.0', coverage: 'cohort_complete',
-    samples: [sample('release-a', 'a', 0, 100, 100)],
-  },
-  {
-    generation_id: 'candidate', origin: {kind: 'git_revision'}, display_label: 'main@cccccccc',
-    event_time_utc: '2026-08-02T00:00:00Z', dso_version: '0.9.0', coverage: 'cohort_complete',
-    baseline_generation_id: 'release', samples: [sample('candidate-a', 'a', 10, 110, 100)],
-  },
-], 'release', 'candidate');
-const renderedTable = rendered['progression-table'].innerHTML;
-if (!renderedTable.includes('Largest per-artifact changes: v1.0.0 → main@cccccccc')
-    || !renderedTable.includes('v1.0.0<br>Baseline G8r+ABC product')
-    || !renderedTable.includes('main@cccccccc<br>Current G8r+ABC product')
-    || !renderedTable.includes('Change<br>main@cccccccc − v1.0.0')) {
-  throw new Error(`per-artifact table does not identify both endpoints: ${renderedTable}`);
-}
-const renderedSummary = rendered['progression-summary'].innerHTML;
-if (!renderedSummary.includes('canonical structural-hash cohort')
-    || renderedSummary.includes('identical IR bytes')) {
-  throw new Error(`candidate comparison overstates its pairing guarantee: ${renderedSummary}`);
-}
 const stats = api.releaseStats([{generation_id: 'quality', version: '1.0.0', dso_version: '1.0.0', samples: [
   sample('larger-regression', 'd', 10, 110, 100),
   sample('smaller-improvement', 'e', -5, 45, 50),
@@ -2568,14 +2564,7 @@ if (stats.g8r_total !== 155 || stats.yosys_total !== 150 || stats.total_loss !==
     || stats.gross_regression !== 10 || stats.gross_improvement !== 5) {
   throw new Error(`unexpected aggregate quality statistics: ${JSON.stringify(stats)}`);
 }
-const layeredSvg = api.progressionSvg([
-  {display_label: 'v1.0.0', origin: {kind: 'crate_release'}, event_time_utc: '2026-08-01T00:00:00Z', value: 1},
-  {display_label: 'main@cccccccc', origin: {kind: 'git_revision'}, event_time_utc: '2026-08-02T00:00:00Z', value: 1},
-], [{key: 'value', lineClass: 'line', dotClass: 'dot', title: row => row.display_label}], 'value', String, 'layering');
-if (layeredSvg.indexOf('<title>main@cccccccc</title>')
-    > layeredSvg.indexOf('<title>v1.0.0</title>')) {
-  throw new Error(`Git marker must be emitted before the release marker: ${layeredSvg}`);
-}
+
 "#;
     let mut child = match Command::new("node")
         .arg("-e")

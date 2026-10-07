@@ -16,6 +16,30 @@ use crate::store::ArtifactStore;
 
 const FINITE_WORKER_MAX_CONSECUTIVE_ERRORS: usize = 3;
 
+/// Install only for the CLI worker command, not for embedded/web runners or unit tests.
+/// The handlers only set an atomic flag; leases and durable flushing remain on worker threads.
+pub(crate) struct WorkerShutdownSignals(Vec<signal_hook::SigId>);
+
+impl WorkerShutdownSignals {
+    pub(crate) fn install(shutdown: &Arc<AtomicBool>) -> Result<Self> {
+        let mut guard = Self(Vec::new());
+        for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+            guard
+                .0
+                .push(signal_hook::flag::register(signal, shutdown.clone())?);
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for WorkerShutdownSignals {
+    fn drop(&mut self) {
+        for id in self.0.drain(..) {
+            signal_hook::low_level::unregister(id);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunWorkersSummary {
     pub(crate) workers: usize,
@@ -40,6 +64,7 @@ pub(crate) fn run_workers(
     batch_size: usize,
     reclaim_expired: bool,
     exit_when_idle: bool,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<RunWorkersSummary> {
     if workers == 0 {
         bail!("--workers must be > 0");
@@ -65,10 +90,12 @@ pub(crate) fn run_workers(
         let repo_root = repo_root.clone();
         let drained_actions = drained_actions.clone();
         let stop = stop.clone();
+        let shutdown = shutdown.clone();
         let worker_id = format!("{}:runner-{}", worker_id_prefix, worker_index);
         handles.push(thread::spawn(move || {
             worker_loop(
                 &stop,
+                &shutdown,
                 &drained_actions,
                 &worker_id,
                 poll_interval,
@@ -82,7 +109,7 @@ pub(crate) fn run_workers(
                         &worker_id,
                         lease_seconds,
                         reclaim_expired,
-                        None,
+                        Some(&shutdown),
                     )
                 },
                 || queue_is_idle(&store),
@@ -120,7 +147,9 @@ pub(crate) fn run_workers(
         exit_when_idle,
         drained_actions: drained_actions.load(Ordering::Relaxed),
         elapsed_secs: started.elapsed().as_secs_f64(),
-        exit_reason: if exit_when_idle {
+        exit_reason: if shutdown.load(Ordering::Relaxed) {
+            "shutdown_requested".to_string()
+        } else if exit_when_idle {
             "idle".to_string()
         } else {
             "completed".to_string()
@@ -130,6 +159,7 @@ pub(crate) fn run_workers(
 
 fn worker_loop(
     stop: &AtomicBool,
+    shutdown: &AtomicBool,
     drained_actions: &AtomicUsize,
     worker_id: &str,
     poll_interval: Duration,
@@ -140,7 +170,7 @@ fn worker_loop(
 ) -> Result<()> {
     let mut consecutive_errors = 0_usize;
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed) {
             return Ok(());
         }
         match drain() {
@@ -177,28 +207,25 @@ fn worker_loop(
 }
 
 fn queue_is_idle(store: &ArtifactStore) -> bool {
-    count_queue_pb_files(&store.queue_pending_dir()) == 0
-        && count_queue_pb_files(&store.queue_running_dir()) == 0
+    // Existence, not cardinality: do not count the whole pending tree after every batch.
+    !queue_has_pb_files(&store.queue_pending_dir())
+        && !queue_has_pb_files(&store.queue_running_dir())
 }
 
-fn count_queue_pb_files(dir: &Path) -> usize {
-    if !dir.exists() {
-        return 0;
+fn queue_has_pb_files(dir: &Path) -> bool {
+    match std::fs::metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+        Ok(_) => {}
     }
-    WalkDir::new(dir)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|ext| ext == "pb")
-                .unwrap_or(false)
-        })
-        .count()
+    WalkDir::new(dir).into_iter().any(|entry| match entry {
+        // A failed read must not make a finite worker report the queue as empty.
+        Err(_) => true,
+        Ok(entry) => {
+            entry.file_type().is_file()
+                && entry.path().extension().and_then(|s| s.to_str()) == Some("pb")
+        }
+    })
 }
 
 #[cfg(test)]
@@ -236,6 +263,7 @@ mod tests {
             4,
             true,
             true,
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("run workers");
         assert_eq!(summary.exit_reason, "idle");
@@ -245,16 +273,159 @@ mod tests {
     }
 
     #[test]
-    fn count_queue_pb_files_ignores_non_pb_files() {
+    fn queue_has_pb_files_ignores_non_pb_files() {
         let (store, root) = make_test_store("queue-count");
         let queue_dir = store.queue_pending_dir();
         fs::create_dir_all(&queue_dir).expect("create queue dir");
         fs::write(queue_dir.join("a.pb"), "{}").expect("write protobuf placeholder");
         fs::write(queue_dir.join("b.bad"), "{}").expect("write bad");
         fs::write(queue_dir.join("c.tmp"), "{}").expect("write tmp");
-        assert_eq!(count_queue_pb_files(&queue_dir), 1);
+        assert!(queue_has_pb_files(&queue_dir));
+        fs::remove_file(queue_dir.join("a.pb")).expect("remove only queue record");
+        assert!(!queue_has_pb_files(&queue_dir));
 
         fs::remove_dir_all(root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn shutdown_finishes_current_drain_without_starting_another() {
+        let stop = AtomicBool::new(false);
+        let shutdown = AtomicBool::new(false);
+        let drained = AtomicUsize::new(0);
+        let invocations = AtomicUsize::new(0);
+        worker_loop(
+            &stop,
+            &shutdown,
+            &drained,
+            "shutdown-test",
+            Duration::from_millis(1),
+            false,
+            None,
+            || {
+                assert_eq!(invocations.fetch_add(1, Ordering::Relaxed), 0);
+                shutdown.store(true, Ordering::Relaxed);
+                // The active drain still returns its completed, finalized actions.
+                Ok(3)
+            },
+            || false,
+        )
+        .unwrap();
+        assert_eq!(drained.load(Ordering::Relaxed), 3);
+        assert_eq!(invocations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn graceful_signals_finish_in_flight_drain_in_subprocess() {
+        // Exercise actual signal delivery in a child so the test runner's signal state is untouched.
+        const CHILD_DIR: &str = "BVC_TEST_SHUTDOWN_CHILD_DIR";
+        if let Some(root) = std::env::var_os(CHILD_DIR) {
+            let root = PathBuf::from(root);
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let _signals = WorkerShutdownSignals::install(&shutdown).unwrap();
+            let stop = AtomicBool::new(false);
+            let drained = AtomicUsize::new(0);
+            let invocations = AtomicUsize::new(0);
+            worker_loop(
+                &stop,
+                &shutdown,
+                &drained,
+                "signal-child",
+                Duration::from_millis(1),
+                false,
+                None,
+                || {
+                    assert_eq!(invocations.fetch_add(1, Ordering::Relaxed), 0);
+                    fs::write(root.join("ready"), []).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    while !shutdown.load(Ordering::Relaxed) {
+                        assert!(Instant::now() < deadline, "signal did not arrive");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    fs::write(root.join("finalized"), b"3").unwrap();
+                    Ok(3)
+                },
+                || false,
+            )
+            .unwrap();
+            assert_eq!(drained.load(Ordering::Relaxed), 3);
+            assert_eq!(invocations.load(Ordering::Relaxed), 1);
+            return;
+        }
+        for signal in ["-TERM", "-INT"] {
+            let (store, root) = make_test_store("signal-child");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ops::tests::graceful_signals_finish_in_flight_drain_in_subprocess",
+                    "--nocapture",
+                ])
+                .env(CHILD_DIR, &root)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !root.join("ready").is_file() && Instant::now() < deadline {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            if !root.join("ready").is_file() {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!("child never reached in-flight drain: {output:?}");
+            }
+            let sent = std::process::Command::new("kill")
+                .args([signal, &child.id().to_string()])
+                .status()
+                .unwrap();
+            assert!(sent.success());
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "signal child failed: {output:?}");
+            assert_eq!(
+                fs::read_to_string(root.join("finalized"))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap(),
+                3
+            );
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn pre_requested_shutdown_preserves_pending_work_for_resume() {
+        let (store, root) = make_test_store("shutdown-before-claim");
+        let action_id = crate::queue::enqueue_action(
+            &store,
+            crate::model::ActionSpec::ImportIrPackageFile {
+                source_sha256: "d".repeat(64),
+                top_fn_name: None,
+            },
+        )
+        .unwrap();
+        let summary = run_workers(
+            store.clone(),
+            root.clone(),
+            2,
+            "shutdown-test",
+            60,
+            Duration::from_millis(1),
+            4,
+            true,
+            true,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap();
+        assert_eq!(summary.exit_reason, "shutdown_requested");
+        assert_eq!(summary.drained_actions, 0);
+        assert!(store.pending_queue_path(&action_id).is_file());
+        assert!(!queue_has_pb_files(&store.queue_running_dir()));
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -264,6 +435,7 @@ mod tests {
         let attempts = AtomicUsize::new(0);
         let error = worker_loop(
             &stop,
+            &AtomicBool::new(false),
             &drained,
             "persistent-error-test",
             Duration::from_millis(1),
@@ -292,6 +464,7 @@ mod tests {
         let attempts = AtomicUsize::new(0);
         worker_loop(
             &stop,
+            &AtomicBool::new(false),
             &drained,
             "transient-error-test",
             Duration::from_millis(1),

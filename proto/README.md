@@ -8,6 +8,10 @@ static-publication boundaries.
 
 - The initial package is `xlsynth.bvc.v1`.
 - Files are grouped by domain rather than by storage tree.
+- Standalone full-corpus publication uses `xlsynth.bvc.corpus_site.v1` under
+  `xlsynth/bvc/corpus_site/v1/`. It imports canonical action/publication types but
+  is generated separately from the evaluation-store descriptor set. Publication
+  format changes therefore do not trigger evaluation-store migrations.
 - A package-version change is distinct from an operational record-version or
   action-identity-version change.
 - Generated Rust is produced by the pinned `prost-build` and vendored

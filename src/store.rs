@@ -473,6 +473,51 @@ struct SledArtifactBackend {
     db_path: PathBuf,
     db: Mutex<Option<sled::Db>>,
     materialization_lock: RwLock<()>,
+    validated_provenance: Mutex<ValidatedProvenanceCache>,
+}
+
+/// Bounded, process-local memoization of validated protobuf rows. Every lookup still reads Sled
+/// and compares the exact row bytes: deletion, replacement and corruption cannot be masked by a
+/// positive cache entry. No failures or missing records are cached.
+#[derive(Debug, Default)]
+struct ValidatedProvenanceCache {
+    entries: HashMap<String, (sled::IVec, Arc<Provenance>)>,
+    insertion_order: VecDeque<String>,
+    byte_len: usize,
+}
+
+impl ValidatedProvenanceCache {
+    const CAPACITY: usize = 16_384;
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
+
+    fn get(&self, key: &str, bytes: &sled::IVec) -> Option<Arc<Provenance>> {
+        self.entries
+            .get(key)
+            .and_then(|(cached, provenance)| (cached == bytes).then(|| provenance.clone()))
+    }
+
+    fn insert(&mut self, key: &str, bytes: sled::IVec, provenance: Arc<Provenance>) {
+        if bytes.len() > Self::MAX_BYTES {
+            return;
+        }
+        if let Some((old_bytes, old_provenance)) = self.entries.get_mut(key) {
+            self.byte_len -= old_bytes.len();
+            self.byte_len += bytes.len();
+            *old_bytes = bytes;
+            *old_provenance = provenance;
+        } else {
+            self.byte_len += bytes.len();
+            self.insertion_order.push_back(key.to_owned());
+            self.entries.insert(key.to_owned(), (bytes, provenance));
+        }
+        while self.entries.len() > Self::CAPACITY || self.byte_len > Self::MAX_BYTES {
+            if let Some(oldest) = self.insertion_order.pop_front() {
+                if let Some((removed, _)) = self.entries.remove(&oldest) {
+                    self.byte_len -= removed.len();
+                }
+            }
+        }
+    }
 }
 
 impl SledArtifactBackend {
@@ -499,6 +544,19 @@ impl SledArtifactBackend {
                 provenance.action_id
             );
         }
+        Ok(provenance)
+    }
+
+    fn validated_provenance(&self, key: &str, bytes: sled::IVec) -> Result<Arc<Provenance>> {
+        if let Some(provenance) = self.validated_provenance.lock().unwrap().get(key, &bytes) {
+            return Ok(provenance);
+        }
+        // Decode outside the cache lock so unrelated dependency checks stay concurrent.
+        let provenance = Arc::new(Self::decode_keyed_provenance(key.as_bytes(), &bytes)?);
+        self.validated_provenance
+            .lock()
+            .unwrap()
+            .insert(key, bytes, provenance.clone());
         Ok(provenance)
     }
 
@@ -2337,11 +2395,10 @@ impl ArtifactBackend for SledArtifactBackend {
         let Ok(tree) = db.open_tree(Self::TREE_PROVENANCE_BY_ACTION) else {
             return false;
         };
-        matches!(
-            tree.get(action_id.as_bytes()),
-            Ok(Some(value))
-                if Self::decode_keyed_provenance(action_id.as_bytes(), value.as_ref()).is_ok()
-        )
+        match tree.get(action_id.as_bytes()) {
+            Ok(Some(value)) => self.validated_provenance(action_id, value).is_ok(),
+            _ => false,
+        }
     }
 
     fn load_provenance(&self, _store_root: &Path, action_id: &str) -> Result<Provenance> {
@@ -2353,7 +2410,8 @@ impl ArtifactBackend for SledArtifactBackend {
             .get(action_id.as_bytes())
             .context("loading provenance row from sled")?
             .ok_or_else(|| anyhow::anyhow!("provenance not found for action {}", action_id))?;
-        Self::decode_keyed_provenance(action_id.as_bytes(), bytes.as_ref())
+        self.validated_provenance(action_id, bytes)
+            .map(|value| (*value).clone())
             .context("validating loaded provenance row identity")
     }
 
@@ -2831,6 +2889,7 @@ struct TimedCache<T> {
 #[derive(Debug)]
 pub(crate) struct ArtifactStore {
     pub(crate) root: PathBuf,
+    pub(crate) pending_path_cache: crate::queue::PendingPathCache,
     artifact_backend_selection: ArtifactBackendSelection,
     artifact_backend: Box<dyn ArtifactBackend>,
     list_cache_ttl: Duration,
@@ -2872,9 +2931,11 @@ impl ArtifactStore {
             db_path,
             db: Mutex::new(None),
             materialization_lock: RwLock::new(()),
+            validated_provenance: Mutex::default(),
         });
         Self {
             root,
+            pending_path_cache: crate::queue::PendingPathCache::default(),
             artifact_backend_selection,
             artifact_backend,
             list_cache_ttl: Self::list_cache_ttl_from_env(),
@@ -2896,6 +2957,7 @@ impl ArtifactStore {
             Box::new(SnapshotArtifactBackend { snapshot_dir });
         Self {
             root,
+            pending_path_cache: crate::queue::PendingPathCache::default(),
             artifact_backend_selection,
             artifact_backend,
             list_cache_ttl: Self::list_cache_ttl_from_env(),
@@ -4058,6 +4120,134 @@ mod tests {
     }
 
     #[test]
+    fn validated_provenance_cache_detects_replacement_corruption_and_deletion() {
+        let root = make_test_root("xlsynth-bvc-validation-cache");
+        let backend = SledArtifactBackend {
+            db_path: root.join("store.sled"),
+            db: Mutex::new(None),
+            materialization_lock: RwLock::new(()),
+            validated_provenance: Mutex::default(),
+        };
+        backend.ensure_layout(&root).unwrap();
+        let mut provenance = make_test_provenance(&"d".repeat(64), "payload/result.txt", 5);
+        let key = provenance.action_id.clone();
+        let tree = backend
+            .open_db()
+            .unwrap()
+            .open_tree(SledArtifactBackend::TREE_PROVENANCE_BY_ACTION)
+            .unwrap();
+        let original: sled::IVec = crate::proto::encode_provenance(&provenance).unwrap().into();
+        tree.insert(key.as_bytes(), original.clone()).unwrap();
+        let first = backend
+            .validated_provenance(&key, original.clone())
+            .unwrap();
+        let reused = backend
+            .validated_provenance(&key, original.clone())
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert!(backend.action_exists(&root, &key));
+        provenance.commands.clear();
+        tree.insert(
+            key.as_bytes(),
+            crate::proto::encode_provenance(&provenance).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            backend
+                .load_provenance(&root, &key)
+                .unwrap()
+                .commands
+                .is_empty()
+        );
+        tree.insert(key.as_bytes(), &[0xff]).unwrap();
+        assert!(!backend.action_exists(&root, &key));
+        assert!(backend.load_provenance(&root, &key).is_err());
+        tree.remove(key.as_bytes()).unwrap();
+        assert!(!backend.action_exists(&root, &key));
+        assert!(backend.load_provenance(&root, &key).is_err());
+        // Missing/corrupt reads must not poison later restoration.
+        tree.insert(key.as_bytes(), original).unwrap();
+        assert!(backend.action_exists(&root, &key));
+        assert_eq!(
+            backend.load_provenance(&root, &key).unwrap().commands.len(),
+            1
+        );
+        drop(tree);
+        drop(backend);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validated_provenance_cache_is_bounded_and_replacements_do_not_grow_it() {
+        let mut cache = ValidatedProvenanceCache::default();
+        let p = Arc::new(make_test_provenance(
+            &"d".repeat(64),
+            "payload/result.txt",
+            5,
+        ));
+        let bytes: sled::IVec = crate::proto::encode_provenance(&p).unwrap().into();
+        for i in 0..=ValidatedProvenanceCache::CAPACITY {
+            cache.insert(&i.to_string(), bytes.clone(), p.clone());
+        }
+        assert_eq!(cache.entries.len(), ValidatedProvenanceCache::CAPACITY);
+        assert!(cache.get("0", &bytes).is_none());
+        let key = ValidatedProvenanceCache::CAPACITY.to_string();
+        for _ in 0..10 {
+            cache.insert(&key, bytes.clone(), p.clone());
+        }
+        assert_eq!(
+            cache.insertion_order.len(),
+            ValidatedProvenanceCache::CAPACITY
+        );
+        assert_eq!(
+            cache.byte_len,
+            bytes.len() * ValidatedProvenanceCache::CAPACITY
+        );
+        assert!(cache.get(&key, &bytes).is_some());
+        // Exercise the byte limit independently of the entry limit.
+        let large: sled::IVec = vec![0; ValidatedProvenanceCache::MAX_BYTES / 2 + 1].into();
+        cache.insert("large-a", large.clone(), p.clone());
+        cache.insert("large-b", large.clone(), p);
+        assert!(cache.byte_len <= ValidatedProvenanceCache::MAX_BYTES);
+        assert!(cache.get("large-a", &large).is_none());
+        assert!(cache.get("large-b", &large).is_some());
+    }
+
+    #[test]
+    #[ignore = "manual provenance validation microbenchmark"]
+    fn benchmark_validated_provenance_cache() {
+        let p = make_test_provenance(&"d".repeat(64), "payload/result.txt", 5);
+        let bytes: sled::IVec = crate::proto::encode_provenance(&p).unwrap().into();
+        let backend = SledArtifactBackend {
+            db_path: PathBuf::new(),
+            db: Mutex::new(None),
+            materialization_lock: RwLock::new(()),
+            validated_provenance: Mutex::default(),
+        };
+        let start = Instant::now();
+        for _ in 0..100_000 {
+            std::hint::black_box(
+                SledArtifactBackend::decode_keyed_provenance(p.action_id.as_bytes(), &bytes)
+                    .unwrap(),
+            );
+        }
+        let uncached = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..100_000 {
+            std::hint::black_box(
+                backend
+                    .validated_provenance(&p.action_id, bytes.clone())
+                    .unwrap(),
+            );
+        }
+        eprintln!(
+            "provenance validation: repetitions=100000 uncached_ms={} cached_ms={}",
+            uncached.as_millis(),
+            start.elapsed().as_millis()
+        );
+    }
+
+    #[test]
     fn sled_provenance_replacement_updates_canonical_and_materialized_copies() {
         let root = make_test_root("xlsynth-bvc-store-sled-provenance-replacement");
         let db_path = root.join("store.sled");
@@ -4177,6 +4367,7 @@ mod tests {
             db_path,
             db: Mutex::new(None),
             materialization_lock: RwLock::new(()),
+            validated_provenance: Mutex::default(),
         };
         backend.ensure_layout(&root).expect("ensure sled layout");
 
@@ -4223,6 +4414,7 @@ mod tests {
             db_path,
             db: Mutex::new(None),
             materialization_lock: RwLock::new(()),
+            validated_provenance: Mutex::default(),
         });
         backend.ensure_layout(&root).expect("ensure sled layout");
 

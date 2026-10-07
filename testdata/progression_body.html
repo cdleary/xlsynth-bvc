@@ -1,0 +1,25 @@
+<header><p><a href="./">← Results</a></p><h1>Fixed-IR generation progression</h1><p class="meta">Follow the same functions across releases and tested Git revisions.</p><p id="error" role="alert"></p></header>
+<main id="progression" data-dataset-key="ir-fn-corpus-g8r-abc-vs-codegen-yosys-abc.v2.json">
+<div class="toolbar"><label>Fixed cohort <select id="progression-cohort" aria-label="Fixed artifact cohort"></select></label><label>Baseline <select id="baseline-version" aria-label="Baseline generation"></select></label><label>Current <select id="current-version" aria-label="Current generation"></select></label><label><input id="include-incomplete" type="checkbox"> Include incomplete generations</label></div>
+<p id="progression-status" class="meta" aria-live="polite">Loading generation data…</p>
+<section id="progression-overview" aria-labelledby="progression-overview-title">
+<h2 id="progression-overview-title">Did the releases improve?</h2>
+<p class="meta">Cost = AIG AND nodes × depth after ABC. Lower is better. Graph logical effort is shown separately below.</p>
+<div class="toolbar"><label>Compare cost with <select id="progression-reference" aria-label="Cost comparison reference"><option value="baseline">Selected baseline generation</option><option value="yosys">Each generation’s Yosys/ABC reference</option></select></label></div>
+<section id="progression-summary" class="grid" aria-live="polite"></section>
+<section id="progression-chart" class="progression-chart" aria-live="polite"><p class="muted">Loading generation data…</p></section>
+<article class="progression-chart-panel contribution-panel"><h3>Which functions account for it?</h3><p id="progression-contribution-context" class="meta"></p><div class="toolbar"><label>Change units <select id="progression-change-units" aria-label="Per-function change units"><option value="absolute">Absolute cost — contribution to total</option><option value="percent">Percent — relative impact</option></select></label></div><div id="progression-contributions" class="progression-plot" aria-label="Sorted per-function cost changes"></div><p id="progression-contribution-status" class="meta"></p><div id="progression-function-detail" aria-live="polite"></div><details><summary>Exact per-function costs</summary><section id="progression-table"></section></details></article>
+</section>
+<section id="progression-vectors" aria-labelledby="vector-title" hidden>
+<div class="vector-heading"><div><p class="science-label">Function movement / graph logical effort × AIG nodes</p><h2 id="vector-title">Where did the functions move?</h2></div><p id="vector-window" class="vector-window"></p></div>
+<p id="vector-description" class="meta">Each arrow runs from baseline ○ to current ▶. Down and left is better; opposite directions are tradeoffs. Both measurements describe the same selected-stage AIG.</p>
+<dl id="vector-counts" class="vector-counts"></dl>
+<div class="toolbar vector-controls"><label>AIG stage <select id="vector-stage" aria-label="Vector AIG stage"><option value="abc">G8r+ABC</option><option value="raw">G8r (pre-ABC)</option></select></label><label>Axes <select id="vector-scale" aria-label="Vector axis scale"><option value="log">Log (zero-safe)</option><option value="linear">Linear</option></select></label><label>Show <select id="vector-filter" aria-label="Vector movement filter"><option value="all">All functions</option><option value="changed">Changed only</option><option value="improved">Improved</option><option value="regressed">Regressed</option><option value="tradeoff">Tradeoffs</option><option value="unchanged">Unchanged</option></select></label><label>Find function <input id="vector-search" type="search" placeholder="Name or structural hash" aria-label="Find vector function"></label></div>
+<p id="vector-warning" class="coverage-warning" hidden></p>
+<div class="vector-plot-panel"><div id="vector-plot" aria-label="Graph logical effort and AIG node count movement"></div></div>
+<p id="vector-status" class="meta" aria-live="polite"></p>
+<p class="meta vector-help">Drag to pan · scroll to zoom · click an endpoint to inspect. Counts cover all measured pairs; filters retain the same axes. LE changes within 1e−9 relative tolerance are treated as equal.</p>
+<section id="vector-detail" class="sample-detail" aria-live="polite"></section>
+<details class="vector-functions"><summary>Browse functions and exact changes</summary><div id="vector-table"></div></details>
+</section>
+<h2>Fixed-IR coverage</h2><section id="progression-inventory" aria-live="polite"></section></main>
