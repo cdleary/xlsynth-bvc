@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -27,35 +27,152 @@ static QUEUE_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A scheduling hint, never an authority for queue state or lease ownership. Share one sorted
 /// enumeration across workers instead of walking the entire tree for every claim and batch.
-/// Pending writes in this process invalidate it; reconciliation discovers external writers and
-/// drops stale paths. Claims still reread records and take the existing per-action lease lock.
+/// Local writes are immediately visible through a small path overlay. One reader periodically
+/// reconciles the filesystem outside the state lock; other readers keep using the old snapshot.
+/// Claims still reread records and take the existing per-action lease lock.
 #[derive(Debug, Default)]
 pub(crate) struct PendingPathCache {
-    snapshot: Mutex<Option<(Instant, Arc<Vec<PathBuf>>)>>,
+    state: Mutex<PendingPathState>,
+    refresh: Mutex<()>,
     claim_cursor: AtomicUsize,
     compatible_cursor: AtomicUsize,
 }
 
-impl PendingPathCache {
-    const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+#[derive(Debug, Default)]
+struct PendingPathState {
+    snapshot: Option<(Instant, Arc<Vec<PathBuf>>)>,
+    writes: BTreeMap<PathBuf, u64>,
+    generation: u64,
+    refreshing: bool,
+}
 
-    fn paths(&self, root: &Path) -> Result<Arc<Vec<PathBuf>>> {
-        let mut snapshot = self.snapshot.lock().unwrap();
-        if let Some((loaded, paths)) = snapshot.as_ref()
-            && loaded.elapsed() < Self::REFRESH_INTERVAL
-            && !paths.is_empty()
-        {
-            return Ok(paths.clone());
-        }
-        let mut paths = list_queue_files(root)?;
-        paths.sort_unstable();
-        let paths = Arc::new(paths);
-        *snapshot = Some((Instant::now(), paths.clone()));
-        Ok(paths)
+/// An immutable read view without copying the full snapshot for each local enqueue.
+struct PendingPaths {
+    snapshot: Arc<Vec<PathBuf>>,
+    additions: Vec<PathBuf>,
+}
+
+impl PendingPaths {
+    fn len(&self) -> usize {
+        self.snapshot.len() + self.additions.len()
     }
 
-    fn invalidate(&self) {
-        *self.snapshot.lock().unwrap() = None;
+    fn is_empty(&self) -> bool {
+        self.snapshot.is_empty() && self.additions.is_empty()
+    }
+}
+
+impl std::ops::Index<usize> for PendingPaths {
+    type Output = PathBuf;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        if index < self.additions.len() {
+            &self.additions[index]
+        } else {
+            &self.snapshot[index - self.additions.len()]
+        }
+    }
+}
+
+impl PendingPathState {
+    fn view(&self) -> Option<PendingPaths> {
+        let (_, snapshot) = self.snapshot.as_ref()?;
+        Some(PendingPaths {
+            snapshot: snapshot.clone(),
+            additions: self
+                .writes
+                .keys()
+                .filter(|path| snapshot.binary_search(path).is_err())
+                .cloned()
+                .collect(),
+        })
+    }
+
+    fn is_fresh(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(|(loaded, _)| {
+            loaded.elapsed() < PendingPathCache::REFRESH_INTERVAL
+                && self.writes.len() < PendingPathCache::MAX_WRITES_BEFORE_REFRESH
+        })
+    }
+}
+
+impl PendingPathCache {
+    const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+    const MAX_WRITES_BEFORE_REFRESH: usize = 4096;
+
+    fn paths(&self, root: &Path) -> Result<PendingPaths> {
+        self.paths_with_scan(root, list_queue_files)
+    }
+
+    fn paths_with_scan(
+        &self,
+        root: &Path,
+        scan: impl FnOnce(&Path) -> Result<Vec<PathBuf>>,
+    ) -> Result<PendingPaths> {
+        {
+            let state = self.state.lock().unwrap();
+            if state.is_fresh() {
+                return Ok(state.view().expect("fresh snapshot"));
+            }
+        }
+        // Never acquire the refresh gate while holding state: the scanner needs state only
+        // to publish. Warm readers do not wait for either the filesystem walk or its sort.
+        let _refresh = match self.refresh.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => {
+                if let Some(view) = self.state.lock().unwrap().view() {
+                    return Ok(view);
+                }
+                // There is no usable snapshot on first load. Join the single cold refresh.
+                self.refresh
+                    .lock()
+                    .map_err(|_| anyhow!("pending snapshot refresh poisoned"))?
+            }
+            Err(TryLockError::Poisoned(_)) => bail!("pending snapshot refresh poisoned"),
+        };
+        let generation = {
+            let mut state = self.state.lock().unwrap();
+            if state.is_fresh() {
+                return Ok(state.view().expect("fresh snapshot"));
+            }
+            state.refreshing = true;
+            state.generation
+        };
+        let scanned = scan(root).map(|mut paths| {
+            paths.sort_unstable();
+            Arc::new(paths)
+        });
+        let mut state = self.state.lock().unwrap();
+        state.refreshing = false;
+        // On error keep the old snapshot and every write; the next reader retries. Do not
+        // convert an unreadable queue into a successful empty snapshot.
+        let paths = scanned?;
+        let retired = state.snapshot.replace((Instant::now(), paths));
+        // Writes after the scan began may not have appeared in its directory walk. Retain
+        // them even when the same path was already present in the previous snapshot.
+        state.writes.retain(|_, written| *written > generation);
+        let view = state.view().expect("published snapshot");
+        drop(state);
+        // Releasing a large old path vector can itself be expensive.
+        drop(retired);
+        Ok(view)
+    }
+
+    fn record_pending(&self, path: &Path) {
+        let mut state = self.state.lock().unwrap();
+        if !state.refreshing
+            && state
+                .snapshot
+                .as_ref()
+                .is_none_or(|(_, paths)| paths.binary_search_by(|p| p.as_path().cmp(path)).is_ok())
+        {
+            // Before first load the scan will discover the write. Without an in-flight
+            // refresh, an existing path already exposes retries and priority changes.
+            return;
+        }
+        state.generation += 1;
+        let generation = state.generation;
+        state.writes.insert(path.to_path_buf(), generation);
     }
 }
 
@@ -141,7 +258,7 @@ fn new_queue_lease_token(action_id: &str, worker_id: &str) -> String {
 fn write_bytes_atomic(store: &ArtifactStore, path: &Path, contents: &[u8]) -> Result<()> {
     store.write_record_atomic("queue", path, contents)?;
     if path.starts_with(store.queue_pending_dir()) {
-        store.pending_path_cache.invalidate();
+        store.pending_path_cache.record_pending(path);
     }
     Ok(())
 }
@@ -2202,6 +2319,222 @@ mod tests {
         action_id
     }
 
+    fn expire_pending_snapshot(cache: &PendingPathCache) {
+        cache.state.lock().unwrap().snapshot.as_mut().unwrap().0 =
+            Instant::now() - PendingPathCache::REFRESH_INTERVAL;
+    }
+
+    fn pending_view_paths(view: &PendingPaths) -> Vec<PathBuf> {
+        let mut paths: Vec<_> = (0..view.len()).map(|i| view[i].clone()).collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    #[test]
+    fn pending_refresh_does_not_block_warm_readers_or_lose_racing_writes() {
+        let cache = Arc::new(PendingPathCache::default());
+        let root = Path::new("queue");
+        let first = root.join("first.pb");
+        let second = root.join("second.pb");
+        let initial = cache
+            .paths_with_scan(root, |_| Ok(vec![first.clone()]))
+            .unwrap();
+        expire_pending_snapshot(&cache);
+        let (scanned_tx, scanned_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let refresher_cache = cache.clone();
+        let refresher = thread::spawn(move || {
+            refresher_cache
+                .paths_with_scan(root, |_| {
+                    // Both files are absent from this captured scan. Rewriting first must be
+                    // retained even though it was present in the old snapshot.
+                    scanned_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(Vec::new())
+                })
+                .unwrap()
+        });
+        scanned_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (written_tx, written_rx) = mpsc::channel();
+        let writer_cache = cache.clone();
+        let written_paths = [first.clone(), second.clone()];
+        let writer = thread::spawn(move || {
+            for path in &written_paths {
+                writer_cache.record_pending(path);
+            }
+            let view = writer_cache
+                .paths_with_scan(root, |_| panic!("duplicate refresh"))
+                .unwrap();
+            written_tx.send(view).unwrap();
+        });
+        let result = written_rx.recv_timeout(Duration::from_secs(2));
+        // Always release the deliberately stalled scan before checking for a blocked writer.
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let published = refresher.join().unwrap();
+        let during = result.expect("local writes and warm reads must not wait for a scan");
+        assert!(Arc::ptr_eq(&initial.snapshot, &during.snapshot));
+        assert_eq!(pending_view_paths(&during), [first.clone(), second.clone()]);
+        assert_eq!(
+            pending_view_paths(&published),
+            [first.clone(), second.clone()]
+        );
+        assert_eq!(cache.state.lock().unwrap().writes.len(), 2);
+        expire_pending_snapshot(&cache);
+        let reconciled = cache
+            .paths_with_scan(root, |_| Ok(vec![second.clone(), first.clone()]))
+            .unwrap();
+        assert_eq!(pending_view_paths(&reconciled), [first, second]);
+        assert!(cache.state.lock().unwrap().writes.is_empty());
+    }
+
+    #[test]
+    fn pending_cold_readers_share_one_scan_and_keep_concurrent_writes() {
+        let cache = Arc::new(PendingPathCache::default());
+        let scans = Arc::new(AtomicUsize::new(0));
+        let root = Path::new("queue");
+        let first = root.join("first.pb");
+        let second = root.join("second.pb");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_cache = cache.clone();
+        let first_scans = scans.clone();
+        let scan_result = vec![first.clone()];
+        let first_reader = thread::spawn(move || {
+            first_cache
+                .paths_with_scan(root, |_| {
+                    first_scans.fetch_add(1, Ordering::Relaxed);
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(scan_result)
+                })
+                .unwrap()
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let ready = Arc::new(Barrier::new(9));
+        let (tx, rx) = mpsc::channel();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                let scans = scans.clone();
+                let ready = ready.clone();
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    ready.wait();
+                    tx.send(
+                        cache
+                            .paths_with_scan(root, |_| {
+                                scans.fetch_add(1, Ordering::Relaxed);
+                                Ok(Vec::new())
+                            })
+                            .unwrap(),
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+        drop(tx);
+        ready.wait();
+        cache.record_pending(&second);
+        let early = rx.recv_timeout(Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        let first_view = first_reader.join().unwrap();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert_eq!(
+            pending_view_paths(&first_view),
+            [first.clone(), second.clone()]
+        );
+        let views: Vec<_> = rx.into_iter().collect();
+        assert_eq!(views.len(), 8);
+        for view in views {
+            assert!(Arc::ptr_eq(&first_view.snapshot, &view.snapshot));
+            assert_eq!(pending_view_paths(&view), [first.clone(), second.clone()]);
+        }
+        assert_eq!(scans.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn pending_empty_snapshot_discovers_local_and_external_writes_and_retries_errors() {
+        let (store, root) = make_test_store();
+        let cache = &store.pending_path_cache;
+        let queue_dir = store.queue_pending_dir();
+        assert!(cache.paths(&queue_dir).unwrap().is_empty());
+        let first = queue_dir.join("first.pb");
+        fs::write(&first, []).unwrap();
+        cache.record_pending(&first);
+        let local = cache
+            .paths_with_scan(&queue_dir, |_| panic!("local write triggered a scan"))
+            .unwrap();
+        assert_eq!(pending_view_paths(&local), [first.clone()]);
+        let external = queue_dir.join("external.pb");
+        fs::write(&external, []).unwrap();
+        expire_pending_snapshot(cache);
+        assert!(
+            cache
+                .paths_with_scan(&queue_dir, |_| bail!("simulated directory failure"))
+                .is_err()
+        );
+        {
+            let state = cache.state.lock().unwrap();
+            assert!(!state.refreshing);
+            assert_eq!(pending_view_paths(&state.view().unwrap()), [first.clone()]);
+        }
+        let recovered = cache.paths(&queue_dir).unwrap();
+        assert_eq!(pending_view_paths(&recovered), [external, first]);
+        assert!(cache.state.lock().unwrap().writes.is_empty());
+        let cold = PendingPathCache::default();
+        assert!(
+            cold.paths_with_scan(&queue_dir, |_| bail!("cold scan failure"))
+                .is_err()
+        );
+        assert!(cold.state.lock().unwrap().snapshot.is_none());
+        assert_eq!(cold.paths(&queue_dir).unwrap().len(), 2);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_overlay_coalesces_writes_and_reconciles_large_bursts() {
+        let cache = PendingPathCache::default();
+        let root = Path::new("queue");
+        let existing = root.join("existing.pb");
+        cache.record_pending(&existing);
+        assert!(cache.state.lock().unwrap().writes.is_empty());
+        let initial = cache
+            .paths_with_scan(root, |_| Ok(vec![existing.clone()]))
+            .unwrap();
+        let added = root.join("added.pb");
+        for _ in 0..100 {
+            cache.record_pending(&existing);
+            cache.record_pending(&added);
+        }
+        assert_eq!(cache.state.lock().unwrap().writes.len(), 1);
+        let current = cache
+            .paths_with_scan(root, |_| panic!("write invalidated snapshot"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&initial.snapshot, &current.snapshot));
+        assert_eq!(
+            pending_view_paths(&current),
+            [added.clone(), existing.clone()]
+        );
+        let mut expected = vec![existing, added];
+        for i in 0..PendingPathCache::MAX_WRITES_BEFORE_REFRESH {
+            let path = root.join(format!("{i:064x}.pb"));
+            cache.record_pending(&path);
+            expected.push(path);
+        }
+        let reconciled = cache
+            .paths_with_scan(root, |_| Ok(expected.clone()))
+            .unwrap();
+        expected.sort_unstable();
+        assert_eq!(pending_view_paths(&reconciled), expected);
+        assert!(!Arc::ptr_eq(&initial.snapshot, &reconciled.snapshot));
+        assert!(cache.state.lock().unwrap().writes.is_empty());
+    }
+
     #[test]
     fn pending_path_cache_shares_snapshots_and_reconciles_external_changes() {
         let (store, root) = make_test_store();
@@ -2210,31 +2543,24 @@ mod tests {
         fs::write(&first, []).unwrap();
         let initial = store.pending_path_cache.paths(&queue_dir).unwrap();
         let reused = store.pending_path_cache.paths(&queue_dir).unwrap();
-        assert!(Arc::ptr_eq(&initial, &reused));
-        assert_eq!(&**initial, &[first.clone()]);
+        assert!(Arc::ptr_eq(&initial.snapshot, &reused.snapshot));
+        assert_eq!(pending_view_paths(&initial), [first.clone()]);
 
         // Simulate another process modifying the filesystem without cache invalidation.
         let second = queue_dir.join("second.pb");
         fs::write(&second, []).unwrap();
         fs::remove_file(&first).unwrap();
-        store
-            .pending_path_cache
-            .snapshot
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .0 = Instant::now() - PendingPathCache::REFRESH_INTERVAL;
+        expire_pending_snapshot(&store.pending_path_cache);
         let refreshed = store.pending_path_cache.paths(&queue_dir).unwrap();
-        assert!(!Arc::ptr_eq(&initial, &refreshed));
-        assert_eq!(&**refreshed, &[second]);
+        assert!(!Arc::ptr_eq(&initial.snapshot, &refreshed.snapshot));
+        assert_eq!(pending_view_paths(&refreshed), [second]);
         // An in-flight reader retains a valid immutable snapshot; paths are only hints.
-        assert_eq!(&**initial, &[first]);
+        assert_eq!(pending_view_paths(&initial), [first]);
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn pending_writes_invalidate_shared_snapshot_and_stale_paths_cannot_be_claimed() {
+    fn pending_writes_overlay_shared_snapshot_and_stale_paths_cannot_be_claimed() {
         let (store, root) = make_test_store();
         let first = enqueue_action(&store, terminal_test_action()).unwrap();
         let initial = store
@@ -2251,7 +2577,7 @@ mod tests {
             .pending_path_cache
             .paths(&store.queue_pending_dir())
             .unwrap();
-        assert!(!Arc::ptr_eq(&initial, &refreshed));
+        assert!(Arc::ptr_eq(&initial.snapshot, &refreshed.snapshot));
         assert_eq!(refreshed.len(), 2);
         let claimed = claim_next_pending_item(&store, "cache-test", 60)
             .unwrap()
@@ -2278,6 +2604,11 @@ mod tests {
 
     #[test]
     fn shared_pending_snapshot_preserves_exclusive_claims() {
+        check_shared_pending_claims(false);
+        check_shared_pending_claims(true);
+    }
+
+    fn check_shared_pending_claims(during_refresh: bool) {
         let (store, root) = make_test_store();
         let store = Arc::new(store);
         let mut expected = HashSet::new();
@@ -2298,9 +2629,33 @@ mod tests {
             .pending_path_cache
             .paths(&store.queue_pending_dir())
             .unwrap();
+        let refresh = if during_refresh {
+            expire_pending_snapshot(&store.pending_path_cache);
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let refresh_store = store.clone();
+            let handle = thread::spawn(move || {
+                refresh_store
+                    .pending_path_cache
+                    .paths_with_scan(&refresh_store.queue_pending_dir(), |root| {
+                        let paths = list_queue_files(root)?;
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(paths)
+                    })
+                    .unwrap()
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            expected.insert(enqueue_action(&store, terminal_test_action()).unwrap());
+            Some((release_tx, handle))
+        } else {
+            None
+        };
+        let (done_tx, done_rx) = mpsc::channel();
         let workers: Vec<_> = (0..8)
             .map(|i| {
                 let store = store.clone();
+                let done_tx = done_tx.clone();
                 thread::spawn(move || {
                     let mut ids = Vec::new();
                     while let Some(claimed) =
@@ -2308,15 +2663,32 @@ mod tests {
                     {
                         ids.push(claimed.action_id().to_owned());
                     }
+                    done_tx.send(()).unwrap();
                     ids
                 })
             })
             .collect();
+        drop(done_tx);
+        let mut finished = 0;
+        while finished < workers.len() {
+            if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                break;
+            }
+            finished += 1;
+        }
+        if let Some((release_tx, handle)) = refresh {
+            release_tx.send(()).unwrap();
+            handle.join().unwrap();
+        }
         let ids: Vec<_> = workers
             .into_iter()
             .flat_map(|w| w.join().unwrap())
             .collect();
         assert_eq!(ids.len(), expected.len());
+        assert_eq!(
+            finished, 8,
+            "claims must finish without waiting for refresh"
+        );
         assert_eq!(ids.into_iter().collect::<HashSet<_>>(), expected);
         assert_eq!(initial.len(), 24);
         fs::remove_dir_all(root).unwrap();
@@ -2346,6 +2718,73 @@ mod tests {
             "queue enumeration: paths={count} repetitions={repetitions} uncached_ms={} shared_snapshot_including_cold_ms={}",
             uncached.as_millis(),
             cached.as_millis()
+        );
+    }
+
+    #[test]
+    #[ignore = "read-only cache contention benchmark; set BVC_QUEUE_BENCH_DIR"]
+    fn benchmark_pending_cache_contention() {
+        measure_pending_cache_contention(false);
+    }
+
+    #[test]
+    #[ignore = "read-only periodic-refresh benchmark; set BVC_QUEUE_BENCH_DIR"]
+    fn benchmark_pending_cache_refresh_contention() {
+        measure_pending_cache_contention(true);
+    }
+
+    fn measure_pending_cache_contention(force_refresh: bool) {
+        let root = PathBuf::from(std::env::var_os("BVC_QUEUE_BENCH_DIR").expect("queue input"));
+        let cache = PendingPathCache::default();
+        let initial = cache.paths(&root).expect("warm snapshot");
+        let written_path = if initial.is_empty() {
+            root.join("benchmark-local-hint.pb")
+        } else {
+            initial[0].clone()
+        };
+        let readers = 24;
+        let rounds = 8;
+        let ready = Barrier::new(readers + 1);
+        let finished = Barrier::new(readers + 1);
+        let started = Instant::now();
+        let mut latencies = thread::scope(|scope| {
+            let handles: Vec<_> = (0..readers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut latencies = Vec::new();
+                        for _ in 0..rounds {
+                            ready.wait();
+                            let start = Instant::now();
+                            std::hint::black_box(cache.paths(&root).expect("read snapshot"));
+                            latencies.push(start.elapsed());
+                            finished.wait();
+                        }
+                        latencies
+                    })
+                })
+                .collect();
+            for _ in 0..rounds {
+                if force_refresh {
+                    expire_pending_snapshot(&cache);
+                } else {
+                    cache.record_pending(&written_path);
+                }
+                ready.wait();
+                finished.wait();
+            }
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        latencies.sort_unstable();
+        eprintln!(
+            "pending cache contention: force_refresh={force_refresh} paths={} readers={readers} rounds={rounds} elapsed_ms={} read_p50_us={} read_p95_us={} read_max_us={}",
+            initial.len(),
+            started.elapsed().as_millis(),
+            latencies[latencies.len() / 2].as_micros(),
+            latencies[latencies.len() * 95 / 100].as_micros(),
+            latencies.last().unwrap().as_micros()
         );
     }
 
