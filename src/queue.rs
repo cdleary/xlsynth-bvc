@@ -98,6 +98,13 @@ impl QueueTransitionLock {
         Ok(Self { file })
     }
 
+    fn acquire_shared(store: &ArtifactStore, action_id: &str) -> Result<Self> {
+        let (file, path) = Self::open(store, action_id)?;
+        FileExt::lock_shared(&file)
+            .with_context(|| format!("locking queue transition for reading: {}", path.display()))?;
+        Ok(Self { file })
+    }
+
     fn try_acquire(store: &ArtifactStore, action_id: &str) -> Result<Option<Self>> {
         let (file, path) = Self::open(store, action_id)?;
         match file.try_lock_exclusive() {
@@ -431,10 +438,12 @@ pub(crate) fn enqueue_action_with_priority(
     action: ActionSpec,
     priority: i32,
 ) -> Result<String> {
+    // Enqueues only read the alias graph. Keep it stable through the per-action update without
+    // serializing unrelated enqueues; identity migrations still take this lock exclusively.
     let _migration_lock = if action_dependency_action_ids(&action).is_empty() {
         None
     } else {
-        Some(QueueTransitionLock::acquire(
+        Some(QueueTransitionLock::acquire_shared(
             store,
             QUEUE_IDENTITY_MIGRATION_LOCK_KEY,
         )?)
@@ -518,7 +527,7 @@ pub(crate) fn retry_action_with_priority(
     let _migration_lock = if action_dependency_action_ids(&action).is_empty() {
         None
     } else {
-        Some(QueueTransitionLock::acquire(
+        Some(QueueTransitionLock::acquire_shared(
             store,
             QUEUE_IDENTITY_MIGRATION_LOCK_KEY,
         )?)
@@ -3252,8 +3261,15 @@ mod tests {
     }
 
     #[test]
-    fn identity_migration_lock_blocks_concurrent_dependency_enqueue() {
+    fn identity_migration_lock_blocks_concurrent_dependency_enqueue_and_retry() {
+        for retry in [false, true] {
+            check_identity_migration_blocks_dependency_write(retry);
+        }
+    }
+
+    fn check_identity_migration_blocks_dependency_write(retry: bool) {
         let (store, root) = make_test_store();
+        let store = Arc::new(store);
         let held = QueueTransitionLock::acquire(&store, QUEUE_IDENTITY_MIGRATION_LOCK_KEY)
             .expect("acquire migration lock");
         let old_dependency_id = "a".repeat(64);
@@ -3276,11 +3292,15 @@ mod tests {
             .expect("publish dependency alias during migration");
         let (started_tx, started_rx) = mpsc::channel();
         let (enqueued_tx, enqueued_rx) = mpsc::channel();
-        let other_root = root.clone();
+        let other_store = store.clone();
         let handle = thread::spawn(move || {
-            let other_store = ArtifactStore::new(other_root);
             started_tx.send(()).expect("signal enqueue attempt");
-            let action_id = enqueue_action(&other_store, action).expect("enqueue dependency");
+            let action_id = if retry {
+                retry_action_with_priority(&other_store, action, 9)
+            } else {
+                enqueue_action_with_priority(&other_store, action, 9)
+            }
+            .expect("enqueue dependency");
             enqueued_tx
                 .send(action_id)
                 .expect("signal completed enqueue");
@@ -3301,6 +3321,7 @@ mod tests {
         let pending = load_queue_pending_record(&store, &expected_action_id)
             .expect("load canonical dependency action")
             .expect("canonical dependency action exists");
+        assert_eq!(pending.priority, 9);
         assert!(matches!(
             pending.action,
             ActionSpec::DriverAigToStats { aig_action_id, .. }
@@ -3319,6 +3340,132 @@ mod tests {
         assert_eq!(retry_id, expected_action_id);
         handle.join().expect("join lock contender");
 
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn dependency_enqueues_and_retries_share_migration_lock() {
+        let (store, root) = make_test_store();
+        let store = Arc::new(store);
+        let held = QueueTransitionLock::acquire_shared(&store, QUEUE_IDENTITY_MIGRATION_LOCK_KEY)
+            .expect("hold alias graph read lock");
+        let other_store = store.clone();
+        assert!(
+            QueueTransitionLock::try_acquire(&other_store, QUEUE_IDENTITY_MIGRATION_LOCK_KEY)
+                .expect("try migration write lock")
+                .is_none()
+        );
+        let (tx, rx) = mpsc::channel();
+        let mut handles = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..4 {
+            let action = ActionSpec::DriverAigToStats {
+                aig_action_id: format!("{index:064x}"),
+                version: "v0.35.0".to_string(),
+                runtime: sample_runtime(),
+            };
+            let action_id = crate::executor::compute_action_id(&action).expect("action id");
+            expected.push((action_id.clone(), action.clone(), index));
+            let thread_store = store.clone();
+            let tx = tx.clone();
+            handles.push(thread::spawn(move || {
+                let result = if index % 2 == 0 {
+                    enqueue_action_with_priority(&thread_store, action, index)
+                } else {
+                    retry_action_with_priority(&thread_store, action, index)
+                };
+                tx.send(result).expect("send enqueue result");
+            }));
+        }
+        drop(tx);
+        let results: Vec<_> = (0..4)
+            .map(|_| rx.recv_timeout(Duration::from_secs(2)))
+            .collect();
+        // Release before asserting so a regression cannot leave threads blocked on this guard.
+        drop(held);
+        for handle in handles {
+            handle.join().expect("join enqueue thread");
+        }
+        let mut ids: Vec<_> = results
+            .into_iter()
+            .map(|result| {
+                result
+                    .expect("enqueue while another reader holds lock")
+                    .expect("enqueue")
+            })
+            .collect();
+        ids.sort();
+        let mut expected_ids: Vec<_> = expected.iter().map(|(id, _, _)| id.clone()).collect();
+        expected_ids.sort();
+        assert_eq!(ids, expected_ids);
+        for (action_id, action, priority) in expected {
+            let pending = load_queue_pending_record(&store, &action_id)
+                .expect("read pending record")
+                .expect("pending record exists");
+            assert_eq!(
+                crate::proto::action_spec_to_proto(&pending.action).expect("pending action"),
+                crate::proto::action_spec_to_proto(&action).expect("expected action")
+            );
+            assert_eq!(pending.priority, priority);
+        }
+        assert!(
+            QueueTransitionLock::try_acquire(&other_store, QUEUE_IDENTITY_MIGRATION_LOCK_KEY)
+                .expect("migration can acquire after readers finish")
+                .is_some()
+        );
+        drop(other_store);
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn concurrent_dependency_enqueues_and_retries_preserve_max_priority() {
+        let (store, root) = make_test_store();
+        let store = Arc::new(store);
+        let action = ActionSpec::DriverAigToStats {
+            aig_action_id: write_completed_provenance(&store, &"a".repeat(64)),
+            version: "v0.35.0".to_string(),
+            runtime: sample_runtime(),
+        };
+        let expected_id = crate::executor::compute_action_id(&action).expect("action id");
+        let barrier = Arc::new(Barrier::new(16));
+        let mut handles = Vec::new();
+        for priority in 0..16 {
+            let thread_store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            let action = action.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                if priority % 2 == 0 {
+                    enqueue_action_with_priority(&thread_store, action, priority)
+                } else {
+                    retry_action_with_priority(&thread_store, action, priority)
+                }
+                .expect("enqueue same action")
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.join().expect("join contender"), expected_id);
+        }
+        let pending = load_queue_pending_record(&store, &expected_id)
+            .expect("load pending")
+            .expect("pending exists");
+        assert_eq!(
+            crate::proto::action_spec_to_proto(&pending.action).expect("pending action"),
+            crate::proto::action_spec_to_proto(&action).expect("expected action")
+        );
+        assert_eq!(pending.priority, 15);
+        let running = claim_next_pending_item(&store, "first-worker", 900)
+            .expect("claim once")
+            .expect("one queued action");
+        assert_eq!(running.action_id(), expected_id);
+        assert_eq!(running.priority(), 15);
+        assert!(
+            claim_next_pending_item(&store, "second-worker", 900)
+                .expect("second claim")
+                .is_none()
+        );
         drop(store);
         fs::remove_dir_all(root).expect("cleanup");
     }

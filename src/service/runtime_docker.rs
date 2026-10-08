@@ -3,6 +3,7 @@
 use super::*;
 use fs2::FileExt;
 use prost::Message;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const RUNTIME_FINGERPRINT_LABEL: &str = "org.xlsynth-bvc.runtime-fingerprint";
 const DRIVER_SOURCE_REPOSITORY_LABEL: &str = "org.xlsynth-bvc.driver-source-repository";
@@ -1541,7 +1542,55 @@ pub(crate) fn bind_yosys_runtime_image(
         Ok(runtime)
     }
 }
+
+/// Process-local capability cache, not evidence about image existence or runtime identity.
+/// Resolve references on every call so retagging and image removal are still observed.
+/// Each immutable image has its own probe lock; unrelated images need not wait on it.
+#[derive(Default)]
+struct PythonImageProbeCache {
+    images: Mutex<BTreeMap<String, Arc<Mutex<bool>>>>,
+}
+
+impl PythonImageProbeCache {
+    fn has_python3(
+        &self,
+        image: &str,
+        resolve: impl FnOnce(&str) -> Result<Option<String>>,
+        probe: impl FnOnce(&str) -> Result<bool>,
+    ) -> Result<bool> {
+        let Some(image_id) = resolve(image)? else {
+            return Ok(false);
+        };
+        let content_ref = docker_image_content_ref(&image_id)?;
+        let validated = self
+            .images
+            .lock()
+            .map_err(|_| anyhow!("Python image probe cache lock poisoned"))?
+            .entry(content_ref.clone())
+            .or_default()
+            .clone();
+        let mut validated = validated
+            .lock()
+            .map_err(|_| anyhow!("Python image probe lock poisoned"))?;
+        if *validated {
+            return Ok(true);
+        }
+        // Probe the resolved ID, never the possibly retagged input. Only success
+        // is reusable: transient Docker failures and negative probes must retry.
+        let available = probe(&content_ref)?;
+        *validated = available;
+        Ok(available)
+    }
+}
+
 fn image_has_python3(image: &str) -> Result<bool> {
+    static CACHE: OnceLock<PythonImageProbeCache> = OnceLock::new();
+    CACHE
+        .get_or_init(PythonImageProbeCache::default)
+        .has_python3(image, inspect_image_id, probe_image_has_python3)
+}
+
+fn probe_image_has_python3(image: &str) -> Result<bool> {
     let output = Command::new("docker")
         .args([
             "run",
@@ -3156,6 +3205,195 @@ mod tests {
             nanos
         ));
         root
+    }
+
+    #[test]
+    fn python_probe_cache_shares_success_across_aliases() -> Result<()> {
+        let cache = PythonImageProbeCache::default();
+        let image_id = "a".repeat(64);
+        let content_ref = docker_image_content_ref(&image_id)?;
+        let mut resolved = Vec::new();
+        let mut probed = Vec::new();
+        let references = ["example/yosys:one", "example/yosys:two", &content_ref];
+        for reference in references {
+            assert!(cache.has_python3(
+                reference,
+                |image| {
+                    resolved.push(image.to_string());
+                    Ok(Some(image_id.clone()))
+                },
+                |image| {
+                    probed.push(image.to_string());
+                    Ok(true)
+                },
+            )?);
+        }
+        assert_eq!(resolved, references);
+        assert_eq!(probed, [content_ref]);
+        Ok(())
+    }
+
+    #[test]
+    fn python_probe_cache_rechecks_retagged_images() -> Result<()> {
+        let cache = PythonImageProbeCache::default();
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        let mut probed = Vec::new();
+        for image_id in [&first, &second, &first] {
+            assert!(cache.has_python3(
+                "example/yosys:mutable",
+                |_| Ok(Some(image_id.clone())),
+                |image| {
+                    probed.push(image.to_string());
+                    Ok(true)
+                },
+            )?);
+        }
+        assert_eq!(
+            probed,
+            [
+                docker_image_content_ref(&first)?,
+                docker_image_content_ref(&second)?
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn python_probe_cache_does_not_hide_missing_images_or_inspection_errors() -> Result<()> {
+        let cache = PythonImageProbeCache::default();
+        let reference = docker_image_content_ref(&"a".repeat(64))?;
+        assert!(cache.has_python3(&reference, |_| Ok(Some(reference.clone())), |_| Ok(true))?);
+        assert!(!cache.has_python3(
+            &reference,
+            |_| Ok(None),
+            |_| panic!("missing images must not be probed"),
+        )?);
+        assert!(
+            cache
+                .has_python3(
+                    &reference,
+                    |_| bail!("simulated inspection failure"),
+                    |_| panic!("failed inspection must not reach the probe"),
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn python_probe_cache_retries_negative_results_and_errors() -> Result<()> {
+        let cache = PythonImageProbeCache::default();
+        let image_id = "a".repeat(64);
+        let calls = std::cell::Cell::new(0);
+        let check = || {
+            cache.has_python3(
+                "example/yosys:retry",
+                |_| Ok(Some(image_id.clone())),
+                |_| {
+                    let attempt = calls.get();
+                    calls.set(attempt + 1);
+                    match attempt {
+                        0 => Ok(false),
+                        1 => bail!("simulated probe failure"),
+                        2 => Ok(true),
+                        _ => panic!("successful probe should be cached"),
+                    }
+                },
+            )
+        };
+        assert!(!check()?);
+        assert!(check().is_err());
+        assert!(check()?);
+        assert!(check()?);
+        assert_eq!(calls.get(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn python_probe_cache_rejects_invalid_resolved_ids() {
+        let cache = PythonImageProbeCache::default();
+        assert!(
+            cache
+                .has_python3(
+                    "example/yosys:invalid",
+                    |_| Ok(Some("not-an-image-id".to_string())),
+                    |_| panic!("unvalidated image IDs must not be probed"),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn python_probe_cache_coalesces_concurrent_calls() {
+        let cache = PythonImageProbeCache::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let ready = std::sync::Barrier::new(16);
+        thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        cache.has_python3(
+                            "example/yosys:concurrent",
+                            |_| {
+                                ready.wait();
+                                Ok(Some("a".repeat(64)))
+                            },
+                            |image| {
+                                assert_eq!(image, format!("sha256:{}", "a".repeat(64)));
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                Ok(true)
+                            },
+                        )
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert!(handle.join().expect("probe thread").expect("probe result"));
+            }
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[ignore = "requires Docker and XLSYNTH_BVC_TEST_PROBE_IMAGE naming an existing image with Python"]
+    fn python_probe_cache_docker_benchmark() -> Result<()> {
+        let _guard = docker_integration_test_lock()
+            .lock()
+            .map_err(|_| anyhow!("docker integration test lock poisoned"))?;
+        let image = std::env::var("XLSYNTH_BVC_TEST_PROBE_IMAGE")
+            .context("set XLSYNTH_BVC_TEST_PROBE_IMAGE to an existing image with Python")?;
+        let image_id = inspect_image_id(&image)?.context("benchmark image is missing")?;
+        let content_ref = docker_image_content_ref(&image_id)?;
+        let rounds = 8;
+        let started = Instant::now();
+        for _ in 0..rounds {
+            assert!(probe_image_has_python3(&content_ref)?);
+        }
+        let uncached = started.elapsed();
+
+        let cache = PythonImageProbeCache::default();
+        let probes = std::cell::Cell::new(0);
+        let started = Instant::now();
+        for _ in 0..rounds {
+            assert!(cache.has_python3(&image, inspect_image_id, |reference| {
+                probes.set(probes.get() + 1);
+                probe_image_has_python3(reference)
+            })?);
+        }
+        let cached = started.elapsed();
+        assert_eq!(probes.get(), 1);
+        let started = Instant::now();
+        for _ in 0..rounds {
+            assert!(cache.has_python3(&image, inspect_image_id, |_| {
+                panic!("warm cache must not launch a probe")
+            })?);
+        }
+        eprintln!(
+            "Python capability probe, {rounds} calls: uncached={uncached:?} (8 containers); cached={cached:?} (1 container); warm={:?} (0 containers)",
+            started.elapsed()
+        );
+        Ok(())
     }
 
     #[test]
