@@ -5,6 +5,9 @@
 
 use super::*;
 
+#[path = "site_corpus/provenance.rs"]
+mod provenance;
+
 pub(super) mod wire {
     include!(concat!(env!("OUT_DIR"), "/xlsynth.bvc.corpus_site.v1.rs"));
 }
@@ -37,6 +40,9 @@ struct Metric {
     source_relpath: String,
     source_sha256: String,
     top_fn_name: String,
+    input_kinds: Vec<String>,
+    function_names: Vec<String>,
+    provenance_source: String,
     ir_node_count: u64,
     g8r_nodes: u64,
     g8r_depth: u64,
@@ -337,6 +343,7 @@ fn ingest(run: &Path) -> Result<(wire::Generation, Vec<wire::Sample>)> {
             bail!("exported corpus input IR checksum mismatch");
         }
         let sample = wire::Sample {
+            provenance: None,
             input: Some(input),
             sample_id: row.sample_id.clone(),
             input_ir,
@@ -392,6 +399,7 @@ fn validate_sample(
     dso: &str,
 ) -> Result<ProgressionRuntimeIdentity> {
     let input = required(&sample.input, "input")?;
+    provenance::validate(sample)?;
     normalized_relpath(&input.source_relpath)?;
     if sample.sample_id != crate::corpus::sample_id_for_relpath(&input.source_relpath)
         || input.top_fn_name.is_empty()
@@ -480,6 +488,14 @@ fn project(samples: &[wire::Sample]) -> Result<(Vec<u8>, Vec<u8>)> {
             source_relpath: input.source_relpath.clone(),
             source_sha256: hex::encode(&input.source_sha256),
             top_fn_name: input.top_fn_name.clone(),
+            input_kinds: provenance::kinds(sample),
+            function_names: provenance::names(sample),
+            provenance_source: if sample.provenance.is_some() {
+                "snapshot"
+            } else {
+                "name_only"
+            }
+            .into(),
             ir_node_count: nodes,
             g8r_nodes: g.and_nodes,
             g8r_depth: g.depth,
@@ -612,6 +628,7 @@ pub(super) fn build_in_place(
     runs: &[PathBuf],
     target: usize,
 ) -> Result<BuildStaticSiteSummary> {
+    let origins = provenance::Index::from_snapshot(&options.snapshot_dir)?;
     let mut site = wire::CorpusSite {
         record_version: 1,
         generations: vec![],
@@ -619,7 +636,10 @@ pub(super) fn build_in_place(
     };
     for run in runs {
         eprintln!("Validating completed corpus run {}", run.display());
-        let (mut generation, samples) = ingest(run)?;
+        let (mut generation, mut samples) = ingest(run)?;
+        for sample in &mut samples {
+            origins.enrich(sample)?;
+        }
         if site
             .generations
             .iter()

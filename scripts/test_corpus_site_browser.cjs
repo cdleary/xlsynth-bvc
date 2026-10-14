@@ -119,6 +119,20 @@ async function main() {
   await control('kind', 'whole');
   await ready();
   await checkPlots(filterRows(paired, {kind:'whole',max:null,losses:false}));
+  const adders = paired.filter(r=>r.function_names.includes('__float32__add'));
+  if(adders.length) {
+    // Independent expected population: aliases, not the surviving top name,
+    // determine whether the real f32 adder survives the whole-function filter.
+    await control('search', '__float32__add');
+    await ready();
+    await checkPlots(adders);
+    assert(adders.every(r=>r.input_kinds.includes('whole')));
+    await shot('corpus-f32-add');
+  }
+  await control('search', 'no_such_corpus_function');
+  await ready();
+  await checkPlots([]);
+  await control('search', '');
   await control('kind', 'all');
   await ready();
   const sample = paired.find(r=>r.ir_node_count>0&&r.change>0)||paired[0], generation = catalog.generations.at(-1);

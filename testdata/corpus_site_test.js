@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 'use strict';
 const assert = require('node:assert/strict');
-const {kind, pairRows, filterRows, summarize, lossRows} = require('../src/site_assets/corpus.js');
-const row = {sample_id:'a',source_sha256:'1',top_fn_name:'whole',ir_node_count:4,g8r_nodes:2,g8r_depth:3,g8r_le:1.5,yosys_nodes:3,yosys_depth:3,yosys_le:2};
+const {names, pairRows, filterRows, summarize, lossRows} = require('../src/site_assets/corpus.js');
+const row = {sample_id:'a',source_sha256:'1',top_fn_name:'whole',source_relpath:'whole.ir',input_kinds:['whole'],function_names:['whole'],ir_node_count:4,g8r_nodes:2,g8r_depth:3,g8r_le:1.5,yosys_nodes:3,yosys_depth:3,yosys_le:2};
 const all = pairRows([row,{...row,sample_id:'b',g8r_nodes:4},{...row,sample_id:'c',g8r_nodes:3}]);
 assert.deepEqual(summarize(all), {count:3,cost:27,reference:27,better:1,worse:1,unchanged:1});
 assert.deepEqual(filterRows(all,{kind:'all',max:4,losses:true}).map(r=>r.sample_id),['b']);
 assert.deepEqual(filterRows(all,{kind:'all',max:3,losses:false}),[]);
-assert.equal(kind({...row,top_fn_name:'__k3_cone_123'}),'k3');
-assert.equal(kind({...row,top_fn_name:'__mffc_123'}),'mffc');
-assert.equal(kind(row),'whole');
+// The f32 adder is a whole function AND a deduplicated extracted MFFC.
+const adder = {...row,sample_id:'adder',top_fn_name:'__mffc_345679b6c3fb1f66',input_kinds:['mffc','whole'],function_names:['__float32__add']};
+const cone = {...row,sample_id:'cone',input_kinds:['k3'],function_names:[]};
+const population = pairRows([adder,cone]);
+for(const kind of ['whole','mffc']) assert.deepEqual(filterRows(population,{kind,max:null}).map(r=>r.sample_id),['adder']);
+assert.deepEqual(filterRows(population,{kind:'all',max:null}).map(r=>r.sample_id),['adder','cone']);
+assert.deepEqual(filterRows(population,{kind:'k3',max:null}).map(r=>r.sample_id),['cone']);
+assert.deepEqual(filterRows(population,{kind:'all',max:null,search:'FLOAT32__ADD'}).map(r=>r.sample_id),['adder']);
+assert.deepEqual(filterRows(population,{kind:'whole',max:null,search:'345679b6'}).map(r=>r.sample_id),['adder']);
+assert.equal(names(adder),'__float32__add');
+assert.equal(names(cone),'whole');
 const compared = pairRows([row],[{...row,g8r_nodes:1,g8r_le:1}])[0];
 assert.equal(compared.change,3);
 assert.equal(compared.reference_le,1);

@@ -34,6 +34,37 @@ message Sample {
   Stats g8r_raw = 6;
   // Import, G8r lowering, G8r ABC, codegen, Yosys ABC, final comparison.
   repeated xlsynth.bvc.v1.ActionSpec actions = 7;
+  // Optional enrichment from a verified snapshot. Never changes the evaluated
+  // input identity or measurement population.
+  InputProvenance provenance = 8;
+}
+
+enum InputKind {
+  INPUT_KIND_UNSPECIFIED = 0;
+  INPUT_KIND_WHOLE = 1;
+  INPUT_KIND_MFFC = 2;
+  INPUT_KIND_K3 = 3;
+  INPUT_KIND_OTHER = 4;
+}
+
+message FunctionOrigin {
+  string ir_top = 1;
+  InputKind kind = 2;
+  bytes ir_action_id = 3;
+  optional string dslx_file = 4;
+  optional string dslx_fn_name = 5;
+}
+
+message InputProvenance {
+  bytes source_snapshot_sha256 = 1;
+  // Byte-identical functions may have several historical structural identities.
+  // Retain all of them, sorted and unique, rather than arbitrarily choosing one.
+  repeated bytes structural_hashes = 2;
+  // SHA-256 of the exact selected function block, including its declaration.
+  // A structural-hash-looking directory name is not sufficient evidence.
+  bytes function_sha256 = 3;
+  // Sorted and unique by canonical protobuf encoding. Kinds can overlap.
+  repeated FunctionOrigin origins = 4;
 }
 
 message EvidenceShard { repeated Sample samples = 1; }

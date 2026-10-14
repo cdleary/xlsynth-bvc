@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 'use strict';
 (() => {
-  const kind = row => row.top_fn_name.startsWith('__k3_cone_') ? 'k3' : row.top_fn_name.startsWith('__mffc_') ? 'mffc' : 'whole';
+  const names = row => row.function_names.length ? row.function_names.join(', ') : row.top_fn_name;
   const product = row => row.g8r_nodes * row.g8r_depth;
   function pairRows(rows, baseline) {
     const lookup = baseline ? new Map(baseline.map(r => [r.sample_id, r])) : null;
@@ -14,7 +14,9 @@
     });
   }
   function filterRows(rows, options) {
-    return rows.filter(r => (options.kind === 'all' || kind(r) === options.kind)
+    const query = (options.search || '').trim().toLowerCase();
+    return rows.filter(r => (options.kind === 'all' || r.input_kinds.includes(options.kind))
+      && (!query || [r.top_fn_name,r.source_relpath,...r.function_names].some(n=>n.toLowerCase().includes(query)))
       && (options.max === null || r.ir_node_count <= options.max) && (!options.losses || r.change > 0));
   }
   function summarize(rows) {
@@ -23,7 +25,7 @@
       {count:0,cost:0,reference:0,better:0,worse:0,unchanged:0});
   }
   const lossRows = rows => rows.filter(r => Number.isFinite(r.ir_node_count) && r.ir_node_count > 0 && Number.isFinite(r.change) && r.change > 0);
-  if (typeof module !== 'undefined') module.exports = {kind,pairRows,filterRows,summarize,lossRows};
+  if (typeof module !== 'undefined') module.exports = {names,pairRows,filterRows,summarize,lossRows};
   if (typeof document === 'undefined') return;
   const byId = id => document.getElementById(id), fmt = n => n.toLocaleString(undefined,{maximumFractionDigits:3});
   const load = async url => {const r=await fetch(url);if(!r.ok)throw Error(`${url}: HTTP ${r.status}`);return r.json()};
@@ -35,7 +37,7 @@
   }
   async function selectSample(row) {
     const token=++state.selected;
-    byId('selected').textContent=`${row.top_fn_name} · ${row.source_relpath} · ${fmt(row.ir_node_count)} IR nodes · selected ${fmt(row.cost)} / reference ${fmt(row.reference_cost)} · Δ ${fmt(row.change)}`;
+    byId('selected').textContent=`${names(row)} · evaluated top: ${row.top_fn_name} · kinds: ${row.input_kinds.join(', ')} (${row.provenance_source==='snapshot'?'snapshot provenance':'name-only classification'}) · ${row.source_relpath} · ${fmt(row.ir_node_count)} IR nodes · selected ${fmt(row.cost)} / reference ${fmt(row.reference_cost)} · Δ ${fmt(row.change)}`;
     byId('ir').hidden=false; byId('ir').textContent='Loading verified IR…';
     try {const data=await load(row.ir_url);if(token===state.selected){if(typeof data[row.sample_id]!=='string')throw Error('IR is missing');byId('ir').textContent=data[row.sample_id]}}
     catch(e){if(token===state.selected)byId('ir').textContent=e.message}
@@ -70,7 +72,7 @@
     if(token!==state.epoch)return;
     for(const key of state.cache.keys())if(key!==version&&(!baseline||key!==baselineVersion))state.cache.delete(key);
     const maxValue=byId('max-ir').value;
-    state.rows=filterRows(pairRows(current,baseline),{kind:byId('kind').value,max:maxValue===''?null:Math.max(0,Number(maxValue)),losses:byId('losses').checked});
+    state.rows=filterRows(pairRows(current,baseline),{kind:byId('kind').value,search:byId('search').value,max:maxValue===''?null:Math.max(0,Number(maxValue)),losses:byId('losses').checked});
     const rows=state.rows,s=summarize(rows),reference=baseline?`v${baselineVersion} G8r+ABC`:'codegen+Yosys/ABC';
     byId('scope').textContent=`${fmt(s.count)} / ${fmt(state.catalog.sample_count)} inputs · v${version} G8r+ABC versus ${reference}`;
     const pct=s.reference?`${((s.cost/s.reference-1)*100).toFixed(3)}%`:'undefined';
@@ -78,7 +80,7 @@
     ++state.selected;byId('selected').textContent='Click a point or outlier to inspect its verified source IR.';byId('ir').hidden=true;
     const body=byId('outliers');body.replaceChildren();
     for(const row of [...rows].filter(r=>r.change>0).sort((a,b)=>b.change-a.change||a.sample_id.localeCompare(b.sample_id)).slice(0,30)){
-      const tr=document.createElement('tr'),first=document.createElement('td'),button=document.createElement('button');button.textContent=row.top_fn_name;button.addEventListener('click',()=>void selectSample(row));first.append(button);tr.append(first);
+      const tr=document.createElement('tr'),first=document.createElement('td'),button=document.createElement('button');button.textContent=names(row);button.addEventListener('click',()=>void selectSample(row));first.append(button);tr.append(first);
       for(const n of [row.cost,row.reference_cost,row.change]){const td=document.createElement('td');td.textContent=fmt(n);tr.append(td)}body.append(tr);
     }
     await scatter('loss',lossRows(rows),r=>r.ir_node_count,r=>r.change,'IR node count (log scale)',`Product loss vs ${reference} (log scale)`,true,false,'IR nodes: %{x}<br>Positive product loss: %{y}<extra></extra>');
@@ -107,7 +109,7 @@
     byId('baseline').value=versions.includes(query.get('baseline'))?query.get('baseline'):versions.at(-2)||versions[0];
     byId('reference').value=query.get('reference')==='release'?'release':'yosys';
     byId('coverage').textContent=`${versions.length} complete releases · ${fmt(state.catalog.sample_count)} identical frozen inputs each · post-ABC measurements · no partial samples`;
-    for(const name of ['release','baseline','reference','kind','max-ir','losses'])byId(name).addEventListener('change',requestRender);
+    for(const name of ['release','baseline','reference','kind','search','max-ir','losses'])byId(name).addEventListener('change',requestRender);
     await requestRender();
   }
   void main().catch(e=>{byId('error').textContent=e.message;byId('corpus-site').dataset.rendered='error'});

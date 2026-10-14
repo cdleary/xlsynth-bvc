@@ -86,7 +86,20 @@ Open `http://127.0.0.1:8000/`. Choose the release, compare its G8r+ABC result wi
 matched codegen+Yosys/ABC reference or another release's G8r+ABC result, and filter by input kind,
 IR size, or positive product loss. Click a point/outlier to load its source IR. The cards include
 zero-cost inputs; logarithmic plots explicitly omit zero-valued points. Undefined graph logical
-effort is omitted only from that plot. Input-kind labels follow corpus top-function conventions.
+effort is omitted only from that plot. In dashboard builds, the verified snapshot's structural
+index supplies original function names and input-kind membership. The join first matches the
+exact selected function bytes in the snapshot's IR evidence; directory names alone are not
+evidence of structural identity. These aliases are persisted in typed publication protobufs.
+Deduplicated inputs may be both whole functions and MFFCs/cones, so kind filters can overlap,
+but “All inputs” still counts each evaluated input once. For example, a whole f32 adder whose
+representative has an MFFC name remains visible under Whole functions and searchable by its
+original name. The inspected IR and evaluated top remain unchanged.
+
+When byte-identical functions have multiple historical structural hashes, the evidence retains
+all of those identities and aliases; it does not arbitrarily pick one hash.
+Standalone builds without a snapshot, and inputs not matched in a supplied snapshot, retain
+explicitly labeled name-only MFFC/cone classification. Other names are unclassified, not claimed
+to be whole-function provenance. Search accepts original names, evaluated names, or input paths.
 The leading full-width **Product loss vs IR size** plot puts small, high-loss inputs in the upper
 left. Both axes are logarithmic, and it includes every positive product-cost delta under the
 selected comparison (including node/depth tradeoffs). Nonpositive losses or IR sizes are omitted
