@@ -31,6 +31,14 @@ use crate::snapshot::snapshot_web_index_path;
 const SLED_OPEN_LOCK_RETRIES: usize = 20;
 const SLED_OPEN_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
 
+pub(crate) fn open_sled_db(config: sled::Config) -> sled::Result<sled::Db> {
+    // Sled's asynchronous I/O can briefly retain the file lock after the
+    // last application handle is dropped. Bound retry delays to 500 ms; a
+    // live owner still returns the lock error, and other errors fail
+    // immediately. No durability or exclusive-ownership rule is relaxed.
+    retry_sled_open(|| config.open(), std::thread::sleep)
+}
+
 fn retry_sled_open<T>(
     mut open: impl FnMut() -> sled::Result<T>,
     mut pause: impl FnMut(Duration),
@@ -717,11 +725,7 @@ impl SledArtifactBackend {
         let config = sled::Config::new()
             .path(&self.db_path)
             .cache_capacity(cache_capacity);
-        // Sled's asynchronous I/O can briefly retain the file lock after the
-        // last application handle is dropped. Bound retries to 500 ms; a live
-        // owner still returns the original lock error, and other errors fail
-        // immediately. No durability or exclusive-ownership rule is relaxed.
-        let db = retry_sled_open(|| config.open(), std::thread::sleep).with_context(|| {
+        let db = open_sled_db(config).with_context(|| {
             format!(
                 "opening sled db: {} (cache_capacity_bytes={})",
                 self.db_path.display(),
@@ -1007,11 +1011,11 @@ pub(crate) fn compact_sled_db(
         "compact-sled-db: opening source {}",
         source_db_path.display()
     );
-    let source_db = match sled::Config::new()
-        .path(source_db_path)
-        .cache_capacity(SOURCE_CACHE_CAPACITY_BYTES)
-        .open()
-    {
+    let source_db = match open_sled_db(
+        sled::Config::new()
+            .path(source_db_path)
+            .cache_capacity(SOURCE_CACHE_CAPACITY_BYTES),
+    ) {
         Ok(db) => db,
         Err(err) => {
             let err_text = err.to_string();
@@ -1030,16 +1034,17 @@ pub(crate) fn compact_sled_db(
         "compact-sled-db: creating destination {}",
         destination_path.display()
     );
-    let destination_db = sled::Config::new()
-        .path(&destination_path)
-        .cache_capacity(DEST_CACHE_CAPACITY_BYTES)
-        .open()
-        .with_context(|| {
-            format!(
-                "opening destination sled db: {}",
-                destination_path.display()
-            )
-        })?;
+    let destination_db = open_sled_db(
+        sled::Config::new()
+            .path(&destination_path)
+            .cache_capacity(DEST_CACHE_CAPACITY_BYTES),
+    )
+    .with_context(|| {
+        format!(
+            "opening destination sled db: {}",
+            destination_path.display()
+        )
+    })?;
 
     let tree_names = source_db.tree_names();
     eprintln!("compact-sled-db: copying {} trees", tree_names.len());
@@ -1492,11 +1497,11 @@ pub(crate) fn prune_sled_actions_by_ids(
     let started = Instant::now();
     let seed_action_ids = action_ids.iter().cloned().collect::<BTreeSet<_>>();
     eprintln!("prune-sled-actions: opening {}", db_path.display());
-    let db = match sled::Config::new()
-        .path(db_path)
-        .cache_capacity(PRUNE_CACHE_CAPACITY_BYTES)
-        .open()
-    {
+    let db = match open_sled_db(
+        sled::Config::new()
+            .path(db_path)
+            .cache_capacity(PRUNE_CACHE_CAPACITY_BYTES),
+    ) {
         Ok(db) => db,
         Err(err) => {
             let err_text = err.to_string();
@@ -1691,11 +1696,11 @@ pub(crate) fn prune_sled_actions_by_relpath_size(
         "prune-sled-actions-by-relpath-size: opening {}",
         db_path.display()
     );
-    let db = match sled::Config::new()
-        .path(db_path)
-        .cache_capacity(PRUNE_CACHE_CAPACITY_BYTES)
-        .open()
-    {
+    let db = match open_sled_db(
+        sled::Config::new()
+            .path(db_path)
+            .cache_capacity(PRUNE_CACHE_CAPACITY_BYTES),
+    ) {
         Ok(db) => db,
         Err(err) => {
             let err_text = err.to_string();
@@ -1953,11 +1958,11 @@ pub(crate) fn backfill_sled_action_file_compression(
         "backfill-sled-action-file-compression: opening {}",
         db_path.display()
     );
-    let db = match sled::Config::new()
-        .path(db_path)
-        .cache_capacity(BACKFILL_CACHE_CAPACITY_BYTES)
-        .open()
-    {
+    let db = match open_sled_db(
+        sled::Config::new()
+            .path(db_path)
+            .cache_capacity(BACKFILL_CACHE_CAPACITY_BYTES),
+    ) {
         Ok(db) => db,
         Err(err) => {
             let err_text = err.to_string();
@@ -4174,11 +4179,12 @@ mod tests {
 
         let stored_key = "a".repeat(64);
         let provenance = make_test_provenance(&"b".repeat(64), "payload/result.txt", 10);
-        let db = sled::Config::new()
-            .path(&db_path)
-            .cache_capacity(16 * 1024 * 1024)
-            .open()
-            .expect("open raw sled db");
+        let db = open_sled_db(
+            sled::Config::new()
+                .path(&db_path)
+                .cache_capacity(16 * 1024 * 1024),
+        )
+        .expect("open raw sled db");
         let tree = db
             .open_tree(SledArtifactBackend::TREE_PROVENANCE_BY_ACTION)
             .expect("open provenance tree");
@@ -4680,11 +4686,12 @@ mod tests {
         assert_eq!(summary.unchanged_entries, 0);
         assert_eq!(summary.written_compressed_entries, 1);
 
-        let db = sled::Config::new()
-            .path(&db_path)
-            .cache_capacity(16 * 1024 * 1024)
-            .open()
-            .expect("reopen sled db");
+        let db = open_sled_db(
+            sled::Config::new()
+                .path(&db_path)
+                .cache_capacity(16 * 1024 * 1024),
+        )
+        .expect("reopen sled db");
         let file_tree = db
             .open_tree(SledArtifactBackend::TREE_ACTION_FILE_BYTES)
             .expect("open action_file_bytes tree");
@@ -4740,11 +4747,12 @@ mod tests {
         assert_eq!(summary.rewritten_entries, 1);
         assert_eq!(summary.written_compressed_entries, 1);
 
-        let db = sled::Config::new()
-            .path(&db_path)
-            .cache_capacity(16 * 1024 * 1024)
-            .open()
-            .expect("reopen sled db");
+        let db = open_sled_db(
+            sled::Config::new()
+                .path(&db_path)
+                .cache_capacity(16 * 1024 * 1024),
+        )
+        .expect("reopen sled db");
         let file_tree = db
             .open_tree(SledArtifactBackend::TREE_ACTION_FILE_BYTES)
             .expect("open action_file_bytes tree");
@@ -4792,11 +4800,12 @@ mod tests {
         assert!(source_db_path.exists());
         assert!(destination_db_path.exists());
 
-        let destination_db = sled::Config::new()
-            .path(&destination_db_path)
-            .cache_capacity(16 * 1024 * 1024)
-            .open()
-            .expect("open destination sled db");
+        let destination_db = open_sled_db(
+            sled::Config::new()
+                .path(&destination_db_path)
+                .cache_capacity(16 * 1024 * 1024),
+        )
+        .expect("open destination sled db");
         let alpha_tree = destination_db.open_tree("alpha").expect("open alpha tree");
         let beta_tree = destination_db.open_tree("beta").expect("open beta tree");
         assert_eq!(
@@ -4825,6 +4834,24 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn compact_sled_db_rejects_live_owner_without_creating_destination() {
+        let root = make_test_root("xlsynth-bvc-sled-compact-live-owner");
+        let source = root.join("source.sled");
+        let destination = root.join("destination.sled");
+        let owner = open_sled_db(sled::Config::new().path(&source)).unwrap();
+        owner.insert(b"key", b"value").unwrap();
+        owner.flush().unwrap();
+
+        assert!(compact_sled_db(&source, Some(&destination), true).is_err());
+        assert!(!destination.exists());
+        assert_eq!(owner.get(b"key").unwrap().unwrap().as_ref(), b"value");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+
+        drop(owner);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4859,11 +4886,12 @@ mod tests {
         assert!(source_db_path.exists());
         assert!(!destination_db_path.exists());
 
-        let compacted_source = sled::Config::new()
-            .path(&source_db_path)
-            .cache_capacity(16 * 1024 * 1024)
-            .open()
-            .expect("open swapped source db");
+        let compacted_source = open_sled_db(
+            sled::Config::new()
+                .path(&source_db_path)
+                .cache_capacity(16 * 1024 * 1024),
+        )
+        .expect("open swapped source db");
         let alpha_tree = compacted_source
             .open_tree("alpha")
             .expect("open alpha tree");
@@ -5024,11 +5052,12 @@ mod tests {
         assert_eq!(summary.deleted_queue_pending_files, 1);
         assert!(summary.deleted_action_file_rows >= 3);
 
-        let db = sled::Config::new()
-            .path(&db_path)
-            .cache_capacity(16 * 1024 * 1024)
-            .open()
-            .expect("reopen sled db");
+        let db = open_sled_db(
+            sled::Config::new()
+                .path(&db_path)
+                .cache_capacity(16 * 1024 * 1024),
+        )
+        .expect("reopen sled db");
         let provenance_tree = db
             .open_tree(SledArtifactBackend::TREE_PROVENANCE_BY_ACTION)
             .expect("open provenance tree");

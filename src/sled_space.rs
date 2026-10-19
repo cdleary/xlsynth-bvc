@@ -332,11 +332,11 @@ pub(crate) fn analyze_sled_space(
     let top_n = top_n.max(1);
     let sample_rows_per_tree = sample_rows_per_tree.max(1);
     eprintln!("analyze-sled-space: opening {}", db_path.display());
-    let db = match sled::Config::new()
-        .path(db_path)
-        .cache_capacity(ANALYZE_CACHE_CAPACITY_BYTES)
-        .open()
-    {
+    let db = match crate::store::open_sled_db(
+        sled::Config::new()
+            .path(db_path)
+            .cache_capacity(ANALYZE_CACHE_CAPACITY_BYTES),
+    ) {
         Ok(db) => db,
         Err(err) => {
             let err_text = err.to_string();
