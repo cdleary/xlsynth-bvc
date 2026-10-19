@@ -37,6 +37,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     corpus_site.compile_protos(&["proto/xlsynth/bvc/corpus_site/v1/site.proto"], &["proto"])?;
     println!("cargo:rerun-if-changed=proto/xlsynth/bvc/corpus_site/v1/site.proto");
 
+    let mut cache = prost_build::Config::new();
+    cache.protoc_executable(&protoc);
+    cache.extern_path(".xlsynth.bvc.v1", "crate::proto::v1");
+    cache.compile_protos(&["proto/xlsynth/bvc/cache/v1/cache.proto"], &["proto"])?;
+    println!("cargo:rerun-if-changed=proto/xlsynth/bvc/cache/v1/cache.proto");
+
     let campaign_text = fs::read("campaigns/release-qor-v1.textproto")?;
     let mut child = Command::new(&protoc)
         .args([

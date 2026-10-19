@@ -35,6 +35,60 @@ IR content hashes. All included releases must contain exactly the same relative 
 bytes, and top functions, and use the same stats estimator and Yosys/ABC runtime/script. Each
 generation has one lowering runtime; its own DSO is recorded and bound to its action graph.
 
+When evaluating another release against an existing corpus, pass the existing estimator's
+release as `run-ir-dir-corpus --stats-driver-version VERSION`. This pins all AIG statistics
+actions independently of `--driver-version`; it does not change lowering or code generation.
+Repeat the same flag when finalizing or resuming. An existing workspace rejects a different
+resolved statistics runtime. Git candidates retain their captured baseline estimator and do
+not accept this override.
+
+### Faster repeated evaluation
+
+`run-ir-dir-corpus --prepare-threads 4` imports inputs and enqueues independent
+sample graphs concurrently. The default is four preparation threads; use `1` for
+serial preparation. Each imported artifact and queue record is still committed
+durably before preparation returns. Duplicate-content inputs are serialized, sample
+order is deterministic, and rerunning after interruption fills in missing work.
+This does not start evaluators concurrently with the preparation process.
+
+To reuse downstream computations across release workspaces, seed an opt-in cache
+from a completed canonical store, then pass that cache to the new workers:
+
+```sh
+xlsynth_bvc --store-dir PREVIOUS/.bvc/bvc-artifacts \
+  --artifacts-via-sled PREVIOUS/.bvc/artifacts.sled \
+  seed-downstream-cache --cache-dir SHARED_CACHE
+
+env BVC_DISABLE_AUTO_SUGGESTED_ENQUEUE=1 \
+  xlsynth_bvc --store-dir CURRENT/.bvc/bvc-artifacts \
+  --artifacts-via-sled CURRENT/.bvc/artifacts.sled \
+  --downstream-cache-dir SHARED_CACHE \
+  run-workers --workers 8 --exit-when-idle
+```
+
+Seeding requires exclusive access to the source sled database; use a completed,
+idle workspace. Repeat `--action-id ID` to seed only selected completed actions.
+For a fully enqueued fixed corpus, disable automatic suggested-action expansion
+as above. Otherwise suggestions can add measurements using the latest estimator
+in addition to the explicitly pinned estimator, doing work outside the corpus plan.
+Successful new computations populate the cache automatically when it is enabled.
+The new crate's lowering and code generation always run normally. Only
+Verilog-to-Yosys/ABC, AIG-to-Yosys/ABC, and modern AIG statistics are eligible for
+reuse. Keys bind exact input bytes, tool/runtime identity, flow script, frontend,
+top module, language mode, and an execution-recipe revision. Legacy sidecar/IR
+statistics are excluded. Different upstream action IDs alone do not prevent reuse.
+
+Cache entries are atomic, self-contained protobufs with checked input/source
+provenance and output length/SHA-256. Corrupt or incompatible entries are misses.
+Cache writes intentionally do not add a per-entry durability flush; a crash can
+lose cache entries, while canonical action commits retain their durability.
+Hits retain the current action identity and dependencies, have no fabricated tool
+command, and add `payload/downstream-reuse.pb` containing the original computation's
+provenance. Original computations, not reuse chains, are seeded into the cache.
+The cache can be discarded without losing canonical results; it must not be used
+as a substitute for retaining completed stores. Its schema is compiled separately
+and does not change the artifact-store descriptor fingerprint.
+
 ## All-versions dashboard
 
 Supply a historical snapshot **and** the completed full-corpus runs in the same command to build

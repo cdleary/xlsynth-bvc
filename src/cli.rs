@@ -13,12 +13,24 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub(crate) artifacts_via_sled: Option<PathBuf>,
 
+    /// Reuse verified downstream computations across stores (opt-in).
+    #[arg(long, global = true, value_name = "DIR")]
+    pub(crate) downstream_cache_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     pub(crate) command: TopCommand,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Seed a downstream cache from completed canonical actions in this store.
+    SeedDownstreamCache {
+        #[arg(long, value_name = "DIR")]
+        cache_dir: PathBuf,
+        /// Restrict seeding to selected completed actions; otherwise scan the store.
+        #[arg(long)]
+        action_id: Vec<String>,
+    },
     /// Snapshot local DSLX, optimize concrete functions, and extract cone IR.
     DslxCorpusIngest(DslxCorpusIngestCli),
     /// Render a standalone page from an ingested DSLX corpus and a comparison run.
@@ -53,6 +65,12 @@ pub enum TopCommand {
         priority: i32,
         #[arg(long, value_enum)]
         scheduling_policy: Option<CorpusSchedulingPolicyPreset>,
+        /// Pin the released AIG statistics driver for cross-release comparability.
+        #[arg(long, conflicts_with = "driver_git_commit")]
+        stats_driver_version: Option<String>,
+        /// Bound parallel import/enqueue work; 1 restores serial preparation.
+        #[arg(long, default_value_t = 4)]
+        prepare_threads: usize,
         #[command(flatten)]
         driver: DriverCli,
         #[command(flatten)]

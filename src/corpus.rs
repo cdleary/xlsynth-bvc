@@ -1143,11 +1143,20 @@ pub(crate) fn run_ir_dir_corpus(
     yosys_script: Option<&str>,
     priority: i32,
     scheduling_policy_preset: Option<CorpusSchedulingPolicyPreset>,
+    stats_driver_version: Option<&str>,
+    prepare_threads: usize,
+    downstream_cache_dir: Option<&Path>,
     driver: DriverCli,
     yosys: YosysCli,
 ) -> Result<RunIrDirCorpusSummary> {
+    if !(1..=64).contains(&prepare_threads) {
+        bail!("--prepare-threads must be between 1 and 64");
+    }
     if !input_dir.exists() {
         bail!("input dir does not exist: {}", input_dir.display());
+    }
+    if stats_driver_version.is_some() && driver.driver_git_commit.is_some() {
+        bail!("--stats-driver-version is only supported for release drivers");
     }
     if !input_dir.is_dir() {
         bail!("input dir is not a directory: {}", input_dir.display());
@@ -1177,10 +1186,11 @@ pub(crate) fn run_ir_dir_corpus(
         corpus_workspace_paths(output_dir);
     fs::create_dir_all(&workspace_dir)
         .with_context(|| format!("creating workspace dir: {}", workspace_dir.display()))?;
-    let store = ArtifactStore::new_with_sled(
+    let mut store = ArtifactStore::new_with_sled(
         workspace_store_dir.clone(),
         workspace_artifacts_via_sled.clone(),
     );
+    store.downstream_cache_dir = downstream_cache_dir.map(Path::to_path_buf);
     store.ensure_layout()?;
 
     let manifest_path = output_dir.join(IR_DIR_CORPUS_MANIFEST_FILENAME);
@@ -1217,18 +1227,35 @@ pub(crate) fn run_ir_dir_corpus(
         runtimes
     } else {
         let driver_runtime = driver.into_runtime_with_driver_version(repo_root, version, None)?;
-        let stats_runtime = match resolve_driver_runtime_for_aig_stats(repo_root, &driver_runtime) {
-            Ok(runtime) => runtime,
-            Err(_) if driver_runtime.source_revision.is_none() => driver_runtime.clone(),
-            Err(error) => {
-                return Err(error).context(
+        let stats_runtime = if let Some(stats_version) = stats_driver_version {
+            crate::runtime::bound_driver_runtime_for_driver_version(
+                repo_root,
+                crate::versioning::normalize_tag_version(stats_version),
+                &driver_runtime.release_platform,
+            )?
+        } else {
+            match resolve_driver_runtime_for_aig_stats(repo_root, &driver_runtime) {
+                Ok(runtime) => runtime,
+                Err(_) if driver_runtime.source_revision.is_none() => driver_runtime.clone(),
+                Err(error) => {
+                    return Err(error).context(
                     "resolving the required released stats runtime for a source-driver candidate",
                 );
+                }
             }
         };
         let yosys_runtime = yosys.into_runtime(repo_root, None)?;
         (driver_runtime, stats_runtime, yosys_runtime)
     };
+    if manifest_path.exists() {
+        let previous: IrDirCorpusManifest = serde_json::from_slice(&fs::read(&manifest_path)?)
+            .context("reading captured corpus statistics runtime")?;
+        if previous.stats_runtime != stats_runtime {
+            bail!(
+                "statistics runtime differs from the existing corpus run; preserve its --stats-driver-version or use a new output directory"
+            );
+        }
+    }
     let effective_dso_version = if recipe_preset == CorpusRecipePreset::G8rAbcStats
         && driver_runtime.source_revision.is_some()
     {
@@ -1326,35 +1353,71 @@ pub(crate) fn run_ir_dir_corpus(
         scheduling_policy_record.as_ref(),
     )?;
 
-    for (index, (sample, plan)) in samples.iter().zip(&plans).enumerate() {
-        ensure_imported_ir_action(&store, sample, &plan.import_action)?;
-        match execution_mode {
-            CorpusExecutionMode::Enqueue => {
-                counters.enqueued_actions +=
-                    enqueue_plan(&store, plan, &enqueue_priorities[index])?;
-            }
-            CorpusExecutionMode::Run => {
-                execute_plan(&store, plan, &mut counters)
-                    .map_err(|err| {
-                        run_errors.insert(sample.sample_id.clone(), format!("{:#}", err));
-                        err
-                    })
-                    .ok();
-            }
+    if matches!(execution_mode, CorpusExecutionMode::Enqueue) {
+        use rayon::prelude::*;
+        // Same-content imports can occur under multiple logical sample names.
+        // Serialize those together while allowing unrelated durable writes to coalesce.
+        let locks: Vec<_> = (0..64).map(|_| std::sync::Mutex::new(())).collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(prepare_threads)
+            .build()?;
+        let prepared = pool.install(|| {
+            samples
+                .par_iter()
+                .zip(&plans)
+                .enumerate()
+                .map(|(index, (sample, plan))| {
+                    let slot =
+                        usize::from_str_radix(&plan.import_ir_action_id[..2], 16)? % locks.len();
+                    let _guard = locks[slot]
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("corpus preparation lock poisoned"))?;
+                    ensure_imported_ir_action(&store, sample, &plan.import_action)?;
+                    let count = enqueue_plan(&store, plan, &enqueue_priorities[index])?;
+                    let record = build_sample_record(
+                        &store,
+                        sample,
+                        plan,
+                        &run_errors,
+                        recipe_preset_name,
+                        top_fn_policy,
+                        fraig,
+                        &effective_dso_version,
+                        &driver_runtime,
+                        &stats_runtime,
+                        &yosys_script_ref,
+                    );
+                    Ok((count, record))
+                })
+                .collect::<Result<Vec<_>>>()
+        });
+        for (count, record) in prepared? {
+            counters.enqueued_actions += count;
+            sample_records.push(record);
         }
-        sample_records.push(build_sample_record(
-            &store,
-            sample,
-            plan,
-            &run_errors,
-            recipe_preset_name,
-            top_fn_policy,
-            fraig,
-            &effective_dso_version,
-            &driver_runtime,
-            &stats_runtime,
-            &yosys_script_ref,
-        ));
+    } else {
+        for (sample, plan) in samples.iter().zip(&plans) {
+            ensure_imported_ir_action(&store, sample, &plan.import_action)?;
+            execute_plan(&store, plan, &mut counters)
+                .map_err(|err| {
+                    run_errors.insert(sample.sample_id.clone(), format!("{:#}", err));
+                    err
+                })
+                .ok();
+            sample_records.push(build_sample_record(
+                &store,
+                sample,
+                plan,
+                &run_errors,
+                recipe_preset_name,
+                top_fn_policy,
+                fraig,
+                &effective_dso_version,
+                &driver_runtime,
+                &stats_runtime,
+                &yosys_script_ref,
+            ));
+        }
     }
 
     let joined_rows = build_joined_rows(&store, &sample_records)?;
@@ -3667,6 +3730,9 @@ mod tests {
             yosys_script,
             crate::DEFAULT_QUEUE_PRIORITY,
             None,
+            None,
+            4,
+            None,
             sample_driver_cli(),
             sample_yosys_cli(),
         )
@@ -4160,6 +4226,9 @@ mod tests {
             None,
             crate::DEFAULT_QUEUE_PRIORITY,
             Some(crate::cli::CorpusSchedulingPolicyPreset::ReleaseProgressionIrV1),
+            None,
+            4,
+            None,
             sample_driver_cli(),
             sample_yosys_cli(),
         )
@@ -4751,6 +4820,9 @@ mod tests {
             None,
             0,
             None,
+            None,
+            4,
+            None,
             DriverCli {
                 driver_version: None,
                 driver_git_commit: Some(observation.head_commit.clone()),
@@ -4773,6 +4845,9 @@ mod tests {
             &dso_version,
             None,
             0,
+            None,
+            None,
+            4,
             None,
             DriverCli {
                 driver_version: Some(observation.latest_crate_version),
@@ -4853,6 +4928,175 @@ mod tests {
                 .expect("parse new preset"),
             "g8r-abc-vs-yabc-aig-diff"
         );
+    }
+
+    #[test]
+    fn parallel_preparation_matches_serial_and_resumes_partial_queue() {
+        let root = make_temp_dir("parallel-prepare");
+        let input = root.join("input");
+        fs::create_dir(&input).unwrap();
+        for n in 0..12 {
+            fs::write(input.join(format!("fn{n}.ir")), format!("package pkg{n}\n")).unwrap();
+        }
+        for directory in ["alias-a", "alias-b"] {
+            fs::create_dir(input.join(directory)).unwrap();
+            fs::write(input.join(directory).join("fn0.ir"), "package pkg0\n").unwrap();
+        }
+        let run = |output: &Path, threads| {
+            run_ir_dir_corpus(
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+                &input,
+                output,
+                CorpusRecipePreset::G8rAbcVsYabcAigDiff,
+                CorpusExecutionMode::Enqueue,
+                CorpusTopFnPolicy::FromFilename,
+                None,
+                false,
+                "v0.39.0",
+                None,
+                0,
+                None,
+                None,
+                threads,
+                None,
+                sample_driver_cli(),
+                sample_yosys_cli(),
+            )
+        };
+        let serial = root.join("serial");
+        let parallel = root.join("parallel");
+        let first = run(&serial, 1).unwrap();
+        let second = run(&parallel, 4).unwrap();
+        assert_eq!(first.sample_count, 14);
+        assert_eq!(first.enqueued_actions, 12 * 8);
+        assert_eq!(second.enqueued_actions, first.enqueued_actions);
+        let serial_manifest = read_status_manifest(&serial);
+        let parallel_manifest = read_status_manifest(&parallel);
+        assert_eq!(
+            serde_json::to_value(&serial_manifest.samples).unwrap(),
+            serde_json::to_value(&parallel_manifest.samples).unwrap()
+        );
+        let store = ArtifactStore::new_with_sled(
+            PathBuf::from(&parallel_manifest.workspace_store_dir),
+            PathBuf::from(&parallel_manifest.workspace_artifacts_via_sled),
+        );
+        let interrupted_action = &parallel_manifest.samples[0].g8r_aig_action_id;
+        fs::remove_file(store.pending_queue_path(interrupted_action)).unwrap();
+        drop(store);
+        assert_eq!(run(&parallel, 4).unwrap().enqueued_actions, 1);
+        assert_eq!(run(&parallel, 1).unwrap().enqueued_actions, 0);
+        for invalid in [0, 65] {
+            let output = root.join(format!("invalid{invalid}"));
+            assert!(run(&output, invalid).is_err());
+            assert!(!output.exists());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corpus_stats_pin_binds_actions_and_rejects_resume_changes() {
+        let root = make_temp_dir("corpus-stats-pin");
+        let input = root.join("input");
+        let output = root.join("out");
+        fs::create_dir_all(&input).expect("create input");
+        fs::write(input.join("foo.ir"), "package foo\n").expect("write input");
+        let run = |pin| {
+            run_ir_dir_corpus(
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+                &input,
+                &output,
+                CorpusRecipePreset::G8rAbcVsYabcAigDiff,
+                CorpusExecutionMode::Enqueue,
+                CorpusTopFnPolicy::FromFilename,
+                None,
+                false,
+                "v0.59.0",
+                None,
+                0,
+                None,
+                pin,
+                4,
+                None,
+                DriverCli {
+                    driver_version: Some("0.75.0".into()),
+                    ..sample_driver_cli()
+                },
+                sample_yosys_cli(),
+            )
+        };
+        let first = run(Some("0.74.0")).expect("enqueue with explicit estimator");
+        assert_eq!(first.enqueued_actions, 8);
+        let manifest = read_status_manifest(&output);
+        assert_eq!(manifest.driver_runtime.driver_version, "0.75.0");
+        assert_eq!(manifest.stats_runtime.driver_version, "0.74.0");
+        let store = ArtifactStore::new_with_sled(
+            PathBuf::from(&manifest.workspace_store_dir),
+            PathBuf::from(&manifest.workspace_artifacts_via_sled),
+        );
+        let sample = &manifest.samples[0];
+        for action_id in [
+            sample
+                .g8r_raw_stats_action_id
+                .as_ref()
+                .expect("raw stats action"),
+            &sample.g8r_stats_action_id,
+            &sample.yosys_abc_stats_action_id,
+        ] {
+            let queued = crate::queue::load_queue_pending_record(&store, action_id)
+                .expect("read queued action")
+                .expect("pending action");
+            let ActionSpec::DriverAigToStats { runtime, .. } = queued.action else {
+                panic!("expected typed AIG statistics action");
+            };
+            assert_eq!(runtime, manifest.stats_runtime);
+        }
+        drop(store);
+        let resumed = run(Some("v0.74.0")).expect("resume same estimator");
+        assert_eq!(resumed.enqueued_actions, 0);
+        let bytes = fs::read(output.join(IR_DIR_CORPUS_MANIFEST_FILENAME)).expect("read manifest");
+        for pin in [None, Some("0.75.0"), Some("999.0.0"), Some("latest")] {
+            assert!(
+                run(pin).is_err(),
+                "reject changed or unknown estimator {pin:?}"
+            );
+            assert_eq!(
+                fs::read(output.join(IR_DIR_CORPUS_MANIFEST_FILENAME)).unwrap(),
+                bytes
+            );
+        }
+        fs::remove_dir_all(root).expect("cleanup test fixture");
+    }
+
+    #[test]
+    fn corpus_stats_pin_cli_parses_and_rejects_git_driver() {
+        use clap::Parser;
+        let args = [
+            "xlsynth-bvc",
+            "run-ir-dir-corpus",
+            "--input-dir",
+            "input",
+            "--output-dir",
+            "output",
+            "--version",
+            "v0.59.0",
+            "--stats-driver-version",
+            "0.74.0",
+        ];
+        let cli = crate::cli::Cli::try_parse_from(args).expect("parse estimator pin");
+        let crate::cli::TopCommand::RunIrDirCorpus {
+            stats_driver_version,
+            ..
+        } = cli.command
+        else {
+            panic!("expected corpus command");
+        };
+        assert_eq!(stats_driver_version.as_deref(), Some("0.74.0"));
+        let error = crate::cli::Cli::try_parse_from(args.into_iter().chain([
+            "--driver-git-commit",
+            "0123456789abcdef0123456789abcdef01234567",
+        ]))
+        .expect_err("Git candidates preserve their baseline estimator");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
@@ -5156,6 +5400,9 @@ mod tests {
             "v0.39.0",
             Some("flows/yosys_to_aig.ys"),
             crate::DEFAULT_QUEUE_PRIORITY,
+            None,
+            None,
+            4,
             None,
             sample_driver_cli(),
             sample_yosys_cli(),

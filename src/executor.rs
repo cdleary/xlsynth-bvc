@@ -370,6 +370,8 @@ fn finish_action_execution(
 
     store.promote_staging_action_dir(&action_id, &staging_dir)?;
 
+    crate::downstream_cache::publish_completed(store, repo_root, &provenance);
+
     if incremental_ir_corpus_upsert_enabled()
         && let Err(err) = maybe_upsert_ir_fn_corpus_g8r_vs_yosys_index_for_completed_action(
             store, repo_root, &action_id,
@@ -5123,12 +5125,20 @@ pub(crate) fn run_combo_verilog_to_yosys_abc_aig_action(
     let yosys_script_path = resolve_script_ref(repo_root, yosys_script_ref)?;
 
     let mut commands = Vec::new();
-    let build_trace = ensure_yosys_image(repo_root, runtime)?;
-    if let Some(trace) = build_trace {
-        commands.push(trace);
-    }
+    let cache_action = ActionSpec::ComboVerilogToYosysAbcAig {
+        verilog_action_id: verilog_action_id.to_string(),
+        verilog_top_module_name: verilog_top_module_name.map(str::to_string),
+        frontend: frontend.clone(),
+        yosys_script_ref: yosys_script_ref.clone(),
+        runtime: runtime.clone(),
+    };
+    if !crate::downstream_cache::restore(store, repo_root, &cache_action, payload_dir)? {
+        let build_trace = ensure_yosys_image(repo_root, runtime)?;
+        if let Some(trace) = build_trace {
+            commands.push(trace);
+        }
 
-    let script = r#"
+        let script = r#"
 set -euo pipefail
 {
   if [ "${YOSYS_VERILOG_FRONTEND}" = "slang" ]; then
@@ -5154,41 +5164,42 @@ fi
 test -s /outputs/result.aig
 "#;
 
-    let mut env = BTreeMap::new();
-    env.insert(
-        "YOSYS_VERILOG_FRONTEND".to_string(),
-        match frontend {
-            YosysVerilogFrontend::Builtin => "builtin",
-            YosysVerilogFrontend::Slang { .. } => "slang",
+        let mut env = BTreeMap::new();
+        env.insert(
+            "YOSYS_VERILOG_FRONTEND".to_string(),
+            match frontend {
+                YosysVerilogFrontend::Builtin => "builtin",
+                YosysVerilogFrontend::Slang { .. } => "slang",
+            }
+            .to_string(),
+        );
+        env.insert(
+            "READ_VERILOG_FLAGS".to_string(),
+            if dep.relpath.ends_with(".sv") {
+                "-sv".to_string()
+            } else {
+                "".to_string()
+            },
+        );
+        if let Some(top) = verilog_top_module_name {
+            env.insert("VERILOG_TOP_MODULE_NAME".to_string(), top.to_string());
         }
-        .to_string(),
-    );
-    env.insert(
-        "READ_VERILOG_FLAGS".to_string(),
-        if dep.relpath.ends_with(".sv") {
-            "-sv".to_string()
-        } else {
-            "".to_string()
-        },
-    );
-    if let Some(top) = verilog_top_module_name {
-        env.insert("VERILOG_TOP_MODULE_NAME".to_string(), top.to_string());
+
+        let mounts = vec![
+            DockerMount::read_only(&verilog_input_path, "/inputs/input.v")?,
+            DockerMount::read_only(&yosys_script_path, "/inputs/flow.ys")?,
+            DockerMount::read_write(payload_dir, "/outputs")?,
+        ];
+
+        let run_trace = execute_yosys_persistent_runner_script(
+            &docker_image_content_ref(&runtime.docker_image_id)?,
+            &mounts,
+            &env,
+            script,
+            action_id,
+        )?;
+        commands.push(run_trace);
     }
-
-    let mounts = vec![
-        DockerMount::read_only(&verilog_input_path, "/inputs/input.v")?,
-        DockerMount::read_only(&yosys_script_path, "/inputs/flow.ys")?,
-        DockerMount::read_write(payload_dir, "/outputs")?,
-    ];
-
-    let run_trace = execute_yosys_persistent_runner_script(
-        &docker_image_content_ref(&runtime.docker_image_id)?,
-        &mounts,
-        &env,
-        script,
-        action_id,
-    )?;
-    commands.push(run_trace);
 
     let output_artifact = ArtifactRef {
         action_id: action_id.to_string(),
@@ -5253,12 +5264,18 @@ pub(crate) fn run_aig_to_yosys_abc_aig_action(
     let yosys_script_path = resolve_script_ref(repo_root, yosys_script_ref)?;
 
     let mut commands = Vec::new();
-    let build_trace = ensure_yosys_image(repo_root, runtime)?;
-    if let Some(trace) = build_trace {
-        commands.push(trace);
-    }
+    let cache_action = ActionSpec::AigToYosysAbcAig {
+        aig_action_id: aig_action_id.to_string(),
+        yosys_script_ref: yosys_script_ref.clone(),
+        runtime: runtime.clone(),
+    };
+    if !crate::downstream_cache::restore(store, repo_root, &cache_action, payload_dir)? {
+        let build_trace = ensure_yosys_image(repo_root, runtime)?;
+        if let Some(trace) = build_trace {
+            commands.push(trace);
+        }
 
-    let script = r#"
+        let script = r#"
 set -euo pipefail
 {
   echo "read_aiger /inputs/input.aig"
@@ -5269,20 +5286,21 @@ yosys -s /tmp/run.ys
 test -s /outputs/result.aig
 "#;
 
-    let mounts = vec![
-        DockerMount::read_only(&aig_input_path, "/inputs/input.aig")?,
-        DockerMount::read_only(&yosys_script_path, "/inputs/flow.ys")?,
-        DockerMount::read_write(payload_dir, "/outputs")?,
-    ];
-    let env = BTreeMap::new();
-    let run_trace = execute_yosys_persistent_runner_script(
-        &docker_image_content_ref(&runtime.docker_image_id)?,
-        &mounts,
-        &env,
-        script,
-        action_id,
-    )?;
-    commands.push(run_trace);
+        let mounts = vec![
+            DockerMount::read_only(&aig_input_path, "/inputs/input.aig")?,
+            DockerMount::read_only(&yosys_script_path, "/inputs/flow.ys")?,
+            DockerMount::read_write(payload_dir, "/outputs")?,
+        ];
+        let env = BTreeMap::new();
+        let run_trace = execute_yosys_persistent_runner_script(
+            &docker_image_content_ref(&runtime.docker_image_id)?,
+            &mounts,
+            &env,
+            script,
+            action_id,
+        )?;
+        commands.push(run_trace);
+    }
 
     let output_artifact = ArtifactRef {
         action_id: action_id.to_string(),
@@ -5455,46 +5473,53 @@ test -s /outputs/stats.raw.json
         }
     } else {
         ensure_aiger_input_header(&aig_input_path)?;
-        if let Some(trace) = ensure_driver_image(repo_root, runtime)? {
-            commands.push(trace);
-        }
-        if let Some(trace) = ensure_driver_release_cache(
-            store,
-            repo_root,
-            &runtime_xlsynth_version,
-            &runtime.release_platform,
-            &runtime.release_cache_input_sha256,
-        )? {
-            commands.push(trace);
-        }
-        let script = driver_script(
-            r#"
+        let cache_action = ActionSpec::DriverAigToStats {
+            aig_action_id: aig_action_id.to_string(),
+            version: version.to_string(),
+            runtime: runtime.clone(),
+        };
+        if !crate::downstream_cache::restore(store, repo_root, &cache_action, payload_dir)? {
+            if let Some(trace) = ensure_driver_image(repo_root, runtime)? {
+                commands.push(trace);
+            }
+            if let Some(trace) = ensure_driver_release_cache(
+                store,
+                repo_root,
+                &runtime_xlsynth_version,
+                &runtime.release_platform,
+                &runtime.release_cache_input_sha256,
+            )? {
+                commands.push(trace);
+            }
+            let script = driver_script(
+                r#"
 xlsynth-driver aig-stats /inputs/input.aig --output_json /outputs/stats.json
 test -s /outputs/stats.json
 "#,
-        );
-        let mut env = BTreeMap::new();
-        env.insert(
-            "XLSYNTH_VERSION".to_string(),
-            runtime_xlsynth_version.clone(),
-        );
-        env.insert(
-            "XLSYNTH_PLATFORM".to_string(),
-            runtime.release_platform.to_string(),
-        );
-        let mounts = vec![
-            DockerMount::read_only(&aig_input_path, "/inputs/input.aig")?,
-            DockerMount::read_write(payload_dir, "/outputs")?,
-            driver_cache_mount(store, runtime)?,
-        ];
-        let run_trace = execute_persistent_runner_script(
-            &docker_image_content_ref(&runtime.docker_image_id)?,
-            &mounts,
-            &env,
-            &script,
-            action_id,
-        )?;
-        commands.push(run_trace);
+            );
+            let mut env = BTreeMap::new();
+            env.insert(
+                "XLSYNTH_VERSION".to_string(),
+                runtime_xlsynth_version.clone(),
+            );
+            env.insert(
+                "XLSYNTH_PLATFORM".to_string(),
+                runtime.release_platform.to_string(),
+            );
+            let mounts = vec![
+                DockerMount::read_only(&aig_input_path, "/inputs/input.aig")?,
+                DockerMount::read_write(payload_dir, "/outputs")?,
+                driver_cache_mount(store, runtime)?,
+            ];
+            let run_trace = execute_persistent_runner_script(
+                &docker_image_content_ref(&runtime.docker_image_id)?,
+                &mounts,
+                &env,
+                &script,
+                action_id,
+            )?;
+            commands.push(run_trace);
+        }
         details.insert("aig_stats_mode".to_string(), json!("aiger_aig_stats"));
     }
 

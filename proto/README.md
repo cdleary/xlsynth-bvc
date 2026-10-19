@@ -14,6 +14,10 @@ static-publication boundaries.
   format changes therefore do not trigger evaluation-store migrations.
 - A package-version change is distinct from an operational record-version or
   action-identity-version change.
+- Disposable downstream execution caches use `xlsynth.bvc.cache.v1`, generated
+  separately from the store descriptor. Entries embed canonical provenance;
+  reuse receipts are canonical action payloads. Cache keys carry an explicit
+  execution revision that must change when downstream command semantics change.
 - Generated Rust is produced by the pinned `prost-build` and vendored
   `protoc` dependencies in `Cargo.lock`.
 

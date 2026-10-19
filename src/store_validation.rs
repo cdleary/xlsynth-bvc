@@ -669,7 +669,7 @@ mod tests {
             action,
             error: "test failure".to_string(),
         };
-        let db = sled::open(&db_path).expect("open sled");
+        let db = crate::store::open_sled_db(sled::Config::new().path(&db_path)).expect("open sled");
         let tree = db.open_tree("failed_by_action").expect("open failed tree");
         tree.insert(
             "e".repeat(64).as_bytes(),

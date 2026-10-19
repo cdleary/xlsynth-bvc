@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: Apache-2.0
+syntax = "proto3";
+package xlsynth.bvc.cache.v1;
+
+import "xlsynth/bvc/v1/action.proto";
+import "xlsynth/bvc/v1/common.proto";
+import "xlsynth/bvc/v1/provenance.proto";
+
+// Separate from the canonical store descriptor: cache evolution must not require
+// upgrading active stores. Bump execution_revision when executor semantics change.
+message ExecutionKey {
+  uint32 execution_revision = 1;
+  xlsynth.bvc.v1.Sha256Digest input_sha256 = 2;
+  oneof stage {
+    VerilogToAig verilog_to_aig = 10;
+    AigToAig aig_to_aig = 11;
+    AigToStats aig_to_stats = 12;
+  }
+}
+message VerilogToAig {
+  xlsynth.bvc.v1.YosysRuntimeSpec runtime = 1;
+  xlsynth.bvc.v1.ScriptRef script = 2;
+  xlsynth.bvc.v1.YosysVerilogFrontend frontend = 3;
+  optional string top = 4;
+  bool system_verilog = 5;
+}
+message AigToAig {
+  xlsynth.bvc.v1.YosysRuntimeSpec runtime = 1;
+  xlsynth.bvc.v1.ScriptRef script = 2;
+}
+message AigToStats {
+  xlsynth.bvc.v1.DriverRuntimeSpec runtime = 1;
+  xlsynth.bvc.v1.DsoVersion dso_version = 2;
+}
+message Entry {
+  ExecutionKey key = 1;
+  xlsynth.bvc.v1.Provenance source = 2;
+  xlsynth.bvc.v1.Provenance input = 3;
+  bytes output = 4;
+}
+// Stored in the new action's payload, alongside its independently recorded
+// current dependencies. No command is fabricated for a reused computation.
+message ReuseReceipt {
+  ExecutionKey key = 1;
+  xlsynth.bvc.v1.ActionId source_action_id = 2;
+  xlsynth.bvc.v1.Sha256Digest output_sha256 = 3;
+  xlsynth.bvc.v1.Provenance source = 4;
+  xlsynth.bvc.v1.Provenance input = 5;
+}
