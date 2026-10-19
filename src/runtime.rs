@@ -161,7 +161,7 @@ pub(crate) fn resolve_driver_runtime_for_dslx_list_fns(
     )
 }
 
-fn bound_driver_runtime_for_driver_version(
+pub(crate) fn bound_driver_runtime_for_driver_version(
     repo_root: &Path,
     driver_version: &str,
     release_platform: &str,

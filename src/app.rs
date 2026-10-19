@@ -148,6 +148,7 @@ pub(crate) fn run() -> Result<()> {
     let Cli {
         store_dir,
         artifacts_via_sled,
+        downstream_cache_dir,
         command,
     } = Cli::parse();
     let repo_root = std::env::current_dir().context("getting current directory")?;
@@ -187,6 +188,8 @@ pub(crate) fn run() -> Result<()> {
         yosys_script,
         priority,
         scheduling_policy,
+        stats_driver_version,
+        prepare_threads,
         driver,
         yosys,
     } = command
@@ -204,6 +207,9 @@ pub(crate) fn run() -> Result<()> {
             yosys_script.as_deref(),
             priority,
             scheduling_policy,
+            stats_driver_version.as_deref(),
+            prepare_threads,
+            downstream_cache_dir.as_deref(),
             driver,
             yosys,
         )?;
@@ -547,10 +553,21 @@ pub(crate) fn run() -> Result<()> {
         )?;
         return Ok(());
     }
-    let store = ArtifactStore::new_with_sled(store_dir, artifacts_via_sled.clone());
+    let mut store = ArtifactStore::new_with_sled(store_dir, artifacts_via_sled.clone());
+    store.downstream_cache_dir = downstream_cache_dir;
     store.ensure_layout()?;
 
     match command {
+        TopCommand::SeedDownstreamCache {
+            cache_dir,
+            action_id,
+        } => {
+            let seeded = crate::downstream_cache::seed(&store, &repo_root, &cache_dir, &action_id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({"seeded_actions": seeded}))?
+            );
+        }
         TopCommand::Run { action } => {
             let action_spec = run_action_to_spec(&repo_root, action)?;
             let (action_id, artifact_ref) = execute_action(&store, action_spec)?;
