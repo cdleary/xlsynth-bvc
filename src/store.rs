@@ -28,6 +28,29 @@ use crate::proto::{
 use crate::queue::action_dependency_action_ids;
 use crate::snapshot::snapshot_web_index_path;
 
+const SLED_OPEN_LOCK_RETRIES: usize = 20;
+const SLED_OPEN_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
+
+fn retry_sled_open<T>(
+    mut open: impl FnMut() -> sled::Result<T>,
+    mut pause: impl FnMut(Duration),
+) -> sled::Result<T> {
+    for attempt in 0..=SLED_OPEN_LOCK_RETRIES {
+        match open() {
+            Err(sled::Error::Io(error))
+                if attempt < SLED_OPEN_LOCK_RETRIES
+                    && error.kind() == std::io::ErrorKind::Other
+                    // sled 0.34 erases the underlying lock error's kind.
+                    && error.to_string().starts_with("could not acquire lock on ") =>
+            {
+                pause(SLED_OPEN_LOCK_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the last attempt always returns its result")
+}
+
 #[derive(Clone, Copy)]
 enum StorePathLeafKind {
     Directory,
@@ -691,17 +714,20 @@ impl SledArtifactBackend {
             })?;
         }
         let cache_capacity = Self::cache_capacity_bytes();
-        let db = sled::Config::new()
+        let config = sled::Config::new()
             .path(&self.db_path)
-            .cache_capacity(cache_capacity)
-            .open()
-            .with_context(|| {
-                format!(
-                    "opening sled db: {} (cache_capacity_bytes={})",
-                    self.db_path.display(),
-                    cache_capacity
-                )
-            })?;
+            .cache_capacity(cache_capacity);
+        // Sled's asynchronous I/O can briefly retain the file lock after the
+        // last application handle is dropped. Bound retries to 500 ms; a live
+        // owner still returns the original lock error, and other errors fail
+        // immediately. No durability or exclusive-ownership rule is relaxed.
+        let db = retry_sled_open(|| config.open(), std::thread::sleep).with_context(|| {
+            format!(
+                "opening sled db: {} (cache_capacity_bytes={})",
+                self.db_path.display(),
+                cache_capacity
+            )
+        })?;
         *guard = Some(db.clone());
         Ok(db)
     }
@@ -3704,6 +3730,78 @@ mod tests {
             .expect("clock before epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn sled_open_retries_released_lock_and_preserves_persisted_rows() {
+        let root = make_test_root("xlsynth-bvc-sled-reopen");
+        let config = sled::Config::new().path(&root);
+        let mut owner = Some(config.open().unwrap());
+        owner.as_ref().unwrap().insert(b"key", b"value").unwrap();
+        owner.as_ref().unwrap().flush().unwrap();
+        let mut pauses = 0;
+        let reopened = retry_sled_open(
+            || config.open(),
+            |delay| {
+                pauses += 1;
+                // Release only after an actual failed acquisition, without a
+                // timing-dependent race between the test and another thread.
+                drop(owner.take());
+                std::thread::sleep(delay);
+            },
+        )
+        .unwrap();
+        assert!((1..=SLED_OPEN_LOCK_RETRIES).contains(&pauses));
+        assert_eq!(reopened.get(b"key").unwrap().unwrap().as_ref(), b"value");
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sled_open_retry_is_bounded_and_does_not_retry_other_errors() {
+        let root = make_test_root("xlsynth-bvc-sled-held-lock");
+        let config = sled::Config::new().path(&root);
+        let owner = config.open().unwrap();
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let error = retry_sled_open(
+            || {
+                attempts += 1;
+                config.open()
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap_err();
+        assert!(matches!(error, sled::Error::Io(_)));
+        assert_eq!(attempts, SLED_OPEN_LOCK_RETRIES + 1);
+        assert_eq!(
+            delays,
+            vec![SLED_OPEN_LOCK_RETRY_DELAY; SLED_OPEN_LOCK_RETRIES]
+        );
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            let mut attempts = 0;
+            let error = retry_sled_open(
+                || {
+                    attempts += 1;
+                    Err::<(), _>(sled::Error::Io(std::io::Error::new(
+                        kind,
+                        "unrelated I/O error",
+                    )))
+                },
+                |_| panic!("non-lock errors must not be retried"),
+            )
+            .unwrap_err();
+            let sled::Error::Io(error) = error else {
+                panic!("expected original I/O error");
+            };
+            assert_eq!(error.kind(), kind);
+            assert_eq!(attempts, 1);
+        }
+        drop(owner);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
