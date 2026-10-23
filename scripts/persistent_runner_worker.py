@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import fcntl
 import json
 import os
 import platform
@@ -16,6 +17,7 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TextIO
 
 
 SCHEMA_VERSION = 2
@@ -76,6 +78,28 @@ def ensure_mount_target(target: str, source: str) -> None:
     os.symlink(source, target)
 
 
+def write_heartbeat(
+    heartbeat_path: Path,
+    instance_id: str,
+    runner_key: str,
+    state_fn,
+) -> None:
+    state, current_request_id, idle_since_unix_seconds = state_fn()
+    write_json_atomic(
+        heartbeat_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "runner_instance_id": instance_id,
+            "runner_key": runner_key,
+            "state": state,
+            "current_request_id": current_request_id,
+            "idle_since_unix_seconds": idle_since_unix_seconds,
+            "started_utc": state_fn.started_utc,
+            "last_heartbeat_utc": utc_now(),
+        },
+    )
+
+
 def heartbeat_thread_fn(
     heartbeat_path: Path,
     instance_id: str,
@@ -84,20 +108,7 @@ def heartbeat_thread_fn(
     stop_event: threading.Event,
 ) -> None:
     while not stop_event.wait(HEARTBEAT_INTERVAL_SECS):
-        state, current_request_id, idle_since_unix_seconds = state_fn()
-        write_json_atomic(
-            heartbeat_path,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "runner_instance_id": instance_id,
-                "runner_key": runner_key,
-                "state": state,
-                "current_request_id": current_request_id,
-                "idle_since_unix_seconds": idle_since_unix_seconds,
-                "started_utc": state_fn.started_utc,
-                "last_heartbeat_utc": utc_now(),
-            },
-        )
+        write_heartbeat(heartbeat_path, instance_id, runner_key, state_fn)
 
 
 def list_inbox_requests(inbox_dir: Path) -> list[Path]:
@@ -124,6 +135,36 @@ def claim_request(inbox_dir: Path, processing_dir: Path) -> Path | None:
         except OSError:
             continue
     return None
+
+
+def try_reserve_idle_retirement(
+    runner_root: Path, idle_ttl_secs: int, idle_since_monotonic: float
+) -> TextIO | None:
+    """Return a held slot lock if this idle worker can safely retire.
+
+    The host holds the same flock from selection through result writeback. In
+    particular, an empty inbox alone does not mean a caller has no reservation.
+    The caller must publish a final retired heartbeat before closing this lock.
+    """
+    if idle_ttl_secs == 0 or time.monotonic() - idle_since_monotonic < idle_ttl_secs:
+        return None
+    # Startup creates this file on the host; never replace its inode.
+    slot_lock = (runner_root / "slot.lock").open("r+")
+    try:
+        try:
+            fcntl.flock(slot_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            slot_lock.close()
+            return None
+        if list_inbox_requests(runner_root / "inbox") or list_inbox_requests(
+            runner_root / "processing"
+        ):
+            slot_lock.close()
+            return None
+        return slot_lock
+    except BaseException:
+        slot_lock.close()
+        raise
 
 
 def write_result(result_path: Path, payload: dict) -> None:
@@ -347,7 +388,10 @@ def main() -> int:
     parser.add_argument("--runner-instance-id", required=True)
     parser.add_argument("--container-name", required=True)
     parser.add_argument("--image", required=True)
+    parser.add_argument("--idle-ttl-secs", type=int, required=True)
     args = parser.parse_args()
+    if args.idle_ttl_secs < 0:
+        parser.error("--idle-ttl-secs must be nonnegative (0 disables retirement)")
 
     store_root = Path(args.store_root)
     runner_root = Path(args.runner_root)
@@ -413,18 +457,36 @@ def main() -> int:
     )
     heartbeat_thread.start()
 
+    idle_since_monotonic = time.monotonic()
+    retirement_lock = None
     try:
         while True:
             sync_cache_symlink(store_root)
             request_path = claim_request(inbox_dir, processing_dir)
             if request_path is None:
+                retirement_lock = try_reserve_idle_retirement(
+                    runner_root, args.idle_ttl_secs, idle_since_monotonic
+                )
+                if retirement_lock is not None:
+                    break
                 time.sleep(0.2)
                 continue
             if not process_request(request_path, results_dir, archive_dir, heartbeat_state):
                 break
+            idle_since_monotonic = time.monotonic()
     finally:
         stop_event.set()
-        heartbeat_thread.join(timeout=2.0)
+        heartbeat_thread.join()
+        if retirement_lock is not None:
+            # Do not let a final background heartbeat overwrite this terminal
+            # state, or let a new host select us in the interval before exit.
+            with retirement_lock:
+                heartbeat_state["state"] = "retired"
+                heartbeat_state["idle_since_unix_seconds"] = None
+                write_heartbeat(
+                    heartbeat_path, args.runner_instance_id, args.runner_key, state_fn
+                )
+    return 0
 
 
 if __name__ == "__main__":

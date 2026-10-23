@@ -41,6 +41,9 @@ jobs:
       - name: Test version compatibility metadata
         run: python3 scripts/version_compat_metadata_test.py
 
+      - name: Test persistent runner lifecycle
+        run: python3 scripts/persistent_runner_worker_test.py
+
       - name: Typecheck
         run: cargo check --all-targets
 

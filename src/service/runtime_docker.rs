@@ -1916,6 +1916,7 @@ fn persistent_runner_key(image: &str, store_root: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"xlsynth-bvc/persistent-runner/v2\0");
     hasher.update(PERSISTENT_RUNNER_SCHEMA_VERSION.to_le_bytes());
+    hasher.update(persistent_runner_idle_ttl_secs().to_le_bytes());
     hasher.update(include_bytes!("../../scripts/persistent_runner_worker.py"));
     hasher.update([0]);
     hasher.update(image.as_bytes());
@@ -2076,7 +2077,13 @@ fn load_driver_runner_capabilities(
     let runner_key = persistent_runner_slot_key(&base_runner_key, pool_size, 0);
     let container_name = persistent_runner_container_name(&image, &runner_key);
     let runner_paths = PersistentRunnerPaths::new(&store.root, &runner_key);
-    ensure_persistent_runner_started(
+    let _guard = persistent_runner_start_lock()
+        .lock()
+        .map_err(|_| anyhow!("persistent runner start lock poisoned"))?;
+    // Keep the slot reserved through capability reads and any restart, not
+    // merely startup: the worker may now retire without a live host process.
+    let _slot_guard = PersistentRunnerSlotGuard::acquire(&runner_paths)?;
+    ensure_persistent_runner_started_locked(
         repo_root,
         &store.root,
         &image,
@@ -2087,7 +2094,7 @@ fn load_driver_runner_capabilities(
     let mut capabilities = read_persistent_runner_capabilities(&runner_paths)?;
     if capabilities.runner_family == "driver" && capabilities.driver_subcommands.is_empty() {
         cleanup_persistent_runner_container(&container_name).ok();
-        ensure_persistent_runner_started(
+        ensure_persistent_runner_started_locked(
             repo_root,
             &store.root,
             &image,
@@ -2418,19 +2425,6 @@ fn persistent_runner_is_idle(paths: &PersistentRunnerPaths) -> Result<bool> {
         && heartbeat.idle_since_unix_seconds.is_some())
 }
 
-fn persistent_runner_idle_age_secs(paths: &PersistentRunnerPaths) -> Option<u64> {
-    let heartbeat = read_persistent_runner_heartbeat(paths).ok()??;
-    if heartbeat.state != "idle" || heartbeat.current_request_id.is_some() {
-        return None;
-    }
-    let idle_since = heartbeat.idle_since_unix_seconds?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    now.checked_sub(idle_since)
-}
-
 fn cleanup_persistent_runner_container(container_name: &str) -> Result<()> {
     let output = Command::new("docker")
         .args(["rm", "-f", container_name])
@@ -2440,6 +2434,19 @@ fn cleanup_persistent_runner_container(container_name: &str) -> Result<()> {
         || String::from_utf8_lossy(&output.stderr).contains("No such container")
     {
         return Ok(());
+    }
+    // An idle worker can exit while we inspect it. Docker's --rm may already
+    // be removing that container; wait for its name to become reusable.
+    if String::from_utf8_lossy(&output.stderr).contains("removal of container")
+        && String::from_utf8_lossy(&output.stderr).contains("already in progress")
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if docker_container_id(container_name)?.is_none() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
     }
     bail!(
         "failed removing persistent runner container {}: {}",
@@ -2462,28 +2469,6 @@ fn cleanup_persistent_runner_container_if_id(
     Ok(true)
 }
 
-fn ensure_persistent_runner_started(
-    repo_root: &Path,
-    store_root: &Path,
-    image: &str,
-    runner_key: &str,
-    container_name: &str,
-    runner_paths: &PersistentRunnerPaths,
-) -> Result<()> {
-    let _guard = persistent_runner_start_lock()
-        .lock()
-        .map_err(|_| anyhow!("persistent runner start lock poisoned"))?;
-    let _slot_guard = PersistentRunnerSlotGuard::acquire(runner_paths)?;
-    ensure_persistent_runner_started_locked(
-        repo_root,
-        store_root,
-        image,
-        runner_key,
-        container_name,
-        runner_paths,
-    )
-}
-
 fn ensure_persistent_runner_started_locked(
     repo_root: &Path,
     store_root: &Path,
@@ -2495,7 +2480,11 @@ fn ensure_persistent_runner_started_locked(
     if docker_container_is_running(container_name)? {
         let expected_image_id = inspect_image_id(image)?
             .with_context(|| format!("persistent runner image `{image}` is missing"))?;
-        if docker_container_image_id(container_name)?.as_deref() == Some(expected_image_id.as_str())
+        let retired = read_persistent_runner_heartbeat(runner_paths)?
+            .is_some_and(|heartbeat| heartbeat.state == "retired");
+        if !retired
+            && docker_container_image_id(container_name)?.as_deref()
+                == Some(expected_image_id.as_str())
         {
             return Ok(());
         }
@@ -2532,6 +2521,7 @@ fn ensure_persistent_runner_started_locked(
     let args: Vec<OsString> = vec![
         OsString::from("run"),
         OsString::from("-d"),
+        OsString::from("--rm"),
         OsString::from("--name"),
         OsString::from(container_name.to_string()),
         OsString::from("--pull"),
@@ -2580,6 +2570,8 @@ fn ensure_persistent_runner_started_locked(
         OsString::from(container_name.to_string()),
         OsString::from("--image"),
         OsString::from(image.to_string()),
+        OsString::from("--idle-ttl-secs"),
+        OsString::from(persistent_runner_idle_ttl_secs().to_string()),
     ];
     let output = Command::new("docker")
         .args(&args)
@@ -2639,38 +2631,6 @@ fn persistent_runner_slot_status(
     })
 }
 
-fn cleanup_idle_persistent_runner_pool_slots(
-    store_root: &Path,
-    image: &str,
-    base_runner_key: &str,
-    pool_size: usize,
-) -> Result<()> {
-    if pool_size <= 1 {
-        return Ok(());
-    }
-    let ttl_secs = persistent_runner_idle_ttl_secs();
-    if ttl_secs == 0 {
-        return Ok(());
-    }
-    for slot in 1..pool_size {
-        let runner_key = persistent_runner_slot_key(base_runner_key, pool_size, slot);
-        let paths = PersistentRunnerPaths::new(store_root, &runner_key);
-        let Some(_slot_guard) = PersistentRunnerSlotGuard::try_acquire(&paths)? else {
-            continue;
-        };
-        let status =
-            persistent_runner_slot_status(store_root, image, base_runner_key, pool_size, slot)?;
-        if !status.running || !status.idle {
-            continue;
-        }
-        if persistent_runner_idle_age_secs(&status.paths).unwrap_or(0) < ttl_secs {
-            continue;
-        }
-        cleanup_persistent_runner_container(&status.container_name).ok();
-    }
-    Ok(())
-}
-
 fn select_persistent_runner_locked(
     repo_root: &Path,
     store_root: &Path,
@@ -2679,7 +2639,6 @@ fn select_persistent_runner_locked(
 ) -> Result<Option<SelectedPersistentRunner>> {
     let base_runner_key = persistent_runner_key(image, store_root);
     let pool_size = persistent_runner_pool_size(family);
-    cleanup_idle_persistent_runner_pool_slots(store_root, image, &base_runner_key, pool_size)?;
 
     // A slot reservation spans request publication, execution, result handling,
     // writeback, and any container retirement. This deliberately permits no
@@ -3397,7 +3356,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_runner_idle_age_survives_fresh_heartbeats() {
+    fn persistent_runner_idle_state_excludes_retired_workers() {
         let root = make_temp_store_root("idle-age-heartbeats");
         let paths = PersistentRunnerPaths::new(&root, "runner-key");
         paths.ensure_layout().expect("runner layout");
@@ -3419,11 +3378,16 @@ mod tests {
             )
             .expect("refresh heartbeat");
             assert!(persistent_runner_is_idle(&paths).expect("idle state"));
-            assert!(
-                persistent_runner_idle_age_secs(&paths).expect("idle age") >= 30,
-                "fresh heartbeat writes must not reset idle age"
-            );
         }
+
+        let retired = json!({
+            "runner_instance_id": "instance-1",
+            "state": "retired",
+            "current_request_id": null,
+            "idle_since_unix_seconds": null,
+        });
+        fs::write(&paths.heartbeat_path, serde_json::to_vec(&retired).unwrap()).unwrap();
+        assert!(!persistent_runner_is_idle(&paths).expect("retired state"));
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -4086,6 +4050,126 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
                     .output();
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires docker"]
+    fn persistent_runners_retire_without_host_activity_and_restart() -> Result<()> {
+        let _guard = docker_integration_test_lock()
+            .lock()
+            .map_err(|_| anyhow!("docker integration test lock poisoned"))?;
+        anyhow::ensure!(
+            docker_available(),
+            "Docker is required for this explicit test"
+        );
+        let _idle_ttl = ScopedEnvVar::set(PERSISTENT_RUNNER_IDLE_TTL_SECS_ENV, "1");
+        let repo_root = std::env::current_dir()?;
+        let store_root = make_temp_store_root("idle-retirement");
+        let store = ArtifactStore::new(store_root.clone());
+        store.ensure_layout()?;
+        let mut runtime = fake_driver_runtime(
+            "0.39.0",
+            format!(
+                "xlsynth-bvc-fake-driver:{}",
+                unique_test_token("idle-retirement")
+            ),
+        );
+        let image_ref = fingerprint_qualified_image_ref(
+            &runtime.docker_image,
+            "driver",
+            &driver_runtime_fingerprint(&runtime)?,
+        )?;
+        let mut cleanup = DockerCleanup::new(vec![image_ref.clone()]);
+        ensure_driver_image(&repo_root, &runtime)?;
+        runtime.docker_image_id = inspect_image_id(&image_ref)?.context("test driver image")?;
+        let image = docker_image_content_ref(&runtime.docker_image_id)?;
+        let expiring_key = persistent_runner_key(&image, &store.root);
+        {
+            let _disabled = ScopedEnvVar::set(PERSISTENT_RUNNER_IDLE_TTL_SECS_ENV, "0");
+            assert_ne!(persistent_runner_key(&image, &store.root), expiring_key);
+        }
+        let wait_removed = |name: &str| -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while docker_container_id(name)?.is_some() {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "idle runner did not retire: {name}"
+                );
+                thread::sleep(Duration::from_millis(100));
+            }
+            Ok(())
+        };
+
+        // Cover the singleton pool as well as slot zero and a nonzero slot.
+        for pool_size in [1, 2] {
+            let _pool_size = ScopedEnvVar::set(
+                PERSISTENT_RUNNER_DRIVER_POOL_SIZE_ENV,
+                &pool_size.to_string(),
+            );
+            let base_key = persistent_runner_key(&image, &store.root);
+            let mut names = Vec::new();
+            for slot in 0..pool_size {
+                let key = persistent_runner_slot_key(&base_key, pool_size, slot);
+                let name = persistent_runner_container_name(&image, &key);
+                cleanup.add_container(name.clone());
+                names.push(name);
+            }
+            let mut reservations = Vec::new();
+            {
+                let _start = persistent_runner_start_lock().lock().unwrap();
+                for _ in 0..pool_size {
+                    reservations.push(
+                        select_persistent_runner_locked(
+                            &repo_root,
+                            &store.root,
+                            &image,
+                            PersistentRunnerFamily::Driver,
+                        )?
+                        .context("available slot")?,
+                    );
+                }
+            }
+            let first_instance = reservations[0].runner_instance_id.clone();
+            // Empty inboxes are not sufficient: a host may still be preparing
+            // a request or copying its results while holding the reservation.
+            thread::sleep(Duration::from_secs(2));
+            for name in &names {
+                assert!(docker_container_is_running(name)?);
+            }
+            drop(reservations);
+            for name in &names {
+                wait_removed(name)?;
+            }
+
+            // Capability probing must recreate a retired slot-zero runner.
+            let capabilities = load_driver_runner_capabilities(&store, &repo_root, &runtime)?;
+            assert_eq!(capabilities.runner_family, "driver");
+            let key = persistent_runner_slot_key(&base_key, pool_size, 0);
+            let paths = PersistentRunnerPaths::new(&store.root, &key);
+            let restarted = read_persistent_runner_heartbeat(&paths)?.context("new heartbeat")?;
+            assert_ne!(restarted.runner_instance_id, first_instance);
+
+            // A job longer than the idle timeout still completes and its
+            // externally written result survives the subsequent retirement.
+            let output = store.staging_dir().join(format!("idle-output-{pool_size}"));
+            fs::create_dir_all(&output)?;
+            execute_persistent_runner_script_with_timeout(
+                &image,
+                &[DockerMount::read_write(&output, "/outputs")?],
+                &BTreeMap::new(),
+                "sleep 2; printf completed > /outputs/result.txt",
+                "idle-retirement-active-job",
+                30,
+            )?;
+            for name in &names {
+                wait_removed(name)?;
+            }
+            assert_eq!(fs::read_to_string(output.join("result.txt"))?, "completed");
+            assert!(!persistent_runner_is_idle(&paths)?);
+        }
+        drop(cleanup);
+        fs::remove_dir_all(&store_root)?;
+        Ok(())
     }
 
     #[test]

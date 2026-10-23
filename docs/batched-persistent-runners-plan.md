@@ -42,8 +42,24 @@ Each persistent container acts as a single-runner request loop:
 - write `stdout.log`, `stderr.log`, `result.json`, and heartbeat updates
 
 Heartbeat updates carry both the current state and an explicit idle-start
-timestamp. File freshness is used for liveness; idle-pool TTL cleanup measures
-from the idle-start timestamp so periodic heartbeats do not extend slot life.
+timestamp. File freshness is used for liveness. Every worker, including slot zero
+and singleton pools, exits after an uninterrupted idle interval measured with a
+monotonic clock. Heartbeat writes do not reset that interval; completing a request
+does. This works even after all host workers have exited.
+
+`XLSYNTH_BVC_PERSISTENT_RUNNER_IDLE_TTL_SECS` controls the interval (default 900
+seconds; `0` disables idle retirement). The host passes the policy at startup and
+includes it in the runner identity, so changing it cannot reuse a runner with an
+older policy. Before retiring, the worker acquires the same `slot.lock` reservation
+as the host and checks that both inbox and processing directories are empty. The
+host holds that reservation through preparation, execution, and result writeback;
+capability reads and restarts also reserve the slot. Retirement publishes a final
+`retired` heartbeat before releasing the lock, preventing selection during exit.
+
+Docker removes exited containers automatically (`--rm`). The next request starts
+a replacement as needed. Idle retirement does not delete the bind-mounted store,
+completed results, or caches. Containers started by older binaries do not acquire
+this behavior retroactively and need a separately verified idle-runner cleanup.
 
 The worker does not know anything about the global queue or provenance model.
 
@@ -80,6 +96,7 @@ bvc-artifacts/
         live.json
         heartbeat.json
         capabilities.json
+        slot.lock
         inbox/
         processing/
         results/
