@@ -2198,10 +2198,27 @@ impl ArtifactBackend for SledArtifactBackend {
 
         let mut staged_files: Vec<(String, Vec<u8>)> = Vec::new();
         let mut provenance_bytes: Option<Vec<u8>> = None;
+        // Reuse requires a link-count check. Platforms without the Unix metadata
+        // API conservatively keep the DB-driven materialization path.
+        let mut reusable_staging = cfg!(unix);
         for entry in WalkDir::new(staging_dir).sort_by_file_name() {
             let entry = entry.context("walking staged action directory for sled ingest")?;
+            // The canonical store contains regular files only. Do not retain links or
+            // special files that ingestion intentionally omits from the materialized view.
+            reusable_staging &= entry.file_type().is_file() || entry.file_type().is_dir();
             if !entry.file_type().is_file() {
                 continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                // A regular file can still share its inode with an external hard
+                // link. Rebuild from canonical bytes to isolate it from later writes.
+                reusable_staging &= entry
+                    .metadata()
+                    .context("reading staged file link count")?
+                    .nlink()
+                    == 1;
             }
             let path = entry.path();
             let rel = path
@@ -2299,7 +2316,21 @@ impl ArtifactBackend for SledArtifactBackend {
 
         let materialized_dir = self.materialized_action_dir_for(store_root, action_id);
         if inserted && materialized_dir.exists() {
-            fs::remove_dir_all(&materialized_dir).ok();
+            fs::remove_dir_all(&materialized_dir)
+                .context("invalidating prior materialization after immutable promotion")?;
+        }
+        if inserted && reusable_staging {
+            // Only the transaction winner owns these canonical bytes. Keep its already
+            // produced files as the disposable materialized cache, after the durable DB
+            // flush and while readers/replacement remain excluded by the promotion lock.
+            // Losers must never publish their potentially different payload or provenance.
+            // This cache has the same durability contract as DB-driven materialization:
+            // the canonical database, not these files, is the recovery source of truth.
+            if let Err(error) = promote_staging_action_dir_fs(staging_dir, &materialized_dir) {
+                // Cache publication is optional; downstream readers can rebuild it from
+                // the committed database. A failed rename cannot expose a partial directory.
+                warn!("unable to retain promoted artifact materialization: {error:#}");
+            }
         }
         fs::remove_dir_all(staging_dir).ok();
         Ok(())
@@ -3732,6 +3763,8 @@ mod tests {
     use std::sync::{Arc, Barrier, mpsc};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    include!("store/promotion_benchmark.rs");
+
     fn make_test_root(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4467,6 +4500,154 @@ mod tests {
         assert!(!second.exists());
 
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn sled_promotion_retains_staged_files_and_rebuilds_after_cache_loss() {
+        let root = make_test_root("xlsynth-bvc-store-retain-staging");
+        let db_path = root.join("store.sled");
+        let store = ArtifactStore::new_with_sled(root.clone(), db_path.clone());
+        store.ensure_layout().unwrap();
+        let provenance = make_test_provenance(&"1".repeat(64), "payload/result.txt", 7);
+        let staging = stage_test_sled_action(&store, &provenance, "winner", b"payload");
+        let original_provenance = fs::read(staging.join("provenance.pb")).unwrap();
+        #[cfg(unix)]
+        let original_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(staging.join("payload/result.txt"))
+                .unwrap()
+                .ino()
+        };
+        store
+            .promote_staging_action_dir(&provenance.action_id, &staging)
+            .unwrap();
+        let cached = store.action_dir(&provenance.action_id);
+        // On Unix, inspect directly: materializing first would hide a rebuild.
+        // Other platforms deliberately fall back without a verified link count.
+        #[cfg(not(unix))]
+        {
+            assert!(!cached.exists());
+            assert_eq!(
+                store.materialize_action_dir(&provenance.action_id).unwrap(),
+                cached
+            );
+        }
+        assert!(!staging.exists());
+        assert_eq!(
+            fs::read(cached.join("payload/result.txt")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            fs::read(cached.join("provenance.pb")).unwrap(),
+            original_provenance
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                fs::metadata(cached.join("payload/result.txt"))
+                    .unwrap()
+                    .ino(),
+                original_inode
+            );
+        }
+        drop(store);
+
+        // Losing the entire disposable cache across restart cannot lose committed results.
+        fs::remove_dir_all(&cached).unwrap();
+        let reopened = ArtifactStore::new_with_sled(root.clone(), db_path);
+        reopened.ensure_layout().unwrap();
+        let rebuilt = reopened
+            .materialize_action_dir(&provenance.action_id)
+            .unwrap();
+        assert_eq!(
+            fs::read(rebuilt.join("payload/result.txt")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            fs::read(rebuilt.join("provenance.pb")).unwrap(),
+            original_provenance
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sled_promotion_does_not_retain_unstored_symlinks() {
+        let root = make_test_root("xlsynth-bvc-store-retain-no-links");
+        let store = ArtifactStore::new_with_sled(root.clone(), root.join("store.sled"));
+        store.ensure_layout().unwrap();
+        let provenance = make_test_provenance(&"2".repeat(64), "payload/result.txt", 7);
+        let staging = stage_test_sled_action(&store, &provenance, "winner", b"payload");
+        std::os::unix::fs::symlink("result.txt", staging.join("payload/unstored-link")).unwrap();
+        store
+            .promote_staging_action_dir(&provenance.action_id, &staging)
+            .unwrap();
+        assert!(!store.action_dir(&provenance.action_id).exists());
+        let rebuilt = store.materialize_action_dir(&provenance.action_id).unwrap();
+        assert_eq!(
+            fs::read(rebuilt.join("payload/result.txt")).unwrap(),
+            b"payload"
+        );
+        assert!(fs::symlink_metadata(rebuilt.join("payload/unstored-link")).is_err());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn assert_sled_promotion_detaches_hard_link(relpath: &str) {
+        let root = make_test_root("xlsynth-bvc-store-retain-no-hard-links");
+        let store = ArtifactStore::new_with_sled(root.clone(), root.join("store.sled"));
+        store.ensure_layout().unwrap();
+        let provenance = make_test_provenance(&"3".repeat(64), "payload/result.txt", 7);
+        let staging = stage_test_sled_action(&store, &provenance, "winner", b"payload");
+        let original_provenance = fs::read(staging.join("provenance.pb")).unwrap();
+        let external_link = root.join("external-link");
+        fs::hard_link(staging.join(relpath), &external_link).unwrap();
+
+        store
+            .promote_staging_action_dir(&provenance.action_id, &staging)
+            .unwrap();
+        let cached = store.materialize_action_dir(&provenance.action_id).unwrap();
+        fs::write(&external_link, b"changed through an external hard link").unwrap();
+
+        // Repeated cache hits must still agree with the committed artifact after a
+        // write through the external link, for both payload and provenance files.
+        assert_eq!(
+            store.materialize_action_dir(&provenance.action_id).unwrap(),
+            cached
+        );
+        assert_eq!(
+            fs::read(cached.join("payload/result.txt")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            fs::read(cached.join("provenance.pb")).unwrap(),
+            original_provenance
+        );
+        let canonical = store.load_provenance(&provenance.action_id).unwrap();
+        assert_eq!(
+            canonical.output_files[0].sha256,
+            format!("{:x}", Sha256::digest(b"payload"))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(cached.join(relpath)).unwrap().nlink(), 1);
+        }
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sled_promotion_does_not_retain_hard_linked_payload() {
+        assert_sled_promotion_detaches_hard_link("payload/result.txt");
+    }
+
+    #[test]
+    fn sled_promotion_does_not_retain_hard_linked_provenance() {
+        assert_sled_promotion_detaches_hard_link("provenance.pb");
     }
 
     #[test]

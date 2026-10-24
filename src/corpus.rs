@@ -5528,6 +5528,11 @@ mod tests {
         let output_dir = fixture.output_dir.clone();
         let root = fixture.root.clone();
         let materialized_actions_root = fixture.store.artifacts_dir();
+        // Promotion can retain a disposable materialized copy. Explicitly remove it so
+        // this still verifies that status reads do not reconstruct cold-cache outputs.
+        fs::remove_dir_all(&materialized_actions_root).expect("clear fixture materialization");
+        fs::create_dir_all(&materialized_actions_root)
+            .expect("recreate empty materialization root");
         let materialized_before = WalkDir::new(&materialized_actions_root)
             .into_iter()
             .filter_map(|entry| entry.ok())
