@@ -2198,7 +2198,9 @@ impl ArtifactBackend for SledArtifactBackend {
 
         let mut staged_files: Vec<(String, Vec<u8>)> = Vec::new();
         let mut provenance_bytes: Option<Vec<u8>> = None;
-        let mut reusable_staging = true;
+        // Reuse requires a link-count check. Platforms without the Unix metadata
+        // API conservatively keep the DB-driven materialization path.
+        let mut reusable_staging = cfg!(unix);
         for entry in WalkDir::new(staging_dir).sort_by_file_name() {
             let entry = entry.context("walking staged action directory for sled ingest")?;
             // The canonical store contains regular files only. Do not retain links or
@@ -2206,6 +2208,17 @@ impl ArtifactBackend for SledArtifactBackend {
             reusable_staging &= entry.file_type().is_file() || entry.file_type().is_dir();
             if !entry.file_type().is_file() {
                 continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                // A regular file can still share its inode with an external hard
+                // link. Rebuild from canonical bytes to isolate it from later writes.
+                reusable_staging &= entry
+                    .metadata()
+                    .context("reading staged file link count")?
+                    .nlink()
+                    == 1;
             }
             let path = entry.path();
             let rel = path
@@ -4509,7 +4522,16 @@ mod tests {
             .promote_staging_action_dir(&provenance.action_id, &staging)
             .unwrap();
         let cached = store.action_dir(&provenance.action_id);
-        // Inspect directly: calling materialize first would hide an unwanted rebuild.
+        // On Unix, inspect directly: materializing first would hide a rebuild.
+        // Other platforms deliberately fall back without a verified link count.
+        #[cfg(not(unix))]
+        {
+            assert!(!cached.exists());
+            assert_eq!(
+                store.materialize_action_dir(&provenance.action_id).unwrap(),
+                cached
+            );
+        }
         assert!(!staging.exists());
         assert_eq!(
             fs::read(cached.join("payload/result.txt")).unwrap(),
@@ -4571,6 +4593,61 @@ mod tests {
         assert!(fs::symlink_metadata(rebuilt.join("payload/unstored-link")).is_err());
         drop(store);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn assert_sled_promotion_detaches_hard_link(relpath: &str) {
+        let root = make_test_root("xlsynth-bvc-store-retain-no-hard-links");
+        let store = ArtifactStore::new_with_sled(root.clone(), root.join("store.sled"));
+        store.ensure_layout().unwrap();
+        let provenance = make_test_provenance(&"3".repeat(64), "payload/result.txt", 7);
+        let staging = stage_test_sled_action(&store, &provenance, "winner", b"payload");
+        let original_provenance = fs::read(staging.join("provenance.pb")).unwrap();
+        let external_link = root.join("external-link");
+        fs::hard_link(staging.join(relpath), &external_link).unwrap();
+
+        store
+            .promote_staging_action_dir(&provenance.action_id, &staging)
+            .unwrap();
+        let cached = store.materialize_action_dir(&provenance.action_id).unwrap();
+        fs::write(&external_link, b"changed through an external hard link").unwrap();
+
+        // Repeated cache hits must still agree with the committed artifact after a
+        // write through the external link, for both payload and provenance files.
+        assert_eq!(
+            store.materialize_action_dir(&provenance.action_id).unwrap(),
+            cached
+        );
+        assert_eq!(
+            fs::read(cached.join("payload/result.txt")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            fs::read(cached.join("provenance.pb")).unwrap(),
+            original_provenance
+        );
+        let canonical = store.load_provenance(&provenance.action_id).unwrap();
+        assert_eq!(
+            canonical.output_files[0].sha256,
+            format!("{:x}", Sha256::digest(b"payload"))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(cached.join(relpath)).unwrap().nlink(), 1);
+        }
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sled_promotion_does_not_retain_hard_linked_payload() {
+        assert_sled_promotion_detaches_hard_link("payload/result.txt");
+    }
+
+    #[test]
+    fn sled_promotion_does_not_retain_hard_linked_provenance() {
+        assert_sled_promotion_detaches_hard_link("provenance.pb");
     }
 
     #[test]

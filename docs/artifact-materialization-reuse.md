@@ -1,16 +1,19 @@
 # Reusing promoted artifact files
 
 After an immutable artifact transaction commits and its Sled flush succeeds, the
-transaction winner atomically renames its staging directory into the disposable
-materialized cache. Downstream consumers can use the files already produced by the
-executor instead of recreating them from the database.
+transaction winner atomically renames an eligible staging directory into the
+disposable materialized cache. Downstream consumers can use the files already
+produced by the executor instead of recreating them from the database.
 
 The canonical protobuf provenance and file rows, transaction, and durable flush
 are unchanged. The promotion's shared materialization lock remains held through
 cache publication; materialization and provenance replacement take its exclusive
 side. A conflicting promotion never publishes its losing files. Staging trees
-containing symlinks or special files fall back to DB-driven materialization, which
-includes only the regular files admitted to the canonical store.
+containing symlinks, special files, or multiply linked regular files fall back to
+DB-driven materialization. This includes only the regular files admitted to the
+canonical store and gives them independent inodes, so writes through external
+hard links cannot change the cached payload or provenance. Reuse requires Unix
+link-count metadata; other platforms conservatively use DB-driven materialization.
 
 Cache publication is best-effort and occurs only after the canonical commit is
 durable. The cache has the same rebuildable, non-authoritative status as before;
@@ -22,8 +25,9 @@ to remove an obsolete cache is reported instead of accepting stale contents.
 
 Tests cover inode-preserving retention, first-writer preservation (including
 concurrent conflicting promotions), provenance replacement, cache loss and reopen,
-and symlink exclusion. The status test explicitly starts with an empty cache to
-keep verifying that progress queries do not materialize outputs.
+symlink exclusion, and isolation from external hard-link writes to both payload
+and provenance. The status test explicitly starts with an empty cache to keep
+verifying that progress queries do not materialize outputs.
 
 An ignored promotion-and-consumption benchmark provides a common fixture:
 
@@ -50,6 +54,8 @@ load and compare sustained completed-action rates separately after any live drai
 and resume. Keep the corpus, runtime identities, cache, and concurrency unchanged.
 
 ### Initial results
+
+These measurements predate the hard-link eligibility check.
 
 Eight release-mode trials used 8,192 actions and 32 threads, in ABBA then BAAB
 order, while the live evaluator continued running:
