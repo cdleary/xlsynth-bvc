@@ -586,8 +586,33 @@ fn enqueue_action_with_priority_locked(
     priority: i32,
     action_id: String,
 ) -> Result<String> {
+    if let Some(prepared) =
+        pending_item_for_enqueue_locked(store, action, priority, &action_id, false)?
+    {
+        write_bytes_atomic(
+            store,
+            &store.pending_queue_path(&action_id),
+            &encode_queue_item(&prepared.item)?,
+        )?;
+    }
+    Ok(action_id)
+}
+
+struct PreparedPendingItem {
+    item: QueueItem,
+    is_new: bool,
+    needs_write: bool,
+}
+
+fn pending_item_for_enqueue_locked(
+    store: &ArtifactStore,
+    action: ActionSpec,
+    priority: i32,
+    action_id: &str,
+    refresh_pending: bool,
+) -> Result<Option<PreparedPendingItem>> {
     if store.action_exists(&action_id) {
-        return Ok(action_id);
+        return Ok(None);
     }
 
     let pending_path = store.pending_queue_path(&action_id);
@@ -596,7 +621,7 @@ fn enqueue_action_with_priority_locked(
         || store.failed_action_record_exists(&action_id)
         || store.canceled_queue_path(&action_id).exists()
     {
-        return Ok(action_id);
+        return Ok(None);
     }
 
     if pending_path.exists() {
@@ -611,12 +636,17 @@ fn enqueue_action_with_priority_locked(
         if !bytes.is_empty()
             && let Ok(mut item) = decode_queue_item(&bytes)
             && item.action_id == action_id
-            && item.priority < priority
+            && (refresh_pending || item.priority < priority)
         {
-            item.priority = priority;
-            write_bytes_atomic(store, &pending_path, &encode_queue_item(&item)?)?;
+            let needs_write = item.priority < priority;
+            item.priority = item.priority.max(priority);
+            return Ok(Some(PreparedPendingItem {
+                item,
+                is_new: false,
+                needs_write,
+            }));
         }
-        return Ok(action_id);
+        return Ok(None);
     }
 
     let parent = pending_path
@@ -627,13 +657,75 @@ fn enqueue_action_with_priority_locked(
 
     let item = QueueItem {
         schema_version: crate::ACTION_SCHEMA_VERSION,
-        action_id: action_id.clone(),
+        action_id: action_id.to_string(),
         enqueued_utc: Utc::now(),
         priority,
         action,
     };
-    write_bytes_atomic(store, &pending_path, &encode_queue_item(&item)?)?;
-    Ok(action_id)
+    Ok(Some(PreparedPendingItem {
+        item,
+        is_new: true,
+        needs_write: true,
+    }))
+}
+
+/// Bounded, restartable bulk preparation. Records remain individually atomic protobufs.
+/// Sorted transition locks prevent overlapping batches from deadlocking; the shared migration
+/// lock keeps dependency aliases stable through the final durability acknowledgement.
+pub(crate) fn enqueue_actions_with_priorities(
+    store: &ArtifactStore,
+    actions: &[(ActionSpec, i32)],
+) -> Result<usize> {
+    let mut enqueued = 0;
+    for chunk in actions.chunks(crate::store::MAX_ATOMIC_RECORD_BATCH) {
+        let _migration_lock =
+            QueueTransitionLock::acquire_shared(store, QUEUE_IDENTITY_MIGRATION_LOCK_KEY)?;
+        let mut canonical = BTreeMap::<String, (ActionSpec, i32)>::new();
+        for (action, priority) in chunk {
+            let mut action = action.clone();
+            replace_action_dependency_aliases(store, &mut action)?;
+            let action = crate::executor::canonicalize_action_identity(action);
+            let id = crate::executor::compute_action_id(&action)?;
+            canonical
+                .entry(id)
+                .and_modify(|(_, p)| *p = (*p).max(*priority))
+                .or_insert((action, *priority));
+        }
+        let _locks = canonical
+            .keys()
+            .map(|id| QueueTransitionLock::acquire(store, id))
+            .collect::<Result<Vec<_>>>()?;
+        let mut records = Vec::new();
+        let mut existing = Vec::new();
+        let mut new_count = 0;
+        for (id, (action, priority)) in canonical {
+            // An interrupted batch may have renamed a pending record without syncing its
+            // parent. Finish durability without rewriting unchanged bytes on every resume.
+            if let Some(prepared) =
+                pending_item_for_enqueue_locked(store, action, priority, &id, true)?
+            {
+                if prepared.needs_write {
+                    records.push((
+                        store.pending_queue_path(&id),
+                        encode_queue_item(&prepared.item)?,
+                    ));
+                } else {
+                    existing.push(store.pending_queue_path(&id));
+                }
+                new_count += usize::from(prepared.is_new);
+            }
+        }
+        store.write_records_atomic("queue", &records)?;
+        store.sync_existing_records(&existing)?;
+        for (path, _) in &records {
+            store.pending_path_cache.record_pending(path);
+        }
+        for path in &existing {
+            store.pending_path_cache.record_pending(path);
+        }
+        enqueued += new_count;
+    }
+    Ok(enqueued)
 }
 
 pub(crate) fn retry_action_with_priority(
@@ -3944,6 +4036,170 @@ mod tests {
             discovery_runtime: None,
             stdlib_tarball_sha256: "11".repeat(32),
         }
+    }
+
+    fn bulk_test_actions(count: usize) -> Vec<(ActionSpec, i32)> {
+        (0..count)
+            .map(|i| {
+                (
+                    ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+                        version: "v0.37.0".to_string(),
+                        discovery_runtime: None,
+                        stdlib_tarball_sha256: format!("{i:064x}"),
+                    },
+                    i as i32,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bulk_enqueue_matches_single_records_and_resumes_idempotently() {
+        let (single, single_root) = make_test_store();
+        let (bulk, bulk_root) = make_test_store();
+        let mut actions = bulk_test_actions(270); // Cross the bounded batch boundary.
+        actions.push((actions[0].0.clone(), 1000));
+        for (action, priority) in &actions {
+            enqueue_action_with_priority(&single, action.clone(), *priority).unwrap();
+        }
+        assert_eq!(
+            enqueue_actions_with_priorities(&bulk, &actions).unwrap(),
+            270
+        );
+        let mut timestamps = Vec::new();
+        for (action, _) in &actions {
+            let id = crate::executor::compute_action_id(action).unwrap();
+            let a = load_queue_pending_record(&single, &id).unwrap().unwrap();
+            let b = load_queue_pending_record(&bulk, &id).unwrap().unwrap();
+            assert_eq!(a.action_id, b.action_id);
+            assert_eq!(a.priority, b.priority);
+            assert_eq!(
+                crate::proto::action_spec_to_proto(&a.action).unwrap(),
+                crate::proto::action_spec_to_proto(&b.action).unwrap()
+            );
+            timestamps.push((id, b.enqueued_utc));
+        }
+        assert_eq!(enqueue_actions_with_priorities(&bulk, &actions).unwrap(), 0);
+        for (id, timestamp) in timestamps {
+            assert_eq!(
+                load_queue_pending_record(&bulk, &id)
+                    .unwrap()
+                    .unwrap()
+                    .enqueued_utc,
+                timestamp
+            );
+        }
+        drop(single);
+        drop(bulk);
+        fs::remove_dir_all(single_root).unwrap();
+        fs::remove_dir_all(bulk_root).unwrap();
+    }
+
+    #[test]
+    fn overlapping_bulk_and_single_enqueues_preserve_priority_without_deadlock() {
+        let (store, root) = make_test_store();
+        let store = Arc::new(store);
+        let actions = bulk_test_actions(12);
+        let barrier = Arc::new(Barrier::new(4));
+        let (tx, rx) = mpsc::channel();
+        let mut handles = Vec::new();
+        for worker in 0..4 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let tx = tx.clone();
+            let mut batch = actions.clone();
+            if worker % 2 == 1 {
+                batch.reverse();
+            }
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for (_, priority) in &mut batch {
+                    *priority = worker;
+                }
+                if worker == 0 {
+                    for (action, priority) in batch {
+                        enqueue_action_with_priority(&store, action, priority).unwrap();
+                    }
+                } else {
+                    enqueue_actions_with_priorities(&store, &batch).unwrap();
+                }
+                tx.send(()).unwrap();
+            }));
+        }
+        for _ in 0..4 {
+            rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        for (action, _) in actions {
+            let id = crate::executor::compute_action_id(&action).unwrap();
+            assert_eq!(
+                load_queue_pending_record(&store, &id)
+                    .unwrap()
+                    .unwrap()
+                    .priority,
+                3
+            );
+        }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bulk_enqueue_preserves_running_and_failed_records_and_follows_aliases() {
+        let (store, root) = make_test_store();
+        let actions = bulk_test_actions(2);
+        enqueue_actions_with_priorities(&store, &actions).unwrap();
+        let failed = claim_next_pending_item(&store, "bulk-test", 900)
+            .unwrap()
+            .unwrap();
+        write_failed_record(&store, &failed, "bulk-test", "injected failure").unwrap();
+        let running = claim_next_pending_item(&store, "bulk-test", 900)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            enqueue_actions_with_priorities(&store, &actions).unwrap(),
+            0
+        );
+        assert_eq!(
+            queue_state_for_action(&store, failed.action_id()),
+            QueueState::Failed
+        );
+        assert!(matches!(
+            queue_state_for_action(&store, running.action_id()),
+            QueueState::Running { .. }
+        ));
+        assert!(!store.pending_queue_path(failed.action_id()).exists());
+        assert!(!store.pending_queue_path(running.action_id()).exists());
+        let completed_id = write_completed_provenance(&store, &"c".repeat(64));
+        let completed = store.load_provenance(&completed_id).unwrap().action;
+        assert_eq!(
+            enqueue_actions_with_priorities(&store, &[(completed, 99)]).unwrap(),
+            0
+        );
+        assert!(!store.pending_queue_path(&completed_id).exists());
+        let old = "a".repeat(64);
+        let new = "b".repeat(64);
+        write_queue_identity_alias(&store, &old, &new).unwrap();
+        let action = ActionSpec::DriverAigToStats {
+            aig_action_id: old,
+            version: "v0.35.0".to_string(),
+            runtime: sample_runtime(),
+        };
+        enqueue_actions_with_priorities(&store, &[(action, 0)]).unwrap();
+        let canonical = ActionSpec::DriverAigToStats {
+            aig_action_id: new.clone(),
+            version: "v0.35.0".to_string(),
+            runtime: sample_runtime(),
+        };
+        let id = crate::executor::compute_action_id(&canonical).unwrap();
+        assert!(
+            matches!(load_queue_pending_record(&store, &id).unwrap().unwrap().action,
+            ActionSpec::DriverAigToStats { aig_action_id, .. } if aig_action_id == new)
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

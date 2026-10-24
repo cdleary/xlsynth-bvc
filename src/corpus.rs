@@ -27,8 +27,9 @@ use crate::model::{
     YosysVerilogFrontend,
 };
 use crate::queue::{
-    enqueue_action_with_priority, load_queue_canceled_record, load_queue_done_record,
-    load_queue_failed_record, queue_state_for_action, suggested_action_queue_priority,
+    enqueue_action_with_priority, enqueue_actions_with_priorities, load_queue_canceled_record,
+    load_queue_done_record, load_queue_failed_record, queue_state_for_action,
+    suggested_action_queue_priority,
 };
 use crate::runtime::resolve_driver_runtime_for_aig_stats;
 use crate::service::{
@@ -1363,37 +1364,53 @@ pub(crate) fn run_ir_dir_corpus(
             .build()?;
         let prepared = pool.install(|| {
             samples
-                .par_iter()
-                .zip(&plans)
+                .par_chunks(32)
                 .enumerate()
-                .map(|(index, (sample, plan))| {
-                    let slot =
-                        usize::from_str_radix(&plan.import_ir_action_id[..2], 16)? % locks.len();
-                    let _guard = locks[slot]
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("corpus preparation lock poisoned"))?;
-                    ensure_imported_ir_action(&store, sample, &plan.import_action)?;
-                    let count = enqueue_plan(&store, plan, &enqueue_priorities[index])?;
-                    let record = build_sample_record(
-                        &store,
-                        sample,
-                        plan,
-                        &run_errors,
-                        recipe_preset_name,
-                        top_fn_policy,
-                        fraig,
-                        &effective_dso_version,
-                        &driver_runtime,
-                        &stats_runtime,
-                        &yosys_script_ref,
-                    );
-                    Ok((count, record))
+                .map(|(chunk_index, chunk)| {
+                    let start = chunk_index * 32;
+                    let chunk_plans = &plans[start..start + chunk.len()];
+                    let mut actions = Vec::new();
+                    for (offset, (sample, plan)) in chunk.iter().zip(chunk_plans).enumerate() {
+                        let slot = usize::from_str_radix(&plan.import_ir_action_id[..2], 16)?
+                            % locks.len();
+                        let _guard = locks[slot]
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("corpus preparation lock poisoned"))?;
+                        ensure_imported_ir_action(&store, sample, &plan.import_action)?;
+                        actions.extend(
+                            plan.planned_actions()
+                                .into_iter()
+                                .zip(&enqueue_priorities[start + offset])
+                                .map(|(a, p)| (a.clone(), *p)),
+                        );
+                    }
+                    let count = enqueue_actions_with_priorities(&store, &actions)?;
+                    let records = chunk
+                        .iter()
+                        .zip(chunk_plans)
+                        .map(|(sample, plan)| {
+                            build_sample_record(
+                                &store,
+                                sample,
+                                plan,
+                                &run_errors,
+                                recipe_preset_name,
+                                top_fn_policy,
+                                fraig,
+                                &effective_dso_version,
+                                &driver_runtime,
+                                &stats_runtime,
+                                &yosys_script_ref,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    Ok((count, records))
                 })
                 .collect::<Result<Vec<_>>>()
         });
-        for (count, record) in prepared? {
+        for (count, records) in prepared? {
             counters.enqueued_actions += count;
-            sample_records.push(record);
+            sample_records.extend(records);
         }
     } else {
         for (sample, plan) in samples.iter().zip(&plans) {
@@ -2648,6 +2665,7 @@ fn checked_enqueue_plan_priorities(
         .collect()
 }
 
+#[cfg(test)]
 fn enqueue_plan(
     store: &ArtifactStore,
     plan: &CorpusActionPlan,
@@ -2657,20 +2675,12 @@ fn enqueue_plan(
     if priorities.len() != actions.len() {
         bail!("corpus enqueue plan priority count does not match action count");
     }
-    let mut enqueued = 0_usize;
-    for (action, action_priority) in actions.into_iter().zip(priorities.iter().copied()) {
-        let action_id = compute_action_id(action)?;
-        let was_known = store.action_exists(&action_id)
-            || !matches!(
-                queue_state_for_action(store, &action_id),
-                crate::queue::QueueState::None
-            );
-        enqueue_action_with_priority(store, action.clone(), action_priority)?;
-        if !was_known && !store.action_exists(&action_id) {
-            enqueued += 1;
-        }
-    }
-    Ok(enqueued)
+    let actions = actions
+        .into_iter()
+        .zip(priorities)
+        .map(|(a, p)| (a.clone(), *p))
+        .collect::<Vec<_>>();
+    enqueue_actions_with_priorities(store, &actions)
 }
 
 fn execute_plan(
