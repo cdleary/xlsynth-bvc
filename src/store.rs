@@ -19,6 +19,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
+mod atomic_record_batch;
+pub(crate) use atomic_record_batch::MAX_ATOMIC_RECORD_BATCH;
+
 use crate::model::{ArtifactRef, Provenance, QueueFailed};
 use crate::proto::{COMPATIBLE_PRIOR_SCHEMA_DESCRIPTOR_SHA256S, FILE_DESCRIPTOR_SET, v1 as pb};
 use crate::proto::{
