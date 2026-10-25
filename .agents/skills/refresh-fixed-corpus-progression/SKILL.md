@@ -1,12 +1,39 @@
 ---
 name: refresh-fixed-corpus-progression
-description: Compute, resume, publish, or diagnose xlsynth-bvc fixed-corpus progression comparisons for release and Git generations. Use for whole-functions-v1 or mffc-v1 backtests, release-vs-release or release-vs-HEAD plots, progression ETAs, and local progression website refreshes.
+description: Evaluate new xlsynth-bvc crate releases across full-corpus, whole-functions-v1, and mffc-v1; compute, resume, publish, or diagnose release and Git progression comparisons, ETAs, and local website refreshes.
 ---
 
 # Refresh fixed-corpus progression
 
 Keep computation, export finalization, site construction, and browser validation as explicit
 stages. Report status and ETA for each stage separately.
+
+## New-release coverage contract
+
+When asked to process or evaluate a new crate release without narrowing the cohort, include all
+three evaluation populations:
+
+| Site view | Input population | Site-build input |
+| --- | --- | --- |
+| `full-corpus` | Frozen full-corpus replay inputs | `--corpus-run-dir` |
+| `whole-functions-v1` | Registered `release-progression-ir-v1` manifest | `--progression-run-dir` |
+| `mffc-v1` | Registered `mffc-progression-ir-v1` manifest | `--progression-run-dir` |
+
+These are independently frozen populations. The name "full corpus" does not mean it contains
+the exact inputs of the other two, and those views are not filters of the full-corpus run. Derive
+expected counts and identities from each population's pinned manifest; do not infer coverage
+from function names, matching counts, or completion of another population. Reuse work only
+through verified content-bound action identities or the verified downstream cache.
+
+Before enqueueing, record each population's workspace, pinned input identity, expected count,
+and completion state. Resume existing compatible work and enqueue missing work for all three.
+Report progress per population. Call the release's evaluation complete only after all three
+have finalized exports, every expected sample and planned action is done, and no failed or
+missing samples/artifacts remain. If only one finishes, name that population explicitly.
+
+Respect an explicitly narrower request. Status, diagnosis, and render-only requests do not
+authorize new evaluations: report any missing populations instead of silently starting them.
+Evaluation completion does not imply the site was refreshed or authorize deployment.
 
 ## Choose a comparable recipe
 
@@ -16,7 +43,7 @@ stages. Report status and ETA for each stage separately.
 - Use `release-progression-ir-v1` for `whole-functions-v1` and
   `mffc-progression-ir-v1` for `mffc-v1`.
 - Keep DSO, Yosys/ABC runtime, Yosys script, and released stats-driver compatible across a pair.
-- Never treat `g8r-vs-yabc-aig-diff` G8r metrics as comparable to the post-ABC Git path.
+- Never treat `g8r-vs-yabc-aig-diff` g8r metrics as comparable to the post-ABC Git path.
 
 Before enqueue, verify the manifest policy's cohort count and artifact-manifest digest. Use a new
 output directory for a different release, commit, DSO, runtime, or immutable candidate identity.
@@ -69,22 +96,31 @@ results through their content-bound action identities, but rebuild derived publi
 Do not use `--skip-rebuild-web-indices` after release metadata, cohort definitions, or recipes
 change.
 
-Pass every completed release or Git workspace directly to one site build:
+For an all-versions dashboard, pass the completed full-corpus and both fixed-cohort workspaces
+for the new release, retaining the completed earlier releases:
 
 ```bash
 xlsynth_bvc build-static-site \
   --snapshot-dir SNAPSHOT_DIR \
   --out-dir SITE_DIR \
-  --progression-run-dir RELEASE_RUN_DIR \
-  --progression-run-dir GIT_RUN_DIR
+  --corpus-run-dir FULL_CORPUS_RUN_DIR \
+  --progression-run-dir WHOLE_FUNCTION_RUN_DIR \
+  --progression-run-dir MFFC_RUN_DIR
 ```
 
-The flag is repeatable. Do not use the hidden legacy `--candidate-run-dir` alias in new workflows.
+Both run-directory flags are repeatable. Add completed Git workspaces with `--progression-run-dir`
+when requested. Do not use the hidden legacy `--candidate-run-dir` alias in new workflows.
 The builder validates and verifies its staged output before installation. Do not immediately repeat
 a full `verify-static-site` or `smoke-static-site` unless an independent audit is requested or the
 installed bytes changed.
 
 ## Validate the requested comparison
+
+For a new-release dashboard refresh, verify that the release appears as complete in all three
+cohort selectors/trends and that each uses its own expected population. Check the generated
+catalog and the rendered views; successful full-corpus rendering alone is not sufficient. If a
+render-only request encounters unevaluated cohorts, explicitly identify their missing coverage
+and last evaluated release in the handoff rather than describing the site as fully up to date.
 
 Open `progression.html` with the intended `cohort`, `baseline`, and `current` generation IDs. Check:
 
