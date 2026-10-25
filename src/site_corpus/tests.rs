@@ -171,7 +171,7 @@ fn builds_complete_matching_releases_with_bounded_deterministic_shards() {
     .encoded_len()
         + 512;
     let mut options = root.options();
-    let built = build(&options, &[], &[b.clone(), a.clone()], target).unwrap();
+    let built = build(&options, &[], &[b.clone(), a.clone()], &[], target).unwrap();
     let verified = verify_static_site(&options.out_dir).unwrap();
     assert_eq!(built.snapshot_id, verified.snapshot_id);
     assert_eq!(built.dataset_count, 2);
@@ -196,7 +196,9 @@ fn builds_complete_matching_releases_with_bounded_deterministic_shards() {
     }
     options.overwrite = true;
     assert_eq!(
-        build(&options, &[], &[a, b], target).unwrap().snapshot_id,
+        build(&options, &[], &[a, b], &[], target)
+            .unwrap()
+            .snapshot_id,
         built.snapshot_id
     );
 }
@@ -259,21 +261,21 @@ fn failed_build_preserves_previous_site_and_rejects_unsafe_inputs() {
     let a = fixture_run(&root.0, "0.73.0", 2);
     let b = fixture_run(&root.0, "0.74.0", 1);
     let mut options = root.options();
-    build(&options, &[], std::slice::from_ref(&a), 100_000).unwrap();
+    build(&options, &[], std::slice::from_ref(&a), &[], 100_000).unwrap();
     let before = fs::read(options.out_dir.join(STATIC_SITE_MANIFEST_FILENAME)).unwrap();
     options.overwrite = true;
     for runs in [vec![a.clone(), b], vec![a.clone(), a.clone()]] {
-        assert!(build(&options, &[], &runs, 100_000).is_err());
+        assert!(build(&options, &[], &runs, &[], 100_000).is_err());
         assert_eq!(
             fs::read(options.out_dir.join(STATIC_SITE_MANIFEST_FILENAME)).unwrap(),
             before
         );
     }
     for size in [0, 1, MAX_SHARD_TARGET + 1] {
-        assert!(build(&options, &[], std::slice::from_ref(&a), size).is_err());
+        assert!(build(&options, &[], std::slice::from_ref(&a), &[], size).is_err());
     }
     options.out_dir = a.join("site");
-    assert!(build(&options, &[], &[a], 100_000).is_err());
+    assert!(build(&options, &[], &[a], &[], 100_000).is_err());
 }
 
 #[test]
@@ -284,11 +286,20 @@ fn corpus_build_and_publication_allow_siblings_but_protect_the_checkout() {
     let protected = [("resource checkout", checkout.as_path())];
     let mut options = root.options();
     options.out_dir = checkout.join("site");
-    assert!(build(&options, &protected, std::slice::from_ref(&run), 100_000).is_err());
+    assert!(
+        build(
+            &options,
+            &protected,
+            std::slice::from_ref(&run),
+            &[],
+            100_000
+        )
+        .is_err()
+    );
     assert!(!options.out_dir.exists());
 
     options.out_dir = checkout.join("../bvc-site");
-    let summary = build(&options, &protected, &[run], 100_000).unwrap();
+    let summary = build(&options, &protected, &[run], &[], 100_000).unwrap();
     let unsafe_publication = checkout.join("publication");
     assert!(
         crate::publish::publish_static_site_with_protected_roots(
@@ -321,7 +332,7 @@ fn verifier_rejects_projection_tampering_even_with_updated_file_hashes() {
     let root = Fixture::new();
     let a = fixture_run(&root.0, "0.74.0", 1);
     let options = root.options();
-    build(&options, &[], &[a], 100_000).unwrap();
+    build(&options, &[], &[a], &[], 100_000).unwrap();
     let mut site =
         wire::CorpusSite::decode(fs::read(options.out_dir.join(MANIFEST)).unwrap().as_slice())
             .unwrap();
@@ -388,6 +399,25 @@ fn corpus_site_cli_supports_composed_and_standalone_sources() {
     assert!(parse(&["--snapshot-dir", "snapshot"]).is_ok());
     assert!(parse(&["--corpus-run-dir", "a", "--corpus-run-dir", "b"]).is_ok());
     assert!(parse(&["--corpus-run-dir", "a", "--snapshot-dir", "snapshot"]).is_ok());
+    let evidence_only =
+        parse(&["--corpus-evidence-dir", "a", "--corpus-evidence-dir", "b"]).unwrap();
+    let crate::cli::TopCommand::BuildStaticSite {
+        corpus_evidence_dirs,
+        corpus_run_dirs,
+        snapshot_dir,
+        ..
+    } = evidence_only.command
+    else {
+        panic!("wrong command")
+    };
+    assert_eq!(
+        corpus_evidence_dirs,
+        [PathBuf::from("a"), PathBuf::from("b")]
+    );
+    assert!(corpus_run_dirs.is_empty());
+    assert!(snapshot_dir.is_none());
+    assert!(parse(&["--corpus-evidence-dir", "a", "--corpus-run-dir", "b"]).is_ok());
+    assert!(parse(&["--corpus-evidence-dir", "a", "--snapshot-dir", "snapshot"]).is_ok());
     assert!(
         parse(&[
             "--corpus-run-dir",
@@ -417,6 +447,7 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
         &[],
         &[root.0.join("candidate")],
         &[run],
+        &[],
         100_000,
     )
     .unwrap();
@@ -443,6 +474,18 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
         stages["raw"]["points"][0]["url"],
         "corpus/?release=0.74.0&reference=release&baseline=0.74.0&stage=raw"
     );
+    let mut reused_options = options.clone();
+    reused_options.out_dir = root.0.join("reused-dashboard");
+    let reused = super::super::site_dashboard::build(
+        &reused_options,
+        &[],
+        &[root.0.join("candidate")],
+        &[],
+        &[options.out_dir.join("corpus")],
+        100_000,
+    )
+    .unwrap();
+    assert_eq!(reused.snapshot_id, summary.snapshot_id);
     let published =
         crate::publish::publish_static_site(&options.out_dir, &root.0.join("publication")).unwrap();
     assert_eq!(published.snapshot_id, summary.snapshot_id);
@@ -506,12 +549,334 @@ fn corpus_browser_semantics() {
     );
 }
 
+fn evidence_index(directory: &Path) -> wire::CorpusSite {
+    wire::CorpusSite::decode(fs::read(directory.join(MANIFEST)).unwrap().as_slice()).unwrap()
+}
+
+// Deliberately rebind a test bundle, so rejection must be semantic rather than
+// merely a stale checksum. This helper never touches an evaluation store.
+fn rebind_evidence(directory: &Path, site: &wire::CorpusSite) {
+    let bytes = site.encode_to_vec();
+    write_file(directory, MANIFEST, &bytes).unwrap();
+    let manifest = pb::StaticSiteManifest {
+        record_version: STATIC_SITE_RECORD_VERSION,
+        source_snapshot_id: Some(
+            crate::proto::digest_from_hex(&sha256_hex(&bytes), "site").unwrap(),
+        ),
+        base_url: "/nested/".into(),
+        files: actual_site_relpaths(directory)
+            .unwrap()
+            .iter()
+            .map(|p| publication_file(directory, p).unwrap())
+            .collect(),
+    };
+    write_file(
+        directory,
+        STATIC_SITE_MANIFEST_FILENAME,
+        &manifest.encode_to_vec(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn evidence_rebuild_is_identical_without_evaluation_stores_or_old_web_assets() {
+    let root = Fixture::new();
+    let a = fixture_run(&root.0, "0.73.0", 4);
+    let b = fixture_run(&root.0, "0.74.0", 4);
+    let mut options = root.options();
+    let original = build(&options, &[], &[a.clone(), b.clone()], &[], 100_000).unwrap();
+    let source = options.out_dir.clone();
+    fs::rename(a, root.0.join("retired-a")).unwrap();
+    fs::rename(b, root.0.join("retired-b")).unwrap();
+    // No old browser projection or template is an internal source of truth.
+    for path in actual_site_relpaths(&source).unwrap() {
+        if !path.ends_with(".pb") {
+            fs::remove_file(source.join(path)).unwrap();
+        }
+    }
+    options.out_dir = root.0.join("rebuilt");
+    let rebuilt = build(&options, &[], &[], &[source], 100_000).unwrap();
+    assert_eq!(rebuilt.snapshot_id, original.snapshot_id);
+    assert_eq!(rebuilt.file_count, original.file_count);
+    assert_eq!(rebuilt.total_bytes, original.total_bytes);
+    assert_eq!(
+        verify_static_site(&options.out_dir).unwrap().snapshot_id,
+        original.snapshot_id
+    );
+}
+
+#[test]
+fn mixes_multiple_evidence_sources_with_new_runs_and_reshards_deterministically() {
+    let root = Fixture::new();
+    let a = fixture_run(&root.0, "0.72.0", 4);
+    let b = fixture_run(&root.0, "0.73.0", 4);
+    let c = fixture_run(&root.0, "0.74.0", 4);
+    let (_, samples) = ingest(&a).unwrap();
+    let target = wire::EvidenceShard {
+        samples: samples[..1].to_vec(),
+    }
+    .encoded_len()
+        + 512;
+    let mut options = root.options();
+    let direct = build(
+        &options,
+        &[],
+        &[a.clone(), b.clone(), c.clone()],
+        &[],
+        target,
+    )
+    .unwrap();
+    let mut sources = Vec::new();
+    for (name, run) in [("older-a", a), ("older-b", b)] {
+        options.out_dir = root.0.join(name);
+        build(&options, &[], std::slice::from_ref(&run), &[], 100_000).unwrap();
+        sources.push(options.out_dir.clone());
+        fs::rename(run, root.0.join(format!("retired-{name}"))).unwrap();
+    }
+    options.out_dir = root.0.join("mixed");
+    let mixed = build(&options, &[], &[c], &sources, target).unwrap();
+    assert_eq!(mixed.snapshot_id, direct.snapshot_id);
+    let site = evidence_index(&options.out_dir);
+    assert_eq!(
+        site.generations
+            .iter()
+            .map(|g| (g.crate_version.as_str(), g.sample_count, g.shards.len()))
+            .collect::<Vec<_>>(),
+        [("0.72.0", 4, 4), ("0.73.0", 4, 4), ("0.74.0", 4, 4)]
+    );
+}
+
+#[test]
+fn evidence_reuse_rejects_corruption_and_preserves_existing_output() {
+    let root = Fixture::new();
+    let run = fixture_run(&root.0, "0.74.0", 2);
+    let mut options = root.options();
+    build(&options, &[], &[run], &[], 100_000).unwrap();
+    let source = options.out_dir.clone();
+    options.out_dir = root.0.join("destination");
+    let before = build(&options, &[], &[], std::slice::from_ref(&source), 100_000).unwrap();
+    options.overwrite = true;
+    let original_index = evidence_index(&source);
+    let relative = path(&original_index.generations[0].shards[0].evidence).unwrap();
+    let original_bytes = fs::read(source.join(&relative)).unwrap();
+    // Missing, corrupt, and symlinked evidence must all fail closed.
+    fs::rename(source.join(&relative), source.join("saved.pb")).unwrap();
+    assert!(build(&options, &[], &[], std::slice::from_ref(&source), 100_000).is_err());
+    std::os::unix::fs::symlink(source.join("saved.pb"), source.join(&relative)).unwrap();
+    assert!(build(&options, &[], &[], std::slice::from_ref(&source), 100_000).is_err());
+    fs::remove_file(source.join(&relative)).unwrap();
+    fs::rename(source.join("saved.pb"), source.join(&relative)).unwrap();
+    fs::write(source.join(&relative), b"invalid protobuf").unwrap();
+    assert!(build(&options, &[], &[], std::slice::from_ref(&source), 100_000).is_err());
+    fs::write(source.join(&relative), &original_bytes).unwrap();
+    // Rehashed but invalid action evidence also fails the semantic verifier.
+    let mut shard = wire::EvidenceShard::decode(original_bytes.as_slice()).unwrap();
+    shard.samples[0].actions.clear();
+    fs::write(source.join(&relative), shard.encode_to_vec()).unwrap();
+    let mut changed = original_index.clone();
+    changed.generations[0].shards[0].evidence = Some(publication_file(&source, &relative).unwrap());
+    rebind_evidence(&source, &changed);
+    assert!(build(&options, &[], &[], std::slice::from_ref(&source), 100_000).is_err());
+    fs::write(source.join(&relative), &original_bytes).unwrap();
+    // A forged population or escaping shard reference cannot reuse a valid bundle.
+    for change in [0, 1, 2] {
+        let mut changed = original_index.clone();
+        match change {
+            0 => changed.generations[0].sample_count += 1,
+            1 => changed.generations[0].cohort_sha256[0] ^= 1,
+            _ => {
+                changed.generations[0].shards[0]
+                    .evidence
+                    .as_mut()
+                    .unwrap()
+                    .relpath
+                    .as_mut()
+                    .unwrap()
+                    .value = "../escaped.pb".into()
+            }
+        }
+        rebind_evidence(&source, &changed);
+        assert!(build(&options, &[], &[], std::slice::from_ref(&source), 100_000).is_err());
+    }
+    assert_eq!(
+        verify_static_site(&options.out_dir).unwrap().snapshot_id,
+        before.snapshot_id
+    );
+}
+
+#[test]
+fn evidence_reuse_rejects_duplicate_releases_mixed_populations_and_overlap() {
+    let root = Fixture::new();
+    let a = fixture_run(&root.0, "0.73.0", 2);
+    let b = fixture_run(&root.0, "0.74.0", 1);
+    let mut options = root.options();
+    build(&options, &[], std::slice::from_ref(&a), &[], 100_000).unwrap();
+    let source = options.out_dir.clone();
+    options.overwrite = true;
+    assert!(build(&options, &[], &[], std::slice::from_ref(&source), 100_000).is_err());
+    options.out_dir = root.0.join("destination");
+    assert!(
+        build(
+            &options,
+            &[],
+            &[],
+            &[source.clone(), source.clone()],
+            100_000
+        )
+        .is_err()
+    );
+    assert!(build(&options, &[], &[a], std::slice::from_ref(&source), 100_000).is_err());
+    assert!(build(&options, &[], &[b], &[source], 100_000).is_err());
+    assert!(!options.out_dir.exists());
+}
+
+#[test]
+fn evidence_reuse_preserves_aliases_or_refreshes_them_from_an_explicit_snapshot() {
+    let root = Fixture::new();
+    let run = fixture_run(&root.0, "0.74.0", 1);
+    let mut options = root.options();
+    build(&options, &[], &[run], &[], 100_000).unwrap();
+    let source = options.out_dir.clone();
+    let mut site = evidence_index(&source);
+    let mut samples = evidence::Source::open(&source)
+        .unwrap()
+        .samples(&site.generations[0])
+        .unwrap();
+    let sample = &mut samples[0];
+    let top = &sample.input.as_ref().unwrap().top_fn_name;
+    sample.provenance = Some(wire::InputProvenance {
+        source_snapshot_sha256: vec![1; 32],
+        structural_hashes: vec![vec![2; 32]],
+        function_sha256: Sha256::digest(
+            crate::executor::extract_ir_fn_block_by_name(&sample.input_ir, top)
+                .unwrap()
+                .as_bytes(),
+        )
+        .to_vec(),
+        origins: vec![wire::FunctionOrigin {
+            ir_top: top.clone(),
+            kind: wire::InputKind::Whole as i32,
+            ir_action_id: vec![3; 32],
+            ..Default::default()
+        }],
+    });
+    site.generations[0].shards.clear();
+    write_shards(&source, &mut site.generations[0], &samples, 100_000).unwrap();
+    rebind_evidence(&source, &site);
+    let frozen = verify_static_site(&source).unwrap();
+    options.out_dir = root.0.join("retained");
+    let rebuilt = build(&options, &[], &[], std::slice::from_ref(&source), 100_000).unwrap();
+    assert_eq!(rebuilt.snapshot_id, frozen.snapshot_id);
+    let retained = evidence::Source::open(&options.out_dir).unwrap();
+    assert_eq!(
+        retained.samples(&retained.site.generations[0]).unwrap(),
+        samples
+    );
+
+    // The supplied snapshot lacks this function. Its verified index must replace
+    // the old alias binding rather than silently retaining stale classifications.
+    let historical = Fixture::new();
+    super::super::tests::build_historical_candidate_site_fixture(&historical.0);
+    options.snapshot_dir = historical.0.join("snapshot");
+    options.out_dir = root.0.join("refreshed");
+    build(&options, &[], &[], std::slice::from_ref(&source), 100_000).unwrap();
+    samples[0].provenance = None;
+    let refreshed = evidence::Source::open(&options.out_dir).unwrap();
+    assert_eq!(
+        refreshed.samples(&refreshed.site.generations[0]).unwrap(),
+        samples
+    );
+
+    // A new snapshot cannot launder an invalid old binding before validation.
+    samples[0].provenance = Some(wire::InputProvenance::default());
+    site.generations[0].shards.clear();
+    write_shards(&source, &mut site.generations[0], &samples, 100_000).unwrap();
+    rebind_evidence(&source, &site);
+    options.out_dir = root.0.join("invalid-binding");
+    assert!(build(&options, &[], &[], &[source], 100_000).is_err());
+    assert!(!options.out_dir.exists());
+}
+
+#[test]
+fn evidence_reuse_rejects_incompatible_measurement_runtimes() {
+    let root = Fixture::new();
+    let mut options = root.options();
+    let mut sources = Vec::new();
+    for version in ["0.73.0", "0.74.0"] {
+        let run = fixture_run(&root.0, version, 1);
+        options.out_dir = root.0.join(format!("site-{version}"));
+        build(&options, &[], &[run], &[], 100_000).unwrap();
+        sources.push(options.out_dir.clone());
+    }
+    let source = &sources[1];
+    let mut site = evidence_index(source);
+    let relative = path(&site.generations[0].shards[0].evidence).unwrap();
+    let mut shard =
+        wire::EvidenceShard::decode(fs::read(source.join(&relative)).unwrap().as_slice()).unwrap();
+    let sample = &mut shard.samples[0];
+    let ActionSpec::DriverIrToG8rAig {
+        runtime: driver, ..
+    } = crate::proto::action_spec_from_proto(&sample.actions[1]).unwrap()
+    else {
+        panic!("missing lowering")
+    };
+    let ActionSpec::AigToYosysAbcAig {
+        runtime: yosys,
+        yosys_script_ref: script,
+        ..
+    } = crate::proto::action_spec_from_proto(&sample.actions[2]).unwrap()
+    else {
+        panic!("missing ABC")
+    };
+    let ActionSpec::DriverAigToStats {
+        runtime: mut estimator,
+        ..
+    } = required_progression_action(&sample.g8r_abc.as_ref().unwrap().action, "stats").unwrap()
+    else {
+        panic!("missing estimator")
+    };
+    estimator.docker_image_id = "9".repeat(64);
+    let graph = actions(
+        sample.input.as_ref().unwrap(),
+        &site.generations[0].dso_version,
+        &driver,
+        &estimator,
+        &yosys,
+        &script,
+    )
+    .unwrap();
+    sample.actions = graph
+        .ancestors
+        .iter()
+        .map(crate::proto::action_spec_to_proto)
+        .collect::<Result<_>>()
+        .unwrap();
+    for (stats, action) in [
+        &mut sample.g8r_abc,
+        &mut sample.yosys_abc,
+        &mut sample.g8r_raw,
+    ]
+    .into_iter()
+    .zip(&graph.stats)
+    {
+        stats.as_mut().unwrap().action = Some(crate::proto::action_spec_to_proto(action).unwrap());
+    }
+    fs::write(source.join(&relative), shard.encode_to_vec()).unwrap();
+    site.generations[0].shards[0].evidence = Some(publication_file(source, &relative).unwrap());
+    rebind_evidence(source, &site);
+    // Each bundle is valid independently, but they cannot be compared together.
+    verify_static_site(source).unwrap();
+    options.out_dir = root.0.join("incompatible");
+    assert!(build(&options, &[], &[], &sources, 100_000).is_err());
+    assert!(!options.out_dir.exists());
+}
+
 #[test]
 fn corpus_site_works_with_immutable_publication() {
     let root = Fixture::new();
     let run = fixture_run(&root.0, "0.74.0", 1);
     let options = root.options();
-    let site = build(&options, &[], &[run], 100_000).unwrap();
+    let site = build(&options, &[], &[run], &[], 100_000).unwrap();
     let publication = root.0.join("published");
     let first = crate::publish::publish_static_site(&options.out_dir, &publication).unwrap();
     assert_eq!(first.snapshot_id, site.snapshot_id);

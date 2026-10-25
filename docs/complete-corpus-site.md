@@ -89,6 +89,43 @@ The cache can be discarded without losing canonical results; it must not be used
 as a substitute for retaining completed stores. Its schema is compiled separately
 and does not change the artifact-store descriptor fingerprint.
 
+## Reuse completed release evidence
+
+After the first build, reuse its typed publication evidence instead of reopening every completed
+evaluation store. Add only newly finalized releases as raw run inputs:
+
+```bash
+cargo run --release --bin xlsynth_bvc -- build-static-site \
+  --corpus-evidence-dir ../previous-site \
+  --corpus-run-dir runs/newly-completed-release \
+  --out-dir ../next-site
+```
+
+For an earlier all-versions dashboard, use `../previous-site/corpus` as the evidence directory.
+The flag is repeatable and works without any `--corpus-run-dir`, including in the dashboard
+command below. To create a reusable bundle for just one release, build a standalone corpus site
+from that release once. Every release in each evidence directory is included; duplicate release
+versions, unequal input populations, and incompatible measurement runtimes are rejected.
+
+This is an explicit frozen publication input, not an automatic cache of a mutable run directory.
+The reader consumes `site_manifest.v1.pb`, `corpus-site.pb`, and their bound `data/**/*.pb`
+evidence shards. It checks canonical encoding, identities, checksums, paths, sample counts, and
+cohort identity without accessing the original run or its sled database. Old HTML, JavaScript,
+catalog JSON, and metric/IR JSON are neither read nor copied: current templates and projections
+are regenerated, with the requested shard size and base URL. The completed output still receives
+the full semantic, comparability, hosting-budget, and integrity verification before installation.
+
+The source evidence is sufficient even after the original evaluation store has been archived.
+Conversely, changes to that store do **not** update an existing publication artifact: explicitly
+rebuild that release from `--corpus-run-dir` to include reevaluated results. There is no mtime-based
+cache hit or implicit preference between duplicate releases. Keep evidence inputs and output
+directories disjoint, and retain the source until the new build succeeds. This avoids millions of
+small provenance/export reads, but does not skip validation of the resulting website.
+
+Without a snapshot, existing function aliases and their provenance bindings are retained. With
+`--snapshot-dir`, those bindings are validated and then refreshed from the supplied snapshot,
+just as for run-directory inputs. Measurement evidence remains frozen in either case.
+
 ## All-versions dashboard
 
 Supply a historical snapshot **and** the completed full-corpus runs in the same command to build

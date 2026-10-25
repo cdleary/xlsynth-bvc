@@ -392,6 +392,7 @@ pub(crate) fn run() -> Result<()> {
         snapshot_dir,
         out_dir,
         corpus_run_dirs,
+        corpus_evidence_dirs,
         corpus_shard_bytes,
         progression_run_dirs,
         candidate_run_dirs,
@@ -404,7 +405,8 @@ pub(crate) fn run() -> Result<()> {
             ("private store", store_dir.as_path()),
             ("artifact database", artifacts_via_sled.as_path()),
         ];
-        if snapshot_dir.is_some() && !corpus_run_dirs.is_empty() {
+        let has_corpus = !corpus_run_dirs.is_empty() || !corpus_evidence_dirs.is_empty();
+        if snapshot_dir.is_some() && has_corpus {
             let progression = progression_run_dirs
                 .iter()
                 .chain(candidate_run_dirs)
@@ -420,12 +422,13 @@ pub(crate) fn run() -> Result<()> {
                 &protected_roots,
                 &progression,
                 corpus_run_dirs,
+                corpus_evidence_dirs,
                 *corpus_shard_bytes,
             )?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
             return Ok(());
         }
-        if !corpus_run_dirs.is_empty() {
+        if has_corpus {
             if !progression_run_dirs.is_empty() || !candidate_run_dirs.is_empty() {
                 bail!("--progression-run-dir requires --snapshot-dir");
             }
@@ -438,6 +441,7 @@ pub(crate) fn run() -> Result<()> {
                 },
                 &protected_roots,
                 corpus_run_dirs,
+                corpus_evidence_dirs,
                 *corpus_shard_bytes,
             )?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
