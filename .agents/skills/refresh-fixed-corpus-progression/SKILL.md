@@ -83,8 +83,9 @@ Require the pinned cohort count, every sample `done`, and zero failed/missing/ex
 hand-stitch JSON or run a separate merge script.
 
 Operational JSON is an ingress adapter. The site builder must validate it and persist each admitted
-generation as typed `FixedCorpusProgressionRunEvidence` protobuf. Keep protobuf through the
-publication pipeline; emit JSON only for the final browser catalog and data projections.
+fixed-cohort generation as `FixedCorpusProgressionRunEvidence` protobuf, and full-corpus releases
+as `CorpusSite` and `EvidenceShard` protobufs. Keep protobuf through the publication pipeline;
+emit JSON only for the final browser catalog and data projections.
 
 ## Build the site
 
