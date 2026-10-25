@@ -2078,7 +2078,7 @@ pub(super) fn render_stdlib_g8r_vs_yosys_html(
   <meta charset=\"utf-8\">\
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
   <link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">\
-  <title>xlsynth-bvc G8r vs Yosys/ABC</title>\
+  <title>xlsynth-bvc g8r vs Yosys/ABC</title>\
   <style>\
     :root {\
       --bg: #050911;\

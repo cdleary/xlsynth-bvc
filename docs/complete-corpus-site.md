@@ -114,10 +114,18 @@ to the dashboard, including from nested campaign pages. These directories are ev
 boundaries, not separate sites. Dashboard release trends exclude Git
 candidates and incomplete cohorts; those remain available in detailed progression.
 
-Each trend is the change in summed post-ABC AND-nodes × depth versus its first complete release.
-Partial historical populations are explicitly labeled and never mixed into that sum. Raw G8r
-historical comparisons remain accessible but are not treated as post-ABC measurements. Counts
-across full-corpus, historical pairs, and fixed cohorts may overlap and must not be added together.
+The chart defaults to pre-ABC g8r, with FRAIG disabled. Its stage selector also offers post-ABC
+measurements; `?stage=raw` and `?stage=abc` preserve that selection in links. Each trend is the
+change in summed AND-nodes × depth versus the first complete release at the selected stage.
+Folding and structural hashing remain enabled; carry-out and priority-encode preparation rewrites
+are disabled by the evaluation recipe. The latest-change card and chart links follow the stage.
+
+Every plotted release uses the same complete input population. A missing measurement excludes
+the entire release from that stage and creates a labeled gap, rather than reducing the sample
+count or inserting zero cost. Partial historical populations remain accessible in detail views.
+Counts across full-corpus, historical pairs, and fixed cohorts may overlap and must not be added
+together. Fixed-cohort raw points open the pre-ABC graph-LE/node vector comparison; full-corpus
+points open the release comparison with both sides at the selected stage.
 
 This is native composition, not a merge of operational JSON: `dashboard.pb` binds the two verified
 child manifests. That composition also determines the detail-page navigation and the old overview
@@ -136,9 +144,10 @@ does not discover run directories or backfill missing evaluations automatically.
 python3 -m http.server 8000 --bind 127.0.0.1 --directory ../bvc-site
 ```
 
-Open `http://127.0.0.1:8000/`. Choose the release, compare its G8r+ABC result with either its
-matched codegen+Yosys/ABC reference or another release's G8r+ABC result, and filter by input kind,
-IR size, or positive product loss. Click a point/outlier to load its source IR. The cards include
+Open `http://127.0.0.1:8000/`. On the dashboard, select a cohort and AIG stage, then click a release
+point. In the full-corpus explorer, compare pre-ABC g8r with another release at the same stage,
+or compare g8r+ABC with another release or its matched codegen+Yosys/ABC reference. Filter by input
+kind, IR size, or positive product loss. Click a point/outlier to load its source IR. The cards include
 zero-cost inputs; logarithmic plots explicitly omit zero-valued points. Undefined graph logical
 effort is omitted only from that plot. In dashboard builds, the verified snapshot's structural
 index supplies original function names and input-kind membership. The join first matches the

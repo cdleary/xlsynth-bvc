@@ -64,7 +64,7 @@
     text.textContent = [
       `Sample: ${sample.sample_id}`,
       `Cone top: ${sample.ir_top}; IR ops: ${sample.ir_op_count ?? "unknown"}`,
-      `G8r+ABC: ${sample.g8r_nodes} AND nodes, ${sample.g8r_depth} levels`,
+      `g8r+ABC: ${sample.g8r_nodes} AND nodes, ${sample.g8r_depth} levels`,
       `Codegen+Yosys/ABC: ${sample.yosys_nodes} AND nodes, ${sample.yosys_depth} levels`,
       "",
       "Source occurrences (overlaps are preserved):",
@@ -73,8 +73,8 @@
       `DSLX driver: ${coverage.driver_version}`,
       `Comparison driver: ${sample.driver_crate_version}; DSO: ${sample.dso_version}`,
       `ABC script SHA-256: ${sample.yosys_script_sha256}`,
-      `G8r ABC action: ${sample.g8r_abc_aig_action_id}`,
-      `G8r stats action: ${sample.g8r_stats_action_id}`,
+      `g8r ABC action: ${sample.g8r_abc_aig_action_id}`,
+      `g8r stats action: ${sample.g8r_stats_action_id}`,
       `Yosys ABC action: ${sample.yosys_aig_action_id}`,
       `Yosys stats action: ${sample.yosys_stats_action_id}`,
     ].join("\n");
@@ -104,7 +104,7 @@
     xlabel.textContent = `Codegen+Yosys/ABC ${axis}`;
     canvas.append(xlabel);
     const ylabel = svg("text", {x:18, y:192, transform:"rotate(-90 18 192)", fill:"#d8eaf2", "text-anchor":"middle", "font-size":13});
-    ylabel.textContent = `G8r+ABC ${axis}`;
+    ylabel.textContent = `g8r+ABC ${axis}`;
     canvas.append(ylabel);
     for (const sample of filtered) {
       const classification = outcome(sample);

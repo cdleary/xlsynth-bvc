@@ -315,7 +315,7 @@ fn ingest(run: &Path) -> Result<(wire::Generation, Vec<wire::Sample>)> {
             row.g8r_aig_action_id.as_str(),
             row.g8r_abc_aig_action_id
                 .as_deref()
-                .context("missing G8r ABC action")?,
+                .context("missing g8r ABC action")?,
             row.combo_verilog_action_id.as_str(),
             row.yosys_abc_aig_action_id.as_str(),
             diff.aig_stat_diff_action_id.as_str(),
@@ -331,7 +331,7 @@ fn ingest(run: &Path) -> Result<(wire::Generation, Vec<wire::Sample>)> {
             row.yosys_abc_stats_action_id.as_str(),
             row.g8r_raw_stats_action_id
                 .as_deref()
-                .context("missing raw G8r stats")?,
+                .context("missing raw g8r stats")?,
         ]) {
             if id(a)? != expected {
                 bail!("corpus stats action identity mismatch");
@@ -416,7 +416,7 @@ fn validate_sample(
         .collect::<Result<Vec<_>>>()?;
     let driver = match &actual[1] {
         ActionSpec::DriverIrToG8rAig { runtime, .. } => runtime,
-        _ => bail!("corpus evidence is missing G8r lowering"),
+        _ => bail!("corpus evidence is missing g8r lowering"),
     };
     let (yosys, script) = match &actual[2] {
         ActionSpec::AigToYosysAbcAig {
@@ -424,12 +424,12 @@ fn validate_sample(
             yosys_script_ref,
             ..
         } => (runtime, yosys_script_ref),
-        _ => bail!("corpus evidence is missing G8r ABC"),
+        _ => bail!("corpus evidence is missing g8r ABC"),
     };
     let stats = [
-        required(&sample.g8r_abc, "G8r stats")?,
+        required(&sample.g8r_abc, "g8r stats")?,
         required(&sample.yosys_abc, "Yosys stats")?,
-        required(&sample.g8r_raw, "raw G8r stats")?,
+        required(&sample.g8r_raw, "raw g8r stats")?,
     ];
     let stats_action = required_progression_action(&stats[0].action, "stats action")?;
     let stats_driver = match &stats_action {
@@ -477,7 +477,7 @@ fn project(samples: &[wire::Sample]) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut ir = BTreeMap::new();
     for sample in samples {
         let input = required(&sample.input, "input")?;
-        let g = required(&sample.g8r_abc, "G8r stats")?;
+        let g = required(&sample.g8r_abc, "g8r stats")?;
         let y = required(&sample.yosys_abc, "Yosys stats")?;
         let r = required(&sample.g8r_raw, "raw stats")?;
         let nodes =

@@ -3,7 +3,7 @@
 'use strict';
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),cp=require('node:child_process'),assert=require('node:assert/strict');
 const {once}=require('node:events');
-const {trendSpec,resultHref}=require('../src/site_assets/dashboard.js');
+const {trendSpec,resultHref,stageInfo,change,headline}=require('../src/site_assets/dashboard.js');
 const url=new URL(process.argv[2]),screenshots=process.argv[3];
 const profile=fs.mkdtempSync(path.join(os.tmpdir(),'bvc-dashboard-browser-'));
 const chrome=cp.spawn(process.env.BVC_CHROME||'google-chrome',['--headless=new','--no-sandbox','--disable-gpu','--disable-dev-shm-usage','--disable-background-networking','--disable-component-update','--disable-default-apps','--disable-sync','--no-first-run','--remote-debugging-pipe',`--user-data-dir=${profile}`,'about:blank'],{stdio:['ignore','ignore','ignore','pipe','pipe']});
@@ -21,16 +21,33 @@ async function main(){
   await send('Runtime.enable');await send('Page.enable');await send('Network.enable');
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1180,deviceScaleFactor:1,mobile:false});await send('Page.navigate',{url:url.href});await ready();
   assert.equal(await evaluate("document.getElementById('latest-version').textContent"),`v${data.versions.at(-1).crate_version}`);
-  assert.equal(await evaluate("document.getElementById('latest-link').getAttribute('href')"),resultHref(data.versions.at(-1)));
+  assert.equal(await evaluate("document.getElementById('stage').value"),'raw');
+  assert.equal(await evaluate("document.getElementById('latest-link').getAttribute('href')"),resultHref(data.versions.at(-1),'raw'));
   assert.deepEqual(await evaluate("Array.from(document.querySelectorAll('#version-rows tr'),r=>r.firstChild.textContent)"),[...data.versions].reverse().map(v=>`v${v.crate_version}`));
   assert.deepEqual(await evaluate("Array.from(document.getElementById('cohort').options,o=>o.value)"),data.trends.map(t=>t.id));
   await shot('dashboard-desktop');
-  for(const trend of data.trends){
-    await evaluate(`document.getElementById('cohort').value=${JSON.stringify(trend.id)};document.getElementById('cohort').dispatchEvent(new Event('change'))`);await ready();
-    assert.deepEqual(await evaluate("document.getElementById('trend').data[0].y"),trendSpec(trend).data[0].y);
-    assert.deepEqual(await evaluate("document.getElementById('trend').data[0].customdata"),trend.points.map(p=>p.url));
-    assert.equal(trend.points.at(-1).lower+trend.points.at(-1).equal+trend.points.at(-1).higher,trend.count);
+  for(const stage of ['raw','abc']){
+    await evaluate(`document.getElementById('stage').value=${JSON.stringify(stage)};document.getElementById('stage').dispatchEvent(new Event('change'))`);await ready();
+    assert.equal(await evaluate("document.getElementById('trend-title').textContent"),stageInfo[stage].title);
+    const full=data.trends.find(t=>t.id==='full-corpus').stages[stage],last=full.points.at(-1),prior=full.points.at(-2);
+    assert.equal(await evaluate("document.getElementById('latest-change').textContent"),prior?headline(change(prior.cost,last.cost)):last?'One complete release':'No complete releases');
+    assert.equal(new URL(await evaluate("document.getElementById('compare-link').href")).searchParams.get('stage'),stage);
+    for(const trend of data.trends){
+      await evaluate(`document.getElementById('cohort').value=${JSON.stringify(trend.id)};document.getElementById('cohort').dispatchEvent(new Event('change'))`);await ready();
+      const series=trend.stages[stage],spec=trendSpec(series);
+      assert.deepEqual(await evaluate("document.getElementById('trend').data[0].y"),spec.data[0].y);
+      assert.deepEqual(await evaluate("document.getElementById('trend').data[0].customdata"),spec.data[0].customdata);
+      assert.equal(await evaluate("document.getElementById('trend').data[0].connectgaps"),false);
+      assert.equal(await evaluate("document.getElementById('stage-coverage').textContent!==''"),series.unavailable_versions.length>0);
+      const latest=series.points.at(-1);
+      if(latest)assert.equal(latest.lower+latest.equal+latest.higher,trend.count);
+      assert.equal(await evaluate("new URL(location.href).searchParams.get('stage')"),stage);
+      await shot(`dashboard-${trend.id}-${stage}`);
+    }
   }
+  const documentOrigin=await evaluate('performance.timeOrigin');
+  await send('Page.reload');await waitFor(`performance.timeOrigin!==${documentOrigin}`);await ready();
+  assert.equal(await evaluate("document.getElementById('stage').value"),'abc');
   // The splash only fetches the small dashboard projection, never sample shards.
   assert.deepEqual([...new Set(resources.filter(r=>new URL(r).pathname.endsWith('.json')).map(r=>new URL(r).pathname))],[new URL('dashboard.json',url).pathname]);
   const links=await evaluate("Array.from(document.querySelectorAll('a[href]'),a=>a.href)");
@@ -56,30 +73,35 @@ async function main(){
   await new Promise(r=>setTimeout(r,500));
   assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true);await shot('dashboard-mobile');
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1180,deviceScaleFactor:1,mobile:false});
-  const historical=data.trends.find(t=>t.id!=='full-corpus'&&t.points.length>1);
+  const historical=data.trends.find(t=>t.id!=='full-corpus'&&t.stages.raw.points.length>1);
   if(historical){
-    for(const point of [historical.points[0],historical.points.at(-1)]){
+    for(const point of [historical.stages.raw.points[0],historical.stages.raw.points.at(-1)]){
       const target=new URL(point.url,url);
       await send('Page.navigate',{url:target.href});
       await waitFor("document.getElementById('progression')?.dataset.progressionRendered==='true'");
       assert.equal(await evaluate("document.getElementById('progression-cohort').value"),historical.id);
       assert.equal(await evaluate("document.getElementById('current-version').value"),target.searchParams.get('current'));
       assert.equal(await evaluate("document.getElementById('baseline-version').value"),target.searchParams.get('baseline'));
+      await waitFor("document.getElementById('progression-vectors')?.dataset.rendered==='true'");
+      assert.equal(await evaluate("document.getElementById('vector-stage').value"),'raw');
     }
     await shot('progression-navigation');
     await evaluate("document.querySelector('.bvc-navigation-home').click()");await ready();
     assert.equal(await evaluate('location.pathname'),new URL('index.html',url).pathname);
   }
-  const trend=data.trends.find(t=>t.id==='full-corpus'),last=trend.points.at(-1);
+  const trend=data.trends.find(t=>t.id==='full-corpus'),last=trend.stages.raw.points.at(-1);
+  await evaluate("document.getElementById('stage').value='raw';document.getElementById('stage').dispatchEvent(new Event('change'))");await ready();
   await evaluate(`document.getElementById('cohort').value='full-corpus';document.getElementById('cohort').dispatchEvent(new Event('change'))`);await ready();await shot('dashboard-full-corpus');
   await evaluate(`document.getElementById('trend').emit('plotly_click',{points:[{customdata:${JSON.stringify(last.url)}}]})`);
   await waitFor("document.getElementById('corpus-site')?.dataset.rendered==='true'");
   assert.equal(await evaluate("document.getElementById('release').value"),last.version);
+  assert.equal(await evaluate("document.getElementById('stage').value"),'raw');
+  assert.equal(await evaluate("document.getElementById('reference').value"),'release');
   await shot('corpus-navigation');
   await evaluate("Array.from(document.querySelectorAll('.bvc-navigation a')).find(a=>a.textContent==='All versions').click()");await ready();
   assert.equal(await evaluate('location.hash'),'#versions');
   assert.deepEqual(errors,[]);
-  console.log(JSON.stringify({versions:data.versions.map(v=>v.crate_version),cohorts:data.trends.map(t=>({id:t.id,count:t.count,releases:t.points.length})),desktop:true,mobile:true,links:true,pointNavigation:true,errors},null,2));
+  console.log(JSON.stringify({versions:data.versions.map(v=>v.crate_version),cohorts:data.trends.map(t=>({id:t.id,count:t.count,stages:Object.fromEntries(Object.entries(t.stages).map(([stage,series])=>[stage,{releases:series.points.length,unavailable:series.unavailable_versions}]))})),desktop:true,mobile:true,links:true,pointNavigation:true,errors},null,2));
 }
 const timer=setTimeout(()=>{console.error('Dashboard browser test timed out');chrome.kill('SIGKILL');process.exitCode=1},180000);
 main().catch(e=>{console.error(e);process.exitCode=1}).finally(async()=>{clearTimeout(timer);const exited=once(chrome,'exit');chrome.kill('SIGTERM');await exited;await fs.promises.rm(profile,{recursive:true,force:true,maxRetries:10,retryDelay:200})});

@@ -44,7 +44,7 @@ cargo run --bin xlsynth_bvc -- render-dslx-corpus-report \
 
 The comparison runner uses its standard runtime and container setup (see
 [the IR directory runner](ir-dir-corpus-runner.md)). In `run` mode it executes immediately; in
-`enqueue` mode refresh its exports after workers finish. The matched recipe lowers G8r with the
+`enqueue` mode refresh its exports after workers finish. The matched recipe lowers g8r with the
 frontend mode, skips driver FRAIG, then applies `flows/yosys_to_aig.ys` to its AIG. The other
 branch converts IR to combinational Verilog and applies that **same** Yosys/ABC script. The
 joined row includes AIG stats, action IDs, the script digest, and runtime versions for each pair.

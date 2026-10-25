@@ -171,7 +171,51 @@ struct Trend {
     id: String,
     label: String,
     count: usize,
+    stages: Stages,
+}
+
+#[derive(Default, Serialize)]
+struct Series {
     points: Vec<Point>,
+    unavailable_versions: Vec<String>,
+}
+
+#[derive(Default, Serialize)]
+struct Stages {
+    raw: Series,
+    abc: Series,
+}
+
+#[derive(Default)]
+struct SeriesBuilder {
+    series: Series,
+    baseline: Option<(String, BTreeMap<String, f64>)>,
+}
+
+impl SeriesBuilder {
+    fn add(
+        &mut self,
+        version: &str,
+        generation: &str,
+        count: usize,
+        costs: Option<BTreeMap<String, f64>>,
+        url: impl FnOnce(&str) -> String,
+    ) -> Result<()> {
+        let Some(costs) = costs else {
+            self.series.unavailable_versions.push(version.into());
+            return Ok(());
+        };
+        if costs.len() != count {
+            bail!("complete dashboard stage has missing samples");
+        }
+        let (first_id, first) = self
+            .baseline
+            .get_or_insert_with(|| (generation.into(), costs.clone()));
+        self.series
+            .points
+            .push(point(version, url(first_id), first, &costs)?);
+        Ok(())
+    }
 }
 
 #[derive(Serialize)]
@@ -296,10 +340,10 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
             id: cohort.cohort_id.clone(),
             label: cohort.display_label.clone(),
             count: cohort.cohort_ir_count as usize,
-            points: vec![],
+            stages: Stages::default(),
         };
-        let mut baseline = None;
-        let mut baseline_id = None;
+        let mut raw = SeriesBuilder::default();
+        let mut abc = SeriesBuilder::default();
         let mut generations = cohort
             .generations
             .iter()
@@ -342,26 +386,52 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
                 &version,
                 &g.dso_version,
             )?;
-            let now = samples
-                .into_iter()
-                .map(|(key, sample)| (key, sample.g8r_product))
-                .collect::<BTreeMap<_, _>>();
-            if now.len() != trend.count {
-                bail!("complete dashboard cohort has missing samples");
-            }
-            let first = baseline.get_or_insert_with(|| now.clone());
-            let first_id = baseline_id.get_or_insert_with(|| g.generation_id.clone());
-            trend.points.push(point(
+            // A missing raw measurement excludes the entire generation from
+            // this stage, never just that input from its fixed population.
+            let raw_costs = samples
+                .iter()
+                .map(|(key, sample)| {
+                    sample
+                        .g8r_raw_stats
+                        .as_ref()
+                        .map(|stats| (key.clone(), stats.and_nodes * stats.depth))
+                })
+                .collect::<Option<BTreeMap<_, _>>>();
+            raw.add(
                 &version,
-                format!(
-                    "{}&baseline={first_id}",
-                    progression_url(&cohort.cohort_id, &g.generation_id, true)
+                &g.generation_id,
+                trend.count,
+                raw_costs,
+                |first_id| {
+                    format!(
+                        "{}&baseline={first_id}&vector_stage=raw#progression-vectors",
+                        progression_url(&cohort.cohort_id, &g.generation_id, true),
+                    )
+                },
+            )?;
+            abc.add(
+                &version,
+                &g.generation_id,
+                trend.count,
+                Some(
+                    samples
+                        .into_iter()
+                        .map(|(key, sample)| (key, sample.g8r_product))
+                        .collect(),
                 ),
-                first,
-                &now,
-            )?);
+                |first_id| {
+                    format!(
+                        "{}&baseline={first_id}&vector_stage=abc",
+                        progression_url(&cohort.cohort_id, &g.generation_id, true),
+                    )
+                },
+            )?;
         }
-        if !trend.points.is_empty() {
+        trend.stages = Stages {
+            raw: raw.series,
+            abc: abc.series,
+        };
+        if !trend.stages.abc.points.is_empty() {
             trends.push(trend);
         }
     }
@@ -371,10 +441,10 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
         id: "full-corpus".into(),
         label: "Full frozen corpus".into(),
         count: site.generations[0].sample_count as usize,
-        points: vec![],
+        stages: Stages::default(),
     };
-    let mut baseline = None;
-    let baseline_version = site.generations[0].crate_version.clone();
+    let mut raw = SeriesBuilder::default();
+    let mut abc = SeriesBuilder::default();
     for generation in site.generations {
         let version = generation.crate_version;
         versions
@@ -385,6 +455,7 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
             })
             .full_count = generation.sample_count;
         let mut now = BTreeMap::new();
+        let mut raw_now = BTreeMap::new();
         for shard in generation.shards {
             let path = shard
                 .evidence
@@ -394,26 +465,33 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
                 .value;
             let evidence = wire::EvidenceShard::decode(fs::read(corpus.join(path))?.as_slice())?;
             for sample in evidence.samples {
-                let stats = sample.g8r_abc.context("missing G8r stats")?;
+                let raw_stats = sample.g8r_raw.context("missing raw g8r stats")?;
+                raw_now.insert(
+                    sample.sample_id.clone(),
+                    raw_stats.and_nodes as f64 * raw_stats.depth as f64,
+                );
+                let stats = sample.g8r_abc.context("missing g8r stats")?;
                 now.insert(
                     sample.sample_id,
                     stats.and_nodes as f64 * stats.depth as f64,
                 );
             }
         }
-        let first = baseline.get_or_insert_with(|| now.clone());
-        trend.points.push(point(
-            &version,
-            format!("corpus/?release={version}&reference=release&baseline={baseline_version}"),
-            first,
-            &now,
-        )?);
+        for (builder, costs, stage) in [(&mut raw, raw_now, "raw"), (&mut abc, now, "abc")] {
+            builder.add(&version, &version, trend.count, Some(costs), |baseline_version| {
+                format!("corpus/?release={version}&reference=release&baseline={baseline_version}&stage={stage}")
+            })?;
+        }
     }
+    trend.stages = Stages {
+        raw: raw.series,
+        abc: abc.series,
+    };
     trends.insert(0, trend);
     let mut versions = versions.into_values().collect::<Vec<_>>();
     versions.sort_by(|a, b| cmp_dotted_numeric_version(&a.crate_version, &b.crate_version));
     Ok(serde_json::to_vec(&Dashboard {
-        schema_version: 1,
+        schema_version: 2,
         versions,
         trends,
     })?)
@@ -557,6 +635,63 @@ pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stage_series_preserves_its_population_and_skips_missing_releases() {
+        let mut raw = SeriesBuilder::default();
+        let first = BTreeMap::from([("a".into(), 4.), ("b".into(), 2.)]);
+        raw.add("0.54.0", "first", 2, None, str::to_string).unwrap();
+        raw.add("0.55.0", "baseline", 2, Some(first), str::to_string)
+            .unwrap();
+        raw.add("0.56.0", "missing", 2, None, str::to_string)
+            .unwrap();
+        raw.add(
+            "0.57.0",
+            "current",
+            2,
+            Some(BTreeMap::from([("a".into(), 2.), ("b".into(), 3.)])),
+            str::to_string,
+        )
+        .unwrap();
+        assert_eq!(raw.series.unavailable_versions, ["0.54.0", "0.56.0"]);
+        assert_eq!(
+            raw.series
+                .points
+                .iter()
+                .map(|p| (
+                    p.version.as_str(),
+                    p.url.as_str(),
+                    p.cost,
+                    p.lower,
+                    p.equal,
+                    p.higher
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("0.55.0", "baseline", 6., 0, 2, 0),
+                ("0.57.0", "baseline", 5., 1, 0, 1),
+            ]
+        );
+        assert!(
+            raw.add(
+                "0.58.0",
+                "incomplete",
+                2,
+                Some(BTreeMap::from([("a".into(), 2.)])),
+                str::to_string
+            )
+            .is_err()
+        );
+        assert!(
+            raw.add(
+                "0.58.0",
+                "different",
+                2,
+                Some(BTreeMap::from([("a".into(), 2.), ("c".into(), 3.)])),
+                str::to_string
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn progression_links_explicitly_include_partial_generations() {
         assert_eq!(

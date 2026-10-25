@@ -24,6 +24,17 @@ assert.equal(compared.reference_le,1);
 assert.throws(()=>pairRows([row],[]));
 assert.throws(()=>pairRows([row],[{...row,source_sha256:'2'}]));
 assert.throws(()=>pairRows([row],[{...row,top_fn_name:'different'}]));
+// Raw comparisons must select both sides' raw measurements, including LE,
+// while leaving the cached post-ABC rows intact.
+const raw={...row,raw_nodes:4,raw_depth:5,raw_le:6};
+const rawBaseline={...raw,raw_nodes:3,raw_depth:4,raw_le:5};
+const rawPair=pairRows([raw],[rawBaseline],'raw')[0];
+assert.deepEqual([rawPair.g8r_nodes,rawPair.g8r_depth,rawPair.g8r_le,rawPair.reference_nodes,rawPair.reference_depth,rawPair.reference_le,rawPair.cost,rawPair.reference_cost,rawPair.change],[4,5,6,3,4,5,20,12,8]);
+assert.equal(raw.g8r_nodes,2);
+assert.equal(rawBaseline.g8r_nodes,2);
+assert.throws(()=>pairRows([raw],null,'raw'));
+assert.throws(()=>pairRows([row],[rawBaseline],'raw'));
+assert.throws(()=>pairRows([raw],[row],'raw'));
 assert.equal(summarize(pairRows([{...row,g8r_nodes:0,yosys_nodes:0}])).count,1);
 assert.deepEqual(lossRows(all).map(r=>[r.sample_id,r.ir_node_count,r.change]),[['b',4,3]]);
 // A node/depth tradeoff with net positive cost remains visible; nonpositive

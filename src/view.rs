@@ -374,9 +374,9 @@ pub(crate) enum G8rVsYosysViewScope {
 impl G8rVsYosysViewScope {
     pub(crate) fn title(self) -> &'static str {
         match self {
-            Self::Stdlib => "DSLX Fn G8r vs Yosys/ABC",
-            Self::IrFnCorpus => "IR Fn Corpus G8r vs Yosys/ABC",
-            Self::IrFnCorpusG8rAbcVsCodegenYosysAbc => "IR Fn Corpus G8r+ABC vs Codegen+Yosys/ABC",
+            Self::Stdlib => "DSLX Fn g8r vs Yosys/ABC",
+            Self::IrFnCorpus => "IR Fn Corpus g8r vs Yosys/ABC",
+            Self::IrFnCorpusG8rAbcVsCodegenYosysAbc => "IR Fn Corpus g8r+ABC vs Codegen+Yosys/ABC",
         }
     }
 
@@ -417,7 +417,7 @@ impl StdlibTrendKind {
 
     pub(crate) fn title(self) -> &'static str {
         match self {
-            Self::G8r => "DSLX Fn G8r Trends",
+            Self::G8r => "DSLX Fn g8r Trends",
             Self::YosysAbc => "DSLX Fn Yosys/ABC Trends",
         }
     }

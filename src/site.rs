@@ -890,7 +890,7 @@ fn progression_run_evidence_to_proto(
                 )
             })?;
         if source.g8r.g8r_stats_action_id != sample.g8r_stats_action_id {
-            bail!("progression sample source evidence has the wrong G8r stats action");
+            bail!("progression sample source evidence has the wrong g8r stats action");
         }
         let (
             yosys_abc_stats_output_bytes,
@@ -1078,7 +1078,7 @@ fn validate_progression_sample_action_graph(
         bail!("progression import action does not match its published action ID");
     }
 
-    let g8r_aig = required_progression_action(&graph.g8r_aig, "G8r action")?;
+    let g8r_aig = required_progression_action(&graph.g8r_aig, "g8r action")?;
     let g8r_runtime = match &g8r_aig {
         ActionSpec::DriverIrToG8rAig {
             ir_action_id,
@@ -1098,11 +1098,11 @@ fn validate_progression_sample_action_graph(
         {
             runtime
         }
-        _ => bail!("progression G8r action does not match the fixed post-ABC recipe"),
+        _ => bail!("progression g8r action does not match the fixed post-ABC recipe"),
     };
     let g8r_aig_id = crate::executor::compute_action_id(&g8r_aig)?;
 
-    let g8r_abc_aig = required_progression_action(&graph.g8r_abc_aig, "G8r ABC action")?;
+    let g8r_abc_aig = required_progression_action(&graph.g8r_abc_aig, "g8r ABC action")?;
     let (yosys_script, yosys_runtime) = match &g8r_abc_aig {
         ActionSpec::AigToYosysAbcAig {
             aig_action_id,
@@ -1113,11 +1113,11 @@ fn validate_progression_sample_action_graph(
         {
             (yosys_script_ref, runtime)
         }
-        _ => bail!("progression G8r ABC action does not follow the published G8r action"),
+        _ => bail!("progression g8r ABC action does not follow the published g8r action"),
     };
     let g8r_abc_aig_id = crate::executor::compute_action_id(&g8r_abc_aig)?;
 
-    let g8r_stats = required_progression_action(&graph.g8r_stats, "G8r stats action")?;
+    let g8r_stats = required_progression_action(&graph.g8r_stats, "g8r stats action")?;
     let stats_runtime = match &g8r_stats {
         ActionSpec::DriverAigToStats {
             aig_action_id,
@@ -1126,10 +1126,10 @@ fn validate_progression_sample_action_graph(
         } if aig_action_id == &g8r_abc_aig_id && normalize_tag_version(version) == dso_version => {
             runtime
         }
-        _ => bail!("progression G8r stats action does not follow the post-ABC artifact"),
+        _ => bail!("progression g8r stats action does not follow the post-ABC artifact"),
     };
     if crate::executor::compute_action_id(&g8r_stats)? != g8r_stats_action_id {
-        bail!("progression G8r stats action does not match its published action ID");
+        bail!("progression g8r stats action does not match its published action ID");
     }
 
     let (expected_source_version, expected_stats_version) = match origin {
@@ -1146,9 +1146,9 @@ fn validate_progression_sample_action_graph(
             let source = g8r_runtime
                 .source_revision
                 .as_ref()
-                .context("Git progression G8r action has no source revision")?;
+                .context("Git progression g8r action has no source revision")?;
             if source.repository != *repository || source.commit != *commit {
-                bail!("Git progression G8r runtime does not match its source revision");
+                bail!("Git progression g8r runtime does not match its source revision");
             }
             (
                 baseline_crate_version.as_str(),
@@ -1432,7 +1432,7 @@ fn decode_progression_run_evidence(
             sample
                 .g8r_stats_action_id
                 .as_ref()
-                .context("progression sample has no G8r stats action ID")?,
+                .context("progression sample has no g8r stats action ID")?,
             "progression_sample.g8r_stats_action_id",
         )?;
         let yosys_abc_stats_action_id = crate::proto::action_id_to_hex(
@@ -1443,20 +1443,20 @@ fn decode_progression_run_evidence(
             "progression_sample.yosys_abc_stats_action_id",
         )?;
         if sample.g8r_stats_output_bytes == 0 {
-            bail!("progression sample has an empty G8r stats output");
+            bail!("progression sample has an empty g8r stats output");
         }
         crate::proto::digest_to_hex(
             sample
                 .g8r_stats_output_sha256
                 .as_ref()
-                .context("progression sample has no G8r stats output digest")?,
+                .context("progression sample has no g8r stats output digest")?,
             "progression_sample.g8r_stats_output_sha256",
         )?;
         let g8r_projection = crate::proto::digest_to_hex(
             sample
                 .g8r_metric_projection_sha256
                 .as_ref()
-                .context("progression sample has no G8r metric projection digest")?,
+                .context("progression sample has no g8r metric projection digest")?,
             "progression_sample.g8r_metric_projection_sha256",
         )?;
         if g8r_projection
@@ -1466,7 +1466,7 @@ fn decode_progression_run_evidence(
                 sample.g8r_abc_graph_logical_effort,
             )?
         {
-            bail!("progression sample G8r metrics disagree with their projection digest");
+            bail!("progression sample g8r metrics disagree with their projection digest");
         }
         let release_origin = matches!(origin, BrowserProgressionOrigin::CrateRelease);
         match (
@@ -2214,7 +2214,7 @@ fn validate_candidate_corpus_manifest_input(manifest: &CandidateCorpusManifestIn
         || normalize_tag_version(&manifest.dso_version)
             != normalize_tag_version(&candidate_run.dso_version)
     {
-        bail!("candidate corpus manifest does not match the fixed-IR G8r+ABC contract");
+        bail!("candidate corpus manifest does not match the fixed-IR g8r+ABC contract");
     }
     if candidate_run.candidate.repository != crate::XLSYNTH_CRATE_GIT_REPOSITORY
         || !is_canonical_lower_hex(&candidate_run.candidate.commit, 40)
@@ -2589,7 +2589,7 @@ fn validate_candidate_progression_generation(
             .context("candidate progression sample has no release baseline")?;
         for (field, action_id) in [
             ("IR action", &sample.ir_action_id),
-            ("G8r stats action", &sample.g8r_stats_action_id),
+            ("g8r stats action", &sample.g8r_stats_action_id),
             ("reference stats action", &sample.yosys_abc_stats_action_id),
         ] {
             if !is_canonical_lower_hex(action_id, 64) {
@@ -2666,7 +2666,7 @@ fn preflight_progression_run_dirs(progression_run_dirs: &[PathBuf]) -> Result<()
                 || release.samples.iter().any(|sample| sample.status != "done")
             {
                 bail!(
-                    "release progression run {} must be cohort-complete and use g8r-abc-vs-yabc-aig-diff; unmatched G8r data is not comparable to Git G8r+ABC runs",
+                    "release progression run {} must be cohort-complete and use g8r-abc-vs-yabc-aig-diff; unmatched g8r data is not comparable to Git g8r+ABC runs",
                     run_dir.display()
                 );
             }
@@ -2777,7 +2777,7 @@ fn decode_raw_g8r_stats(
     raw: &pb::ProgressionRawG8rStatsEvidence,
     expected: &ActionSpec,
 ) -> Result<BrowserRawG8rStats> {
-    let action = required_progression_action(&raw.stats_action, "raw G8r stats")?;
+    let action = required_progression_action(&raw.stats_action, "raw g8r stats")?;
     let id = crate::proto::action_id_to_hex(
         raw.stats_action_id
             .as_ref()
@@ -2788,7 +2788,7 @@ fn decode_raw_g8r_stats(
         || id != crate::executor::compute_action_id(expected)?
         || raw.output_bytes == 0
     {
-        bail!("raw G8r stats do not match their pre-ABC action and runtime");
+        bail!("raw g8r stats do not match their pre-ABC action and runtime");
     }
     crate::proto::digest_to_hex(
         raw.output_sha256
@@ -2809,7 +2809,7 @@ fn decode_raw_g8r_stats(
             raw.graph_logical_effort,
         )?
     {
-        bail!("raw G8r stats disagree with their metric digest");
+        bail!("raw g8r stats disagree with their metric digest");
     }
     Ok(BrowserRawG8rStats {
         and_nodes: raw.and_nodes,
@@ -2829,7 +2829,7 @@ fn read_optional_raw_g8r_stats(
     let id = match (action_id, status) {
         (None, None) => return Ok(None),
         (Some(id), Some("done")) => id,
-        _ => bail!("raw G8r stats are incomplete"),
+        _ => bail!("raw g8r stats are incomplete"),
     };
     let (_, stats) = read_verified_progression_stats_with_evidence(
         run_dir,
@@ -3006,7 +3006,7 @@ where
             .context("candidate sample is outside the fixed cohort")?;
         let baseline = baseline_samples
             .get(&structural_hash)
-            .context("candidate sample has no matching G8r+ABC release baseline")?;
+            .context("candidate sample has no matching g8r+ABC release baseline")?;
         let import_action = ActionSpec::ImportIrPackageFile {
             source_sha256: sample.source_sha256.clone(),
             top_fn_name: Some(sample.top_fn_name.clone()),
@@ -3071,7 +3071,7 @@ where
             || !baseline_stats_action_ids.contains(&baseline.g8r_stats_action_id)
         {
             bail!(
-                "candidate sample does not match its fixed IR, action graph, or common G8r+ABC release baseline"
+                "candidate sample does not match its fixed IR, action graph, or common g8r+ABC release baseline"
             );
         }
         let stats = read_stats(
@@ -3222,7 +3222,7 @@ fn load_candidate_progression_generation_with_evidence(
                 )
                 .is_some()
             {
-                bail!("candidate evidence contains duplicate G8r stats action");
+                bail!("candidate evidence contains duplicate g8r stats action");
             }
             Ok(value)
         },
@@ -4338,7 +4338,7 @@ fn progression_body(root_site_url: &str) -> String {
 <div class="vector-heading"><div><p class="science-label">Function movement / graph logical effort × AIG nodes</p><h2 id="vector-title">Where did the functions move?</h2></div><p id="vector-window" class="vector-window"></p></div>
 <p id="vector-description" class="meta">Each arrow runs from baseline ○ to current ▶. Down and left is better; opposite directions are tradeoffs. Both measurements describe the same selected-stage AIG.</p>
 <dl id="vector-counts" class="vector-counts"></dl>
-<div class="toolbar vector-controls"><label>AIG stage <select id="vector-stage" aria-label="Vector AIG stage"><option value="abc">G8r+ABC</option><option value="raw">G8r (pre-ABC)</option></select></label><label>Axes <select id="vector-scale" aria-label="Vector axis scale"><option value="log">Log (zero-safe)</option><option value="linear">Linear</option></select></label><label>Show <select id="vector-filter" aria-label="Vector movement filter"><option value="all">All functions</option><option value="changed">Changed only</option><option value="improved">Improved</option><option value="regressed">Regressed</option><option value="tradeoff">Tradeoffs</option><option value="unchanged">Unchanged</option></select></label><label>Find function <input id="vector-search" type="search" placeholder="Name or structural hash" aria-label="Find vector function"></label></div>
+<div class="toolbar vector-controls"><label>AIG stage <select id="vector-stage" aria-label="Vector AIG stage"><option value="abc">g8r+ABC</option><option value="raw">g8r (pre-ABC)</option></select></label><label>Axes <select id="vector-scale" aria-label="Vector axis scale"><option value="log">Log (zero-safe)</option><option value="linear">Linear</option></select></label><label>Show <select id="vector-filter" aria-label="Vector movement filter"><option value="all">All functions</option><option value="changed">Changed only</option><option value="improved">Improved</option><option value="regressed">Regressed</option><option value="tradeoff">Tradeoffs</option><option value="unchanged">Unchanged</option></select></label><label>Find function <input id="vector-search" type="search" placeholder="Name or structural hash" aria-label="Find vector function"></label></div>
 <p id="vector-warning" class="coverage-warning" hidden></p>
 <div class="vector-plot-panel"><div id="vector-plot" aria-label="Graph logical effort and AIG node count movement"></div></div>
 <p id="vector-status" class="meta" aria-live="polite"></p>
@@ -4449,7 +4449,7 @@ fn comparison_plots_body(
     rhs_label: &str,
 ) -> String {
     format!(
-        "<header class=\"comparison-header\"><p><a href=\"{root_site_url}\">← Results</a></p><h1>{}</h1><p class=\"meta\">The same interactive paired-synthesis view as the dynamic site: log/log levels and nodes, four-quadrant deltas, and strict product loss versus IR size</p><nav class=\"comparison-nav\"><a href=\"{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/\">G8r vs Yosys/ABC</a><a href=\"{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/\">G8r+ABC vs codegen+Yosys/ABC</a><a href=\"{root_site_url}mffc-discrepancies.html\">MFFC discrepancies</a></nav><p id=\"error\" role=\"alert\"></p></header><main id=\"comparison-plots\" class=\"comparison-page\" data-dataset-key=\"{}\" data-ir-dataset-key=\"{}\" data-lhs-label=\"{}\" data-rhs-label=\"{}\"><section class=\"comparison-controls\"><div class=\"toolbar\"><label>Crate version scope <select id=\"comparison-crate-version\" aria-label=\"Comparison crate version\"></select></label><label>Sample mode <select id=\"comparison-sample-mode\" aria-label=\"Comparison sample mode\"><option value=\"all\">all samples</option><option value=\"losses_only\">show losses only</option></select></label><label>Maximum IR nodes <input id=\"comparison-max-ir-nodes\" class=\"comparison-range\" type=\"range\" step=\"1\" aria-label=\"Maximum IR nodes\"></label><output id=\"comparison-max-ir-nodes-value\"></output></div><div class=\"comparison-status meta\"><span>scope: <strong id=\"comparison-scope-label\">loading…</strong></span><span>filtered: <strong id=\"comparison-filtered-count\">0</strong> / <strong id=\"comparison-total-count\">0</strong></span><span>strict positive-loss plot: <strong id=\"loss-positive-count\">0</strong></span></div><p id=\"comparison-no-data\" class=\"muted\" hidden>No paired samples match the current filters.</p></section><section class=\"plot-grid\"><article class=\"plot-panel\"><h2 class=\"plot-title\">{} levels vs {} levels</h2><div id=\"plot-levels\" class=\"plotly-host\"></div></article><article class=\"plot-panel\"><h2 class=\"plot-title\">{} nodes vs {} nodes</h2><div id=\"plot-nodes\" class=\"plotly-host\"></div></article><article class=\"plot-panel\"><h2 class=\"plot-title\">Quadrant deltas: levels vs nodes</h2><div id=\"plot-delta-quadrant\" class=\"plotly-host\"></div></article><article class=\"plot-panel\"><h2 class=\"plot-title\">{} product loss amount vs IR node count</h2><div id=\"plot-loss-vs-ir\" class=\"plotly-host\"></div></article></section><p class=\"meta\">Scroll to zoom, drag to pan, and click any point for its exact XLS IR, sample identity, and structural evidence. Zeroes on the log/log pair plots are displayed at 1 so they remain visible.</p><section class=\"card comparison-detail\" aria-live=\"polite\"><h2>Selected sample</h2><p id=\"comparison-detail-empty\" class=\"muted\">Click any point in any plot to inspect it.</p><p id=\"comparison-detail-evidence\" class=\"meta\"></p><section id=\"comparison-detail-ir\" class=\"comparison-ir-detail\" hidden></section><details id=\"comparison-detail-raw\" class=\"comparison-raw-detail\" hidden><summary>Raw sample metadata</summary><pre id=\"comparison-detail-json\"></pre></details></section><p class=\"meta\">Raw exported data: <a href=\"{root_site_url}dataset.html?key={}\">dataset explorer</a>.</p></main>",
+        "<header class=\"comparison-header\"><p><a href=\"{root_site_url}\">← Results</a></p><h1>{}</h1><p class=\"meta\">The same interactive paired-synthesis view as the dynamic site: log/log levels and nodes, four-quadrant deltas, and strict product loss versus IR size</p><nav class=\"comparison-nav\"><a href=\"{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/\">g8r vs Yosys/ABC</a><a href=\"{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/\">g8r+ABC vs codegen+Yosys/ABC</a><a href=\"{root_site_url}mffc-discrepancies.html\">MFFC discrepancies</a></nav><p id=\"error\" role=\"alert\"></p></header><main id=\"comparison-plots\" class=\"comparison-page\" data-dataset-key=\"{}\" data-ir-dataset-key=\"{}\" data-lhs-label=\"{}\" data-rhs-label=\"{}\"><section class=\"comparison-controls\"><div class=\"toolbar\"><label>Crate version scope <select id=\"comparison-crate-version\" aria-label=\"Comparison crate version\"></select></label><label>Sample mode <select id=\"comparison-sample-mode\" aria-label=\"Comparison sample mode\"><option value=\"all\">all samples</option><option value=\"losses_only\">show losses only</option></select></label><label>Maximum IR nodes <input id=\"comparison-max-ir-nodes\" class=\"comparison-range\" type=\"range\" step=\"1\" aria-label=\"Maximum IR nodes\"></label><output id=\"comparison-max-ir-nodes-value\"></output></div><div class=\"comparison-status meta\"><span>scope: <strong id=\"comparison-scope-label\">loading…</strong></span><span>filtered: <strong id=\"comparison-filtered-count\">0</strong> / <strong id=\"comparison-total-count\">0</strong></span><span>strict positive-loss plot: <strong id=\"loss-positive-count\">0</strong></span></div><p id=\"comparison-no-data\" class=\"muted\" hidden>No paired samples match the current filters.</p></section><section class=\"plot-grid\"><article class=\"plot-panel\"><h2 class=\"plot-title\">{} levels vs {} levels</h2><div id=\"plot-levels\" class=\"plotly-host\"></div></article><article class=\"plot-panel\"><h2 class=\"plot-title\">{} nodes vs {} nodes</h2><div id=\"plot-nodes\" class=\"plotly-host\"></div></article><article class=\"plot-panel\"><h2 class=\"plot-title\">Quadrant deltas: levels vs nodes</h2><div id=\"plot-delta-quadrant\" class=\"plotly-host\"></div></article><article class=\"plot-panel\"><h2 class=\"plot-title\">{} product loss amount vs IR node count</h2><div id=\"plot-loss-vs-ir\" class=\"plotly-host\"></div></article></section><p class=\"meta\">Scroll to zoom, drag to pan, and click any point for its exact XLS IR, sample identity, and structural evidence. Zeroes on the log/log pair plots are displayed at 1 so they remain visible.</p><section class=\"card comparison-detail\" aria-live=\"polite\"><h2>Selected sample</h2><p id=\"comparison-detail-empty\" class=\"muted\">Click any point in any plot to inspect it.</p><p id=\"comparison-detail-evidence\" class=\"meta\"></p><section id=\"comparison-detail-ir\" class=\"comparison-ir-detail\" hidden></section><details id=\"comparison-detail-raw\" class=\"comparison-raw-detail\" hidden><summary>Raw sample metadata</summary><pre id=\"comparison-detail-json\"></pre></details></section><p class=\"meta\">Raw exported data: <a href=\"{root_site_url}dataset.html?key={}\">dataset explorer</a>.</p></main>",
         escape_html(title),
         escape_html(dataset_key),
         crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
@@ -4466,7 +4466,7 @@ fn comparison_plots_body(
 
 fn mffc_discrepancies_body(root_site_url: &str) -> String {
     format!(
-        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>MFFC discrepancies</h1><p class=\"meta\">Paired MFFCs lowered through G8r+ABC and codegen+Yosys/ABC, ranked by signed nodes × levels product loss; positive means G8r is worse</p><p id=\"error\" role=\"alert\"></p></header><main id=\"mffc-discrepancies\" data-dataset-key=\"{}\" data-ir-dataset-key=\"{}\"><div class=\"toolbar\"><label>Crate release <select id=\"mffc-crate-version\" aria-label=\"MFFC crate release\"></select></label><label>Maximum IR nodes <input id=\"mffc-max-ir-nodes\" type=\"number\" min=\"1\" inputmode=\"numeric\" placeholder=\"all\" aria-label=\"Maximum MFFC IR nodes\"></label><label>Samples <select id=\"mffc-sample-mode\" aria-label=\"MFFC sample mode\"><option value=\"losses_only\">G8r losses only</option><option value=\"all\">all paired MFFCs</option></select></label></div><section id=\"mffc-summary\" class=\"grid\" aria-live=\"polite\"></section><section id=\"mffc-detail\" class=\"sample-detail\" aria-live=\"polite\"><h2>Selected MFFC</h2><p class=\"muted\">Click an MFFC name in the chart or table to inspect its origin, exact XLS IR, and synthesis evidence.</p></section><section id=\"mffc-chart\" aria-live=\"polite\"><p class=\"muted\">Loading paired MFFC data…</p></section><section id=\"mffc-table\" aria-live=\"polite\"></section><p class=\"meta\">Raw exported data: <a href=\"{root_site_url}dataset.html?key={}\">dataset explorer</a>.</p></main>",
+        "<header><p><a href=\"{root_site_url}\">← Results</a></p><h1>MFFC discrepancies</h1><p class=\"meta\">Paired MFFCs lowered through g8r+ABC and codegen+Yosys/ABC, ranked by signed nodes × levels product loss; positive means g8r is worse</p><p id=\"error\" role=\"alert\"></p></header><main id=\"mffc-discrepancies\" data-dataset-key=\"{}\" data-ir-dataset-key=\"{}\"><div class=\"toolbar\"><label>Crate release <select id=\"mffc-crate-version\" aria-label=\"MFFC crate release\"></select></label><label>Maximum IR nodes <input id=\"mffc-max-ir-nodes\" type=\"number\" min=\"1\" inputmode=\"numeric\" placeholder=\"all\" aria-label=\"Maximum MFFC IR nodes\"></label><label>Samples <select id=\"mffc-sample-mode\" aria-label=\"MFFC sample mode\"><option value=\"losses_only\">g8r losses only</option><option value=\"all\">all paired MFFCs</option></select></label></div><section id=\"mffc-summary\" class=\"grid\" aria-live=\"polite\"></section><section id=\"mffc-detail\" class=\"sample-detail\" aria-live=\"polite\"><h2>Selected MFFC</h2><p class=\"muted\">Click an MFFC name in the chart or table to inspect its origin, exact XLS IR, and synthesis evidence.</p></section><section id=\"mffc-chart\" aria-live=\"polite\"><p class=\"muted\">Loading paired MFFC data…</p></section><section id=\"mffc-table\" aria-live=\"polite\"></section><p class=\"meta\">Raw exported data: <a href=\"{root_site_url}dataset.html?key={}\">dataset explorer</a>.</p></main>",
         crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
         crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME,
         url_encode(crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME),
@@ -4485,7 +4485,7 @@ fn homepage_body(
         .get(..12)
         .unwrap_or(&snapshot.snapshot_id);
     format!(
-        r#"<header class="science-header"><div class="science-topline"><div><p class="science-label">xlsynth-bvc / static result corpus</p><h1>Boolean synthesis comparison</h1></div><nav class="science-nav" aria-label="Primary navigation"><a href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">QoR explorer</a><a href="{root_site_url}progression.html">Release history</a><a href="{root_site_url}releases.html">Processing status</a><a href="{root_site_url}runs.html">Runs</a><a href="{root_site_url}dataset.html">Data</a></nav></div><p class="science-abstract">Paired measurements of XLS IR through G8r+ABC and codegen+Yosys/ABC. Both paths share ABC downstream, so the overview isolates frontend structure; the full explorers provide sample-level links to immutable exported evidence.</p><dl class="science-meta"><div><dt>snapshot</dt><dd><code title="{}">{}</code></dd></div><div><dt>verified runs</dt><dd>{}</dd></div><div><dt>datasets</dt><dd>{}</dd></div><div><dt>generated</dt><dd>{}</dd></div></dl><p id="error" role="alert"></p></header><main class="science-main"><section id="home-overview" data-dataset-key="{}" data-lhs-label="G8r+ABC" data-rhs-label="codegen+Yosys/ABC" aria-labelledby="overview-title"><div class="overview-heading"><div><p class="science-label">latest crate release / G8r+ABC vs codegen+Yosys/ABC</p><h2 id="overview-title">Corpus overview</h2><p id="home-overview-status" class="meta" aria-live="polite">Loading paired synthesis measurements…</p></div><a id="home-full-explorer-link" class="text-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">Open the full interactive view →</a></div><p id="home-coverage-warning" class="coverage-warning" hidden role="status"></p><dl class="metric-row"><div><dt>crate release</dt><dd id="home-overview-release">—</dd></div><div><dt>paired IR samples</dt><dd id="home-sample-count">—</dd></div><div><dt>Q1 pure wins</dt><dd id="home-pure-win-count">—</dd></div><div><dt>Q3 strict losses</dt><dd id="home-strict-loss-count">—</dd></div><div><dt>median signed product Δ</dt><dd id="home-median-loss">—</dd></div></dl><div class="home-plot-grid"><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic levels</h3><span>log / log · y=x · zero→1 disclosed</span></div><div id="home-plot-levels" class="home-plot" aria-label="G8r plus ABC versus codegen plus Yosys ABC logic levels"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic nodes</h3><span>log / log · y=x · zero→1 disclosed</span></div><div id="home-plot-nodes" class="home-plot" aria-label="G8r plus ABC versus codegen plus Yosys ABC logic nodes"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Node / level delta quadrants</h3><span>positive = G8r+ABC better</span></div><div id="home-plot-deltas" class="home-plot" aria-label="Four quadrant node and level delta plot"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Strict product losses vs IR size</h3><span>Q3 positive only · click to inspect</span></div><div id="home-plot-loss" class="home-plot" aria-label="G8r plus ABC strict product loss versus IR size"></div></article></div></section><section class="analysis-index" aria-labelledby="analysis-title"><div class="analysis-index-header"><h2 id="analysis-title">Analysis views</h2><p>Focused views of the same exported corpus</p></div><nav class="analysis-list" aria-label="Analysis views"><a class="analysis-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/"><span>01</span><span><strong>G8r+ABC vs codegen+Yosys/ABC</strong><small>Frontend structure comparison with a shared downstream optimizer.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/"><span>02</span><span><strong>G8r vs Yosys/ABC</strong><small>Direct backend comparison across releases, filters, quadrants, and sample evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}mffc-discrepancies.html"><span>03</span><span><strong>MFFC discrepancies</strong><small>Local cone ranking with paired IR and synthesis evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}progression.html"><span>04</span><span><strong>Release progression</strong><small>Aggregate quality and per-artifact distributions on fixed IR.</small></span><span>→</span></a></nav></section><footer class="publication-bar"><span>Self-contained static publication · no live database at request time</span><nav aria-label="Publication details"><a href="{root_site_url}runs.html">Campaign runs</a><a href="{root_site_url}dataset.html">Raw datasets</a></nav></footer></main>"#,
+        r#"<header class="science-header"><div class="science-topline"><div><p class="science-label">xlsynth-bvc / static result corpus</p><h1>Boolean synthesis comparison</h1></div><nav class="science-nav" aria-label="Primary navigation"><a href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">QoR explorer</a><a href="{root_site_url}progression.html">Release history</a><a href="{root_site_url}releases.html">Processing status</a><a href="{root_site_url}runs.html">Runs</a><a href="{root_site_url}dataset.html">Data</a></nav></div><p class="science-abstract">Paired measurements of XLS IR through g8r+ABC and codegen+Yosys/ABC. Both paths share ABC downstream, so the overview isolates frontend structure; the full explorers provide sample-level links to immutable exported evidence.</p><dl class="science-meta"><div><dt>snapshot</dt><dd><code title="{}">{}</code></dd></div><div><dt>verified runs</dt><dd>{}</dd></div><div><dt>datasets</dt><dd>{}</dd></div><div><dt>generated</dt><dd>{}</dd></div></dl><p id="error" role="alert"></p></header><main class="science-main"><section id="home-overview" data-dataset-key="{}" data-lhs-label="g8r+ABC" data-rhs-label="codegen+Yosys/ABC" aria-labelledby="overview-title"><div class="overview-heading"><div><p class="science-label">latest crate release / g8r+ABC vs codegen+Yosys/ABC</p><h2 id="overview-title">Corpus overview</h2><p id="home-overview-status" class="meta" aria-live="polite">Loading paired synthesis measurements…</p></div><a id="home-full-explorer-link" class="text-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/">Open the full interactive view →</a></div><p id="home-coverage-warning" class="coverage-warning" hidden role="status"></p><dl class="metric-row"><div><dt>crate release</dt><dd id="home-overview-release">—</dd></div><div><dt>paired IR samples</dt><dd id="home-sample-count">—</dd></div><div><dt>Q1 pure wins</dt><dd id="home-pure-win-count">—</dd></div><div><dt>Q3 strict losses</dt><dd id="home-strict-loss-count">—</dd></div><div><dt>median signed product Δ</dt><dd id="home-median-loss">—</dd></div></dl><div class="home-plot-grid"><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic levels</h3><span>log / log · y=x · zero→1 disclosed</span></div><div id="home-plot-levels" class="home-plot" aria-label="g8r plus ABC versus codegen plus Yosys ABC logic levels"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Logic nodes</h3><span>log / log · y=x · zero→1 disclosed</span></div><div id="home-plot-nodes" class="home-plot" aria-label="g8r plus ABC versus codegen plus Yosys ABC logic nodes"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Node / level delta quadrants</h3><span>positive = g8r+ABC better</span></div><div id="home-plot-deltas" class="home-plot" aria-label="Four quadrant node and level delta plot"></div></article><article class="home-chart-panel"><div class="home-chart-header"><h3>Strict product losses vs IR size</h3><span>Q3 positive only · click to inspect</span></div><div id="home-plot-loss" class="home-plot" aria-label="g8r plus ABC strict product loss versus IR size"></div></article></div></section><section class="analysis-index" aria-labelledby="analysis-title"><div class="analysis-index-header"><h2 id="analysis-title">Analysis views</h2><p>Focused views of the same exported corpus</p></div><nav class="analysis-list" aria-label="Analysis views"><a class="analysis-link" href="{root_site_url}ir-fn-g8r-abc-vs-codegen-yosys-abc/"><span>01</span><span><strong>g8r+ABC vs codegen+Yosys/ABC</strong><small>Frontend structure comparison with a shared downstream optimizer.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}ir-fn-corpus-g8r-vs-yosys-abc/"><span>02</span><span><strong>g8r vs Yosys/ABC</strong><small>Direct backend comparison across releases, filters, quadrants, and sample evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}mffc-discrepancies.html"><span>03</span><span><strong>MFFC discrepancies</strong><small>Local cone ranking with paired IR and synthesis evidence.</small></span><span>→</span></a><a class="analysis-link" href="{root_site_url}progression.html"><span>04</span><span><strong>Release progression</strong><small>Aggregate quality and per-artifact distributions on fixed IR.</small></span><span>→</span></a></nav></section><footer class="publication-bar"><span>Self-contained static publication · no live database at request time</span><nav aria-label="Publication details"><a href="{root_site_url}runs.html">Campaign runs</a><a href="{root_site_url}dataset.html">Raw datasets</a></nav></footer></main>"#,
         escape_html(&snapshot.snapshot_id),
         escape_html(snapshot_short),
         catalog.runs.len(),
@@ -4544,16 +4544,16 @@ fn expected_fixed_site_files(
     for (page_relpath, page_title, dataset_key, lhs_label, rhs_label) in [
         (
             "ir-fn-corpus-g8r-vs-yosys-abc/index.html",
-            "IR corpus: G8r vs Yosys/ABC",
+            "IR corpus: g8r vs Yosys/ABC",
             crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
-            "G8r",
+            "g8r",
             "Yosys/ABC",
         ),
         (
             "ir-fn-g8r-abc-vs-codegen-yosys-abc/index.html",
-            "IR corpus: G8r+ABC vs codegen+Yosys/ABC",
+            "IR corpus: g8r+ABC vs codegen+Yosys/ABC",
             crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
-            "G8r+ABC",
+            "g8r+ABC",
             "codegen+Yosys/ABC",
         ),
     ] {
@@ -5282,16 +5282,16 @@ fn build_static_site_with_progression_runs_in_place(
     for (page_relpath, page_title, dataset_key, lhs_label, rhs_label) in [
         (
             "ir-fn-corpus-g8r-vs-yosys-abc/index.html",
-            "IR corpus: G8r vs Yosys/ABC",
+            "IR corpus: g8r vs Yosys/ABC",
             crate::WEB_IR_FN_CORPUS_G8R_VS_YOSYS_INDEX_FILENAME,
-            "G8r",
+            "g8r",
             "Yosys/ABC",
         ),
         (
             "ir-fn-g8r-abc-vs-codegen-yosys-abc/index.html",
-            "IR corpus: G8r+ABC vs codegen+Yosys/ABC",
+            "IR corpus: g8r+ABC vs codegen+Yosys/ABC",
             crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME,
-            "G8r+ABC",
+            "g8r+ABC",
             "codegen+Yosys/ABC",
         ),
     ] {
@@ -6411,12 +6411,12 @@ pub(crate) fn smoke_static_site(
             ("mffc-discrepancies.html", "MFFC discrepancies", Vec::new()),
             (
                 "ir-fn-corpus-g8r-vs-yosys-abc/",
-                "IR corpus: G8r vs Yosys/ABC",
+                "IR corpus: g8r vs Yosys/ABC",
                 vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
             ),
             (
                 "ir-fn-g8r-abc-vs-codegen-yosys-abc/",
-                "IR corpus: G8r+ABC vs codegen+Yosys/ABC",
+                "IR corpus: g8r+ABC vs codegen+Yosys/ABC",
                 vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
             ),
             ("dataset.html", "Dataset explorer", Vec::new()),

@@ -113,6 +113,24 @@ async function main() {
   const paired = pairRows(allRows.get(newest), allRows.get(baseline));
   await checkPlots(paired);
   await shot('corpus-release-comparison');
+  await control('stage','raw');
+  await ready();
+  assert.equal(await evaluate("document.getElementById('reference').value"),'release');
+  assert.equal(await evaluate("document.querySelector('#reference option[value=yosys]').disabled"),true);
+  for(const version of versions){
+    await control('release',version);await ready();
+    await checkPlots(pairRows(allRows.get(version),allRows.get(baseline),'raw'));
+  }
+  await shot('corpus-pre-abc');
+  assert.equal(await evaluate("new URL(location.href).searchParams.get('stage')"),'raw');
+  const documentOrigin=await evaluate('performance.timeOrigin');
+  await send('Page.reload');
+  await waitFor(`performance.timeOrigin!==${documentOrigin}`);await ready();
+  assert.equal(await evaluate("document.getElementById('stage').value"),'raw');
+  await checkPlots(pairRows(allRows.get(newest),allRows.get(baseline),'raw'));
+  await control('stage','abc');await ready();
+  assert.equal(await evaluate("document.querySelector('#reference option[value=yosys]').disabled"),false);
+  await checkPlots(paired);
   // Rapid edits exercise coalescing while a Plotly render is in flight.
   await control('kind', 'mffc');
   await control('kind', 'k3');
@@ -156,7 +174,7 @@ async function main() {
   console.log(JSON.stringify({releases:versions,samples_each:catalog.sample_count,desktop:true,mobile:true,paired:true,filters:true,ir:true,errors}));
 }
 const timeout = new Promise((_, reject)=>{
-  const timer = setTimeout(()=>reject(Error('Browser test timed out')), 180000);
+  const timer = setTimeout(()=>reject(Error('Browser test timed out')), 360000);
   timer.unref();
 });
 Promise.race([main(), timeout, new Promise((_,reject)=>chrome.once('error',reject))])
