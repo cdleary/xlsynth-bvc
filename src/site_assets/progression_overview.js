@@ -39,7 +39,7 @@ function costOverview(generations, baselineId, currentId, mode = 'baseline') {
   const selected = costComparison(baseline, current, mode);
   const history = generations.filter(g => g.coverage === 'cohort_complete').map(g =>
     ({generation: g, ...costComparison(baseline, g, mode)})).filter(row => row.complete);
-  const referenceLabel = mode === 'yosys' ? 'matched codegen+Yosys/ABC' : `${generationLabel(baseline)} G8r+ABC`;
+  const referenceLabel = mode === 'yosys' ? 'matched codegen+Yosys/ABC' : `${generationLabel(baseline)} g8r+ABC`;
   return {baseline, current, mode, selected, history, referenceLabel};
 }
 function costPlotLayout(xTitle, yTitle) {
@@ -70,7 +70,7 @@ function costTrendSpec(model) {
     marker: {color: '#d2a8ff', size: rows.map(row => row.generation.generation_id === model.current.generation_id ? 12 : 7),
       symbol: rows.map(row => generationIsGit(row.generation) ? 'diamond-open' : 'circle')},
     customdata: rows.map(row => row.generation.generation_id),
-    text: rows.map(row => `${esc(generationLabel(row.generation))}<br>${esc(row.generation.event_time_utc || 'Date unavailable')} · DSO v${esc(row.generation.dso_version)}<br>Index: ${product(row.index)}<br>G8r+ABC cost: ${product(row.now)}<br>Reference cost: ${product(row.old)}<br>${row.rows.length} paired functions`),
+    text: rows.map(row => `${esc(generationLabel(row.generation))}<br>${esc(row.generation.event_time_utc || 'Date unavailable')} · DSO v${esc(row.generation.dso_version)}<br>Index: ${product(row.index)}<br>g8r+ABC cost: ${product(row.now)}<br>Reference cost: ${product(row.old)}<br>${row.rows.length} paired functions`),
     hovertemplate: '%{text}<extra></extra>'};
   return {traces: [trace], layout};
 }
@@ -115,14 +115,14 @@ function renderGenerationPair(generations, baselineId, currentId) {
   if (!root) return;
   const mode = byId('progression-reference').value;
   const model = costOverview(generations, baselineId, currentId, mode), s = model.selected;
-  const currentLabel = generationLabel(model.current), context = `${currentLabel} G8r+ABC vs ${model.referenceLabel}`;
+  const currentLabel = generationLabel(model.current), context = `${currentLabel} g8r+ABC vs ${model.referenceLabel}`;
   root.dataset.costReference = mode;
   root.dataset.rendered = 'loading';
   const previousTrend = byId('progression-trend');
   if (previousTrend && typeof Plotly !== 'undefined') Plotly.purge(previousTrend);
   const warning = !s.complete ? `<p class="coverage-warning">Incomplete fixed-IR warning: this selected comparison uses only ${s.rows.length} paired functions (${s.added} current-only, ${s.removed} reference-only). It is not a full-cohort result. Incomplete generations are never plotted in the historical charts.</p>` : '';
   byId('progression-summary').innerHTML = warning + `<article class="card"><div class="muted">${esc(context)}</div><div class="stat-value cost-text-${costKind(s.delta)}">${costHeadline(s)}</div><div class="meta">${product(s.old)} → ${product(s.now)} nodes × depth. ${s.percent === null ? 'A percentage is undefined when the reference total is zero.' : 'Ratio of summed costs; larger functions carry more weight.'}</div></article><article class="card"><div class="muted">How widespread is it?</div><div class="cost-summary-counts">${costKinds.map(kind => `<span class="cost-text-${kind.key}"><strong>${s.counts[kind.key]}</strong> ${kind.label.toLowerCase()}</span>`).join('')}</div><div class="meta">${s.rows.length} paired functions, each counted once. Equal cost need not mean equal nodes and depth.</div></article>`;
-  byId('progression-chart').innerHTML = `<div class="progression-chart-grid"><article class="progression-chart-panel"><h3>How much did total cost change?</h3><p class="meta">Lower index is better · reference = 100</p><div id="progression-trend" class="progression-plot" aria-label="Indexed total cost by generation"></div></article><article class="progression-chart-panel"><h3>How many functions improved?</h3><p class="meta">Product cost vs ${esc(model.referenceLabel)}</p><div class="cost-legend">${costKinds.map(kind => `<span class="cost-text-${kind.key}">● ${kind.label}</span>`).join('')}</div><div class="cost-breadth">${costBreadthRows(model) || '<p class="muted">No complete, matched generations.</p>'}</div><p class="meta cost-chart-help">Counts: lower / equal / higher. Click a row or trend point to inspect that generation.</p></article></div><p class="meta cost-chart-help">Same canonical structural-hash cohort in every historical point. ${mode === 'yosys' ? 'Each point uses its own matched Yosys/ABC reference; changes in this gap can come from either implementation. This is not a direct release-to-release change.' : `Each point compares G8r+ABC directly with ${esc(generationLabel(model.baseline))}; no Yosys/ABC subtraction. DSO and runtime details remain in the coverage inventory.`} The indexed line uses a zoomed vertical range around the observed values; 100 marks parity.</p>`;
+  byId('progression-chart').innerHTML = `<div class="progression-chart-grid"><article class="progression-chart-panel"><h3>How much did total cost change?</h3><p class="meta">Lower index is better · reference = 100</p><div id="progression-trend" class="progression-plot" aria-label="Indexed total cost by generation"></div></article><article class="progression-chart-panel"><h3>How many functions improved?</h3><p class="meta">Product cost vs ${esc(model.referenceLabel)}</p><div class="cost-legend">${costKinds.map(kind => `<span class="cost-text-${kind.key}">● ${kind.label}</span>`).join('')}</div><div class="cost-breadth">${costBreadthRows(model) || '<p class="muted">No complete, matched generations.</p>'}</div><p class="meta cost-chart-help">Counts: lower / equal / higher. Click a row or trend point to inspect that generation.</p></article></div><p class="meta cost-chart-help">Same canonical structural-hash cohort in every historical point. ${mode === 'yosys' ? 'Each point uses its own matched Yosys/ABC reference; changes in this gap can come from either implementation. This is not a direct release-to-release change.' : `Each point compares g8r+ABC directly with ${esc(generationLabel(model.baseline))}; no Yosys/ABC subtraction. DSO and runtime details remain in the coverage inventory.`} The indexed line uses a zoomed vertical range around the observed values; 100 marks parity.</p>`;
   const selectGeneration = id => {
     const select = byId('current-version'); select.value = id; select.dispatchEvent(new Event('change'));
   };
@@ -132,10 +132,10 @@ function renderGenerationPair(generations, baselineId, currentId) {
   byId('progression-contribution-context').textContent = context;
   byId('progression-function-detail').innerHTML = '';
   const exactRows = [...s.rows].sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta) || a.key.localeCompare(b.key));
-  byId('progression-table').innerHTML = `<div class="table-wrap"><table><caption>${esc(context)} · all ${s.rows.length} paired functions, ordered by absolute change</caption><thead><tr><th>Function</th><th>${esc(model.referenceLabel)}</th><th>${esc(currentLabel)} G8r+ABC</th><th>Cost change</th><th>Percent change</th></tr></thead><tbody>${exactRows.map(row => `<tr><td><button type="button" class="sample-link" data-cost-function="${row.key}">${esc(row.label)}</button></td><td>${product(row.old)}</td><td>${product(row.now)}</td><td class="cost-text-${row.kind}">${product(row.delta)}</td><td>${percentage(row.percent)}</td></tr>`).join('')}</tbody></table></div>`;
+  byId('progression-table').innerHTML = `<div class="table-wrap"><table><caption>${esc(context)} · all ${s.rows.length} paired functions, ordered by absolute change</caption><thead><tr><th>Function</th><th>${esc(model.referenceLabel)}</th><th>${esc(currentLabel)} g8r+ABC</th><th>Cost change</th><th>Percent change</th></tr></thead><tbody>${exactRows.map(row => `<tr><td><button type="button" class="sample-link" data-cost-function="${row.key}">${esc(row.label)}</button></td><td>${product(row.old)}</td><td>${product(row.now)}</td><td class="cost-text-${row.kind}">${product(row.delta)}</td><td>${percentage(row.percent)}</td></tr>`).join('')}</tbody></table></div>`;
   const inspect = key => {
     const row = s.rows.find(row => row.key === key); if (!row) return;
-    byId('progression-function-detail').innerHTML = `<div class="cost-function-detail"><h4>${esc(row.label)}</h4><code>${row.key}</code><p>${esc(model.referenceLabel)}: ${product(row.old)} → ${esc(currentLabel)} G8r+ABC: ${product(row.now)} nodes × depth</p><p class="cost-text-${row.kind}">Change: ${product(row.delta)} (${percentage(row.percent)})${row.percent === null ? ' · percentage undefined: zero reference cost' : ''}</p></div>`;
+    byId('progression-function-detail').innerHTML = `<div class="cost-function-detail"><h4>${esc(row.label)}</h4><code>${row.key}</code><p>${esc(model.referenceLabel)}: ${product(row.old)} → ${esc(currentLabel)} g8r+ABC: ${product(row.now)} nodes × depth</p><p class="cost-text-${row.kind}">Change: ${product(row.delta)} (${percentage(row.percent)})${row.percent === null ? ' · percentage undefined: zero reference cost' : ''}</p></div>`;
   };
   root.querySelectorAll('[data-cost-function]').forEach(button => button.onclick = () => inspect(button.dataset.costFunction));
   const revision = String(Number(root.dataset.plotRevision || 0) + 1); root.dataset.plotRevision = revision;

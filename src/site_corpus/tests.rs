@@ -433,7 +433,16 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
     );
     assert_eq!(data["versions"][1]["full_count"], 2);
     assert_eq!(data["trends"][0]["count"], 2);
-    assert_eq!(data["trends"][0]["points"][0]["equal"], 2);
+    assert_eq!(data["schema_version"], 2);
+    let stages = &data["trends"][0]["stages"];
+    assert_eq!(stages["abc"]["points"][0]["equal"], 2);
+    assert_eq!(stages["raw"]["points"][0]["equal"], 2);
+    assert_eq!(stages["abc"]["points"][0]["cost"], 30.0);
+    assert_eq!(stages["raw"]["points"][0]["cost"], 38.0);
+    assert_eq!(
+        stages["raw"]["points"][0]["url"],
+        "corpus/?release=0.74.0&reference=release&baseline=0.74.0&stage=raw"
+    );
     let published =
         crate::publish::publish_static_site(&options.out_dir, &root.0.join("publication")).unwrap();
     assert_eq!(published.snapshot_id, summary.snapshot_id);

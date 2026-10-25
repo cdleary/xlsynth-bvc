@@ -112,7 +112,7 @@ self-contained workspace under `OUTPUT_DIR/.bvc/` and writes public manifests/ex
 For a pinned progression cohort in enqueue mode, pass its checked-in scheduling policy. Release
 generations that will be compared with Git revisions must use
 `--recipe-preset g8r-abc-vs-yabc-aig-diff`; Git revisions use the direct
-`--recipe-preset g8r-abc-stats` path. Both measure post-ABC G8r with the same Yosys/ABC runtime and
+`--recipe-preset g8r-abc-stats` path. Both measure post-ABC g8r with the same Yosys/ABC runtime and
 script. The policies validate the exact cohort and may prioritize known stragglers without changing
 action identities or QoR results.
 
@@ -171,7 +171,7 @@ Use `--scheduling-policy mffc-progression-ir-v1` with the materialized 904-artif
 
 `--driver-git-commit` accepts only a full lowercase 40-character commit from the canonical
 `xlsynth/xlsynth-crate` repository and conflicts with `--driver-version`. The direct preset runs
-only `Git-built G8r frontend -> common Yosys/ABC -> common released-driver AIG stats`; it does not
+only `Git-built g8r frontend -> common Yosys/ABC -> common released-driver AIG stats`; it does not
 schedule the codegen+Yosys branch. For a policy-validated candidate run, `manifest.json` records a
 typed immutable candidate-run identity containing the exact Git commit, observed latest release
 version and commit, DSO, exact source-driver, ABC, and stats runtimes, execution recipe, exact
@@ -352,6 +352,11 @@ or evaluation runs that produced the data. These principles are the intended nav
   input population, and coverage. Fixed-cohort trends compare the same inputs; partial coverage
   must not masquerade as a quality change. Keep incompatible comparisons distinguishable without
   making the reader navigate separate sites.
+  The splash chart defaults to g8r before ABC, with FRAIG disabled, and offers post-ABC results
+  through the same stage selector. Each stage uses the complete fixed input population; missing
+  stage measurements create a labeled gap rather than a partial-population total. The latest
+  change card and chart comparison links follow the selected stage. g8r folding and hashing
+  remain enabled; carry-out and priority-encode preparation rewrites are disabled in this recipe.
 - **Use descriptive language.** Titles name the analysis, and explanatory text states the
   methodology or interpretation. Avoid slogans, duplicate summaries, and navigation labels that
   require knowledge of the implementation.
@@ -533,7 +538,7 @@ Notes:
 - Compaction needs additional free disk temporarily (source + compacted copy,
   until swap completes).
 
-## Structural-Hash G8r Enqueue
+## Structural-Hash g8r Enqueue
 
 ```bash
 # Enqueue one ir2g8r action per unique optimized-IR structural hash for a target crate runtime.

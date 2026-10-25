@@ -567,7 +567,7 @@ fn build_historical_candidate_site_fixture_with_graph_le(
             runtime: candidate_runtime.clone(),
         };
         let candidate_g8r_action_id =
-            compute_action_id(&candidate_g8r_action).expect("candidate G8r action ID");
+            compute_action_id(&candidate_g8r_action).expect("candidate g8r action ID");
         let candidate_abc_action = ActionSpec::AigToYosysAbcAig {
             aig_action_id: candidate_g8r_action_id.clone(),
             yosys_script_ref: script_ref.clone(),
@@ -593,7 +593,7 @@ fn build_historical_candidate_site_fixture_with_graph_le(
             runtime: stats_runtime.clone(),
         };
         let baseline_g8r_action_id =
-            compute_action_id(&baseline_g8r_action).expect("baseline G8r action ID");
+            compute_action_id(&baseline_g8r_action).expect("baseline g8r action ID");
         let baseline_abc_action = ActionSpec::AigToYosysAbcAig {
             aig_action_id: baseline_g8r_action_id,
             yosys_script_ref: script_ref.clone(),
@@ -1110,7 +1110,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     action_graph.g8r_stats = action_graph.import_ir.clone();
     let action_graph_error = decode_progression_run_evidence(&wrong_graph.encode_to_vec())
         .expect_err("typed action graph must independently bind published action IDs");
-    assert!(format!("{action_graph_error:#}").contains("G8r stats action"));
+    assert!(format!("{action_graph_error:#}").contains("g8r stats action"));
 
     let mut custom_runtime =
         pb::FixedCorpusProgressionRunEvidence::decode(evidence_bytes.as_slice())
@@ -1123,14 +1123,14 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
             .expect("candidate action graph")
             .g8r_stats
             .as_mut()
-            .expect("candidate G8r stats action");
+            .expect("candidate g8r stats action");
         let mut action = crate::proto::action_spec_from_proto(g8r_stats)
-            .expect("decode candidate G8r stats action");
+            .expect("decode candidate g8r stats action");
         match &mut action {
             ActionSpec::DriverAigToStats { runtime, .. } => {
                 runtime.docker_image = "private.example/xlsynth-driver:custom".to_string();
             }
-            _ => panic!("expected candidate G8r stats action"),
+            _ => panic!("expected candidate g8r stats action"),
         }
         *g8r_stats =
             crate::proto::action_spec_to_proto(&action).expect("encode custom stats runtime");
@@ -1421,7 +1421,7 @@ fn release_preflight_rejects_unmatched_and_incomplete_runs() {
     );
     let unmatched = preflight_progression_run_dirs(std::slice::from_ref(&run_dir))
         .expect_err("unmatched release recipe must fail");
-    assert!(format!("{unmatched:#}").contains("unmatched G8r data is not comparable"));
+    assert!(format!("{unmatched:#}").contains("unmatched g8r data is not comparable"));
 
     write_release_preflight_manifest(
         &run_dir,
@@ -1795,7 +1795,7 @@ fn site_build_and_verify_supports_subdirectory_base() {
     assert!(APP_JS.contains("loadIrFnCorpusIrEntry"));
     assert!(APP_JS.contains("data-copy-comparison-ir"));
     assert!(APP_JS.contains("Loading exact XLS IR"));
-    assert!(frontend_comparison_html.contains("G8r+ABC vs codegen+Yosys/ABC"));
+    assert!(frontend_comparison_html.contains("g8r+ABC vs codegen+Yosys/ABC"));
     assert!(APP_JS.contains("renderComparisonQuadrants"));
     assert!(APP_JS.contains("renderComparisonLoss"));
     assert!(!APP_JS.contains("scattergl"));
@@ -1810,13 +1810,13 @@ fn site_build_and_verify_supports_subdirectory_base() {
         mffc_html.contains(crate::WEB_IR_FN_CORPUS_G8R_ABC_VS_CODEGEN_YOSYS_ABC_INDEX_FILENAME)
     );
     assert!(mffc_html.contains(crate::WEB_IR_FN_CORPUS_IR_INDEX_FILENAME));
-    assert!(mffc_html.contains("positive means G8r is worse"));
+    assert!(mffc_html.contains("positive means g8r is worse"));
     assert!(APP_JS.contains("No paired MFFC samples are available in this snapshot."));
-    assert!(APP_JS.contains("Largest G8r product losses"));
+    assert!(APP_JS.contains("Largest g8r product losses"));
     assert!(APP_JS.contains("Both evidence paths reference this same action and top."));
     assert!(APP_JS.contains("entry.g8r_stats_action_id===sample.g8r_stats_action_id"));
     assert!(APP_JS.contains("entry.yosys_abc_stats_action_id===sample.yosys_abc_stats_action_id"));
-    assert!(APP_JS.contains("mffcIrPanel('G8r'"));
+    assert!(APP_JS.contains("mffcIrPanel('g8r'"));
     assert!(APP_JS.contains("mffcIrPanel('Yosys/ABC'"));
     assert!(APP_JS.contains("Representative subject"));
     assert!(APP_JS.contains("Yosys/ABC IR action"));
@@ -2543,7 +2543,7 @@ const direct = api.compareSamples(
   value => value.g8r_product,
 );
 if (direct.pairs.length !== 1 || direct.pairs[0].delta !== 1000) {
-  throw new Error(`commit-to-release comparison must use direct G8r product: ${JSON.stringify(direct)}`);
+  throw new Error(`commit-to-release comparison must use direct g8r product: ${JSON.stringify(direct)}`);
 }
 const generation = (generation_id, dso_version) => ({
   generation_id,
@@ -2637,7 +2637,7 @@ global.document = {
 const app = fs.readFileSync(0, 'utf8');
 const prefix = app.slice(0, app.indexOf('async function main()'));
 const api = new Function(prefix + '\nreturn {comparisonDefaultVersion,comparisonIsLoss,comparisonQuadrant,comparisonSelectionKey,latestDsoSamplesByCrate};')();
-const state = {lhs: 'G8r', rhs: 'Yosys/ABC'};
+const state = {lhs: 'g8r', rhs: 'Yosys/ABC'};
 const sample = (g8r_nodes, g8r_levels, yosys_abc_nodes, yosys_abc_levels) => ({
   g8r_nodes,
   g8r_levels,
@@ -2753,7 +2753,7 @@ const state = {
 {logical_key: irDatasetKey(firstHash), url: 'first-ir.json'},
 {logical_key: irDatasetKey(secondHash), url: 'second-ir.json'},
   ]},
-  lhs: 'G8r',
+  lhs: 'g8r',
   rhs: 'Yosys/ABC',
   irDatasetKey: 'ir-fn-corpus-ir.v1.json',
   selectedSampleKey: null,

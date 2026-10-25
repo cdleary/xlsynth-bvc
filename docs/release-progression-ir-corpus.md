@@ -16,9 +16,9 @@ The MFFC cohort additionally retains its extraction lineage in `src/site_assets/
 ## Graph logical-effort vector view
 
 The progression page also plots baseline-to-current arrows at `(graph LE, AIG AND nodes)`
-for each paired structural hash. The AIG-stage selector chooses raw G8r (pre-ABC) or
-G8r+ABC. Both coordinates always come from the same stage's AIG; aggregate charts
-below the vector view continue to describe G8r+ABC.
+for each paired structural hash. The AIG-stage selector chooses raw g8r (pre-ABC) or
+g8r+ABC. Both coordinates always come from the same stage's AIG; aggregate charts
+below the vector view continue to describe g8r+ABC.
 Green means neither coordinate worsens and at least one improves; red is the reverse;
 amber marks tradeoffs; gray marks unchanged functions. LE comparisons use a relative
 tolerance of `1e-9` with a floor of one FO4. Node comparisons are exact.
@@ -88,7 +88,7 @@ Policies are accepted only with `--execution-mode enqueue`. The run records the 
 
 The cohort was captured on 2026-09-03 from a production static-site snapshot whose `catalog.json` SHA-256 is `5a99a8efcc222687995a12ef0fe1a7f70dfd5ab87812b3c895df3c5943aaeeb2`. The snapshot's `ir-fn-corpus-ir.v1.json` descriptor SHA-256 is `d08e478594386e648347757ac9bef9d5d652d71a9752c479848b54ebc3bc0aba`; its paired `ir-fn-corpus-g8r-abc-vs-codegen-yosys-abc.v1.json` descriptor SHA-256 is `cd778dec73387f41ddf137616a3ad2fced7290f488fb86a215b93a3633e59246`.
 
-It is the common set of exact whole-function structural hashes with paired G8r and Yosys/ABC measurements in both of these complete generations:
+It is the common set of exact whole-function structural hashes with paired g8r and Yosys/ABC measurements in both of these complete generations:
 
 - xlsynth crate `0.66.0`, DSO `0.54.7`: 187 artifacts
 - xlsynth crate `0.68.0`, DSO `0.54.7`: 187 artifacts
@@ -117,7 +117,7 @@ done < src/site_assets/mffc_progression_ir_artifacts.tsv
 Then evaluate releases with `--recipe-preset g8r-abc-vs-yabc-aig-diff` and exact Git
 revisions with `--recipe-preset g8r-abc-stats`. Both use
 `--top-fn-policy infer-single-package` and `--scheduling-policy mffc-progression-ir-v1`.
-The release recipe is intentionally matched: its G8r result passes through the same Yosys/ABC
+The release recipe is intentionally matched: its g8r result passes through the same Yosys/ABC
 runtime and script as the Git path. Raw `g8r-vs-yabc-aig-diff` release results are not comparable
 and publication rejects them. Completed actions are cache-addressed and runs are resumable.
 
@@ -214,6 +214,6 @@ jq -s -r --rawfile manifest "$manifest_out" '
 ```
 
 The materialized directory contains 187 files. Hashing each file with its hash-only filename in sorted order produces `983fab9ccbfc6d6cb3ce112215730203b0c7731514281ebd4610a61cd82fc6a6`. Run the `g8r-abc-vs-yabc-aig-diff` corpus recipe against that directory for every historical
-crate/DSO pair that will be compared with direct G8r+ABC Git evaluations.
+crate/DSO pair that will be compared with direct g8r+ABC Git evaluations.
 
 Each checked-in named manifest is the benchmark identity. Do not replace it merely because a newer release adds or removes input functions; create and review a new cohort version when intentionally changing the benchmark.

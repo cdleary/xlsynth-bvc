@@ -136,14 +136,14 @@ They use the same action graph shape and differ only in the Yosys/ABC script use
 - `g8r-vs-yabc-aig-diff` uses `flows/yosys_to_aig.ys`
 - `g8r-vs-yabc-no-fraig-aig-diff` uses `flows/abc_ablate_no_fraig.ys`
 
-The generation-candidate preset deliberately schedules only the comparable G8r path:
+The generation-candidate preset deliberately schedules only the comparable g8r path:
 
 1. `ImportIrPackageFile`
 1. `DriverIrToG8rAig` with `frontend_no_prep_rewrite` and `fraig=false`
 1. `AigToYosysAbcAig` using `flows/yosys_to_aig.ys`
 1. `DriverAigToStats` using the latest-release stats runtime
 
-This makes G8r implementation revision the intended variable; DSO, lowering mode, ABC, stats,
+This makes g8r implementation revision the intended variable; DSO, lowering mode, ABC, stats,
 and recipe revision remain explicit and common. Candidate input bytes are pinned by their digests,
 and comparison to the release baseline is paired by canonical structural hash. No codegen+Yosys
 leg or branch diff is planned for `g8r-abc-stats`.
@@ -222,13 +222,13 @@ cargo run --bin xlsynth_bvc -- \
 ```
 
 The option is repeatable. A release run must use `g8r-abc-vs-yabc-aig-diff`; an unmatched
-`g8r-vs-yabc-aig-diff` run is rejected because its G8r metrics are not comparable to the Git
-G8r+ABC path. Rendering rejects partial, mismatched, or noncanonical run data. DSO, fixed structural
+`g8r-vs-yabc-aig-diff` run is rejected because its g8r metrics are not comparable to the Git
+g8r+ABC path. Rendering rejects partial, mismatched, or noncanonical run data. DSO, fixed structural
 hashes, source-byte digests, the complete reconstructed action graph, common Yosys/ABC
 script/runtime, and stats runtime must all match. Metrics are loaded from each canonical run store
 and must match their provenance-declared byte digest. The site retains every admitted generation as
 typed protobuf evidence and emits JSON only for the final browser projection. A valid Git
-generation is dated by commit time and defaults to a direct post-ABC G8r product comparison against
+generation is dated by commit time and defaults to a direct post-ABC g8r product comparison against
 its captured release. `--candidate-run-dir` remains a hidden compatibility alias.
 
 ## Scheduling Policies
@@ -312,7 +312,7 @@ the whole tree. The Sled backend memoizes validated provenance, bounded by entry
 bytes; each lookup still checks the current database row, so replacements, deletions, and corrupt
 rows cannot be hidden by the cache. Neither cache changes the durable store format or action IDs.
 
-Raw G8r lowering and ordinary combinational codegen have equal scheduling priority, preventing a
+Raw g8r lowering and ordinary combinational codegen have equal scheduling priority, preventing a
 blanket preference for one side of a comparison. Explicit queue priorities and leaf-first
 scheduling still apply; MFFC codegen retains its existing higher priority. This improves the
 opportunity to produce paired results early, not a guarantee of equal completion rates.

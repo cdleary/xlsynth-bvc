@@ -3,11 +3,18 @@
 (() => {
   const names = row => row.function_names.length ? row.function_names.join(', ') : row.top_fn_name;
   const product = row => row.g8r_nodes * row.g8r_depth;
-  function pairRows(rows, baseline) {
+  function stageRow(row, stage) {
+    if(stage !== 'raw') return row;
+    if(!Number.isFinite(row.raw_nodes) || !Number.isFinite(row.raw_depth)) throw Error('Missing pre-ABC measurements');
+    return {...row,g8r_nodes:row.raw_nodes,g8r_depth:row.raw_depth,g8r_le:row.raw_le};
+  }
+  function pairRows(rows, baseline, stage = 'abc') {
+    if(stage === 'raw' && !baseline) throw Error('Pre-ABC comparisons require another release at the same stage');
     const lookup = baseline ? new Map(baseline.map(r => [r.sample_id, r])) : null;
     return rows.map(row => {
-      const other = lookup?.get(row.sample_id);
+      const source = lookup?.get(row.sample_id), other = source ? stageRow(source, stage) : null;
       if (lookup && (!other || other.source_sha256 !== row.source_sha256 || other.top_fn_name !== row.top_fn_name)) throw Error('Release inputs do not match');
+      row = stageRow(row, stage);
       const nodes = other ? other.g8r_nodes : row.yosys_nodes, depth = other ? other.g8r_depth : row.yosys_depth;
       return {...row, reference_nodes:nodes, reference_depth:depth, reference_le:other ? other.g8r_le : row.yosys_le,
         cost:product(row), reference_cost:nodes*depth, change:product(row)-nodes*depth};
@@ -65,6 +72,10 @@
   async function render() {
     const token=state.epoch;byId('error').textContent='';byId('corpus-site').dataset.rendered='loading';
     byId('scope').textContent='Loading selected release…';
+    const stage=byId('stage').value, stageLabel=stage==='raw'?'g8r (no FRAIG, pre-ABC)':'g8r+ABC';
+    byId('reference').querySelector('option[value="yosys"]').disabled=stage==='raw';
+    if(stage==='raw')byId('reference').value='release';
+    byId('reference').querySelector('option[value="release"]').textContent=`Another release’s ${stageLabel}`;
     byId('baseline').disabled=byId('reference').value!=='release';
     const version=byId('release').value, baselineVersion=byId('baseline').value, compare=byId('reference').value;
     const current=await loadRelease(state.catalog.generations.find(g=>g.crate_version===version));
@@ -72,9 +83,10 @@
     if(token!==state.epoch)return;
     for(const key of state.cache.keys())if(key!==version&&(!baseline||key!==baselineVersion))state.cache.delete(key);
     const maxValue=byId('max-ir').value;
-    state.rows=filterRows(pairRows(current,baseline),{kind:byId('kind').value,search:byId('search').value,max:maxValue===''?null:Math.max(0,Number(maxValue)),losses:byId('losses').checked});
-    const rows=state.rows,s=summarize(rows),reference=baseline?`v${baselineVersion} G8r+ABC`:'codegen+Yosys/ABC';
-    byId('scope').textContent=`${fmt(s.count)} / ${fmt(state.catalog.sample_count)} inputs · v${version} G8r+ABC versus ${reference}`;
+    state.rows=filterRows(pairRows(current,baseline,stage),{kind:byId('kind').value,search:byId('search').value,max:maxValue===''?null:Math.max(0,Number(maxValue)),losses:byId('losses').checked});
+    const rows=state.rows,s=summarize(rows),reference=baseline?`v${baselineVersion} ${stageLabel}`:'codegen+Yosys/ABC';
+    byId('scope').textContent=`${fmt(s.count)} / ${fmt(state.catalog.sample_count)} inputs · v${version} ${stageLabel} versus ${reference}`;
+    byId('coverage').textContent=`${state.catalog.generations.length} complete releases · ${fmt(state.catalog.sample_count)} identical frozen inputs each · ${stage==='raw'?'pre-ABC, no FRAIG':'post-ABC'} measurements · no partial samples`;
     const pct=s.reference?`${((s.cost/s.reference-1)*100).toFixed(3)}%`:'undefined';
     byId('summary').replaceChildren(...[[`Aggregate cost change`,pct],['Lower / higher cost',`${fmt(s.better)} / ${fmt(s.worse)}`],['Unchanged cost',fmt(s.unchanged)],['Filtered inputs',fmt(s.count)]].map(([label,value])=>{const card=document.createElement('div');card.className='card';const title=document.createElement('span');title.textContent=label;const number=document.createElement('strong');number.textContent=value;card.append(title,number);return card}));
     ++state.selected;byId('selected').textContent='Click a point or outlier to inspect its verified source IR.';byId('ir').hidden=true;
@@ -89,7 +101,7 @@
     await scatter('nodes',rows,r=>r.reference_nodes,r=>r.g8r_nodes,`${reference} AND nodes`,`v${version} AND nodes`,true,true);
     await scatter('delta',rows,r=>r.g8r_nodes-r.reference_nodes,r=>r.g8r_depth-r.reference_depth,'Selected − reference AND nodes','Selected − reference depth',false,false);
     if(token!==state.epoch)return;
-    const url=new URL(location.href);url.searchParams.set('release',version);url.searchParams.set('reference',compare);url.searchParams.set('baseline',baselineVersion);history.replaceState(null,'',url);
+    const url=new URL(location.href);url.searchParams.set('release',version);url.searchParams.set('reference',compare);url.searchParams.set('baseline',baselineVersion);url.searchParams.set('stage',stage);history.replaceState(null,'',url);
     byId('corpus-site').dataset.rendered='true';byId('corpus-site').dataset.sampleCount=String(rows.length);
   }
   async function requestRender(){
@@ -108,8 +120,8 @@
     byId('release').value=versions.includes(query.get('release'))?query.get('release'):versions.at(-1);
     byId('baseline').value=versions.includes(query.get('baseline'))?query.get('baseline'):versions.at(-2)||versions[0];
     byId('reference').value=query.get('reference')==='release'?'release':'yosys';
-    byId('coverage').textContent=`${versions.length} complete releases · ${fmt(state.catalog.sample_count)} identical frozen inputs each · post-ABC measurements · no partial samples`;
-    for(const name of ['release','baseline','reference','kind','search','max-ir','losses'])byId(name).addEventListener('change',requestRender);
+    byId('stage').value=query.get('stage')==='raw'?'raw':'abc';
+    for(const name of ['release','baseline','reference','stage','kind','search','max-ir','losses'])byId(name).addEventListener('change',requestRender);
     await requestRender();
   }
   void main().catch(e=>{byId('error').textContent=e.message;byId('corpus-site').dataset.rendered='error'});
