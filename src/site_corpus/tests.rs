@@ -436,6 +436,7 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
     let root = Fixture::new();
     super::super::tests::build_historical_candidate_site_fixture(&root.0);
     let run = fixture_run(&root.0, "0.74.0", 2);
+    let newer = fixture_run(&root.0, "0.75.0", 2);
     let options = BuildStaticSiteOptions {
         snapshot_dir: root.0.join("snapshot"),
         out_dir: root.0.join("dashboard"),
@@ -446,7 +447,7 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
         &options,
         &[],
         &[root.0.join("candidate")],
-        &[run],
+        &[run, newer],
         &[],
         100_000,
     )
@@ -460,16 +461,24 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
             .iter()
             .map(|v| v["crate_version"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["0.66.0", "0.74.0"]
+        vec!["0.66.0", "0.74.0", "0.75.0"]
     );
     assert_eq!(data["versions"][1]["full_count"], 2);
     assert_eq!(data["trends"][0]["count"], 2);
-    assert_eq!(data["schema_version"], 2);
+    assert_eq!(data["schema_version"], 3);
     let stages = &data["trends"][0]["stages"];
     assert_eq!(stages["abc"]["points"][0]["equal"], 2);
     assert_eq!(stages["raw"]["points"][0]["equal"], 2);
     assert_eq!(stages["abc"]["points"][0]["cost"], 30.0);
     assert_eq!(stages["raw"]["points"][0]["cost"], 38.0);
+    let transition = &stages["raw"]["points"][1]["transition"];
+    assert_eq!(transition["baseline_version"], "0.74.0");
+    assert_eq!(transition["equal"], 2);
+    let detail_path = transition["details"].as_str().unwrap();
+    let detail_bytes = fs::read(options.out_dir.join(detail_path)).unwrap();
+    let detail: serde_json::Value = serde_json::from_slice(&detail_bytes).unwrap();
+    assert_eq!(detail["higher"], 0);
+    assert_eq!(detail["largest"], serde_json::json!([]));
     assert_eq!(
         stages["raw"]["points"][0]["url"],
         "corpus/?release=0.74.0&reference=release&baseline=0.74.0&stage=raw"
@@ -486,6 +495,20 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
     )
     .unwrap();
     assert_eq!(reused.snapshot_id, summary.snapshot_id);
+    // Even after rehashing, browser-only edits cannot change the transition evidence.
+    let manifest_path = options.out_dir.join(STATIC_SITE_MANIFEST_FILENAME);
+    let manifest_bytes = fs::read(&manifest_path).unwrap();
+    fs::write(options.out_dir.join(detail_path), b"{}").unwrap();
+    let mut modified = pb::StaticSiteManifest::decode(manifest_bytes.as_slice()).unwrap();
+    *modified
+        .files
+        .iter_mut()
+        .find(|f| f.logical_key == detail_path)
+        .unwrap() = publication_file(&options.out_dir, detail_path).unwrap();
+    fs::write(&manifest_path, modified.encode_to_vec()).unwrap();
+    assert!(verify_static_site(&options.out_dir).is_err());
+    fs::write(options.out_dir.join(detail_path), detail_bytes).unwrap();
+    fs::write(&manifest_path, manifest_bytes).unwrap();
     let published =
         crate::publish::publish_static_site(&options.out_dir, &root.0.join("publication")).unwrap();
     assert_eq!(published.snapshot_id, summary.snapshot_id);

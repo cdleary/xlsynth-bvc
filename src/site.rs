@@ -6395,7 +6395,7 @@ pub(crate) fn smoke_static_site(
     let origin = format!("http://{address}");
     let timeout = Duration::from_secs(timeout_seconds);
     let pages = if dashboard_mode {
-        vec![("", "Synthesis quality by release", progression_markers)]
+        vec![("", "g8r cost by release", progression_markers)]
     } else if corpus_mode {
         vec![("", "IR corpus synthesis results", progression_markers)]
     } else {

@@ -3,7 +3,7 @@
 'use strict';
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),cp=require('node:child_process'),assert=require('node:assert/strict');
 const {once}=require('node:events');
-const {trendSpec,resultHref,stageInfo,change,headline}=require('../src/site_assets/dashboard.js');
+const {trendSpec,transitionSpec,resultHref,stageInfo,change,percent,validateDetail}=require('../src/site_assets/dashboard.js');
 const url=new URL(process.argv[2]),screenshots=process.argv[3];
 const profile=fs.mkdtempSync(path.join(os.tmpdir(),'bvc-dashboard-browser-'));
 const chrome=cp.spawn(process.env.BVC_CHROME||'google-chrome',['--headless=new','--no-sandbox','--disable-gpu','--disable-dev-shm-usage','--disable-background-networking','--disable-component-update','--disable-default-apps','--disable-sync','--no-first-run','--remote-debugging-pipe',`--user-data-dir=${profile}`,'about:blank'],{stdio:['ignore','ignore','ignore','pipe','pipe']});
@@ -13,7 +13,7 @@ chrome.stdio[4].on('data',chunk=>{buffer+=chunk.toString();let end;while((end=bu
 const send=(method,params={},browser=false)=>new Promise((resolve,reject)=>{const id=++serial;requests.set(id,{resolve,reject});chrome.stdio[3].write(JSON.stringify({id,method,params,...(session&&!browser?{sessionId:session}:{})})+'\0')});
 const evaluate=async expression=>{const r=await send('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(r.exceptionDetails)throw Error(JSON.stringify(r.exceptionDetails));return r.result.value};
 const waitFor=async expression=>{const deadline=Date.now()+60000;do{if(await evaluate(expression))return;await new Promise(r=>setTimeout(r,100))}while(Date.now()<deadline);throw Error(`Timed out: ${expression}`)};
-const ready=()=>waitFor("document.getElementById('dashboard')?.dataset.rendered==='true'");
+const ready=()=>waitFor("document.getElementById('dashboard')?.dataset.rendered==='true'&&document.getElementById('regressions')?.dataset.rendered==='true'");
 const shot=async name=>{if(!screenshots)return;fs.mkdirSync(screenshots,{recursive:true});const r=await send('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(screenshots,`${name}.png`),Buffer.from(r.data,'base64'))};
 async function main(){
   const response=await fetch(new URL('dashboard.json',url));assert.equal(response.status,200);const data=await response.json();
@@ -26,30 +26,70 @@ async function main(){
   assert.deepEqual(await evaluate("Array.from(document.querySelectorAll('#version-rows tr'),r=>r.firstChild.textContent)"),[...data.versions].reverse().map(v=>`v${v.crate_version}`));
   assert.deepEqual(await evaluate("Array.from(document.getElementById('cohort').options,o=>o.value)"),data.trends.map(t=>t.id));
   await shot('dashboard-desktop');
+  const initialCohort=await evaluate("document.getElementById('cohort').value"),initialSeries=data.trends.find(t=>t.id===initialCohort).stages.raw;
+  const initialJson=[...new Set(resources.filter(r=>new URL(r).pathname.endsWith('.json')).map(r=>new URL(r).pathname))];
+  assert.deepEqual(initialJson,[new URL('dashboard.json',url).pathname,...(initialSeries.points.at(-1)?.transition?[new URL(initialSeries.points.at(-1).transition.details,url).pathname]:[])]);
   for(const stage of ['raw','abc']){
     await evaluate(`document.getElementById('stage').value=${JSON.stringify(stage)};document.getElementById('stage').dispatchEvent(new Event('change'))`);await ready();
     assert.equal(await evaluate("document.getElementById('trend-title').textContent"),stageInfo[stage].title);
-    const full=data.trends.find(t=>t.id==='full-corpus').stages[stage],last=full.points.at(-1),prior=full.points.at(-2);
-    assert.equal(await evaluate("document.getElementById('latest-change').textContent"),prior?headline(change(prior.cost,last.cost)):last?'One complete release':'No complete releases');
-    assert.equal(new URL(await evaluate("document.getElementById('compare-link').href")).searchParams.get('stage'),stage);
     for(const trend of data.trends){
       await evaluate(`document.getElementById('cohort').value=${JSON.stringify(trend.id)};document.getElementById('cohort').dispatchEvent(new Event('change'))`);await ready();
-      const series=trend.stages[stage],spec=trendSpec(series);
+      const series=trend.stages[stage],selected=await evaluate("document.getElementById('release').value"),point=series.points.find(p=>p.version===selected),spec=trendSpec(series,selected),strip=transitionSpec(series,selected);
       assert.deepEqual(await evaluate("document.getElementById('trend').data[0].y"),spec.data[0].y);
       assert.deepEqual(await evaluate("document.getElementById('trend').data[0].customdata"),spec.data[0].customdata);
       assert.equal(await evaluate("document.getElementById('trend').data[0].connectgaps"),false);
+      assert.deepEqual(await evaluate("document.getElementById('release-changes').data.map(t=>t.y)"),strip.data.map(t=>t.y));
+      assert.deepEqual(await evaluate("document.getElementById('release-changes').data.slice(0,2).map(t=>t.textposition)"),['none','none']);
+      assert.deepEqual(await evaluate("document.getElementById('trend').layout.xaxis.range"),await evaluate("document.getElementById('release-changes').layout.xaxis.range"));
       assert.equal(await evaluate("document.getElementById('stage-coverage').textContent!==''"),series.unavailable_versions.length>0);
       const latest=series.points.at(-1);
       if(latest)assert.equal(latest.lower+latest.equal+latest.higher,trend.count);
+      if(point?.transition){
+        const t=point.transition;
+        assert.equal(t.lower+t.equal+t.higher,trend.count);
+        assert.ok(Math.abs((t.cost_decreases+t.cost_increases)-(point.cost-t.baseline_cost))<1e-7*Math.max(1,point.cost));
+        assert.equal(await evaluate("document.getElementById('net-change').textContent"),percent(change(t.baseline_cost,point.cost)));
+        assert.equal(await evaluate("document.getElementById('compare-link').getAttribute('href')"),t.url);
+        const detail=validateDetail(await (await fetch(new URL(t.details,url))).json(),point);
+        assert.deepEqual(await evaluate("Array.from(document.querySelectorAll('#regression-rows .sample-link'),b=>b.dataset.sampleId)"),detail.largest.map(r=>r.sample_id));
+        await evaluate("document.querySelector('[data-rank=smallest]').click()");
+        assert.deepEqual(await evaluate("Array.from(document.querySelectorAll('#regression-rows .sample-link'),b=>b.dataset.sampleId)"),detail.smallest.map(r=>r.sample_id));
+        if(detail.smallest.length){
+          await evaluate("document.querySelector('#regression-rows .sample-link').click()");
+          assert.equal(await evaluate("document.getElementById('input-title').textContent"),detail.smallest[0].label);
+          assert.equal(await evaluate("document.getElementById('input-comparison').hidden"),false);
+          assert.equal(await evaluate("document.getElementById('input-link').getAttribute('href')"),detail.smallest[0].url);
+        }
+        await evaluate("document.querySelector('[data-rank=largest]').click()");
+      }
       assert.equal(await evaluate("new URL(location.href).searchParams.get('stage')"),stage);
       await shot(`dashboard-${trend.id}-${stage}`);
     }
   }
+  // Rapid changes must converge on the final cohort/stage/release, without
+  // stale examples or stale input details left over from an earlier request.
+  const fullRaw=data.trends.find(t=>t.id==='full-corpus').stages.raw;
+  await evaluate(`for(const stage of ['abc','raw']){document.getElementById('stage').value=stage;document.getElementById('stage').dispatchEvent(new Event('change'))}for(const cohort of ['whole-functions-v1','full-corpus']){document.getElementById('cohort').value=cohort;document.getElementById('cohort').dispatchEvent(new Event('change'))}document.getElementById('release').value=${JSON.stringify(fullRaw.points.at(-1).version)};document.getElementById('release').dispatchEvent(new Event('change'))`);await ready();
+  assert.equal(await evaluate("new URL(location.href).searchParams.get('cohort')"),'full-corpus');
+  assert.equal(await evaluate("new URL(location.href).searchParams.get('stage')"),'raw');
+  assert.equal(await evaluate("document.getElementById('input-comparison').hidden"),true);
+  // A failed lazy request clears stale rows and supports an explicit retry.
+  const retryPoint=fullRaw.points.at(-2);
+  await evaluate(`window.originalDashboardFetch=window.fetch;window.fetch=(input,options)=>new URL(input,location.href).pathname===${JSON.stringify(new URL(retryPoint.transition.details,url).pathname)}?Promise.reject(Error('Synthetic example-load failure')):window.originalDashboardFetch(input,options);document.getElementById('release').value=${JSON.stringify(retryPoint.version)};document.getElementById('release').dispatchEvent(new Event('change'))`);
+  await waitFor("document.getElementById('regressions').dataset.rendered==='error'");
+  assert.equal(await evaluate("document.getElementById('dashboard').dataset.rendered"),'true');
+  assert.equal(await evaluate("document.querySelectorAll('#regression-rows tr').length"),0);
+  assert.equal(await evaluate("document.getElementById('retry-examples').hidden"),false);
+  await evaluate("window.fetch=window.originalDashboardFetch;delete window.originalDashboardFetch;document.getElementById('retry-examples').click()");await ready();
+  const retryDetail=await (await fetch(new URL(retryPoint.transition.details,url))).json();
+  assert.deepEqual(await evaluate("Array.from(document.querySelectorAll('#regression-rows .sample-link'),b=>b.dataset.sampleId)"),retryDetail.largest.map(r=>r.sample_id));
   const documentOrigin=await evaluate('performance.timeOrigin');
   await send('Page.reload');await waitFor(`performance.timeOrigin!==${documentOrigin}`);await ready();
-  assert.equal(await evaluate("document.getElementById('stage').value"),'abc');
-  // The splash only fetches the small dashboard projection, never sample shards.
-  assert.deepEqual([...new Set(resources.filter(r=>new URL(r).pathname.endsWith('.json')).map(r=>new URL(r).pathname))],[new URL('dashboard.json',url).pathname]);
+  assert.equal(await evaluate("document.getElementById('stage').value"),'raw');
+  // Only the summary and bounded selected-transition examples are fetched, not
+  // the corpus catalog, sample metrics, fixed-cohort catalog, or source IR.
+  const allowedJson=new Set([new URL('dashboard.json',url).pathname,...data.trends.flatMap(t=>Object.values(t.stages).flatMap(s=>s.points.flatMap(p=>p.transition?[new URL(p.transition.details,url).pathname]:[])))]);
+  assert.ok(resources.filter(r=>new URL(r).pathname.endsWith('.json')).every(r=>allowedJson.has(new URL(r).pathname)));
   const links=await evaluate("Array.from(document.querySelectorAll('a[href]'),a=>a.href)");
   assert.equal(links.some(href=>['history/','history/index.html'].some(p=>new URL(href).pathname===new URL(p,url).pathname)),false);
   for(const href of new Set(links)){const r=await fetch(href);assert.equal(r.status,200,href);await r.body.cancel()}
@@ -72,6 +112,7 @@ async function main(){
   await send('Emulation.setDeviceMetricsOverride',{width:390,height:1000,deviceScaleFactor:1,mobile:true});await evaluate('window.dispatchEvent(new Event("resize"))');
   await new Promise(r=>setTimeout(r,500));
   assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true);await shot('dashboard-mobile');
+  assert.ok(await evaluate("document.getElementById('release-changes').layout.xaxis.tickvals.length<=4"));
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1180,deviceScaleFactor:1,mobile:false});
   const historical=data.trends.find(t=>t.id!=='full-corpus'&&t.stages.raw.points.length>1);
   if(historical){
@@ -86,19 +127,32 @@ async function main(){
       assert.equal(await evaluate("document.getElementById('vector-stage').value"),'raw');
     }
     await shot('progression-navigation');
-    await evaluate("document.querySelector('.bvc-navigation-home').click()");await ready();
+    await send('Page.navigate',{url:await evaluate("document.querySelector('.bvc-navigation-home').href")});await ready();
     assert.equal(await evaluate('location.pathname'),new URL('index.html',url).pathname);
   }
   const trend=data.trends.find(t=>t.id==='full-corpus'),last=trend.stages.raw.points.at(-1);
   await evaluate("document.getElementById('stage').value='raw';document.getElementById('stage').dispatchEvent(new Event('change'))");await ready();
   await evaluate(`document.getElementById('cohort').value='full-corpus';document.getElementById('cohort').dispatchEvent(new Event('change'))`);await ready();await shot('dashboard-full-corpus');
-  await evaluate(`document.getElementById('trend').emit('plotly_click',{points:[{customdata:${JSON.stringify(last.url)}}]})`);
+  const first=trend.stages.raw.points[0];
+  await evaluate(`document.getElementById('trend').emit('plotly_click',{points:[{customdata:${JSON.stringify(first.version)}}]})`);await ready();
+  assert.equal(await evaluate("document.getElementById('release').value"),first.version);
+  assert.equal(await evaluate("document.getElementById('net-change').textContent"),'—');
+  assert.equal(await evaluate("document.querySelectorAll('#regression-rows tr').length"),0);
+  await evaluate(`document.getElementById('release-changes').emit('plotly_click',{points:[{customdata:${JSON.stringify(last.version)}}]})`);await ready();
+  assert.equal(await evaluate("document.getElementById('release').value"),last.version);
+  const detail=await (await fetch(new URL(last.transition.details,url))).json();
+  if(detail.largest.length){
+    await evaluate("document.querySelector('#regression-rows .sample-link').click()");
+    await send('Page.navigate',{url:await evaluate("document.getElementById('input-link').href")});
+  }else await send('Page.navigate',{url:await evaluate("document.getElementById('compare-link').href")});
   await waitFor("document.getElementById('corpus-site')?.dataset.rendered==='true'");
   assert.equal(await evaluate("document.getElementById('release').value"),last.version);
   assert.equal(await evaluate("document.getElementById('stage').value"),'raw');
   assert.equal(await evaluate("document.getElementById('reference').value"),'release');
+  assert.equal(await evaluate("document.getElementById('baseline').value"),last.transition.baseline_version);
+  if(detail.largest.length){assert.equal(await evaluate("new URL(location.href).searchParams.get('sample')"),detail.largest[0].sample_id);assert.equal(await evaluate("document.getElementById('ir').hidden"),false);}
   await shot('corpus-navigation');
-  await evaluate("Array.from(document.querySelectorAll('.bvc-navigation a')).find(a=>a.textContent==='All versions').click()");await ready();
+  await send('Page.navigate',{url:await evaluate("Array.from(document.querySelectorAll('.bvc-navigation a')).find(a=>a.textContent==='All versions').href")});await ready();
   assert.equal(await evaluate('location.hash'),'#versions');
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({versions:data.versions.map(v=>v.crate_version),cohorts:data.trends.map(t=>({id:t.id,count:t.count,stages:Object.fromEntries(Object.entries(t.stages).map(([stage,series])=>[stage,{releases:series.points.length,unavailable:series.unavailable_versions}]))})),desktop:true,mobile:true,links:true,pointNavigation:true,errors},null,2));

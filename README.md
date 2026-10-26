@@ -361,8 +361,12 @@ or evaluation runs that produced the data. These principles are the intended nav
   making the reader navigate separate sites.
   The splash chart defaults to g8r before ABC, with FRAIG disabled, and offers post-ABC results
   through the same stage selector. Each stage uses the complete fixed input population; missing
-  stage measurements create a labeled gap rather than a partial-population total. The latest
-  change card and chart comparison links follow the selected stage. g8r folding and hashing
+  stage measurements create a labeled gap rather than a partial-population total. The selected
+  transition panel and comparison links follow the selected cohort and stage. The cumulative
+  line shows long-term change against the first complete release; aligned gain/loss bars and
+  input counts compare each release with the preceding evaluated complete release at that stage.
+  Selecting a release updates the transition and bounded regression examples on the same page;
+  input details preserve the release pair and stage. g8r folding and hashing
   remain enabled; carry-out and priority-encode preparation rewrites are disabled in this recipe.
 - **Use descriptive language.** Titles name the analysis, and explanatory text states the
   methodology or interpretation. Avoid slogans, duplicate summaries, and navigation labels that
