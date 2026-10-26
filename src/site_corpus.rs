@@ -5,6 +5,9 @@
 
 use super::*;
 
+#[path = "site_corpus/evidence.rs"]
+mod evidence;
+
 #[path = "site_corpus/provenance.rs"]
 mod provenance;
 
@@ -611,21 +614,27 @@ pub(crate) fn build(
     options: &BuildStaticSiteOptions,
     protected: &[(&str, &Path)],
     runs: &[PathBuf],
+    evidence_dirs: &[PathBuf],
     target: usize,
 ) -> Result<BuildStaticSiteSummary> {
-    if runs.is_empty() || target == 0 || target > MAX_SHARD_TARGET {
-        bail!("provide completed --corpus-run-dir inputs and a shard target in 1..=16 MiB");
+    if (runs.is_empty() && evidence_dirs.is_empty()) || target == 0 || target > MAX_SHARD_TARGET {
+        bail!(
+            "provide --corpus-run-dir or --corpus-evidence-dir inputs and a shard target in 1..=16 MiB"
+        );
     }
-    for run in runs {
+    for run in runs.iter().chain(evidence_dirs) {
         reject_site_output_overlap(&options.out_dir, run, protected)?;
     }
     normalize_base_url(&options.base_url)?;
-    build_static_site_atomically(options, |staging| build_in_place(staging, runs, target))
+    build_static_site_atomically(options, |staging| {
+        build_in_place(staging, runs, evidence_dirs, target)
+    })
 }
 
 pub(super) fn build_in_place(
     options: &BuildStaticSiteOptions,
     runs: &[PathBuf],
+    evidence_dirs: &[PathBuf],
     target: usize,
 ) -> Result<BuildStaticSiteSummary> {
     let origins = provenance::Index::from_snapshot(&options.snapshot_dir)?;
@@ -634,28 +643,49 @@ pub(super) fn build_in_place(
         generations: vec![],
         shard_target_bytes: target as u64,
     };
+    let mut append =
+        |mut generation: wire::Generation, mut samples: Vec<wire::Sample>| -> Result<()> {
+            if !options.snapshot_dir.as_os_str().is_empty() {
+                for sample in &mut samples {
+                    // Validate the frozen binding before replacing it from an explicit snapshot.
+                    provenance::validate(sample)?;
+                    origins.enrich(sample)?;
+                }
+            }
+            if site
+                .generations
+                .iter()
+                .any(|g| g.crate_version == generation.crate_version)
+            {
+                bail!("duplicate corpus release input");
+            }
+            if site
+                .generations
+                .first()
+                .is_some_and(|g| g.cohort_sha256 != generation.cohort_sha256)
+            {
+                bail!("corpus releases do not contain the same exact inputs");
+            }
+            generation.shards.clear();
+            write_shards(&options.out_dir, &mut generation, &samples, target)?;
+            site.generations.push(generation);
+            Ok(())
+        };
+    for directory in evidence_dirs {
+        let source = evidence::Source::open(directory)?;
+        for generation in &source.site.generations {
+            eprintln!(
+                "Reusing corpus evidence for v{} from {}",
+                generation.crate_version,
+                directory.display()
+            );
+            append(generation.clone(), source.samples(generation)?)?;
+        }
+    }
     for run in runs {
         eprintln!("Validating completed corpus run {}", run.display());
-        let (mut generation, mut samples) = ingest(run)?;
-        for sample in &mut samples {
-            origins.enrich(sample)?;
-        }
-        if site
-            .generations
-            .iter()
-            .any(|g| g.crate_version == generation.crate_version)
-        {
-            bail!("duplicate corpus release input");
-        }
-        if site
-            .generations
-            .first()
-            .is_some_and(|g| g.cohort_sha256 != generation.cohort_sha256)
-        {
-            bail!("corpus releases do not contain the same exact inputs");
-        }
-        write_shards(&options.out_dir, &mut generation, &samples, target)?;
-        site.generations.push(generation);
+        let (generation, samples) = ingest(run)?;
+        append(generation, samples)?;
     }
     site.generations
         .sort_by(|a, b| cmp_dotted_numeric_version(&a.crate_version, &b.crate_version));

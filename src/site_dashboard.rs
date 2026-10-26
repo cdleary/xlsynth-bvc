@@ -502,14 +502,15 @@ pub(crate) fn build(
     protected: &[(&str, &Path)],
     progression: &[PathBuf],
     corpus: &[PathBuf],
+    evidence: &[PathBuf],
     target: usize,
 ) -> Result<BuildStaticSiteSummary> {
     reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected)?;
     preflight_progression_run_dirs(progression)?;
-    if corpus.is_empty() || target == 0 || target > 16 * 1024 * 1024 {
+    if (corpus.is_empty() && evidence.is_empty()) || target == 0 || target > 16 * 1024 * 1024 {
         bail!("dashboard requires corpus inputs and shard target in 1..=16 MiB");
     }
-    for run in progression.iter().chain(corpus) {
+    for run in progression.iter().chain(corpus).chain(evidence) {
         reject_site_output_overlap(&options.out_dir, run, protected)?;
     }
     let base_url = normalize_base_url(&options.base_url)?;
@@ -525,7 +526,7 @@ pub(crate) fn build(
             protected,
             progression,
         )?;
-        site_corpus::build_in_place(&child("corpus"), corpus, target)?;
+        site_corpus::build_in_place(&child("corpus"), corpus, evidence, target)?;
         install_child_navigation(
             &staging.out_dir.join("history"),
             ChildNavigation::PreviousVersions,

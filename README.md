@@ -222,6 +222,13 @@ latest results, a large fixed-population progression chart, and an index of ever
 release. Historical pages and full-corpus explorers retain separate, verified evidence roots.
 Building does not deploy or restart evaluations.
 
+For later refreshes, reuse the previous dashboard's typed release evidence with
+`--corpus-evidence-dir ../previous-site/corpus` and pass only newly completed releases via
+`--corpus-run-dir`. This avoids reopening old evaluation stores; it regenerates the web assets
+and still verifies the complete result. Use a separate output directory. See
+[evidence reuse](docs/complete-corpus-site.md#reuse-completed-release-evidence) for the frozen-input
+contract and standalone-site usage.
+
 The enqueue workflow is intentionally explicit:
 
 1. The first `run-ir-dir-corpus` invocation seeds `OUTPUT_DIR/.bvc/`, imports local IR roots,

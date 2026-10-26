@@ -298,13 +298,17 @@ pub enum TopCommand {
         snapshot_dir: PathBuf,
     },
     BuildStaticSite {
-        #[arg(long, value_name = "DIR", required_unless_present = "corpus_run_dirs")]
+        #[arg(long, value_name = "DIR", required_unless_present_any = ["corpus_run_dirs", "corpus_evidence_dirs"])]
         snapshot_dir: Option<PathBuf>,
         #[arg(long, value_name = "DIR")]
         out_dir: PathBuf,
         /// Complete frozen-corpus release runs to render directly (repeatable).
         #[arg(long = "corpus-run-dir", value_name = "DIR")]
         corpus_run_dirs: Vec<PathBuf>,
+        /// Reuse typed evidence from an earlier corpus site (repeatable).
+        /// Use its corpus/ directory for a composed dashboard. No evaluation store is opened.
+        #[arg(long = "corpus-evidence-dir", value_name = "DIR")]
+        corpus_evidence_dirs: Vec<PathBuf>,
         /// Byte target for corpus evidence, metric, and IR shards (at most 16 MiB).
         #[arg(long, default_value_t = 2 * 1024 * 1024)]
         corpus_shard_bytes: usize,
