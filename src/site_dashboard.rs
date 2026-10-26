@@ -5,6 +5,9 @@
 use super::*;
 use site_corpus::wire;
 
+#[path = "site_dashboard/transitions.rs"]
+mod transitions;
+
 pub(super) const MANIFEST: &str = "dashboard.pb";
 const HTML: &str = include_str!("site_assets/dashboard.html");
 const JS: &str = include_str!("site_assets/dashboard.js");
@@ -164,6 +167,7 @@ struct Point {
     lower: usize,
     equal: usize,
     higher: usize,
+    transition: Option<transitions::Transition>,
 }
 
 #[derive(Serialize)]
@@ -190,6 +194,8 @@ struct Stages {
 struct SeriesBuilder {
     series: Series,
     baseline: Option<(String, BTreeMap<String, f64>)>,
+    previous: Option<(String, String, BTreeMap<String, transitions::Input>)>,
+    details: BTreeMap<String, Vec<u8>>,
 }
 
 impl SeriesBuilder {
@@ -198,22 +204,41 @@ impl SeriesBuilder {
         version: &str,
         generation: &str,
         count: usize,
-        costs: Option<BTreeMap<String, f64>>,
-        url: impl FnOnce(&str) -> String,
+        inputs: Option<BTreeMap<String, transitions::Input>>,
+        url: impl Fn(&str) -> String,
+        detail_prefix: &str,
     ) -> Result<()> {
-        let Some(costs) = costs else {
+        let Some(inputs) = inputs else {
             self.series.unavailable_versions.push(version.into());
             return Ok(());
         };
-        if costs.len() != count {
+        if inputs.len() != count {
             bail!("complete dashboard stage has missing samples");
         }
+        let costs = inputs
+            .iter()
+            .map(|(key, input)| (key.clone(), input.metrics.cost()))
+            .collect::<BTreeMap<_, _>>();
         let (first_id, first) = self
             .baseline
             .get_or_insert_with(|| (generation.into(), costs.clone()));
-        self.series
-            .points
-            .push(point(version, url(first_id), first, &costs)?);
+        let mut point = point(version, url(first_id), first, &costs)?;
+        if let Some((previous_version, previous_id, previous)) = &self.previous {
+            let path = format!("{detail_prefix}/{version}.json");
+            normalized_relpath(&path)?;
+            let (transition, detail) = transitions::compare(
+                previous_version,
+                version,
+                previous,
+                &inputs,
+                url(previous_id),
+                path.clone(),
+            )?;
+            self.details.insert(path, serde_json::to_vec(&detail)?);
+            point.transition = Some(transition);
+        }
+        self.series.points.push(point);
+        self.previous = Some((version.into(), generation.into(), inputs));
         Ok(())
     }
 }
@@ -248,6 +273,7 @@ fn point(
         lower: 0,
         equal: 0,
         higher: 0,
+        transition: None,
     };
     for (key, value) in now {
         match value.total_cmp(&baseline[key]) {
@@ -267,7 +293,12 @@ fn progression_url(cohort: &str, generation: &str, complete: bool) -> String {
     url
 }
 
-fn projection(out: &Path) -> Result<Vec<u8>> {
+struct Projection {
+    dashboard: Vec<u8>,
+    details: BTreeMap<String, Vec<u8>>,
+}
+
+fn projection(out: &Path) -> Result<Projection> {
     // Both child projections have already been verified against their protobuf
     // evidence. They are read only to create the final dashboard web projection.
     let history = out.join("history");
@@ -335,6 +366,7 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
     }
     let dataset = load_progression_comparison_dataset_from_site(&history, &catalog.datasets)?;
     let mut trends = Vec::new();
+    let mut details = BTreeMap::new();
     for cohort in &catalog.progression.cohorts {
         let mut trend = Trend {
             id: cohort.cohort_id.clone(),
@@ -391,10 +423,20 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
             let raw_costs = samples
                 .iter()
                 .map(|(key, sample)| {
-                    sample
-                        .g8r_raw_stats
-                        .as_ref()
-                        .map(|stats| (key.clone(), stats.and_nodes * stats.depth))
+                    sample.g8r_raw_stats.as_ref().map(|stats| {
+                        (
+                            key.clone(),
+                            transitions::Input {
+                                label: sample.fn_key.clone(),
+                                ir_nodes: sample.ir_node_count,
+                                metrics: transitions::Metrics {
+                                    nodes: stats.and_nodes,
+                                    depth: stats.depth,
+                                    graph_le: stats.graph_logical_effort,
+                                },
+                            },
+                        )
+                    })
                 })
                 .collect::<Option<BTreeMap<_, _>>>();
             raw.add(
@@ -408,6 +450,7 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
                         progression_url(&cohort.cohort_id, &g.generation_id, true),
                     )
                 },
+                &format!("data/transitions/{}/raw", cohort.cohort_id),
             )?;
             abc.add(
                 &version,
@@ -416,7 +459,20 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
                 Some(
                     samples
                         .into_iter()
-                        .map(|(key, sample)| (key, sample.g8r_product))
+                        .map(|(key, sample)| {
+                            (
+                                key,
+                                transitions::Input {
+                                    label: sample.fn_key,
+                                    ir_nodes: sample.ir_node_count,
+                                    metrics: transitions::Metrics {
+                                        nodes: sample.g8r_nodes,
+                                        depth: sample.g8r_levels,
+                                        graph_le: sample.g8r_abc_graph_logical_effort,
+                                    },
+                                },
+                            )
+                        })
                         .collect(),
                 ),
                 |first_id| {
@@ -425,8 +481,11 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
                         progression_url(&cohort.cohort_id, &g.generation_id, true),
                     )
                 },
+                &format!("data/transitions/{}/abc", cohort.cohort_id),
             )?;
         }
+        details.extend(raw.details);
+        details.extend(abc.details);
         trend.stages = Stages {
             raw: raw.series,
             abc: abc.series,
@@ -445,6 +504,7 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
     };
     let mut raw = SeriesBuilder::default();
     let mut abc = SeriesBuilder::default();
+    let mut input_metadata = BTreeMap::<String, (String, u64)>::new();
     for generation in site.generations {
         let version = generation.crate_version;
         versions
@@ -465,24 +525,61 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
                 .value;
             let evidence = wire::EvidenceShard::decode(fs::read(corpus.join(path))?.as_slice())?;
             for sample in evidence.samples {
+                let input = sample.input.as_ref().context("missing corpus input")?;
+                let (label, ir_nodes) =
+                    if let Some(metadata) = input_metadata.get(&sample.sample_id) {
+                        metadata.clone()
+                    } else {
+                        let label = sample
+                            .provenance
+                            .as_ref()
+                            .and_then(|p| p.origins.iter().map(|o| o.ir_top.as_str()).min())
+                            .unwrap_or(&input.top_fn_name)
+                            .to_string();
+                        let ir_nodes = crate::service::parse_ir_fn_node_count_by_name(
+                            &sample.input_ir,
+                            &input.top_fn_name,
+                        )
+                        .context("dashboard input is missing its declared top function")?;
+                        input_metadata.insert(sample.sample_id.clone(), (label.clone(), ir_nodes));
+                        (label, ir_nodes)
+                    };
                 let raw_stats = sample.g8r_raw.context("missing raw g8r stats")?;
                 raw_now.insert(
                     sample.sample_id.clone(),
-                    raw_stats.and_nodes as f64 * raw_stats.depth as f64,
+                    transitions::Input {
+                        label: label.clone(),
+                        ir_nodes,
+                        metrics: transitions::Metrics {
+                            nodes: raw_stats.and_nodes as f64,
+                            depth: raw_stats.depth as f64,
+                            graph_le: raw_stats.graph_logical_effort,
+                        },
+                    },
                 );
                 let stats = sample.g8r_abc.context("missing g8r stats")?;
                 now.insert(
                     sample.sample_id,
-                    stats.and_nodes as f64 * stats.depth as f64,
+                    transitions::Input {
+                        label,
+                        ir_nodes,
+                        metrics: transitions::Metrics {
+                            nodes: stats.and_nodes as f64,
+                            depth: stats.depth as f64,
+                            graph_le: stats.graph_logical_effort,
+                        },
+                    },
                 );
             }
         }
         for (builder, costs, stage) in [(&mut raw, raw_now, "raw"), (&mut abc, now, "abc")] {
             builder.add(&version, &version, trend.count, Some(costs), |baseline_version| {
                 format!("corpus/?release={version}&reference=release&baseline={baseline_version}&stage={stage}")
-            })?;
+            }, &format!("data/transitions/full-corpus/{stage}"))?;
         }
     }
+    details.extend(raw.details);
+    details.extend(abc.details);
     trend.stages = Stages {
         raw: raw.series,
         abc: abc.series,
@@ -490,11 +587,14 @@ fn projection(out: &Path) -> Result<Vec<u8>> {
     trends.insert(0, trend);
     let mut versions = versions.into_values().collect::<Vec<_>>();
     versions.sort_by(|a, b| cmp_dotted_numeric_version(&a.crate_version, &b.crate_version));
-    Ok(serde_json::to_vec(&Dashboard {
-        schema_version: 2,
-        versions,
-        trends,
-    })?)
+    Ok(Projection {
+        dashboard: serde_json::to_vec(&Dashboard {
+            schema_version: 3,
+            versions,
+            trends,
+        })?,
+        details,
+    })
 }
 
 pub(crate) fn build(
@@ -554,7 +654,11 @@ fn finish(out: &Path, base_url: &str) -> Result<BuildStaticSiteSummary> {
     for (path, bytes) in fixed_files() {
         write_file(out, path, bytes)?;
     }
-    write_file(out, "dashboard.json", &projection(out)?)?;
+    let projection = projection(out)?;
+    write_file(out, "dashboard.json", &projection.dashboard)?;
+    for (path, bytes) in projection.details {
+        write_file(out, &path, &bytes)?;
+    }
     let files = actual_site_relpaths(out)?
         .iter()
         .map(|path| publication_file(out, path))
@@ -625,8 +729,15 @@ pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -
             bail!("dashboard template mismatch");
         }
     }
+    let projection = projection(out)?;
+    for (path, bytes) in &projection.details {
+        expected.insert(path.clone());
+        if fs::read(out.join(path))? != *bytes {
+            bail!("dashboard transition projection mismatch");
+        }
+    }
     if actual_site_relpaths(out)? != expected
-        || fs::read(out.join("dashboard.json"))? != projection(out)?
+        || fs::read(out.join("dashboard.json"))? != projection.dashboard
     {
         bail!("dashboard projection or topology mismatch");
     }
@@ -639,18 +750,46 @@ mod tests {
     #[test]
     fn stage_series_preserves_its_population_and_skips_missing_releases() {
         let mut raw = SeriesBuilder::default();
+        let inputs = |costs: BTreeMap<String, f64>| {
+            costs
+                .into_iter()
+                .map(|(key, cost)| {
+                    (
+                        key,
+                        transitions::Input {
+                            label: "sample".into(),
+                            ir_nodes: 1,
+                            metrics: transitions::Metrics {
+                                nodes: cost,
+                                depth: 1.,
+                                graph_le: None,
+                            },
+                        },
+                    )
+                })
+                .collect()
+        };
         let first = BTreeMap::from([("a".into(), 4.), ("b".into(), 2.)]);
-        raw.add("0.54.0", "first", 2, None, str::to_string).unwrap();
-        raw.add("0.55.0", "baseline", 2, Some(first), str::to_string)
+        raw.add("0.54.0", "first", 2, None, str::to_string, "data/test")
             .unwrap();
-        raw.add("0.56.0", "missing", 2, None, str::to_string)
+        raw.add(
+            "0.55.0",
+            "baseline",
+            2,
+            Some(inputs(first)),
+            str::to_string,
+            "data/test",
+        )
+        .unwrap();
+        raw.add("0.56.0", "missing", 2, None, str::to_string, "data/test")
             .unwrap();
         raw.add(
             "0.57.0",
             "current",
             2,
-            Some(BTreeMap::from([("a".into(), 2.), ("b".into(), 3.)])),
+            Some(inputs(BTreeMap::from([("a".into(), 2.), ("b".into(), 3.)]))),
             str::to_string,
+            "data/test",
         )
         .unwrap();
         assert_eq!(raw.series.unavailable_versions, ["0.54.0", "0.56.0"]);
@@ -672,13 +811,30 @@ mod tests {
                 ("0.57.0", "baseline", 5., 1, 0, 1),
             ]
         );
+        assert!(raw.series.points[0].transition.is_none());
+        let transition = raw.series.points[1].transition.as_ref().unwrap();
+        assert_eq!(transition.baseline_version, "0.55.0");
+        assert_eq!(transition.url, "baseline");
+        assert_eq!(
+            (transition.lower, transition.equal, transition.higher),
+            (1, 0, 1)
+        );
+        assert_eq!(
+            (transition.cost_decreases, transition.cost_increases),
+            (-2., 1.)
+        );
+        assert_eq!(
+            raw.details.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["data/test/0.57.0.json"]
+        );
         assert!(
             raw.add(
                 "0.58.0",
                 "incomplete",
                 2,
-                Some(BTreeMap::from([("a".into(), 2.)])),
-                str::to_string
+                Some(inputs(BTreeMap::from([("a".into(), 2.)]))),
+                str::to_string,
+                "data/test"
             )
             .is_err()
         );
@@ -687,8 +843,9 @@ mod tests {
                 "0.58.0",
                 "different",
                 2,
-                Some(BTreeMap::from([("a".into(), 2.), ("c".into(), 3.)])),
-                str::to_string
+                Some(inputs(BTreeMap::from([("a".into(), 2.), ("c".into(), 3.)]))),
+                str::to_string,
+                "data/test"
             )
             .is_err()
         );

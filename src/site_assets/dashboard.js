@@ -1,92 +1,70 @@
 // SPDX-License-Identifier: Apache-2.0
 'use strict';
 (() => {
-  const change = (before, after) => before === 0 ? null : 100 * (after - before) / before;
-  const headline = percent => percent === null ? 'Change undefined' : percent === 0 ? 'Unchanged total cost' : `${Math.abs(percent).toLocaleString(undefined,{maximumSignificantDigits:4})}% ${percent < 0 ? 'lower' : 'higher'} cost`;
-  const selectedStage = value => value === 'abc' ? 'abc' : 'raw';
-  const stageInfo = {
-    raw: {label:'g8r only · no FRAIG · pre-ABC', title:'Pre-ABC g8r cost progression', note:'Measured after g8r lowering, without FRAIG or ABC.'},
-    abc: {label:'g8r + ABC · no g8r FRAIG', title:'Post-ABC cost progression', note:'Measured after ABC, with g8r FRAIG disabled.'},
-  };
-  function trendSpec(series) {
-    const points = [...series.points,...series.unavailable_versions.map(version=>({version,cost:null,url:null}))]
-      .sort((a,b)=>a.version.localeCompare(b.version,undefined,{numeric:true}));
-    const first = series.points[0], y = points.map(p => !first || p.cost === null ? null : change(first.cost,p.cost));
-    const finite = y.filter(Number.isFinite), lo = Math.min(0,...finite), hi = Math.max(0,...finite), pad = Math.max((hi-lo)*.18,.01);
-    const x = points.map((_,i)=>i), step = Math.max(1,Math.ceil(x.length/9)), ticks=x.filter(i=>i%step===0||i===x.length-1);
-    return {data:[{type:'scatter',mode:'lines+markers',x,y,customdata:points.map(p=>p.url),text:points.map(p=>`v${p.version}`),line:{color:'#80e0b1',width:3},marker:{size:8,color:'#80e0b1'},connectgaps:false,hovertemplate:'%{text}<br>%{y:.4g}% cost change<extra></extra>'}],
-      layout:{paper_bgcolor:'transparent',plot_bgcolor:'transparent',font:{color:'#a0b0c0',family:'system-ui,sans-serif'},showlegend:false,margin:{l:66,r:20,t:25,b:62},
-        xaxis:{tickvals:ticks,ticktext:ticks.map(i=>`v${points[i].version}`),tickangle:-20,range:[-.3,Math.max(.3,x.length-.7)],gridcolor:'#263441',zeroline:false},
-        yaxis:{title:{text:'Cost change (%)'},range:[lo-pad,hi+pad],ticksuffix:'%',gridcolor:'#263441',zerolinecolor:'#8195a7',tickformat:'.4~g'},
-        annotations:finite.length?[]:[{xref:'paper',yref:'paper',x:.5,y:.5,text:first?'Percentage undefined: first release has zero cost':'No complete measurements for this stage',showarrow:false}]}};
+  const change=(before,after)=>before===0?null:100*((after-before)/before);
+  const share=(value,total)=>total===0?null:100*(value/total);
+  const headline=percent=>percent===null?'Change undefined':percent===0?'Unchanged total cost':`${Math.abs(percent).toLocaleString(undefined,{maximumSignificantDigits:4})}% ${percent<0?'lower':'higher'} cost`;
+  const percent=value=>value===null?'Undefined':`${value>0?'+':''}${value.toLocaleString(undefined,{maximumSignificantDigits:4})}%`;
+  const selectedStage=value=>value==='abc'?'abc':'raw';
+  const stageInfo={raw:{label:'g8r only · no FRAIG · pre-ABC',title:'Total pre-ABC g8r cost across releases',note:'Measured after g8r lowering, without FRAIG or ABC.'},abc:{label:'g8r + ABC · no g8r FRAIG',title:'Total post-ABC cost across releases',note:'Measured after ABC, with g8r FRAIG disabled.'}};
+  const orderedPoints=series=>[...series.points,...series.unavailable_versions.map(version=>({version,cost:null,transition:null}))].sort((a,b)=>a.version.localeCompare(b.version,undefined,{numeric:true}));
+  function chartLayout(points,selected,strip,narrow){
+    const step=Math.max(1,Math.ceil(points.length/9)),ticks=narrow?[...new Set(Array.from({length:Math.min(4,points.length)},(_,i)=>Math.round(i*(points.length-1)/Math.max(1,Math.min(4,points.length)-1))))]:points.map((_,i)=>i).filter(i=>i%step===0||i===points.length-1),index=points.findIndex(p=>p.version===selected);
+    return {paper_bgcolor:'transparent',plot_bgcolor:'transparent',font:{color:'#a0b0c0',family:'system-ui,sans-serif',size:11},showlegend:false,margin:{l:70,r:18,t:strip?14:20,b:strip?52:16},barmode:'relative',bargap:.42,
+      xaxis:{tickvals:ticks,ticktext:ticks.map(i=>`v${points[i].version}`),showticklabels:strip,tickangle:narrow?0:-15,title:strip?{text:'Crate release · equally spaced',font:{size:11}}:undefined,range:[-.4,Math.max(.4,points.length-.6)],gridcolor:'#263441',zeroline:false,fixedrange:true},
+      yaxis:{title:{text:strip?'Contribution (%)':'Cost change (%)',font:{size:11}},ticksuffix:'%',gridcolor:'#263441',zerolinecolor:'#8195a7',tickformat:'.4~g',fixedrange:true},
+      shapes:index<0?[]:[{type:'rect',xref:'x',yref:'paper',x0:index-.35,x1:index+.35,y0:0,y1:1,line:{width:0},fillcolor:'#a0b0c014',layer:'below'}],annotations:[]};
   }
-  const resultHref = (version, stage = 'abc') => version.full_count ? `corpus/?release=${version.crate_version}&stage=${stage}${stage==='raw'?'&reference=release':''}` : version.cohorts[0]?.url || (version.historical_abc_count || version.historical_raw_count ? `history/${version.historical_abc_count?'ir-fn-g8r-abc-vs-codegen-yosys-abc':'ir-fn-corpus-g8r-vs-yosys-abc'}/?crate_version=${version.crate_version}` : 'history/dataset.html');
-  function measurementLinks(version) {
-    const links=[];
-    for(const [pairs,measurements,path,pairLabel,measurementLabel] of [
-      [version.historical_abc_count,version.historical_abc_measurements,'ir-fn-g8r-abc-vs-codegen-yosys-abc','post-ABC pairs','post-ABC one-sided measurements'],
-      [version.historical_raw_count,version.historical_raw_measurements,'ir-fn-corpus-g8r-vs-yosys-abc','raw g8r pairs','raw-path one-sided measurements'],
-    ]) {
-      if(pairs)links.push({count:pairs,label:pairLabel,href:`history/${path}/?crate_version=${version.crate_version}`});
-      // Each paired sample accounts for one g8r and one Yosys measurement.
-      const oneSided=measurements-2*pairs;
-      if(oneSided>0)links.push({count:oneSided,label:measurementLabel,href:'history/dataset.html'});
-    }
-    return links;
+  function trendSpec(series,selected,narrow=false){
+    const points=orderedPoints(series),first=series.points[0],y=points.map(p=>!first||p.cost===null?null:change(first.cost,p.cost)),finite=y.filter(Number.isFinite),lo=Math.min(0,...finite),hi=Math.max(0,...finite),pad=Math.max((hi-lo)*.16,.01),layout=chartLayout(points,selected,false,narrow);layout.yaxis.range=[lo-pad,hi+pad];
+    if(!finite.length)layout.annotations=[{xref:'paper',yref:'paper',x:.5,y:.5,text:first?'Percentage undefined: first release has zero cost':'No complete measurements for this stage',showarrow:false}];
+    return {data:[{type:'scatter',mode:'lines+markers',x:points.map((_,i)=>i),y,customdata:points.map(p=>p.cost===null?null:p.version),text:points.map(p=>`v${p.version}`),connectgaps:false,line:{color:'#80e0b1',width:2.5},marker:{size:points.map(p=>p.version===selected?10:6),color:points.map(p=>p.version===selected?'#e7eef5':'#80e0b1')},hovertemplate:'%{text}<br>%{y:.4g}% versus first evaluated release<extra></extra>'}],layout};
   }
-  if(typeof module!=='undefined')module.exports={change,headline,trendSpec,resultHref,measurementLinks,selectedStage,stageInfo};
+  function transitionSpec(series,selected,narrow=false){
+    const points=orderedPoints(series),x=points.map((_,i)=>i),customdata=points.map(p=>p.transition?p.version:null),text=points.map(p=>p.transition?`v${p.version} vs v${p.transition.baseline_version}`:'No preceding comparison'),values=field=>points.map(p=>p.transition?share(p.transition[field],p.transition.baseline_cost):null),decreases=values('cost_decreases'),increases=values('cost_increases'),net=points.map(p=>p.transition?change(p.transition.baseline_cost,p.cost):null);
+    const data=[{type:'bar',name:'Decreases',x,y:decreases,customdata,text,textposition:'none',marker:{color:'#80e0b1'},hovertemplate:'%{text}<br>Decreases: %{y:.4g}% of preceding total<extra></extra>'},{type:'bar',name:'Increases',x,y:increases,customdata,text,textposition:'none',marker:{color:'#ff9aa9'},hovertemplate:'%{text}<br>Increases: %{y:.4g}% of preceding total<extra></extra>'},{type:'scatter',mode:'markers',name:'Net',x,y:net,customdata,text,marker:{symbol:'diamond',size:5,color:'#e7eef5'},hovertemplate:'%{text}<br>Net: %{y:.4g}%<extra></extra>'}];
+    const layout=chartLayout(points,selected,true,narrow),finite=[...decreases,...increases,...net].filter(Number.isFinite),lo=Math.min(0,...finite),hi=Math.max(0,...finite),pad=Math.max((hi-lo)*.15,.01);layout.yaxis.range=[lo-pad,hi+pad];
+    if(!finite.length)layout.annotations=[{xref:'paper',yref:'paper',x:.5,y:.5,text:series.points.length>1?'Percentage undefined: preceding total is zero':'Two complete releases are needed for a transition',showarrow:false}];
+    return {data,layout};
+  }
+  const resultHref=(version,stage='abc')=>version.full_count?`corpus/?release=${version.crate_version}&stage=${stage}${stage==='raw'?'&reference=release':''}`:version.cohorts[0]?.url||(version.historical_abc_count||version.historical_raw_count?`history/${version.historical_abc_count?'ir-fn-g8r-abc-vs-codegen-yosys-abc':'ir-fn-corpus-g8r-vs-yosys-abc'}/?crate_version=${version.crate_version}`:'history/dataset.html');
+  function measurementLinks(version){const links=[];for(const [pairs,measurements,path,pairLabel,measurementLabel] of [[version.historical_abc_count,version.historical_abc_measurements,'ir-fn-g8r-abc-vs-codegen-yosys-abc','post-ABC pairs','post-ABC one-sided measurements'],[version.historical_raw_count,version.historical_raw_measurements,'ir-fn-corpus-g8r-vs-yosys-abc','raw g8r pairs','raw-path one-sided measurements']]){if(pairs)links.push({count:pairs,label:pairLabel,href:`history/${path}/?crate_version=${version.crate_version}`});const oneSided=measurements-2*pairs;if(oneSided>0)links.push({count:oneSided,label:measurementLabel,href:'history/dataset.html'});}return links;}
+  function validateDetail(detail,point){
+    if(detail.schema_version!==1||detail.version!==point.version||detail.baseline_version!==point.transition?.baseline_version||detail.higher!==point.transition.higher||!Number.isInteger(detail.limit)||detail.limit<1||detail.limit>10)throw Error('Regression examples do not match the selected transition');
+    for(const rows of [detail.largest,detail.smallest])if(!Array.isArray(rows)||rows.length>detail.limit||rows.some(r=>typeof r.sample_id!=='string'||typeof r.label!=='string'||typeof r.url!=='string'||!Number.isFinite(r.delta)||r.delta<=0||!Number.isFinite(r.ir_nodes)))throw Error('Invalid regression examples');return detail;
+  }
+  if(typeof module!=='undefined')module.exports={change,share,headline,percent,trendSpec,transitionSpec,resultHref,measurementLinks,selectedStage,stageInfo,validateDetail};
   if(typeof document==='undefined')return;
-  const el=id=>document.getElementById(id), fmt=n=>n.toLocaleString();
-  function link(text,href){const a=document.createElement('a');a.textContent=text;a.href=href;return a}
-  async function main(){
-    const response=await fetch('dashboard.json');if(!response.ok)throw Error(`Dashboard: HTTP ${response.status}`);
-    const data=await response.json();if(data.schema_version!==2||!data.versions.length)throw Error('Invalid dashboard');
-    const latest=data.versions.at(-1), full=data.trends.find(t=>t.id==='full-corpus');
-    el('latest-version').textContent=`v${latest.crate_version}`;
-    el('latest-coverage').textContent=latest.full_count?`${fmt(latest.full_count)} inputs · full-corpus evaluation complete`:'Historical results available · full-corpus backfill not included';
-    el('latest-link').href=resultHref(latest);
-    el('version-count').textContent=`${data.versions.length} releases`;
-    el('version-range').textContent=`v${data.versions[0].crate_version} → v${latest.crate_version} · including partial historical coverage`;
-    for(const version of [...data.versions].reverse()){
-      const tr=document.createElement('tr'), release=document.createElement('td'), corpus=document.createElement('td'), coverage=document.createElement('td'), other=document.createElement('td');
-      release.append(link(`v${version.crate_version}`,resultHref(version)));
-      if(version.full_count){const badge=document.createElement('span');badge.className='badge';badge.textContent='COMPLETE';corpus.append(badge,`${fmt(version.full_count)} inputs`)}else{corpus.textContent='Not included';corpus.className='equal'}
-      for(const c of version.cohorts){coverage.append(link(`${c.label}: ${fmt(c.measured)} / ${fmt(c.total)}`,c.url));if(!c.complete){const small=document.createElement('small');small.textContent='Partial · excluded from trend';coverage.append(small)}}
-      if(!version.cohorts.length){coverage.textContent='No fixed-cohort results';coverage.className='equal'}
-      for(const {count,label,href} of measurementLinks(version))other.append(link(`${fmt(count)} ${label}`,href));
-      if(!other.childNodes.length)other.textContent='—';
-      tr.append(release,corpus,coverage,other);el('version-rows').append(tr);
-    }
-    for(const trend of data.trends){const option=document.createElement('option');option.value=trend.id;option.textContent=`${trend.label} · ${fmt(trend.count)} inputs`;el('cohort').append(option)}
-    const query=new URLSearchParams(location.search), selected=query.get('cohort');
-    el('cohort').value=data.trends.some(t=>t.id===selected)?selected:data.trends.find(t=>t.id==='mffc-v1'&&t.stages.raw.points.length>1)?.id||data.trends[0].id;
-    el('stage').value=selectedStage(query.get('stage'));
-    let rendering=false,pending=false;
-    async function render(){pending=true;if(rendering)return;rendering=true;
-      try{while(pending){pending=false;el('dashboard').dataset.rendered='loading';
-        const stage=el('stage').value, info=stageInfo[stage], trend=data.trends.find(t=>t.id===el('cohort').value), series=trend.stages[stage];
-        const first=series.points[0], last=series.points.at(-1), percent=first?change(first.cost,last.cost):null;
-        const fullSeries=full?.stages[stage], now=fullSeries?.points.at(-1), prior=fullSeries?.points.at(-2);
-        el('latest-link').href=resultHref(latest,stage);
-        el('latest-change').textContent=prior?headline(change(prior.cost,now.cost)):now?'One complete release':'No complete releases';
-        el('latest-comparison').textContent=prior?`v${now.version} vs v${prior.version} · ${fmt(full.count)} identical inputs · ${info.label} · nodes × depth`:`${info.label}. Two complete releases are needed for comparison.`;
-        el('compare-link').href=prior?`corpus/?release=${now.version}&reference=release&baseline=${prior.version}&stage=${stage}`:`corpus/?stage=${stage}&reference=release`;
-        el('trend-title').textContent=info.title;
-        el('trend-method').textContent=`Cost = AND nodes × AIG depth. ${info.note} Totals are size-weighted; counts show inputs with lower, equal, or higher cost. This measures circuit structure, not physical area or timing. Click a release point for ${stage==='raw'&&trend.id!=='full-corpus'?'its pre-ABC graph-LE/node comparison':'details'}.`;
-        el('trend-recipe').textContent='g8r recipe: folding and structural hashing enabled; FRAIG and carry-out / priority-encode preparation rewrites disabled. ABC is applied only in the post-ABC stage.';
-        el('trend-headline').textContent=first?headline(percent):'No complete measurements';el('trend-headline').className=percent===null||percent===0?'equal':percent<0?'lower':'higher';
-        el('trend-scope').textContent=first?`v${last.version} vs v${first.version} · ${fmt(trend.count)} identical inputs in every plotted release`:info.label;
-        el('trend-note').textContent=`${first?`0% = v${first.version}. `:''}Y-axis is zoomed to show changes; releases are equally spaced. ${series.points.length} complete releases at this stage; partial generations are not plotted.`;
-        el('stage-coverage').textContent=series.unavailable_versions.length?`Missing complete ${stage==='raw'?'pre-ABC':'post-ABC'} measurements: ${series.unavailable_versions.map(v=>`v${v}`).join(', ')}. Shown as gaps, not zero cost; no inputs are dropped from other releases.`:'';
-        el('breadth').replaceChildren(...(last?[['lower','↓ Lower cost',last.lower],['equal','= Unchanged',last.equal],['higher','↑ Higher cost',last.higher]]:[]).map(([cls,label,n])=>{const span=document.createElement('span');span.className=cls;span.textContent=`${label}: ${fmt(n)}`;return span}));
-        const spec=trendSpec(series);await Plotly.react('trend',spec.data,spec.layout,{responsive:true,displayModeBar:false});
-        el('trend').removeAllListeners?.('plotly_click');el('trend').on('plotly_click',event=>{const url=event.points?.[0]?.customdata;if(url)location.href=url});
-        const url=new URL(location.href);url.searchParams.set('cohort',trend.id);url.searchParams.set('stage',stage);history.replaceState(null,'',url);
-        el('dashboard').dataset.rendered='true';
-      }}finally{rendering=false}
-    }
-    const failed=e=>{el('error').textContent=e.message;el('dashboard').dataset.rendered='error'};
-    for(const id of ['cohort','stage'])el(id).addEventListener('change',()=>void render().catch(failed));await render();
+  const el=id=>document.getElementById(id),fmt=n=>n.toLocaleString(undefined,{maximumFractionDigits:3}),set=(id,text)=>{el(id).textContent=text;},link=(text,href)=>{const a=document.createElement('a');a.textContent=text;a.href=href;return a;};
+  const state={epoch:0,rendering:false,pending:false,detail:null,point:null,rank:'largest',abort:null};
+  async function load(url,signal){const r=await fetch(url,{signal});if(!r.ok)throw Error(`HTTP ${r.status} loading ${url}`);return r.json();}
+  function showInput(row){
+    el('input-comparison').hidden=false;set('input-title',row.label);set('input-scope',`${row.sample_id} · ${fmt(row.ir_nodes)} IR nodes · v${state.point.version} vs v${state.point.transition.baseline_version}`);
+    el('input-metrics').replaceChildren(...[['AND nodes',row.before.nodes,row.after.nodes],['AIG depth',row.before.depth,row.after.depth],['Nodes × depth',row.before.nodes*row.before.depth,row.after.nodes*row.after.depth],['Graph LE (FO4)',row.before.graph_le,row.after.graph_le]].map(([label,before,after])=>{const group=document.createElement('div'),dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=`${before===null?'Undefined':fmt(before)} → ${after===null?'Undefined':fmt(after)}`;group.append(dt,dd);return group;}));el('input-link').href=row.url;
   }
-  void main().catch(e=>{el('error').textContent=e.message;el('dashboard').dataset.rendered='error'});
+  function examples(){
+    el('input-comparison').hidden=true;document.querySelectorAll('[data-rank]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.rank===state.rank)));
+    set('ranking-note',state.rank==='largest'?'Ordered by absolute increase in nodes × depth. Contribution is in percentage points of the preceding release’s total cost.':'Ordered by smallest IR node count, then largest relative cost increase. Zero-reference inputs have undefined percentages and remain included.');
+    const rows=state.detail?.[state.rank]||[],body=el('regression-rows');body.replaceChildren();for(const row of rows){const tr=document.createElement('tr'),name=document.createElement('td'),button=document.createElement('button'),id=document.createElement('span');button.type='button';button.className='sample-link';button.textContent=row.label;button.dataset.sampleId=row.sample_id;button.addEventListener('click',()=>showInput(row));id.className='sample-id';id.textContent=row.sample_id;name.append(button,id);tr.append(name);for(const [value,cls] of [[fmt(row.ir_nodes),''],[percent(row.percent),''],[row.contribution===null?'Undefined':`${row.contribution.toLocaleString(undefined,{maximumSignificantDigits:4})} pp`,'contribution']]){const td=document.createElement('td');td.textContent=value;td.className=cls;tr.append(td);}body.append(tr);}
+    if(state.detail)set('regression-status',rows.length?`Showing ${rows.length} of ${fmt(state.detail.higher)} higher-cost inputs. Select an input to see nodes and depth separately.`:'No inputs have higher product cost in this transition.');
+  }
+  async function main(){
+    const data=await load('dashboard.json');if(data.schema_version!==3||!data.versions.length)throw Error('Invalid dashboard');const latest=data.versions.at(-1);set('latest-version',`v${latest.crate_version}`);set('latest-coverage',latest.full_count?`· ${fmt(latest.full_count)} full-corpus inputs complete`:'· available results');set('version-count',`${data.versions.length} evaluated releases`);set('version-range',`v${data.versions[0].crate_version} → v${latest.crate_version} · all available release results`);
+    const versionLinks=[];for(const version of [...data.versions].reverse()){const tr=document.createElement('tr'),release=document.createElement('td'),corpus=document.createElement('td'),coverage=document.createElement('td'),other=document.createElement('td'),a=link(`v${version.crate_version}`,resultHref(version));versionLinks.push([version,a]);release.append(a);if(version.full_count){const badge=document.createElement('span');badge.className='badge';badge.textContent='COMPLETE';corpus.append(badge,`${fmt(version.full_count)} inputs`);}else{corpus.textContent='Not included';corpus.className='equal';}for(const c of version.cohorts){coverage.append(link(`${c.label}: ${fmt(c.measured)} / ${fmt(c.total)}`,c.url));if(!c.complete){const small=document.createElement('small');small.textContent='Partial · excluded from trend';coverage.append(small);}}if(!version.cohorts.length){coverage.textContent='No fixed-cohort results';coverage.className='equal';}for(const {count,label,href} of measurementLinks(version))other.append(link(`${fmt(count)} ${label}`,href));if(!other.childNodes.length)other.textContent='—';tr.append(release,corpus,coverage,other);el('version-rows').append(tr);}
+    for(const trend of data.trends){const option=document.createElement('option');option.value=trend.id;option.textContent=`${trend.label} · ${fmt(trend.count)} inputs`;el('cohort').append(option);}const query=new URLSearchParams(location.search),requested=query.get('cohort');el('cohort').value=data.trends.some(t=>t.id===requested)?requested:data.trends.find(t=>t.id==='mffc-v1'&&t.stages.raw.points.length>1)?.id||data.trends[0].id;el('stage').value=selectedStage(query.get('stage'));state.rank=query.get('rank')==='smallest'?'smallest':'largest';let requestedRelease=query.get('release');
+    async function render(){
+      const epoch=state.epoch;el('dashboard').dataset.rendered='loading';set('error','');const stage=el('stage').value,info=stageInfo[stage],trend=data.trends.find(t=>t.id===el('cohort').value),series=trend.stages[stage],first=series.points[0],last=series.points.at(-1),wanted=requestedRelease||el('release').value,point=series.points.find(p=>p.version===wanted)||last;requestedRelease=null;state.point=point;state.detail=null;
+      el('release').replaceChildren(...series.points.map(p=>{const option=document.createElement('option');option.value=p.version;option.textContent=`v${p.version}`;return option;}));el('release').disabled=!point;if(point)el('release').value=point.version;el('latest-link').href=resultHref(latest,stage);for(const [version,a] of versionLinks)a.href=resultHref(version,stage);
+      set('trend-title',info.title);set('trend-scope',first?`Relative to v${first.version} · ${fmt(trend.count)} identical inputs in every plotted release`:info.label);set('trend-headline',first?percent(change(first.cost,last.cost)):'No complete measurements');set('trend-endpoint',first?`v${last.version} vs v${first.version}`:'');set('trend-coverage',`${series.points.length} complete releases at this stage`);set('trend-note',`${first?`0% in the upper chart = v${first.version}. `:''}The lower bars use each preceding evaluated release’s total cost. Axes are zoomed; releases are equally spaced. Select a point or use the release selector.`);set('stage-coverage',series.unavailable_versions.length?`Missing complete ${stage==='raw'?'pre-ABC':'post-ABC'} measurements: ${series.unavailable_versions.map(v=>`v${v}`).join(', ')}. Gaps are not zero cost. Transitions compare consecutive available complete releases.`:'');
+      set('trend-method',`Cost = AND nodes × AIG depth. ${info.note} Each transition pairs the same complete set of inputs at the same stage. Gross decreases and increases sum to the net cost change. This describes circuit structure, not physical area or timing.`);set('trend-recipe','g8r recipe: folding and structural hashing enabled; FRAIG and carry-out / priority-encode preparation rewrites disabled. ABC is applied only in the post-ABC stage.');
+      const t=point?.transition;set('comparison-title',t?`v${point.version} vs v${t.baseline_version}`:point?`v${point.version} · first evaluated release`:'No complete release');set('comparison-scope',`${fmt(trend.count)} fixed inputs · ${info.label}`);set('net-change',t?percent(change(t.baseline_cost,point.cost)):'—');set('net-absolute',t?`${fmt(t.baseline_cost)} → ${fmt(point.cost)} nodes × depth`:'No preceding evaluated release at this stage');set('cost-decreases',t?percent(share(t.cost_decreases,t.baseline_cost)):'—');set('cost-increases',t?percent(share(t.cost_increases,t.baseline_cost)):'—');el('breadth').replaceChildren(...(t?[['lower','↓ Lower cost',t.lower],['equal','= Unchanged',t.equal],['higher','↑ Higher cost',t.higher]]:[]).map(([cls,label,n])=>{const span=document.createElement('span');span.className=cls;span.textContent=`${label}: ${fmt(n)}`;return span;}));
+      el('compare-link').hidden=!point;if(point)el('compare-link').href=t?.url||point.url;set('regression-scope',t?`${fmt(t.higher)} inputs · v${point.version} vs v${t.baseline_version}`:'A preceding complete release is needed for a comparison.');el('retry-examples').hidden=true;examples();set('regression-status',t?'Loading regression examples…':'No preceding release comparison.');el('regressions').dataset.rendered=t?'loading':'true';
+      const narrow=el('trend').clientWidth<600;for(const [id,spec] of [['trend',trendSpec(series,point?.version,narrow)],['release-changes',transitionSpec(series,point?.version,narrow)]]){await Plotly.react(id,spec.data,spec.layout,{responsive:true,displayModeBar:false});const plot=el(id);plot.removeAllListeners?.('plotly_click');plot.on('plotly_click',event=>{const version=event.points?.[0]?.customdata;if(series.points.some(p=>p.version===version)){el('release').value=version;void schedule();}});}if(epoch!==state.epoch)return;
+      const url=new URL(location.href);url.searchParams.set('cohort',trend.id);url.searchParams.set('stage',stage);if(point)url.searchParams.set('release',point.version);else url.searchParams.delete('release');url.searchParams.set('rank',state.rank);history.replaceState(null,'',url);el('dashboard').dataset.rendered='true';
+      if(t){const abort=new AbortController();state.abort=abort;try{const detail=validateDetail(await load(t.details,abort.signal),point);if(epoch!==state.epoch)return;state.detail=detail;examples();el('regressions').dataset.rendered='true';}catch(error){if(epoch!==state.epoch||error.name==='AbortError')return;set('regression-status',`Examples unavailable: ${error.message}`);el('retry-examples').hidden=false;el('regressions').dataset.rendered='error';}}
+    }
+    async function schedule(){++state.epoch;state.pending=true;state.abort?.abort();if(state.rendering)return;state.rendering=true;try{while(state.pending){state.pending=false;try{await render();}catch(error){if(!state.pending){set('error',error.message);el('dashboard').dataset.rendered='error';}}}}finally{state.rendering=false;}}
+    for(const id of ['cohort','stage','release'])el(id).addEventListener('change',()=>void schedule());el('retry-examples').addEventListener('click',()=>void schedule());el('close-input').addEventListener('click',()=>{el('input-comparison').hidden=true;});document.querySelectorAll('[data-rank]').forEach(button=>button.addEventListener('click',()=>{state.rank=button.dataset.rank;examples();const url=new URL(location.href);url.searchParams.set('rank',state.rank);history.replaceState(null,'',url);}));let resizeTimer;window.addEventListener('resize',()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>void schedule(),160);});await schedule();
+  }
+  void main().catch(error=>{set('error',error.message);el('dashboard').dataset.rendered='error';});
 })();

@@ -143,6 +143,10 @@ cargo run --release --bin xlsynth_bvc -- build-static-site \
 
 The root dashboard shows the latest evaluated version, all versions with historical synthesis
 measurements or fixed-cohort results, and a large selectable fixed-population progression chart.
+The compact header leaves the trend visible first. The upper line compares summed cost against
+the first complete release. Aligned lower bars separate gross cost decreases and increases for
+each preceding-evaluated-release transition, with a net marker. Bars use percentages of that
+transition's preceding total; they are not counts or averages of per-input percentages.
 `/` is the only overview: `/history/` and `/history/index.html` redirect to it. Previous-version
 comparisons, datasets, diagnostics, and progression (including Git candidates) remain detail views
 under `history/`; `corpus/` contains the completed full-corpus comparison view. Both sets of detail
@@ -155,21 +159,38 @@ The chart defaults to pre-ABC g8r, with FRAIG disabled. Its stage selector also 
 measurements; `?stage=raw` and `?stage=abc` preserve that selection in links. Each trend is the
 change in summed AND-nodes × depth versus the first complete release at the selected stage.
 Folding and structural hashing remain enabled; carry-out and priority-encode preparation rewrites
-are disabled by the evaluation recipe. The latest-change card and chart links follow the stage.
+are disabled by the evaluation recipe. Selecting a point or a release updates the transition
+panel on the same page. Its release pair, paired lower/equal/higher counts, and comparison links
+follow the cohort and stage. The first release has no transition, rather than a fabricated zero.
+Query parameters `cohort`, `stage`, `release`, and `rank` retain the selection on reload.
+
+Regression examples load lazily from bounded final-web projections, separate from the small
+dashboard summary. Each transition contains up to ten inputs per ranking: largest absolute cost
+increase, or smallest IR input (then largest relative increase within an IR size). All positive
+cost increases, including node/depth tradeoffs and zero-reference inputs, contribute to the
+totals and are eligible for the lists; list bounds do not change the plotted population. Relative
+percentages and total contributions are undefined for zero reference costs, not infinity.
+Selecting an example shows its nodes, depth, product, and graph LE separately, with a link to the
+existing source-IR/comparison view. Full-corpus links use `sample` to select the exact input;
+fixed-cohort links retain the structural identity with `vector_sample`.
 
 Every plotted release uses the same complete input population. A missing measurement excludes
 the entire release from that stage and creates a labeled gap, rather than reducing the sample
 count or inserting zero cost. Partial historical populations remain accessible in detail views.
 Counts across full-corpus, historical pairs, and fixed cohorts may overlap and must not be added
-together. Fixed-cohort raw points open the pre-ABC graph-LE/node vector comparison; full-corpus
-points open the release comparison with both sides at the selected stage.
+together. After selecting a transition, its fixed-cohort comparison link opens the graph-LE/node
+vector view; its full-corpus link opens the release comparison with both sides at the selected
+stage. Chart points select transitions rather than navigating away from the dashboard.
 
 This is native composition, not a merge of operational JSON: `dashboard.pb` binds the two verified
 child manifests. That composition also determines the detail-page navigation and the old overview
 redirect; standalone builders retain their standalone presentation. Verification checks both
 children, exact file closure and templates (including navigation and redirects), and regenerates
 `dashboard.json` from verified evidence. The entire composition installs atomically and shares one
-hosting budget. Only the small summary loads on the splash page, not every release's sample shards.
+hosting budget. Only the summary and the selected transition's bounded examples load on the splash
+page, not every release's sample shards. Both the summary and examples are deterministically
+reconstructed from verified evidence during verification; rehashing edited JSON does not detach
+it from the canonical measurements. No new JSON-based internal pipeline boundary is introduced.
 
 Snapshot-only and corpus-only builds remain available. `--progression-run-dir` requires a snapshot.
 Use a current snapshot when release metadata, recipes, or cohort definitions change; the dashboard

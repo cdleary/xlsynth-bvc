@@ -36,7 +36,7 @@
   if (typeof document === 'undefined') return;
   const byId = id => document.getElementById(id), fmt = n => n.toLocaleString(undefined,{maximumFractionDigits:3});
   const load = async url => {const r=await fetch(url);if(!r.ok)throw Error(`${url}: HTTP ${r.status}`);return r.json()};
-  const state = {catalog:null, cache:new Map(), epoch:0, selected:0, rows:[], rendering:false, pending:false};
+  const state = {catalog:null, cache:new Map(), epoch:0, selected:0, selectedId:null, rows:[], rendering:false, pending:false};
   const color = row => row.change < 0 ? '#7de9ae' : row.change > 0 ? '#ff91ad' : '#9ca8b6';
   function layout(x,y,log=false) {
     return {paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'#111922',font:{color:'#dce7f0'},margin:{l:68,r:18,t:24,b:65},showlegend:false,
@@ -44,6 +44,8 @@
   }
   async function selectSample(row) {
     const token=++state.selected;
+    state.selectedId=row.sample_id;
+    const url=new URL(location.href);url.searchParams.set('sample',row.sample_id);history.replaceState(null,'',url);
     byId('selected').textContent=`${names(row)} · evaluated top: ${row.top_fn_name} · kinds: ${row.input_kinds.join(', ')} (${row.provenance_source==='snapshot'?'snapshot provenance':'name-only classification'}) · ${row.source_relpath} · ${fmt(row.ir_node_count)} IR nodes · selected ${fmt(row.cost)} / reference ${fmt(row.reference_cost)} · Δ ${fmt(row.change)}`;
     byId('ir').hidden=false; byId('ir').textContent='Loading verified IR…';
     try {const data=await load(row.ir_url);if(token===state.selected){if(typeof data[row.sample_id]!=='string')throw Error('IR is missing');byId('ir').textContent=data[row.sample_id]}}
@@ -102,6 +104,8 @@
     await scatter('delta',rows,r=>r.g8r_nodes-r.reference_nodes,r=>r.g8r_depth-r.reference_depth,'Selected − reference AND nodes','Selected − reference depth',false,false);
     if(token!==state.epoch)return;
     const url=new URL(location.href);url.searchParams.set('release',version);url.searchParams.set('reference',compare);url.searchParams.set('baseline',baselineVersion);url.searchParams.set('stage',stage);history.replaceState(null,'',url);
+    const selected=rows.find(r=>r.sample_id===state.selectedId);
+    if(selected){await selectSample(selected);if(location.hash==='#input-detail')byId('input-detail').scrollIntoView({block:'start'});}
     byId('corpus-site').dataset.rendered='true';byId('corpus-site').dataset.sampleCount=String(rows.length);
   }
   async function requestRender(){
@@ -116,6 +120,7 @@
   async function main(){
     state.catalog=await load('catalog.json');if(state.catalog.schema_version!==1||!state.catalog.generations.length)throw Error('Invalid corpus catalog');
     const versions=state.catalog.generations.map(g=>g.crate_version),query=new URLSearchParams(location.search);
+    state.selectedId=query.get('sample');
     for(const name of ['release','baseline'])byId(name).replaceChildren(...versions.map(v=>{const o=document.createElement('option');o.value=v;o.textContent=`v${v}`;return o}));
     byId('release').value=versions.includes(query.get('release'))?query.get('release'):versions.at(-1);
     byId('baseline').value=versions.includes(query.get('baseline'))?query.get('baseline'):versions.at(-2)||versions[0];
