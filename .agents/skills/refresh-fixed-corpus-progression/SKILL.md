@@ -97,20 +97,32 @@ results through their content-bound action identities, but rebuild derived publi
 Do not use `--skip-rebuild-web-indices` after release metadata, cohort definitions, or recipes
 change.
 
-For an all-versions dashboard, pass the completed full-corpus and both fixed-cohort workspaces
-for the new release, retaining the completed earlier releases:
+For an all-versions dashboard refresh, explicitly include earlier releases as well as the new
+release's completed full-corpus and both fixed-cohort workspaces. Builds do not inherit releases
+from the existing output directory or the snapshot. Reuse the previous dashboard's verified
+`corpus/` evidence to retain all its full-corpus generations:
 
 ```bash
 xlsynth_bvc build-static-site \
   --snapshot-dir SNAPSHOT_DIR \
   --out-dir SITE_DIR \
-  --corpus-run-dir FULL_CORPUS_RUN_DIR \
-  --progression-run-dir WHOLE_FUNCTION_RUN_DIR \
-  --progression-run-dir MFFC_RUN_DIR
+  --corpus-evidence-dir PREVIOUS_SITE_DIR/corpus \
+  --corpus-run-dir NEW_FULL_CORPUS_RUN_DIR \
+  --progression-run-dir PRIOR_WHOLE_FUNCTION_RUN_DIR \
+  --progression-run-dir PRIOR_MFFC_RUN_DIR \
+  --progression-run-dir NEW_WHOLE_FUNCTION_RUN_DIR \
+  --progression-run-dir NEW_MFFC_RUN_DIR
 ```
 
-Both run-directory flags are repeatable. Add completed Git workspaces with `--progression-run-dir`
-when requested. Do not use the hidden legacy `--candidate-run-dir` alias in new workflows.
+Repeat the prior fixed-cohort arguments for every completed workspace to retain, not just
+one earlier release. All three input flags are repeatable. If no previous evidence is available
+(including the first build), omit `--corpus-evidence-dir` and repeat `--corpus-run-dir` for every
+earlier completed full-corpus release as well as the new release. Evidence and run inputs must
+cover disjoint release sets; supplying a run already in the evidence is a duplicate, not an
+override. Keep source evidence and output directories disjoint.
+
+Add completed Git workspaces with `--progression-run-dir` when requested. Do not use the hidden
+legacy `--candidate-run-dir` alias in new workflows.
 The builder validates and verifies its staged output before installation. Do not immediately repeat
 a full `verify-static-site` or `smoke-static-site` unless an independent audit is requested or the
 installed bytes changed.
@@ -119,9 +131,11 @@ installed bytes changed.
 
 For a new-release dashboard refresh, verify that the release appears as complete in all three
 cohort selectors/trends and that each uses its own expected population. Check the generated
-catalog and the rendered views; successful full-corpus rendering alone is not sufficient. If a
-render-only request encounters unevaluated cohorts, explicitly identify their missing coverage
-and last evaluated release in the handoff rather than describing the site as fully up to date.
+catalog and the rendered views, and compare retained release sets with the prior publication
+so that earlier releases cannot silently disappear. Successful full-corpus rendering alone is
+not sufficient. If a render-only request encounters unevaluated cohorts, explicitly identify
+their missing coverage and last evaluated release in the handoff rather than describing the
+site as fully up to date.
 
 Open `progression.html` with the intended `cohort`, `baseline`, and `current` generation IDs. Check:
 
