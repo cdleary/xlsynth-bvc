@@ -8,9 +8,8 @@ See `docs/batched-persistent-runners-plan.md` for the implemented persistent Doc
 See `docs/ir-dir-corpus-runner.md` for the batch `IR directory -> recipe preset -> output bundle` runner.
 See `docs/dslx-cone-corpus.md` for `dslx-corpus-ingest`, matched ABC comparison, and a static cone report.
 
-Artifacts are stored in sharded CAS-style paths, e.g.:
-
-`bvc-artifacts/artifacts/<aa>/<bb>/<action_id>/...`
+Looking for the `.ir` files for a particular xlsynth release? Start with
+[Get XLS IR for a release](#get-xls-ir-for-a-release).
 
 ## Build
 
@@ -18,25 +17,60 @@ Artifacts are stored in sharded CAS-style paths, e.g.:
 cargo build
 ```
 
+## Get XLS IR for a release
+
+From the checkout root, you can generate both the raw and optimized XLS IR for
+a concrete DSLX function. This Bash example uses the release's standard-library
+`float32::add`. It requires Cargo, Docker, Python 3 with `requests`, `jq`, and
+network access to fetch the release assets and prepare the driver image.
+On SELinux-enforcing hosts, the worker script (`scripts/persistent_runner_worker.py`)
+and the private store need container-accessible labels such as `container_file_t`.
+
+`--driver-version` selects the xlsynth-driver crate. `--version` selects the
+XLS tool and stdlib release (DSO). Set `crate_version` to a key in the
+[compatibility map](third_party/xlsynth-crate/generated_version_compat.json).
+For example, `crate:v0.68.0` maps to `dso:v0.54.7`.
+
+```bash
+set -eo pipefail
+crate_version=0.68.0
+dso_version=$(jq -er --arg v "$crate_version" '.[$v].xlsynth_release_version' \
+  third_party/xlsynth-crate/generated_version_compat.json)
+store=$(mktemp -d)
+bvc() {
+  cargo run --quiet --bin xlsynth_bvc -- \
+    --store-dir "$store" --artifacts-via-sled "$store/artifacts.sled" "$@"
+}
+run_id() {
+  bvc run "$@" | grep -Ex '[0-9a-f]{64}' | tail -n 1
+}
+
+stdlib_id=$(run_id download-stdlib --version "$dso_version")
+ir_id=$(run_id dslx-fn-to-ir --version "$dso_version" --driver-version "$crate_version" \
+  --dslx-subtree-action-id "$stdlib_id" --dslx-file xls/dslx/stdlib/float32.x --dslx-fn-name add)
+opt_id=$(run_id ir-to-opt --version "$dso_version" --driver-version "$crate_version" \
+  --ir-action-id "$ir_id")
+
+cp "$(bvc resolve "$ir_id")" "$store/float32_add.ir"
+cp "$(bvc resolve "$opt_id")" "$store/float32_add.opt.ir"
+echo "IR files in $store"
+grep '^top fn ' "$store"/float32_add*.ir
+```
+
+`run` prints an action ID and its artifact reference. `resolve` takes that ID,
+materializes the artifact, and prints its local path. To choose a different
+function, run `bvc show-suggested "$stdlib_id"` and use the file and function
+name from a conversion suggestion.
+
+To read recorded IR on a results site, select a release in the full-corpus
+explorer and click a plot point or outlier. On the historical **g8r+ABC vs
+codegen+Yosys/ABC** page, select the crate version and a sample, then use
+**Copy IR**. To extract the fixed 187-file whole-function cohort from its
+reference snapshot, see [Fixed IR progression cohorts](docs/release-progression-ir-corpus.md).
+
 ## Run Actions
 
 ```bash
-# Download and extract stdlib from a release
-cargo run --bin xlsynth_bvc -- run download-stdlib --version v0.37.0
-
-# Convert DSLX function to IR using xlsynth-driver in Docker
-cargo run --bin xlsynth_bvc -- run dslx-fn-to-ir \
-  --dslx-subtree-action-id <stdlib_action_id> \
-  --dslx-file xls/dslx/stdlib/math.x \
-  --dslx-fn-name add \
-  --version v0.37.0
-
-# Optimize IR
-cargo run --bin xlsynth_bvc -- run ir-to-opt \
-  --ir-action-id <ir_action_id> \
-  --top-fn-name foo \
-  --version v0.37.0
-
 # Compute delay info for an IR package (uses release delay_info_main tool)
 cargo run --bin xlsynth_bvc -- run ir-to-delay-info \
   --ir-action-id <opt_ir_action_id> \
@@ -667,10 +701,12 @@ See `third_party/xlsynth-crate/VENDORED.md` for pinned vendored asset sources.
 
 ## Inspect
 
+These commands use the store and IR action ID from [Get XLS IR for a release](#get-xls-ir-for-a-release).
+
 ```bash
-cargo run --bin xlsynth_bvc -- show-provenance <action_id>
-cargo run --bin xlsynth_bvc -- resolve <action_id>
-cargo run --bin xlsynth_bvc -- rematerialize <action_id>
+bvc show-provenance "$ir_id"
+bvc resolve "$ir_id"
+bvc rematerialize "$ir_id"
 ```
 
 ## GC / Rebuild
