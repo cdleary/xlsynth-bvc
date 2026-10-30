@@ -935,11 +935,18 @@ pub(crate) fn discover_dslx_fn_to_ir_suggestions(
 ) -> Result<DslxFnDiscovery> {
     let dslx_files = collect_dslx_files(subtree_root)?;
     let import_context = determine_dslx_import_context(subtree_root);
-    let source_runtime = discovery_runtime
-        .cloned()
-        .unwrap_or(default_driver_runtime_for_version(repo_root, version)?);
-    let discovery_runtime = resolve_driver_runtime_for_dslx_list_fns(repo_root, &source_runtime)
-        .unwrap_or_else(|_| source_runtime.clone());
+    let source_runtime = match discovery_runtime {
+        Some(runtime) => runtime.clone(),
+        None => default_driver_runtime_for_version(repo_root, version)?,
+    };
+    let discovery_runtime = match resolve_driver_runtime_for_dslx_list_fns(
+        repo_root,
+        &source_runtime,
+        store.aux_driver_version.as_deref(),
+    ) {
+        Err(_) if store.aux_driver_version.is_none() => source_runtime.clone(),
+        result => result?,
+    };
     let discovery_runtime_xlsynth_version =
         resolve_xlsynth_version_for_driver(repo_root, &discovery_runtime.driver_version)?;
 
@@ -1620,8 +1627,11 @@ pub(crate) fn run_driver_ir_to_opt_action(
     details.insert("xlsynth_version".to_string(), json!(version));
     insert_driver_version_labels(&mut details, version, runtime);
     details.insert("ir_top".to_string(), json!(ir_top.clone()));
-    let ir_aig_equiv_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
-        .unwrap_or_else(|_| runtime.clone());
+    let ir_aig_equiv_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+        repo_root,
+        runtime,
+        store.aux_driver_version.as_deref(),
+    )?;
     if ir_aig_equiv_runtime != *runtime {
         details.insert(
             "driver_ir_aig_equiv_runtime".to_string(),
@@ -1675,14 +1685,7 @@ pub(crate) fn run_driver_ir_to_opt_action(
     }
 
     let mut input_ir_structural_hash = None;
-    match compute_ir_fn_structural_hash(
-        store,
-        repo_root,
-        &ir_input_path,
-        Some(&ir_top),
-        version,
-        runtime,
-    ) {
+    match compute_ir_fn_structural_hash(store, repo_root, &ir_input_path, Some(&ir_top), runtime) {
         Ok((hash, trace)) => {
             commands.push(trace);
             details.insert(
@@ -1808,7 +1811,6 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir2opt /inputs/input.ir -
             repo_root,
             &output_ir_path,
             Some(&ir_top),
-            version,
             runtime,
         ) {
             Ok((hash, trace)) => {
@@ -2038,7 +2040,6 @@ pub(crate) fn run_driver_ir_to_delay_info_action(
         repo_root,
         &ir_input_path,
         ir_top.as_deref(),
-        version,
         runtime,
     ) {
         Ok((hash, trace)) => {
@@ -2518,7 +2519,6 @@ fn record_input_ir_structural_hash(
     ir_action_id: &str,
     ir_input_path: &Path,
     ir_top: Option<&str>,
-    version: &str,
     runtime: &DriverRuntimeSpec,
     commands: &mut Vec<CommandTrace>,
     details: &mut serde_json::Map<String, serde_json::Value>,
@@ -2549,7 +2549,7 @@ fn record_input_ir_structural_hash(
         return None;
     }
 
-    match compute_ir_fn_structural_hash(store, repo_root, ir_input_path, ir_top, version, runtime) {
+    match compute_ir_fn_structural_hash(store, repo_root, ir_input_path, ir_top, runtime) {
         Ok((hash, trace)) => {
             commands.push(trace);
             details.insert(
@@ -2619,8 +2619,11 @@ fn prepare_driver_ir_to_g8r_batch_action(
     let top_strategy = driver_ir2g8r_top_strategy(ir2g8r_cli, explicit_ir_top.is_some());
     let prepared_ir_relpath = "prep_for_gatify.ir";
     let mut suggested_next_actions = Vec::new();
-    let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
-        .unwrap_or_else(|_| runtime.clone());
+    let stats_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+        repo_root,
+        runtime,
+        store.aux_driver_version.as_deref(),
+    )?;
     if let Ok(next) = build_suggestion(
         "Compute AIG stats with DriverAigToStats",
         ActionSpec::DriverAigToStats {
@@ -2707,8 +2710,11 @@ fn prepare_driver_ir_to_g8r_batch_action(
         );
     }
 
-    let ir_aig_equiv_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
-        .unwrap_or_else(|_| runtime.clone());
+    let ir_aig_equiv_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+        repo_root,
+        runtime,
+        store.aux_driver_version.as_deref(),
+    )?;
     if ir_aig_equiv_runtime != *runtime {
         details.insert(
             "driver_ir_aig_equiv_runtime".to_string(),
@@ -2763,7 +2769,6 @@ fn prepare_driver_ir_to_g8r_batch_action(
         ir_action_id,
         &ir_input_path,
         inferred_ir_top.as_deref(),
-        version,
         runtime,
         &mut commands,
         &mut details,
@@ -3092,8 +3097,11 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
     let top_strategy = driver_ir2g8r_top_strategy(ir2g8r_cli, explicit_ir_top.is_some());
     let prepared_ir_relpath = "prep_for_gatify.ir";
     let mut suggested_next_actions = Vec::new();
-    let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
-        .unwrap_or_else(|_| runtime.clone());
+    let stats_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+        repo_root,
+        runtime,
+        store.aux_driver_version.as_deref(),
+    )?;
     if let Ok(next) = build_suggestion(
         "Compute AIG stats with DriverAigToStats",
         ActionSpec::DriverAigToStats {
@@ -3180,8 +3188,11 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
         );
     }
 
-    let ir_aig_equiv_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
-        .unwrap_or_else(|_| runtime.clone());
+    let ir_aig_equiv_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+        repo_root,
+        runtime,
+        store.aux_driver_version.as_deref(),
+    )?;
     if ir_aig_equiv_runtime != *runtime {
         details.insert(
             "driver_ir_aig_equiv_runtime".to_string(),
@@ -3235,7 +3246,6 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
         ir_action_id,
         &ir_input_path,
         inferred_ir_top.as_deref(),
-        version,
         runtime,
         &mut commands,
         &mut details,
@@ -3495,7 +3505,6 @@ pub(crate) fn run_ir_fn_to_combinational_verilog_action(
         ir_action_id,
         &ir_input_path,
         ir_top.as_deref(),
-        version,
         runtime,
         &mut commands,
         &mut details,
@@ -4563,14 +4572,7 @@ pub(crate) fn run_ir_fn_to_k_bool_cone_corpus_action(
     );
 
     let mut input_ir_structural_hash = None;
-    match compute_ir_fn_structural_hash(
-        store,
-        repo_root,
-        &ir_input_path,
-        Some(&ir_top),
-        version,
-        runtime,
-    ) {
+    match compute_ir_fn_structural_hash(store, repo_root, &ir_input_path, Some(&ir_top), runtime) {
         Ok((hash, trace)) => {
             commands.push(trace);
             details.insert(
@@ -5211,8 +5213,11 @@ test -s /outputs/result.aig
     if let Ok(Some((xlsynth_version, driver_runtime))) =
         infer_driver_context_from_verilog_action(store, verilog_action_id)
     {
-        let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &driver_runtime)
-            .unwrap_or(driver_runtime.clone());
+        let stats_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+            repo_root,
+            &driver_runtime,
+            store.aux_driver_version.as_deref(),
+        )?;
         if let Ok(next) = build_suggestion(
             "Compute AIG stats with DriverAigToStats",
             ActionSpec::DriverAigToStats {
@@ -5312,8 +5317,11 @@ test -s /outputs/result.aig
     if let Ok(Some((xlsynth_version, driver_runtime))) =
         infer_driver_context_from_aig_action(store, aig_action_id)
     {
-        let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &driver_runtime)
-            .unwrap_or(driver_runtime.clone());
+        let stats_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+            repo_root,
+            &driver_runtime,
+            store.aux_driver_version.as_deref(),
+        )?;
         if let Ok(next) = build_suggestion(
             "Compute AIG stats with DriverAigToStats",
             ActionSpec::DriverAigToStats {

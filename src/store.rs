@@ -2955,6 +2955,7 @@ struct TimedCache<T> {
 pub(crate) struct ArtifactStore {
     pub(crate) root: PathBuf,
     pub(crate) downstream_cache_dir: Option<PathBuf>,
+    pub(crate) aux_driver_version: Option<String>,
     pub(crate) pending_path_cache: crate::queue::PendingPathCache,
     artifact_backend_selection: ArtifactBackendSelection,
     artifact_backend: Box<dyn ArtifactBackend>,
@@ -3002,6 +3003,7 @@ impl ArtifactStore {
         Self {
             root,
             downstream_cache_dir: None,
+            aux_driver_version: None,
             pending_path_cache: crate::queue::PendingPathCache::default(),
             artifact_backend_selection,
             artifact_backend,
@@ -3025,6 +3027,7 @@ impl ArtifactStore {
         Self {
             root,
             downstream_cache_dir: None,
+            aux_driver_version: None,
             pending_path_cache: crate::queue::PendingPathCache::default(),
             artifact_backend_selection,
             artifact_backend,

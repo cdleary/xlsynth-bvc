@@ -1149,7 +1149,18 @@ pub(crate) fn run_ir_dir_corpus(
     downstream_cache_dir: Option<&Path>,
     driver: DriverCli,
     yosys: YosysCli,
+    aux_driver_version: Option<&str>,
 ) -> Result<RunIrDirCorpusSummary> {
+    if aux_driver_version.is_some() && driver.driver_git_commit.is_some() {
+        bail!("--aux-driver-version is only supported for release-driver corpus runs");
+    }
+    if let (Some(aux), Some(stats)) = (aux_driver_version, stats_driver_version) {
+        if crate::versioning::normalize_tag_version(aux)
+            != crate::versioning::normalize_tag_version(stats)
+        {
+            bail!("--aux-driver-version and --stats-driver-version must agree");
+        }
+    }
     if !(1..=64).contains(&prepare_threads) {
         bail!("--prepare-threads must be between 1 and 64");
     }
@@ -1192,6 +1203,7 @@ pub(crate) fn run_ir_dir_corpus(
         workspace_artifacts_via_sled.clone(),
     );
     store.downstream_cache_dir = downstream_cache_dir.map(Path::to_path_buf);
+    store.aux_driver_version = aux_driver_version.map(str::to_string);
     store.ensure_layout()?;
 
     let manifest_path = output_dir.join(IR_DIR_CORPUS_MANIFEST_FILENAME);
@@ -1235,13 +1247,20 @@ pub(crate) fn run_ir_dir_corpus(
                 &driver_runtime.release_platform,
             )?
         } else {
-            match resolve_driver_runtime_for_aig_stats(repo_root, &driver_runtime) {
+            match resolve_driver_runtime_for_aig_stats(
+                repo_root,
+                &driver_runtime,
+                aux_driver_version,
+            ) {
                 Ok(runtime) => runtime,
-                Err(_) if driver_runtime.source_revision.is_none() => driver_runtime.clone(),
+                Err(_)
+                    if driver_runtime.source_revision.is_none() && aux_driver_version.is_none() =>
+                {
+                    driver_runtime.clone()
+                }
                 Err(error) => {
-                    return Err(error).context(
-                    "resolving the required released stats runtime for a source-driver candidate",
-                );
+                    return Err(error)
+                        .context("resolving the required auxiliary statistics runtime");
                 }
             }
         };
@@ -3771,6 +3790,7 @@ mod tests {
             None,
             sample_driver_cli(),
             sample_yosys_cli(),
+            None,
         )
         .expect("run ir dir corpus");
 
@@ -4267,6 +4287,7 @@ mod tests {
             None,
             sample_driver_cli(),
             sample_yosys_cli(),
+            None,
         )
         .expect_err("run mode must reject queue scheduling policies");
 
@@ -4867,6 +4888,7 @@ mod tests {
                 docker_image: None,
             },
             yosys.clone(),
+            None,
         )
         .expect("run source candidate chain");
         let release_summary = run_ir_dir_corpus(
@@ -4893,6 +4915,7 @@ mod tests {
                 docker_image: None,
             },
             yosys,
+            None,
         )
         .expect("run release baseline chain");
         assert_eq!(source_summary.completed_samples, 1);
@@ -4997,6 +5020,7 @@ mod tests {
                 None,
                 sample_driver_cli(),
                 sample_yosys_cli(),
+                None,
             )
         };
         let serial = root.join("serial");
@@ -5036,7 +5060,7 @@ mod tests {
         let output = root.join("out");
         fs::create_dir_all(&input).expect("create input");
         fs::write(input.join("foo.ir"), "package foo\n").expect("write input");
-        let run = |pin| {
+        let run = |pin, aux| {
             run_ir_dir_corpus(
                 Path::new(env!("CARGO_MANIFEST_DIR")),
                 &input,
@@ -5058,9 +5082,10 @@ mod tests {
                     ..sample_driver_cli()
                 },
                 sample_yosys_cli(),
+                aux,
             )
         };
-        let first = run(Some("0.74.0")).expect("enqueue with explicit estimator");
+        let first = run(None, Some("0.74.0")).expect("enqueue with auxiliary estimator pin");
         assert_eq!(first.enqueued_actions, 8);
         let manifest = read_status_manifest(&output);
         assert_eq!(manifest.driver_runtime.driver_version, "0.75.0");
@@ -5087,12 +5112,20 @@ mod tests {
             assert_eq!(runtime, manifest.stats_runtime);
         }
         drop(store);
-        let resumed = run(Some("v0.74.0")).expect("resume same estimator");
+        let resumed = run(Some("v0.74.0"), None).expect("resume same estimator");
         assert_eq!(resumed.enqueued_actions, 0);
+        assert_eq!(
+            run(Some("0.74.0"), Some("0.74.0"))
+                .unwrap()
+                .enqueued_actions,
+            0
+        );
         let bytes = fs::read(output.join(IR_DIR_CORPUS_MANIFEST_FILENAME)).expect("read manifest");
+        assert!(run(Some("0.75.0"), Some("0.74.0")).is_err());
+        assert!(run(None, Some("999.0.0")).is_err());
         for pin in [None, Some("0.75.0"), Some("999.0.0"), Some("latest")] {
             assert!(
-                run(pin).is_err(),
+                run(pin, None).is_err(),
                 "reject changed or unknown estimator {pin:?}"
             );
             assert_eq!(
@@ -5442,6 +5475,7 @@ mod tests {
             None,
             sample_driver_cli(),
             sample_yosys_cli(),
+            None,
         )
         .expect_err("mismatched yosys script should fail");
         let err_text = format!("{:#}", err);

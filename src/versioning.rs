@@ -375,6 +375,7 @@ pub(crate) fn discover_releases(
             let runtime = crate::runtime::canonical_stdlib_discovery_runtime_for_version(
                 repo_root,
                 &release.tag_name,
+                store.aux_driver_version.as_deref(),
             )?;
             let release_input = crate::proto::release_input_for_dso_version(&release.tag_name)?;
             let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
