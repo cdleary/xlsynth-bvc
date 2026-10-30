@@ -31,7 +31,7 @@ use crate::queue::{
     load_queue_done_record, load_queue_failed_record, queue_state_for_action,
     suggested_action_queue_priority,
 };
-use crate::runtime::resolve_driver_runtime_for_aig_stats;
+use crate::runtime::{raw_g8r_stats_runtime, resolve_driver_runtime_for_aig_stats};
 use crate::service::{
     collect_output_files, infer_ir_top_function, make_script_ref, sha256_file, summarize_error,
 };
@@ -414,6 +414,9 @@ struct IrDirCorpusJoinedRow {
     driver_source_repository: Option<String>,
     driver_source_commit: Option<String>,
     stats_driver_crate_version: String,
+    g8r_stats_driver_crate_version: String,
+    yosys_abc_stats_driver_crate_version: Option<String>,
+    g8r_raw_stats_driver_crate_version: Option<String>,
     yosys_script: String,
     yosys_script_sha256: String,
     import_ir_action_id: String,
@@ -1149,7 +1152,18 @@ pub(crate) fn run_ir_dir_corpus(
     downstream_cache_dir: Option<&Path>,
     driver: DriverCli,
     yosys: YosysCli,
+    aux_driver_version: Option<&str>,
 ) -> Result<RunIrDirCorpusSummary> {
+    if aux_driver_version.is_some() && driver.driver_git_commit.is_some() {
+        bail!("--aux-driver-version is only supported for release-driver corpus runs");
+    }
+    if let (Some(aux), Some(stats)) = (aux_driver_version, stats_driver_version) {
+        if crate::versioning::normalize_tag_version(aux)
+            != crate::versioning::normalize_tag_version(stats)
+        {
+            bail!("--aux-driver-version and --stats-driver-version must agree");
+        }
+    }
     if !(1..=64).contains(&prepare_threads) {
         bail!("--prepare-threads must be between 1 and 64");
     }
@@ -1200,6 +1214,7 @@ pub(crate) fn run_ir_dir_corpus(
         workspace_artifacts_via_sled.clone(),
     );
     store.downstream_cache_dir = downstream_cache_dir.map(Path::to_path_buf);
+    store.aux_driver_version = aux_driver_version.map(str::to_string);
     store.ensure_layout()?;
 
     let manifest_path = output_dir.join(IR_DIR_CORPUS_MANIFEST_FILENAME);
@@ -1243,13 +1258,20 @@ pub(crate) fn run_ir_dir_corpus(
                 &driver_runtime.release_platform,
             )?
         } else {
-            match resolve_driver_runtime_for_aig_stats(repo_root, &driver_runtime) {
+            match resolve_driver_runtime_for_aig_stats(
+                repo_root,
+                &driver_runtime,
+                aux_driver_version,
+            ) {
                 Ok(runtime) => runtime,
-                Err(_) if driver_runtime.source_revision.is_none() => driver_runtime.clone(),
+                Err(_)
+                    if driver_runtime.source_revision.is_none() && aux_driver_version.is_none() =>
+                {
+                    driver_runtime.clone()
+                }
                 Err(error) => {
-                    return Err(error).context(
-                    "resolving the required released stats runtime for a source-driver candidate",
-                );
+                    return Err(error)
+                        .context("resolving the required auxiliary statistics runtime");
                 }
             }
         };
@@ -1259,6 +1281,13 @@ pub(crate) fn run_ir_dir_corpus(
         let yosys_runtime = yosys.into_runtime(repo_root, slang_commit)?;
         (driver_runtime, stats_runtime, yosys_runtime)
     };
+    if (aux_driver_version.is_some() || stats_driver_version.is_some())
+        && raw_g8r_stats_runtime(&driver_runtime, &stats_runtime) != &stats_runtime
+    {
+        bail!(
+            "a common statistics estimator cannot read this release's native g8r output; legacy raw statistics require the producer runtime"
+        );
+    }
     if manifest_path.exists() {
         let previous: IrDirCorpusManifest = serde_json::from_slice(&fs::read(&manifest_path)?)
             .context("reading captured corpus statistics runtime")?;
@@ -1316,6 +1345,7 @@ pub(crate) fn run_ir_dir_corpus(
                 &effective_dso_version,
                 &driver_runtime,
                 &stats_runtime,
+                None,
                 &yosys_runtime,
                 &yosys_script_ref,
             )
@@ -1446,7 +1476,11 @@ pub(crate) fn run_ir_dir_corpus(
         }
     }
 
-    let joined_rows = build_joined_rows(&store, &sample_records)?;
+    let joined_rows = build_joined_rows(
+        &store,
+        &sample_records,
+        raw_g8r_stats_runtime(&driver_runtime, &stats_runtime),
+    )?;
     export_leaf_artifacts(&store, output_dir, &sample_records)?;
     let planned_actions = plans
         .iter()
@@ -1722,6 +1756,7 @@ fn build_ir_dir_corpus_status_report(
                 &manifest.dso_version,
                 &manifest.driver_runtime,
                 &manifest.stats_runtime,
+                None,
                 &manifest.yosys_runtime,
                 &yosys_script_ref,
             )?;
@@ -1759,6 +1794,12 @@ fn build_ir_dir_corpus_status_report(
             &manifest.dso_version,
             &manifest.driver_runtime,
             &manifest.stats_runtime,
+            (!enqueue_raw_stats).then_some(
+                persisted_sample
+                    .g8r_raw_stats_action_id
+                    .as_deref()
+                    .unwrap_or(&persisted_sample.g8r_stats_action_id),
+            ),
             &manifest.yosys_runtime,
             &yosys_script_ref,
         )?;
@@ -1836,7 +1877,11 @@ fn build_ir_dir_corpus_status_report(
     let joined_jsonl_path = joined_output_path(output_dir, recipe_preset, "jsonl");
     let joined_csv_path = joined_output_path(output_dir, recipe_preset, "csv");
     if refresh_public_outputs {
-        let joined_rows = build_joined_rows(&store, &sample_records)?;
+        let joined_rows = build_joined_rows(
+            &store,
+            &sample_records,
+            raw_g8r_stats_runtime(&manifest.driver_runtime, &manifest.stats_runtime),
+        )?;
         export_leaf_artifacts(&store, output_dir, &sample_records)?;
 
         let refreshed_manifest = IrDirCorpusManifest {
@@ -2440,6 +2485,7 @@ fn build_action_plan(
     version: &str,
     driver_runtime: &DriverRuntimeSpec,
     stats_runtime: &DriverRuntimeSpec,
+    captured_raw_stats_id: Option<&str>,
     yosys_runtime: &YosysRuntimeSpec,
     yosys_script_ref: &crate::model::ScriptRef,
 ) -> Result<CorpusActionPlan> {
@@ -2510,29 +2556,34 @@ fn build_action_plan(
         }
     };
     let yosys_abc_aig_action_id = compute_action_id(&yosys_abc_aig_action)?;
-    let g8r_stats_action = ActionSpec::DriverAigToStats {
-        aig_action_id: if is_g8r_abc_stats {
-            yosys_abc_aig_action_id.clone()
-        } else {
-            g8r_abc_aig_action_id
-                .clone()
-                .unwrap_or_else(|| g8r_aig_action_id.clone())
-        },
+    let stats = |aig_action_id: &str, runtime: &DriverRuntimeSpec| ActionSpec::DriverAigToStats {
+        aig_action_id: aig_action_id.to_string(),
         version: version.to_string(),
-        runtime: stats_runtime.clone(),
+        runtime: runtime.clone(),
+    };
+    let raw_runtime = raw_g8r_stats_runtime(driver_runtime, stats_runtime);
+    let mut raw_stats = stats(&g8r_aig_action_id, raw_runtime);
+    if let Some(captured_id) = captured_raw_stats_id
+        && raw_runtime != stats_runtime
+    {
+        // Status queries must address older results by their captured IDs.
+        let historical = stats(&g8r_aig_action_id, stats_runtime);
+        if compute_action_id(&historical)? == captured_id {
+            raw_stats = historical;
+        }
+    }
+    let post_abc_id = if is_g8r_abc_stats {
+        Some(&yosys_abc_aig_action_id)
+    } else {
+        g8r_abc_aig_action_id.as_ref()
+    };
+    let g8r_stats_action = match post_abc_id {
+        Some(id) => stats(id, stats_runtime),
+        None => raw_stats.clone(),
     };
     let g8r_stats_action_id = compute_action_id(&g8r_stats_action)?;
-    let g8r_raw_stats_action =
-        (is_g8r_abc_stats || matched_abc).then(|| ActionSpec::DriverAigToStats {
-            aig_action_id: g8r_aig_action_id.clone(),
-            version: version.to_string(),
-            runtime: stats_runtime.clone(),
-        });
-    let yosys_abc_stats_action = ActionSpec::DriverAigToStats {
-        aig_action_id: yosys_abc_aig_action_id.clone(),
-        version: version.to_string(),
-        runtime: stats_runtime.clone(),
-    };
+    let g8r_raw_stats_action = post_abc_id.map(|_| raw_stats);
+    let yosys_abc_stats_action = stats(&yosys_abc_aig_action_id, stats_runtime);
     let yosys_abc_stats_action_id = compute_action_id(&yosys_abc_stats_action)?;
     let aig_stat_diff_action = ActionSpec::AigStatDiff {
         opt_ir_action_id: import_ir_action_id.clone(),
@@ -3232,13 +3283,15 @@ fn summarize_sample_status(statuses: &[&str], has_error: bool) -> String {
 fn build_joined_rows(
     store: &ArtifactStore,
     sample_records: &[IrDirCorpusSampleRecord],
+    raw_g8r_runtime: &DriverRuntimeSpec,
 ) -> Result<Vec<IrDirCorpusJoinedRow>> {
     let mut rows = Vec::new();
     for sample in sample_records {
         if sample.status != "done" {
             continue;
         }
-        let (g8r_stats, yosys_stats, diff_json) = if sample.aig_stat_diff_status == "not_planned" {
+        let has_reference = sample.aig_stat_diff_status != "not_planned";
+        let (g8r_stats, yosys_stats, diff_json) = if !has_reference {
             let stats_provenance = store
                 .load_provenance(&sample.g8r_stats_action_id)
                 .with_context(|| {
@@ -3300,6 +3353,19 @@ fn build_joined_rows(
             driver_source_repository: sample.driver_source_repository.clone(),
             driver_source_commit: sample.driver_source_commit.clone(),
             stats_driver_crate_version: sample.stats_driver_crate_version.clone(),
+            // A separate raw stage means the main g8r metrics are post-ABC.
+            // Historical native stats came from the producer even under a helper action ID.
+            g8r_stats_driver_crate_version: if sample.g8r_raw_stats_action_id.is_some() {
+                sample.stats_driver_crate_version.clone()
+            } else {
+                raw_g8r_runtime.driver_version.clone()
+            },
+            yosys_abc_stats_driver_crate_version: has_reference
+                .then(|| sample.stats_driver_crate_version.clone()),
+            g8r_raw_stats_driver_crate_version: sample
+                .g8r_raw_stats_action_id
+                .as_ref()
+                .map(|_| raw_g8r_runtime.driver_version.clone()),
             yosys_script: sample.yosys_script.clone(),
             yosys_script_sha256: sample.yosys_script_sha256.clone(),
             import_ir_action_id: sample.import_ir_action_id.clone(),
@@ -3554,7 +3620,7 @@ fn write_joined_jsonl(path: &Path, rows: &[IrDirCorpusJoinedRow]) -> Result<()> 
 fn write_joined_csv(path: &Path, rows: &[IrDirCorpusJoinedRow]) -> Result<()> {
     let mut text = String::new();
     text.push_str(
-        "sample_id,logical_name,source_relpath,source_sha256,top_fn_policy,top_fn_name,fraig,dso_version,driver_crate_version,driver_source_repository,driver_source_commit,stats_driver_crate_version,yosys_script,yosys_script_sha256,import_ir_action_id,g8r_aig_action_id,g8r_stats_action_id,combo_verilog_action_id,yosys_abc_aig_action_id,yosys_abc_stats_action_id,aig_stat_diff_action_id,g8r_and_nodes,g8r_depth,g8r_product,yosys_abc_and_nodes,yosys_abc_depth,yosys_abc_product,g8r_product_loss,delta_and_nodes_yosys_minus_g8r,delta_depth_yosys_minus_g8r,g8r_abc_aig_action_id\n",
+        "sample_id,logical_name,source_relpath,source_sha256,top_fn_policy,top_fn_name,fraig,dso_version,driver_crate_version,driver_source_repository,driver_source_commit,stats_driver_crate_version,yosys_script,yosys_script_sha256,import_ir_action_id,g8r_aig_action_id,g8r_stats_action_id,combo_verilog_action_id,yosys_abc_aig_action_id,yosys_abc_stats_action_id,aig_stat_diff_action_id,g8r_and_nodes,g8r_depth,g8r_product,yosys_abc_and_nodes,yosys_abc_depth,yosys_abc_product,g8r_product_loss,delta_and_nodes_yosys_minus_g8r,delta_depth_yosys_minus_g8r,g8r_abc_aig_action_id,g8r_stats_driver_crate_version,yosys_abc_stats_driver_crate_version,g8r_raw_stats_driver_crate_version\n",
     );
     for row in rows {
         let fields = [
@@ -3589,6 +3655,17 @@ fn write_joined_csv(path: &Path, rows: &[IrDirCorpusJoinedRow]) -> Result<()> {
             csv_escape(&optional_f64(row.delta_and_nodes_yosys_minus_g8r)),
             csv_escape(&optional_f64(row.delta_depth_yosys_minus_g8r)),
             csv_escape(row.g8r_abc_aig_action_id.as_deref().unwrap_or("")),
+            csv_escape(&row.g8r_stats_driver_crate_version),
+            csv_escape(
+                row.yosys_abc_stats_driver_crate_version
+                    .as_deref()
+                    .unwrap_or(""),
+            ),
+            csv_escape(
+                row.g8r_raw_stats_driver_crate_version
+                    .as_deref()
+                    .unwrap_or(""),
+            ),
         ];
         text.push_str(&fields.join(","));
         text.push('\n');
@@ -3839,6 +3916,7 @@ mod tests {
             None,
             sample_driver_cli(),
             sample_yosys_cli(),
+            None,
         )
         .expect("run ir dir corpus");
 
@@ -4014,6 +4092,7 @@ mod tests {
                     "v0.39.0",
                     &driver_runtime,
                     &stats_runtime,
+                    None,
                     &yosys_runtime,
                     &yosys_script_ref,
                 )
@@ -4335,6 +4414,7 @@ mod tests {
             None,
             sample_driver_cli(),
             sample_yosys_cli(),
+            None,
         )
         .expect_err("run mode must reject queue scheduling policies");
 
@@ -4366,6 +4446,7 @@ mod tests {
             "v0.39.0",
             &sample_driver_runtime(),
             &sample_stats_runtime(),
+            None,
             &sample_yosys_runtime(),
             &sample_yosys_script_ref(),
         )
@@ -4418,6 +4499,7 @@ mod tests {
             "v0.39.0",
             &driver_runtime,
             &stats_runtime,
+            None,
             &sample_yosys_runtime(),
             &sample_yosys_script_ref(),
         )
@@ -4578,6 +4660,7 @@ mod tests {
             "v0.54.7",
             &driver_runtime,
             &stats_runtime,
+            None,
             &yosys_runtime,
             &yosys_script_ref,
         )
@@ -4657,6 +4740,7 @@ mod tests {
             "v0.54.7",
             &driver_runtime,
             &stats_runtime,
+            None,
             &custom_yosys_runtime,
             &yosys_script_ref,
         )
@@ -4755,6 +4839,7 @@ mod tests {
             "v0.54.7",
             &other_runtime,
             &stats_runtime,
+            None,
             &yosys_runtime,
             &yosys_script_ref,
         )
@@ -4794,6 +4879,7 @@ mod tests {
             "v0.54.7",
             &rebuilt_runtime,
             &stats_runtime,
+            None,
             &yosys_runtime,
             &yosys_script_ref,
         )
@@ -4935,6 +5021,7 @@ mod tests {
                 docker_image: None,
             },
             yosys.clone(),
+            None,
         )
         .expect("run source candidate chain");
         let release_summary = run_ir_dir_corpus(
@@ -4961,6 +5048,7 @@ mod tests {
                 docker_image: None,
             },
             yosys,
+            None,
         )
         .expect("run release baseline chain");
         assert_eq!(source_summary.completed_samples, 1);
@@ -5020,6 +5108,7 @@ mod tests {
                     "v0.39.0",
                     &sample_driver_runtime(),
                     &sample_stats_runtime(),
+                    None,
                     &yosys_runtime,
                     &script,
                 )
@@ -5166,6 +5255,7 @@ mod tests {
                 None,
                 sample_driver_cli(),
                 sample_yosys_cli(),
+                None,
             )
         };
         let serial = root.join("serial");
@@ -5199,13 +5289,180 @@ mod tests {
     }
 
     #[test]
+    fn aig_stat_diff_uses_the_queued_estimator_on_a_differently_pinned_worker() {
+        let (root, output, _) =
+            run_enqueue_corpus_for_recipe(CorpusRecipePreset::G8rVsYabcAigDiff, None);
+        let manifest = read_status_manifest(&output);
+        let row = &manifest.samples[0];
+        let mut store = ArtifactStore::new_with_sled(
+            PathBuf::from(&manifest.workspace_store_dir),
+            PathBuf::from(&manifest.workspace_artifacts_via_sled),
+        );
+        assert_ne!(manifest.stats_runtime.driver_version, "0.68.0");
+        store.aux_driver_version = Some("0.68.0".into());
+        let g8r = crate::queue::load_queue_pending_record(&store, &row.g8r_aig_action_id)
+            .unwrap()
+            .unwrap();
+        stage_provenance_record(
+            &store,
+            g8r.action,
+            ArtifactRef {
+                action_id: row.g8r_aig_action_id.clone(),
+                artifact_type: ArtifactType::AigFile,
+                relpath: "payload/result.aig".into(),
+            },
+            Utc::now(),
+            serde_json::json!({}),
+            Vec::new(),
+        );
+        let diff = crate::service::build_aig_stat_diff_suggestion_for_stats_action(
+            &store,
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &row.g8r_stats_action_id,
+            &row.g8r_aig_action_id,
+            &manifest.stats_runtime,
+        )
+        .unwrap()
+        .expect("matching queued Yosys statistics");
+        assert_eq!(
+            compute_action_id(&diff.action).unwrap(),
+            row.aig_stat_diff_action_id
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_g8r_corpus_separates_raw_statistics_from_aiger_statistics() {
+        let root = make_temp_dir("legacy-stats-corpus");
+        let input = root.join("input");
+        let output = root.join("output");
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("foo.ir"), "package foo\n").unwrap();
+        let run = |pin| {
+            run_ir_dir_corpus(
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+                &input,
+                &output,
+                CorpusRecipePreset::G8rVsYabcAigDiff,
+                CorpusExecutionMode::Enqueue,
+                CorpusTopFnPolicy::FromFilename,
+                None,
+                false,
+                "v0.24.0",
+                None,
+                0,
+                None,
+                None,
+                1,
+                None,
+                DriverCli {
+                    driver_version: Some("0.23.0".into()),
+                    ..sample_driver_cli()
+                },
+                sample_yosys_cli(),
+                pin,
+            )
+        };
+        assert!(
+            run(Some("0.74.0"))
+                .unwrap_err()
+                .to_string()
+                .contains("common statistics estimator")
+        );
+        assert!(!output.join(IR_DIR_CORPUS_MANIFEST_FILENAME).exists());
+        run(None).unwrap();
+        let mut manifest = read_status_manifest(&output);
+        let row = &manifest.samples[0];
+        let stats = |id: &str, runtime: &DriverRuntimeSpec| ActionSpec::DriverAigToStats {
+            aig_action_id: id.into(),
+            version: manifest.dso_version.clone(),
+            runtime: runtime.clone(),
+        };
+        let source_stats = stats(&row.g8r_aig_action_id, &manifest.driver_runtime);
+        let yosys_stats = stats(&row.yosys_abc_aig_action_id, &manifest.stats_runtime);
+        assert_eq!(
+            row.g8r_stats_action_id,
+            compute_action_id(&source_stats).unwrap()
+        );
+        assert_eq!(
+            row.yosys_abc_stats_action_id,
+            compute_action_id(&yosys_stats).unwrap()
+        );
+
+        // A status refresh of an older graph still looks up its recorded raw stats ID.
+        let old_id =
+            compute_action_id(&stats(&row.g8r_aig_action_id, &manifest.stats_runtime)).unwrap();
+        assert_ne!(old_id, row.g8r_stats_action_id);
+        let plan = build_action_plan(
+            &sample_specs_from_manifest(&manifest)[0],
+            CorpusRecipePreset::G8rVsYabcAigDiff,
+            false,
+            &manifest.dso_version,
+            &manifest.driver_runtime,
+            &manifest.stats_runtime,
+            Some(&old_id),
+            &manifest.yosys_runtime,
+            &crate::model::ScriptRef {
+                path: manifest.yosys_script.clone(),
+                sha256: manifest.yosys_script_sha256.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.g8r_stats_action_id, old_id);
+        assert_eq!(
+            plan.yosys_abc_stats_action_id,
+            row.yosys_abc_stats_action_id
+        );
+        // Refresh a completed pre-fix row. Keep its original action IDs while
+        // distinguishing the producer's native measurement from the AIGER estimator.
+        let sample = sample_specs_from_manifest(&manifest).remove(0);
+        let row = &mut manifest.samples[0];
+        row.g8r_stats_action_id = old_id.clone();
+        row.aig_stat_diff_action_id = plan.aig_stat_diff_action_id.clone();
+        write_status_manifest(&output, &manifest);
+        let (_, store_dir, sled) = corpus_workspace_paths(&output);
+        let store = ArtifactStore::new_with_sled(store_dir, sled);
+        seed_done_sample(&store, &sample, &plan, Utc::now());
+        drop(store);
+        let refreshed = refresh_ir_dir_corpus_status(&output, 1800, 10).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(refreshed.joined_jsonl_path).unwrap()).unwrap();
+        assert_eq!(json["g8r_stats_action_id"], old_id);
+        assert_eq!(
+            json["stats_driver_crate_version"],
+            manifest.stats_runtime.driver_version
+        );
+        assert_eq!(json["g8r_stats_driver_crate_version"], "0.23.0");
+        assert_eq!(
+            json["yosys_abc_stats_driver_crate_version"],
+            manifest.stats_runtime.driver_version
+        );
+        assert!(json["g8r_raw_stats_driver_crate_version"].is_null());
+        let csv = fs::read_to_string(refreshed.joined_csv_path).unwrap();
+        let mut lines = csv.lines();
+        let columns: BTreeMap<_, _> = lines
+            .next()
+            .unwrap()
+            .split(',')
+            .zip(lines.next().unwrap().split(','))
+            .collect();
+        assert_eq!(columns["g8r_stats_driver_crate_version"], "0.23.0");
+        assert_eq!(
+            columns["yosys_abc_stats_driver_crate_version"],
+            manifest.stats_runtime.driver_version
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn corpus_stats_pin_binds_actions_and_rejects_resume_changes() {
         let root = make_temp_dir("corpus-stats-pin");
         let input = root.join("input");
         let output = root.join("out");
         fs::create_dir_all(&input).expect("create input");
         fs::write(input.join("foo.ir"), "package foo\n").expect("write input");
-        let run = |pin| {
+        let run = |pin, aux| {
             run_ir_dir_corpus(
                 Path::new(env!("CARGO_MANIFEST_DIR")),
                 &input,
@@ -5227,9 +5484,10 @@ mod tests {
                     ..sample_driver_cli()
                 },
                 sample_yosys_cli(),
+                aux,
             )
         };
-        let first = run(Some("0.74.0")).expect("enqueue with explicit estimator");
+        let first = run(None, Some("0.74.0")).expect("enqueue with auxiliary estimator pin");
         assert_eq!(first.enqueued_actions, 8);
         let manifest = read_status_manifest(&output);
         assert_eq!(manifest.driver_runtime.driver_version, "0.75.0");
@@ -5256,12 +5514,20 @@ mod tests {
             assert_eq!(runtime, manifest.stats_runtime);
         }
         drop(store);
-        let resumed = run(Some("v0.74.0")).expect("resume same estimator");
+        let resumed = run(Some("v0.74.0"), None).expect("resume same estimator");
         assert_eq!(resumed.enqueued_actions, 0);
+        assert_eq!(
+            run(Some("0.74.0"), Some("0.74.0"))
+                .unwrap()
+                .enqueued_actions,
+            0
+        );
         let bytes = fs::read(output.join(IR_DIR_CORPUS_MANIFEST_FILENAME)).expect("read manifest");
+        assert!(run(Some("0.75.0"), Some("0.74.0")).is_err());
+        assert!(run(None, Some("999.0.0")).is_err());
         for pin in [None, Some("0.75.0"), Some("999.0.0"), Some("latest")] {
             assert!(
-                run(pin).is_err(),
+                run(pin, None).is_err(),
                 "reject changed or unknown estimator {pin:?}"
             );
             assert_eq!(
@@ -5348,7 +5614,8 @@ mod tests {
             csv.lines()
                 .next()
                 .unwrap()
-                .ends_with(",g8r_abc_aig_action_id")
+                .split(',')
+                .any(|column| column == "g8r_abc_aig_action_id")
         );
         let refreshed =
             refresh_ir_dir_corpus_status(&output_dir, 1800, 10).expect("refresh matched recipe");
@@ -5375,6 +5642,7 @@ mod tests {
             &before.dso_version,
             &before.driver_runtime,
             &before.stats_runtime,
+            None,
             &before.yosys_runtime,
             &crate::model::ScriptRef {
                 path: before.yosys_script.clone(),
@@ -5631,6 +5899,7 @@ mod tests {
             None,
             sample_driver_cli(),
             sample_yosys_cli(),
+            None,
         )
         .expect_err("mismatched yosys script should fail");
         let err_text = format!("{:#}", err);

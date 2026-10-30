@@ -190,7 +190,7 @@ const MAX_PENDING_SCAN_PER_CLAIM: usize = 128;
 const MAX_PENDING_SCAN_PER_COMPATIBLE_CLAIM: usize = 256;
 const QUEUE_IDENTITY_MIGRATION_LOCK_KEY: &str = "queue-identity-migration";
 
-struct QueueTransitionLock {
+pub(crate) struct QueueTransitionLock {
     file: File,
 }
 
@@ -215,7 +215,7 @@ impl QueueTransitionLock {
         Ok((file, path))
     }
 
-    fn acquire(store: &ArtifactStore, action_id: &str) -> Result<Self> {
+    pub(crate) fn acquire(store: &ArtifactStore, action_id: &str) -> Result<Self> {
         let (file, path) = Self::open(store, action_id)?;
         file.lock_exclusive()
             .with_context(|| format!("locking queue transition: {}", path.display()))?;

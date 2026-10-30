@@ -406,22 +406,14 @@ pub(crate) fn recompute_structural_hashes(
         .num_threads(worker_threads)
         .build()
         .context("building structural hash recompute thread pool")?;
-    let repo_root = repo_root.to_path_buf();
-    let store_root = store.root.clone();
-    let artifacts_sled_db_path = store.artifacts_sled_db_path();
     Ok(thread_pool.install(|| {
         jobs.into_par_iter()
             .map(|job| {
-                let worker_store = ArtifactStore::new_with_sled(
-                    store_root.clone(),
-                    artifacts_sled_db_path.clone(),
-                );
                 match compute_ir_fn_structural_hash(
-                    &worker_store,
-                    &repo_root,
+                    store,
+                    repo_root,
                     &job.output_path,
                     Some(job.member.ir_top.as_str()),
-                    &job.dso_version,
                     &job.runtime,
                 ) {
                     Ok((structural_hash, _trace)) => StructuralHashRecomputeResult {
@@ -609,7 +601,6 @@ pub(crate) fn populate_ir_fn_corpus_structural_index(
         recompute_jobs.push(StructuralHashRecomputeJob {
             member,
             output_path,
-            dso_version: version.clone(),
             runtime: runtime.clone(),
         });
     }
@@ -1080,7 +1071,6 @@ pub(crate) fn enqueue_structural_opt_ir_g8r_actions(
     for provenance in &provenances {
         let ActionSpec::DriverIrToOpt {
             top_fn_name,
-            version,
             runtime,
             ..
         } = &provenance.action
@@ -1136,7 +1126,6 @@ pub(crate) fn enqueue_structural_opt_ir_g8r_actions(
                 repo_root,
                 &output_path,
                 Some(&ir_top),
-                version,
                 runtime,
             ) {
                 Ok((hash, _trace)) => {
@@ -1445,6 +1434,57 @@ mod tests {
             details: serde_json::json!({}),
             suggested_next_actions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn parallel_structural_hash_recomputation_preserves_explicit_auxiliary_pin() {
+        let (mut store, root) = make_test_store("recompute-auxiliary-pin");
+        store.aux_driver_version = Some("999.0.0".to_string());
+        let output_path = root.join("input.ir");
+        fs::write(&output_path, "package test\n").expect("write input");
+        let mut runtime = sample_runtime();
+        // Both versions are unavailable: losing the pin must not select the source.
+        runtime.driver_version = "999.1.0".to_string();
+        let job = StructuralHashRecomputeJob {
+            output_path,
+            runtime,
+            member: IrFnCorpusStructuralMember {
+                opt_ir_action_id: "1".repeat(64),
+                source_ir_action_id: "2".repeat(64),
+                ir_top: "main".to_string(),
+                ir_fn_signature: None,
+                ir_op_count: None,
+                crate_version: "999.1.0".to_string(),
+                dso_version: "0.35.0".to_string(),
+                created_utc: Utc::now(),
+                output_artifact: ArtifactRef {
+                    action_id: "1".repeat(64),
+                    artifact_type: ArtifactType::IrPackageFile,
+                    relpath: "payload/result.ir".to_string(),
+                },
+                output_file_sha256: "3".repeat(64),
+                output_file_bytes: 13,
+                hash_source: String::new(),
+                hash_hint_source_action_ids: Vec::new(),
+                dslx_origin: None,
+                producer_action_kind: Some("driver_ir_to_opt".to_string()),
+            },
+        };
+        let results = recompute_structural_hashes(
+            &store,
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            vec![job.clone(), job],
+            2,
+        )
+        .expect("run recomputation workers");
+        assert_eq!(results.len(), 2);
+        for result in results {
+            assert!(result.structural_hash.is_none());
+            let error = result.error.expect("invalid explicit pin must fail");
+            assert!(error.contains("999.0.0"), "{error}");
+        }
+        drop(store);
+        fs::remove_dir_all(root).expect("remove test store");
     }
 
     #[test]
@@ -1968,7 +2008,6 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
     for provenance in &provenances {
         let ActionSpec::DriverIrToOpt {
             top_fn_name,
-            version,
             runtime,
             ..
         } = &provenance.action
@@ -2024,7 +2063,6 @@ pub(crate) fn enqueue_structural_opt_ir_k_bool_cone_actions(
                 repo_root,
                 &output_path,
                 Some(&ir_top),
-                version,
                 runtime,
             ) {
                 Ok((hash, _trace)) => {

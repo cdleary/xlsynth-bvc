@@ -697,7 +697,6 @@ pub(crate) struct IrStructuralHashHint {
 pub(crate) struct StructuralHashRecomputeJob {
     pub(crate) member: IrFnCorpusStructuralMember,
     pub(crate) output_path: PathBuf,
-    pub(crate) dso_version: String,
     pub(crate) runtime: DriverRuntimeSpec,
 }
 
