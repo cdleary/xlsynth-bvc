@@ -96,6 +96,7 @@ bvc-artifacts/
         live.json
         heartbeat.json
         capabilities.json
+        capabilities.pb
         slot.lock
         inbox/
         processing/
@@ -176,7 +177,9 @@ If runner sharing across stores becomes important later, the key can be widened 
 
 ## Capabilities
 
-Boot-time capabilities are now cached at runner startup in `capabilities.json`.
+The worker reports its boot-time probes in `capabilities.json`. The host validates the startup
+report and atomically publishes `capabilities.pb` for the driver slot used by capability queries.
+An absent, incomplete, or mismatched cache triggers a fresh probe under the slot reservation.
 
 Current driver capability metadata includes:
 

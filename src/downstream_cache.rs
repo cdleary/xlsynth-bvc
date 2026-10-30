@@ -12,13 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::executor::compute_action_id;
 use crate::model::{ActionSpec, ArtifactType, Provenance};
-use crate::proto::{self, v1};
+use crate::proto::{self, cache as pb, v1};
 use crate::service::{resolve_script_ref, sha256_file};
 use crate::store::ArtifactStore;
 
-pub(crate) mod pb {
-    include!(concat!(env!("OUT_DIR"), "/xlsynth.bvc.cache.v1.rs"));
-}
 const REVISION: u32 = 1;
 static NONCE: AtomicU64 = AtomicU64::new(0);
 

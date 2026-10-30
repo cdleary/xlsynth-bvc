@@ -133,6 +133,27 @@ class IdleRetirementTest(unittest.TestCase):
                 self.assertFalse(reservation.closed)
 
 
+class DriverCapabilityTest(unittest.TestCase):
+    def test_failed_help_can_retry_and_absent_subcommands_need_no_probe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report = Path(temp) / "capabilities.json"
+            driver = Path(temp) / "xlsynth-driver"
+            driver.write_text("#!/bin/sh\nexit 1\n")
+            driver.chmod(0o755)
+            with mock.patch.object(worker.shutil, "which", return_value=str(driver)):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    worker.write_capabilities(report, "slot", "instance", "image")
+                self.assertFalse(report.exists())
+
+                # An older driver advertises aig2ir and errors on unknown commands.
+                driver.write_text('#!/bin/sh\n[ "$*" = "--help" ] || exit 2\necho "  aig2ir"\n')
+                worker.write_capabilities(report, "slot", "instance", "image")
+            result = json.loads(report.read_text())
+            self.assertTrue(result["driver_subcommands"]["aig2ir"])
+            self.assertFalse(result["driver_subcommands"]["ir2gates"])
+            self.assertFalse(result["driver_help_tokens"]["ir2gates"]["--prepared-ir-out"])
+
+
 class WorkerLifecycleTest(unittest.TestCase):
     def wait_for(self, predicate, process, timeout=8):
         deadline = time.monotonic() + timeout
