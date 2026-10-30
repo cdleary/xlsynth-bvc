@@ -75,6 +75,27 @@ pub(crate) fn execute_action(
     ) {
         configured_action_timeout_seconds()?;
     }
+
+    let legacy_stats = if let ActionSpec::DriverAigToStats {
+        aig_action_id,
+        runtime,
+        ..
+    } = &action
+    {
+        let context = infer_legacy_g8r_stats_context(store, aig_action_id)?;
+        if let Some(source) = &context
+            && runtime != &source.runtime
+        {
+            bail!(
+                "legacy g8r statistics require the producer runtime (driver {}); re-enqueue the statistics action for {aig_action_id}",
+                source.runtime.driver_version
+            );
+        }
+        context
+    } else {
+        None
+    };
+
     let staging_dir = make_staging_dir(store, &action_id)?;
     let payload_dir = staging_dir.join("payload");
     fs::create_dir_all(&payload_dir)
@@ -320,6 +341,7 @@ pub(crate) fn execute_action(
             aig_action_id,
             version,
             runtime,
+            legacy_stats,
             &payload_dir,
         )?,
         ActionSpec::AigStatDiff {
@@ -770,6 +792,7 @@ pub(crate) fn run_download_stdlib_action(
         payload_dir,
         version,
         discovery_runtime,
+        None,
     ) {
         Ok(discovery) => {
             commands.extend(discovery.commands);
@@ -868,6 +891,7 @@ pub(crate) fn run_download_source_subtree_action(
         payload_dir,
         version,
         discovery_runtime,
+        None,
     ) {
         Ok(discovery) => {
             commands.extend(discovery.commands);
@@ -940,14 +964,26 @@ pub(crate) fn discover_dslx_fn_to_ir_suggestions(
     subtree_root: &Path,
     version: &str,
     discovery_runtime: Option<&DriverRuntimeSpec>,
+    bound_enumerator: Option<&DriverRuntimeSpec>,
 ) -> Result<DslxFnDiscovery> {
     let dslx_files = collect_dslx_files(subtree_root)?;
     let import_context = determine_dslx_import_context(subtree_root);
-    let source_runtime = discovery_runtime
-        .cloned()
-        .unwrap_or(default_driver_runtime_for_version(repo_root, version)?);
-    let discovery_runtime = resolve_driver_runtime_for_dslx_list_fns(repo_root, &source_runtime)
-        .unwrap_or_else(|_| source_runtime.clone());
+    let source_runtime = match discovery_runtime {
+        Some(runtime) => runtime.clone(),
+        None => default_driver_runtime_for_version(repo_root, version)?,
+    };
+    let discovery_runtime = if let Some(runtime) = bound_enumerator {
+        runtime.clone()
+    } else {
+        match resolve_driver_runtime_for_dslx_list_fns(
+            repo_root,
+            &source_runtime,
+            store.aux_driver_version.as_deref(),
+        ) {
+            Err(_) if store.aux_driver_version.is_none() => source_runtime.clone(),
+            result => result?,
+        }
+    };
     let discovery_runtime_xlsynth_version =
         resolve_xlsynth_version_for_driver(repo_root, &discovery_runtime.driver_version)?;
 
@@ -1628,8 +1664,11 @@ pub(crate) fn run_driver_ir_to_opt_action(
     details.insert("xlsynth_version".to_string(), json!(version));
     insert_driver_version_labels(&mut details, version, runtime);
     details.insert("ir_top".to_string(), json!(ir_top.clone()));
-    let ir_aig_equiv_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
-        .unwrap_or_else(|_| runtime.clone());
+    let ir_aig_equiv_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+        repo_root,
+        runtime,
+        store.aux_driver_version.as_deref(),
+    )?;
     if ir_aig_equiv_runtime != *runtime {
         details.insert(
             "driver_ir_aig_equiv_runtime".to_string(),
@@ -1683,14 +1722,7 @@ pub(crate) fn run_driver_ir_to_opt_action(
     }
 
     let mut input_ir_structural_hash = None;
-    match compute_ir_fn_structural_hash(
-        store,
-        repo_root,
-        &ir_input_path,
-        Some(&ir_top),
-        version,
-        runtime,
-    ) {
+    match compute_ir_fn_structural_hash(store, repo_root, &ir_input_path, Some(&ir_top), runtime) {
         Ok((hash, trace)) => {
             commands.push(trace);
             details.insert(
@@ -1816,7 +1848,6 @@ xlsynth-driver --toolchain /tmp/xlsynth-toolchain.toml ir2opt /inputs/input.ir -
             repo_root,
             &output_ir_path,
             Some(&ir_top),
-            version,
             runtime,
         ) {
             Ok((hash, trace)) => {
@@ -2046,7 +2077,6 @@ pub(crate) fn run_driver_ir_to_delay_info_action(
         repo_root,
         &ir_input_path,
         ir_top.as_deref(),
-        version,
         runtime,
     ) {
         Ok((hash, trace)) => {
@@ -2363,15 +2393,6 @@ pub(crate) fn probe_driver_subcommand_help_token(
     driver_runner_subcommand_help_has_token(store, repo_root, runtime, subcommand, token)
 }
 
-fn effective_xlsynth_version_for_runtime(
-    repo_root: &Path,
-    requested_version: &str,
-    runtime: &DriverRuntimeSpec,
-) -> String {
-    resolve_xlsynth_version_for_driver(repo_root, &runtime.driver_version)
-        .unwrap_or_else(|_| requested_version.to_string())
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_driver_ir_aig_equiv_action(
     store: &ArtifactStore,
@@ -2526,7 +2547,6 @@ fn record_input_ir_structural_hash(
     ir_action_id: &str,
     ir_input_path: &Path,
     ir_top: Option<&str>,
-    version: &str,
     runtime: &DriverRuntimeSpec,
     commands: &mut Vec<CommandTrace>,
     details: &mut serde_json::Map<String, serde_json::Value>,
@@ -2557,7 +2577,7 @@ fn record_input_ir_structural_hash(
         return None;
     }
 
-    match compute_ir_fn_structural_hash(store, repo_root, ir_input_path, ir_top, version, runtime) {
+    match compute_ir_fn_structural_hash(store, repo_root, ir_input_path, ir_top, runtime) {
         Ok((hash, trace)) => {
             commands.push(trace);
             details.insert(
@@ -2627,14 +2647,17 @@ fn prepare_driver_ir_to_g8r_batch_action(
     let top_strategy = driver_ir2g8r_top_strategy(ir2g8r_cli, explicit_ir_top.is_some());
     let prepared_ir_relpath = "prep_for_gatify.ir";
     let mut suggested_next_actions = Vec::new();
-    let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
-        .unwrap_or_else(|_| runtime.clone());
+    let auxiliary_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+        repo_root,
+        runtime,
+        store.aux_driver_version.as_deref(),
+    )?;
     if let Ok(next) = build_suggestion(
         "Compute AIG stats with DriverAigToStats",
         ActionSpec::DriverAigToStats {
             aig_action_id: action_id.to_string(),
             version: version.to_string(),
-            runtime: stats_runtime,
+            runtime: raw_g8r_stats_runtime(runtime, &auxiliary_runtime).clone(),
         },
     ) {
         suggested_next_actions.push(next);
@@ -2715,24 +2738,17 @@ fn prepare_driver_ir_to_g8r_batch_action(
         );
     }
 
-    let ir_aig_equiv_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
-        .unwrap_or_else(|_| runtime.clone());
-    if ir_aig_equiv_runtime != *runtime {
+    if auxiliary_runtime != *runtime {
         details.insert(
             "driver_ir_aig_equiv_runtime".to_string(),
-            json!(ir_aig_equiv_runtime.clone()),
+            json!(auxiliary_runtime.clone()),
         );
     }
     if !driver_ir_aig_equiv_enabled() {
         details.insert("driver_ir_aig_equiv_supported".to_string(), json!(false));
         details.insert("driver_ir_aig_equiv_quarantined".to_string(), json!(true));
     } else {
-        match resolve_driver_ir_aig_equiv_supported(
-            store,
-            repo_root,
-            version,
-            &ir_aig_equiv_runtime,
-        ) {
+        match resolve_driver_ir_aig_equiv_supported(store, repo_root, version, &auxiliary_runtime) {
             Ok(true) => {
                 details.insert("driver_ir_aig_equiv_supported".to_string(), json!(true));
                 details.insert(
@@ -2746,7 +2762,7 @@ fn prepare_driver_ir_to_g8r_batch_action(
                         aig_action_id: action_id.to_string(),
                         top_fn_name: inferred_ir_top.clone(),
                         version: version.to_string(),
-                        runtime: ir_aig_equiv_runtime.clone(),
+                        runtime: auxiliary_runtime.clone(),
                     },
                 ) {
                     suggested_next_actions.push(next);
@@ -2771,7 +2787,6 @@ fn prepare_driver_ir_to_g8r_batch_action(
         ir_action_id,
         &ir_input_path,
         inferred_ir_top.as_deref(),
-        version,
         runtime,
         &mut commands,
         &mut details,
@@ -3100,14 +3115,17 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
     let top_strategy = driver_ir2g8r_top_strategy(ir2g8r_cli, explicit_ir_top.is_some());
     let prepared_ir_relpath = "prep_for_gatify.ir";
     let mut suggested_next_actions = Vec::new();
-    let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
-        .unwrap_or_else(|_| runtime.clone());
+    let auxiliary_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+        repo_root,
+        runtime,
+        store.aux_driver_version.as_deref(),
+    )?;
     if let Ok(next) = build_suggestion(
         "Compute AIG stats with DriverAigToStats",
         ActionSpec::DriverAigToStats {
             aig_action_id: action_id.to_string(),
             version: version.to_string(),
-            runtime: stats_runtime,
+            runtime: raw_g8r_stats_runtime(runtime, &auxiliary_runtime).clone(),
         },
     ) {
         suggested_next_actions.push(next);
@@ -3188,24 +3206,17 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
         );
     }
 
-    let ir_aig_equiv_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
-        .unwrap_or_else(|_| runtime.clone());
-    if ir_aig_equiv_runtime != *runtime {
+    if auxiliary_runtime != *runtime {
         details.insert(
             "driver_ir_aig_equiv_runtime".to_string(),
-            json!(ir_aig_equiv_runtime.clone()),
+            json!(auxiliary_runtime.clone()),
         );
     }
     if !driver_ir_aig_equiv_enabled() {
         details.insert("driver_ir_aig_equiv_supported".to_string(), json!(false));
         details.insert("driver_ir_aig_equiv_quarantined".to_string(), json!(true));
     } else {
-        match resolve_driver_ir_aig_equiv_supported(
-            store,
-            repo_root,
-            version,
-            &ir_aig_equiv_runtime,
-        ) {
+        match resolve_driver_ir_aig_equiv_supported(store, repo_root, version, &auxiliary_runtime) {
             Ok(true) => {
                 details.insert("driver_ir_aig_equiv_supported".to_string(), json!(true));
                 details.insert(
@@ -3219,7 +3230,7 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
                         aig_action_id: action_id.to_string(),
                         top_fn_name: inferred_ir_top.clone(),
                         version: version.to_string(),
-                        runtime: ir_aig_equiv_runtime.clone(),
+                        runtime: auxiliary_runtime.clone(),
                     },
                 ) {
                     suggested_next_actions.push(next);
@@ -3243,7 +3254,6 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
         ir_action_id,
         &ir_input_path,
         inferred_ir_top.as_deref(),
-        version,
         runtime,
         &mut commands,
         &mut details,
@@ -3503,7 +3513,6 @@ pub(crate) fn run_ir_fn_to_combinational_verilog_action(
         ir_action_id,
         &ir_input_path,
         ir_top.as_deref(),
-        version,
         runtime,
         &mut commands,
         &mut details,
@@ -4571,14 +4580,7 @@ pub(crate) fn run_ir_fn_to_k_bool_cone_corpus_action(
     );
 
     let mut input_ir_structural_hash = None;
-    match compute_ir_fn_structural_hash(
-        store,
-        repo_root,
-        &ir_input_path,
-        Some(&ir_top),
-        version,
-        runtime,
-    ) {
+    match compute_ir_fn_structural_hash(store, repo_root, &ir_input_path, Some(&ir_top), runtime) {
         Ok((hash, trace)) => {
             commands.push(trace);
             details.insert(
@@ -5219,8 +5221,11 @@ test -s /outputs/result.aig
     if let Ok(Some((xlsynth_version, driver_runtime))) =
         infer_driver_context_from_verilog_action(store, verilog_action_id)
     {
-        let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &driver_runtime)
-            .unwrap_or(driver_runtime.clone());
+        let stats_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+            repo_root,
+            &driver_runtime,
+            store.aux_driver_version.as_deref(),
+        )?;
         if let Ok(next) = build_suggestion(
             "Compute AIG stats with DriverAigToStats",
             ActionSpec::DriverAigToStats {
@@ -5320,8 +5325,11 @@ test -s /outputs/result.aig
     if let Ok(Some((xlsynth_version, driver_runtime))) =
         infer_driver_context_from_aig_action(store, aig_action_id)
     {
-        let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &driver_runtime)
-            .unwrap_or(driver_runtime.clone());
+        let stats_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+            repo_root,
+            &driver_runtime,
+            store.aux_driver_version.as_deref(),
+        )?;
         if let Ok(next) = build_suggestion(
             "Compute AIG stats with DriverAigToStats",
             ActionSpec::DriverAigToStats {
@@ -5348,6 +5356,18 @@ test -s /outputs/result.aig
     })
 }
 
+const LEGACY_G8R_STATS_REPLAY: &str = r#"
+replay_dir="$(mktemp -d)"
+trap 'rm -rf -- "$replay_dir"' EXIT
+xlsynth-driver ir2g8r --fraig="${FRAIG}" --bin-out "$replay_dir/result.g8rbin" --stats-out "$replay_dir/stats.raw.json" /inputs/input.ir > /dev/null
+test -s "$replay_dir/stats.raw.json"
+if ! test -s "$replay_dir/result.g8rbin" || ! cmp -s -- /inputs/producer.g8rbin "$replay_dir/result.g8rbin"; then
+  echo "Legacy g8r replay did not reproduce the captured payload. Restore the producer's statistics sidecar." >&2
+  exit 1
+fi
+mv -- "$replay_dir/stats.raw.json" /outputs/stats.raw.json
+"#;
+
 pub(crate) fn run_driver_aig_to_stats_action(
     store: &ArtifactStore,
     repo_root: &Path,
@@ -5355,10 +5375,13 @@ pub(crate) fn run_driver_aig_to_stats_action(
     aig_action_id: &str,
     version: &str,
     runtime: &DriverRuntimeSpec,
+    legacy: Option<LegacyG8rStatsContext>,
     payload_dir: &Path,
 ) -> Result<ActionOutcome> {
     let dep = load_dependency_of_type(store, aig_action_id, ArtifactType::AigFile)?;
-    let aig_input_path = store.resolve_artifact_ref_path(&dep);
+    let aig_input_path = store
+        .materialize_action_dir(aig_action_id)?
+        .join(&dep.relpath);
     if !aig_input_path.exists() {
         bail!(
             "input AIG path does not exist: {}",
@@ -5368,8 +5391,11 @@ pub(crate) fn run_driver_aig_to_stats_action(
 
     let mut commands = Vec::new();
     let mut dependencies = vec![dep];
-    let runtime_xlsynth_version =
-        resolve_xlsynth_version_for_driver(repo_root, &runtime.driver_version)?;
+    let runtime_xlsynth_version = if let Some(ctx) = &legacy {
+        ctx.version.clone()
+    } else {
+        resolve_xlsynth_version_for_driver(repo_root, &runtime.driver_version)?
+    };
     let mut details = serde_json::Map::new();
     details.insert("driver_runtime".to_string(), json!(runtime));
     details.insert("xlsynth_version".to_string(), json!(version));
@@ -5389,8 +5415,8 @@ pub(crate) fn run_driver_aig_to_stats_action(
         "dso_version_label".to_string(),
         json!(version_label("dso", version)),
     );
-    details.insert("driver_subcommand".to_string(), json!("aig-stats"));
-    if let Some(legacy_ctx) = infer_legacy_g8r_stats_context(store, aig_action_id)? {
+    if let Some(legacy_ctx) = legacy {
+        details.insert("driver_subcommand".to_string(), json!("ir2g8r"));
         details.insert(
             "legacy_g8r_source".to_string(),
             json!({
@@ -5400,33 +5426,24 @@ pub(crate) fn run_driver_aig_to_stats_action(
                 "source_xlsynth_version": legacy_ctx.version,
             }),
         );
-        let legacy_sidecar = legacy_ctx.stats_relpath.as_deref().map(|relpath| {
-            let sidecar = store
-                .materialize_action_dir(aig_action_id)
-                .map(|dir| dir.join(relpath))
-                .unwrap_or_else(|_| store.action_dir(aig_action_id).join(relpath));
-            (relpath.to_string(), sidecar)
-        });
-        if let Some((relpath, sidecar_path)) = legacy_sidecar.as_ref() {
-            if sidecar_path.exists() {
-                normalize_legacy_g8r_stats_payload(sidecar_path, &payload_dir.join("stats.json"))?;
-                details.insert(
-                    "aig_stats_mode".to_string(),
-                    json!("legacy_g8r_stats_sidecar"),
-                );
-                details.insert("legacy_g8r_stats_relpath".to_string(), json!(relpath));
-            } else {
-                details.insert(
-                    "legacy_g8r_stats_sidecar_missing".to_string(),
-                    json!(relpath),
-                );
-            }
-        }
-        if details
-            .get("aig_stats_mode")
-            .and_then(|v| v.as_str())
-            .is_none()
-        {
+        let sidecar_path = store
+            .action_dir(aig_action_id)
+            .join(&legacy_ctx.stats_relpath);
+        if sidecar_path.try_exists()? {
+            normalize_legacy_g8r_stats_payload(&sidecar_path, &payload_dir.join("stats.json"))?;
+            details.insert(
+                "aig_stats_mode".to_string(),
+                json!("legacy_g8r_stats_sidecar"),
+            );
+            details.insert(
+                "legacy_g8r_stats_relpath".to_string(),
+                json!(legacy_ctx.stats_relpath),
+            );
+        } else {
+            details.insert(
+                "legacy_g8r_stats_sidecar_missing".to_string(),
+                json!(legacy_ctx.stats_relpath),
+            );
             ensure_driver_runtime_prepared(
                 store,
                 repo_root,
@@ -5443,12 +5460,7 @@ pub(crate) fn run_driver_aig_to_stats_action(
             if !ir_input_path.exists() {
                 bail!("input IR path does not exist: {}", ir_input_path.display());
             }
-            let script = driver_script(
-                r#"
-xlsynth-driver ir2g8r --fraig="${FRAIG}" --stats-out /outputs/stats.raw.json /inputs/input.ir > /dev/null
-test -s /outputs/stats.raw.json
-"#,
-            );
+            let script = driver_script(LEGACY_G8R_STATS_REPLAY);
             let mut env = BTreeMap::new();
             env.insert("XLSYNTH_VERSION".to_string(), legacy_ctx.version.clone());
             env.insert(
@@ -5458,6 +5470,7 @@ test -s /outputs/stats.raw.json
             env.insert("FRAIG".to_string(), legacy_ctx.fraig.to_string());
             let mounts = vec![
                 DockerMount::read_only(&ir_input_path, "/inputs/input.ir")?,
+                DockerMount::read_only(&aig_input_path, "/inputs/producer.g8rbin")?,
                 DockerMount::read_write(payload_dir, "/outputs")?,
                 driver_cache_mount(store, &legacy_ctx.runtime)?,
             ];
@@ -5480,6 +5493,7 @@ test -s /outputs/stats.raw.json
             );
         }
     } else {
+        details.insert("driver_subcommand".to_string(), json!("aig-stats"));
         ensure_aiger_input_header(&aig_input_path)?;
         let cache_action = ActionSpec::DriverAigToStats {
             aig_action_id: aig_action_id.to_string(),
@@ -5538,9 +5552,13 @@ test -s /outputs/stats.json
     };
 
     let mut suggested_next_actions = Vec::new();
-    if let Ok(Some(next)) =
-        build_aig_stat_diff_suggestion_for_stats_action(store, repo_root, action_id, aig_action_id)
-    {
+    if let Ok(Some(next)) = build_aig_stat_diff_suggestion_for_stats_action(
+        store,
+        repo_root,
+        action_id,
+        aig_action_id,
+        runtime,
+    ) {
         suggested_next_actions.push(next);
     }
     if let Ok(Some((source_version, source_runtime))) =
@@ -5670,6 +5688,55 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn legacy_stats_replay_requires_the_same_native_payload() {
+        let root = make_temp_work_dir("legacy-stats-replay").unwrap();
+        fs::create_dir(root.join("inputs")).unwrap();
+        fs::create_dir(root.join("outputs")).unwrap();
+        fs::create_dir(root.join("temporary files")).unwrap();
+        fs::write(root.join("inputs/producer.g8rbin"), b"g8r\0graph").unwrap();
+
+        // Use local directories for the runner mounts and stand in for ir2g8r.
+        let script = LEGACY_G8R_STATS_REPLAY
+            .replace("/inputs/", "inputs/")
+            .replace("/outputs/", "outputs/");
+        let driver = r#"
+set -euo pipefail
+xlsynth-driver() {
+  while (( $# )); do
+    case "$1" in
+      --bin-out) cp replay.bin "$2"; shift ;;
+      --stats-out) printf '{}' > "$2"; shift ;;
+    esac
+    shift
+  done
+}
+"#;
+        for (payload, accepts) in [(b"g8r\0graph", true), (b"g8r\0Graph", false)] {
+            fs::write(root.join("replay.bin"), payload).unwrap();
+            let output = std::process::Command::new("bash")
+                .args(["-c", &format!("{driver}{script}")])
+                .env("FRAIG", "false")
+                .env("TMPDIR", root.join("temporary files"))
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), accepts);
+            let stats = root.join("outputs/stats.raw.json");
+            assert_eq!(stats.exists(), accepts);
+            if accepts {
+                fs::remove_file(stats).unwrap();
+            } else {
+                assert!(String::from_utf8_lossy(&output.stderr).contains("captured payload"));
+            }
+        }
+        assert_eq!(
+            fs::read_dir(root.join("temporary files")).unwrap().count(),
+            0
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn ir2g8r_cli_capabilities_have_independent_boundaries() {

@@ -106,10 +106,40 @@ pub(crate) fn default_structural_index_threads() -> usize {
         .clamp(1, crate::DEFAULT_STRUCTURAL_INDEX_MAX_THREADS)
 }
 
+pub(crate) fn effective_xlsynth_version_for_runtime(
+    repo_root: &Path,
+    requested_version: &str,
+    runtime: &DriverRuntimeSpec,
+) -> String {
+    crate::versioning::resolve_xlsynth_version_for_driver(repo_root, &runtime.driver_version)
+        .unwrap_or_else(|_| requested_version.to_string())
+}
+
+/// ir2g8r computes statistics for native g8r output. The selected aig-stats
+/// runtime measures raw g8r output starting with the AIGER format.
+pub(crate) fn raw_g8r_stats_runtime<'a>(
+    producer: &'a DriverRuntimeSpec,
+    aiger_estimator: &'a DriverRuntimeSpec,
+) -> &'a DriverRuntimeSpec {
+    if crate::versioning::driver_ir2g8r_cli_capabilities(&producer.driver_version).aiger_out {
+        aiger_estimator
+    } else {
+        producer
+    }
+}
+
 pub(crate) fn resolve_driver_runtime_for_aig_stats(
     repo_root: &Path,
     source_runtime: &DriverRuntimeSpec,
+    aux_driver_version: Option<&str>,
 ) -> Result<DriverRuntimeSpec> {
+    if let Some(version) = aux_driver_version {
+        return bound_driver_runtime_for_driver_version(
+            repo_root,
+            version,
+            &source_runtime.release_platform,
+        );
+    }
     let source_driver_version =
         crate::versioning::normalize_tag_version(&source_runtime.driver_version);
     if source_runtime.source_revision.is_some() {
@@ -133,10 +163,30 @@ pub(crate) fn resolve_driver_runtime_for_aig_stats(
     )
 }
 
+pub(crate) fn resolve_driver_runtime_for_aig_stats_or_source(
+    repo_root: &Path,
+    source_runtime: &DriverRuntimeSpec,
+    aux_driver_version: Option<&str>,
+) -> Result<DriverRuntimeSpec> {
+    match resolve_driver_runtime_for_aig_stats(repo_root, source_runtime, aux_driver_version) {
+        // An explicit pin must not silently fall back to the synthesis driver.
+        Err(_) if aux_driver_version.is_none() => Ok(source_runtime.clone()),
+        result => result,
+    }
+}
+
 pub(crate) fn resolve_driver_runtime_for_dslx_list_fns(
     repo_root: &Path,
     source_runtime: &DriverRuntimeSpec,
+    aux_driver_version: Option<&str>,
 ) -> Result<DriverRuntimeSpec> {
+    if let Some(version) = aux_driver_version {
+        return bound_driver_runtime_for_driver_version(
+            repo_root,
+            version,
+            &source_runtime.release_platform,
+        );
+    }
     let source_driver_version =
         crate::versioning::normalize_tag_version(&source_runtime.driver_version);
     if crate::versioning::cmp_dotted_numeric_version(
@@ -166,6 +216,7 @@ pub(crate) fn bound_driver_runtime_for_driver_version(
     driver_version: &str,
     release_platform: &str,
 ) -> Result<DriverRuntimeSpec> {
+    let driver_version = crate::versioning::normalize_tag_version(driver_version);
     let xlsynth_version =
         crate::versioning::resolve_xlsynth_version_for_driver(repo_root, driver_version)?;
     crate::service::bind_driver_runtime_image(
@@ -194,8 +245,8 @@ pub(crate) fn canonical_stdlib_discovery_runtime_for_version(
     match default_driver_runtime_for_version(repo_root, requested_xlsynth_version) {
         Ok(runtime) => Ok(runtime),
         Err(_) => {
-            // Stdlib extraction still works without a direct compat entry; keep
-            // discovery/runtime explicit by using the latest known driver runtime.
+            // This runtime also belongs to the suggested DSLX-to-IR actions.
+            // The worker independently selects the driver for function enumeration.
             let latest_driver_version = crate::versioning::latest_known_driver_version(repo_root)?;
             bound_driver_runtime_for_driver_version(
                 repo_root,
@@ -475,11 +526,11 @@ mod tests {
         let (oldest, latest) = oldest_and_latest_driver_versions(repo_root);
         let source = source_runtime(repo_root, &oldest);
 
-        let stats = resolve_driver_runtime_for_aig_stats(repo_root, &source)
+        let stats = resolve_driver_runtime_for_aig_stats(repo_root, &source, None)
             .expect("substitute AIG stats runtime");
         assert_substitute_runtime_is_self_consistent(repo_root, &source, &stats, &latest);
 
-        let list_fns = resolve_driver_runtime_for_dslx_list_fns(repo_root, &source)
+        let list_fns = resolve_driver_runtime_for_dslx_list_fns(repo_root, &source, None)
             .expect("substitute list-fns runtime");
         assert_substitute_runtime_is_self_consistent(repo_root, &source, &list_fns, &latest);
     }
@@ -522,12 +573,62 @@ mod tests {
         );
         source.dockerfile = crate::DEFAULT_GIT_DOCKERFILE.to_string();
 
-        let stats = resolve_driver_runtime_for_aig_stats(repo_root, &source)
+        let stats = resolve_driver_runtime_for_aig_stats(repo_root, &source, None)
             .expect("released AIG stats runtime");
         assert_eq!(stats.driver_version, source.driver_version);
         assert!(stats.source_revision.is_none());
         assert_eq!(stats.dockerfile, crate::DEFAULT_DOCKERFILE);
         assert_ne!(stats.docker_image_id, source.docker_image_id);
+    }
+
+    #[test]
+    fn auxiliary_pin_binds_its_own_runtime_without_changing_synthesis() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let expected = bound_driver_runtime_for_driver_version(
+            repo_root,
+            "0.74.0",
+            crate::DEFAULT_RELEASE_PLATFORM,
+        )
+        .expect("released auxiliary runtime");
+        for source_version in ["0.68.0", "0.76.0"] {
+            let source = source_runtime(repo_root, source_version);
+            let original = source.clone();
+            let stats =
+                resolve_driver_runtime_for_aig_stats_or_source(repo_root, &source, Some("0.74.0"))
+                    .expect("pinned statistics runtime");
+            assert_eq!(stats, expected);
+            let discovery =
+                resolve_driver_runtime_for_dslx_list_fns(repo_root, &source, Some("0.74.0"))
+                    .expect("pinned discovery runtime");
+            assert_eq!(discovery, stats);
+            assert_eq!(source, original);
+        }
+        let fallback = canonical_stdlib_discovery_runtime_for_version(repo_root, "v999.0.0")
+            .expect("fallback source runtime");
+        assert_eq!(
+            fallback.driver_version,
+            crate::versioning::latest_known_driver_version(repo_root).unwrap()
+        );
+        assert_eq!(
+            resolve_driver_runtime_for_dslx_list_fns(repo_root, &fallback, Some("0.74.0")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn invalid_auxiliary_pin_does_not_fall_back_to_synthesis() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = source_runtime(repo_root, "0.68.0");
+        for invalid in ["999.0.0", "latest"] {
+            assert!(
+                resolve_driver_runtime_for_aig_stats_or_source(repo_root, &source, Some(invalid),)
+                    .is_err()
+            );
+            assert!(
+                resolve_driver_runtime_for_dslx_list_fns(repo_root, &source, Some(invalid),)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

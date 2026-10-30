@@ -137,6 +137,45 @@ cargo run --bin xlsynth_bvc -- discover-releases --after v0.37.0
 cargo run --bin xlsynth_bvc -- drain-queue --worker-id worker-a --lease-seconds 1800
 ```
 
+To pin auxiliary tools independently of the release being benchmarked, pass the global
+`--aux-driver-version` option to both enqueue and worker commands. For example, after building
+the release binary:
+
+```bash
+bvc_cmd=(target/release/xlsynth_bvc
+  --store-dir runs/pinned/store
+  --artifacts-via-sled runs/pinned/artifacts.sled
+  --aux-driver-version 0.74.0)
+"${bvc_cmd[@]}" enqueue-crate-version --crate-version 0.68.0
+"${bvc_cmd[@]}" run-workers --workers 4 --exit-when-idle
+```
+
+The synthesis driver remains 0.68.0. AIGER statistics, newly computed structural hashes, IR/AIG
+equivalence helpers, and DSLX function listing use the pinned release and its compatible native library.
+Suggested actions also honor the pin. An unavailable pin fails instead of falling back to another
+driver. Omit the option to retain automatic helper selection.
+
+Repeat the pin on each process that creates helper actions. Workers execute queued statistics
+and equivalence actions with the runtime in their action specifications. To replace a suggestion
+from an earlier run, re-enqueue it and cancel the obsolete queue entry separately.
+
+Before driver 0.24.0, raw g8r output uses a native binary format. Its statistics come from the
+producer's sidecar or a replay that reproduces the native payload byte for byte. New raw statistics actions
+record the producer runtime. A worker rejects a queued legacy statistics action whose
+estimator differs from its producer. Re-enqueue the suggestion to get the corrected action ID. AIGER output
+from Yosys still uses the selected statistics driver. In an unpinned legacy corpus, `stats_runtime`
+identifies the AIGER estimator and `driver_runtime` identifies the native g8r estimator.
+
+Joined CSV and JSONL rows retain the selected AIGER estimator in `stats_driver_crate_version`.
+The `g8r_stats_driver_crate_version` and `yosys_abc_stats_driver_crate_version` columns identify
+each measured branch. The latter is empty for a stats-only recipe. When the recipe schedules
+a separate raw g8r sidecar, `g8r_raw_stats_driver_crate_version` identifies its estimator.
+
+For release-mode `run-ir-dir-corpus`, this option also selects the default statistics estimator.
+If `--stats-driver-version` is supplied, the two pins must agree. A corpus request for a common
+estimator fails if it would measure native g8r and AIGER with different runtimes. Git-candidate
+corpus runs retain their captured estimator and reject this override.
+
 ## IR Dir Corpus Runner
 
 `run-ir-dir-corpus` is the simple "command line build system with action enqueue" entrypoint for
@@ -664,9 +703,11 @@ records this via `details.semantic_cache_hit`.
 When enqueuing historical suggested actions, stale `aig-to-stats` specs from
 legacy workflows are canonicalized to the current runtime policy.
 For legacy `driver_ir_to_g8r_aig` producers (`crate < v0.24.0`) that emit
-`.g8rbin` via `--bin-out` (non-AIGER), `aig-to-stats` falls back to
-`ir2g8r --stats-out` on the producer IR and normalizes
-`live_nodes/deepest_path -> and_nodes/depth` for downstream trend queries.
+`.g8rbin` via `--bin-out`, `aig-to-stats` reads the producer's statistics sidecar. If the sidecar
+is missing, it runs `ir2g8r --bin-out ... --stats-out ...` on the producer IR with the original
+runtime. Replay statistics are accepted only when the emitted native bytes match the captured
+payload. If they differ, restore the original statistics sidecar.
+Both paths normalize `live_nodes/deepest_path -> and_nodes/depth` for downstream trend queries.
 
 `ir-to-delay-info` emits `payload/delay_info.textproto` by running `delay_info_main --proto_out`
 and decoding `xls.DelayInfoProto` using schema files cached during setup from the
