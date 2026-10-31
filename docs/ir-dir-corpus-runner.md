@@ -308,9 +308,11 @@ does not invent a second store model or a separate export path.
 changes on the next claim after its five-second lifetime and invalidating it on local pending writes. This is
 only a scheduling hint: every candidate is reread and every claim still uses the per-action
 transition lock and lease token. Idle checks stop at the first queue record instead of counting
-the whole tree. The Sled backend memoizes validated provenance, bounded by entry count and encoded
-bytes; each lookup still checks the current database row, so replacements, deletions, and corrupt
-rows cannot be hidden by the cache. Neither cache changes the durable store format or action IDs.
+the whole tree. The Sled backend caches validated provenance in FIFO order. Its 64 MiB budget
+charges the encoded row, both copies of the action ID used as cache keys, and fixed per-entry storage.
+Nested allocations in decoded records and allocator overhead can make actual memory use higher.
+Each lookup reads the stored protobuf by action ID and reuses a cached record only when the bytes
+match exactly.
 
 Raw g8r lowering and ordinary combinational codegen have equal scheduling priority, preventing a
 blanket preference for one side of a comparison. Explicit queue priorities and leaf-first
