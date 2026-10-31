@@ -1434,6 +1434,8 @@ pub(crate) fn drain_queue(
     if lease_seconds <= 0 {
         bail!("--lease-seconds must be > 0, got {}", lease_seconds);
     }
+    // Reject worker misconfiguration before a claim can fail and cancel dependent work.
+    configured_action_timeout_seconds()?;
     maybe_prepare_queue_runtime_environment(store, repo_root)?;
     if reclaim_expired {
         reclaim_expired_running_leases(store)?;
@@ -3720,6 +3722,37 @@ mod tests {
             docker_image_id: "e".repeat(64),
             release_cache_input_sha256: "f".repeat(64),
         }
+    }
+
+    #[test]
+    fn invalid_action_timeout_leaves_ready_work_pending() -> Result<()> {
+        // Set the worker's environment in a child so parallel tests keep their own settings.
+        const CHILD: &str = "BVC_TEST_INVALID_TIMEOUT_CHILD";
+        const SETTING: &str = "XLSYNTH_BVC_ACTION_TIMEOUT_SECONDS";
+        if std::env::var_os(CHILD).is_none() {
+            let test = std::thread::current();
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", test.name().expect("test name")])
+                .env(CHILD, "1")
+                .env(SETTING, "invalid")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        let (store, root) = make_test_store("invalid-action-timeout");
+        let action_id = enqueue_action(
+            &store,
+            ActionSpec::ImportIrPackageFile {
+                source_sha256: "a".repeat(64),
+                top_fn_name: None,
+            },
+        )?;
+        let error = drain_queue(&store, &root, None, "test-worker", 60, false, None)
+            .expect_err("invalid worker configuration");
+        assert!(error.to_string().contains(SETTING));
+        assert!(store.pending_queue_path(&action_id).is_file());
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

@@ -1153,6 +1153,9 @@ pub(crate) fn run_ir_dir_corpus(
     if !(1..=64).contains(&prepare_threads) {
         bail!("--prepare-threads must be between 1 and 64");
     }
+    if matches!(execution_mode, CorpusExecutionMode::Run) {
+        crate::service::configured_action_timeout_seconds()?;
+    }
     if !input_dir.exists() {
         bail!("input dir does not exist: {}", input_dir.display());
     }

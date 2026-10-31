@@ -360,8 +360,13 @@ cancels queued downstream dependents under `queue/canceled/` based on action
 dependency edges.
 It also claims only dependency-ready actions, so items do not run out of
 dependency order.
-Each action execution has a default 300-second timeout; timed-out actions are
-recorded as failed with an error prefix `TIMEOUT(300)`.
+Persistent driver and Yosys requests default to 900 seconds. Set
+`XLSYNTH_BVC_ACTION_TIMEOUT_SECONDS` in the executing process to an integer
+from 1 to 86400. Queue workers validate the setting before claiming work.
+A batched request shares one budget across its members. Equivalence checks
+use their explicit 30-second timeout. Timeout errors start with the effective
+budget, for example `TIMEOUT(7200)`. Workers can reuse a completed output by
+its action ID across timeout settings.
 Before claiming work, `drain-queue` preflights runtime dependencies for pending
 actions (builds required Docker images and fills immutable
 `bvc-artifacts/driver-release-cache/by-input-sha256/<input-manifest-sha256>/`

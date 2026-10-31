@@ -67,6 +67,14 @@ pub(crate) fn execute_action(
         return Ok((action_id, provenance.output_artifact));
     }
 
+    // Downloads record discovery errors in otherwise successful provenance.
+    if matches!(
+        action,
+        ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. }
+            | ActionSpec::DownloadAndExtractXlsynthSourceSubtree { .. }
+    ) {
+        configured_action_timeout_seconds()?;
+    }
     let staging_dir = make_staging_dir(store, &action_id)?;
     let payload_dir = staging_dir.join("payload");
     fs::create_dir_all(&payload_dir)

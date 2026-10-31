@@ -109,6 +109,7 @@ fn start_embedded_web_runner(
     if runner_config.worker_count == 0 {
         bail!("--runner-workers must be > 0");
     }
+    crate::service::configured_action_timeout_seconds()?;
 
     for worker_index in 0..runner_config.worker_count {
         let store = store.clone();

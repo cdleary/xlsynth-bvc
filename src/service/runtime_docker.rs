@@ -2723,6 +2723,23 @@ fn select_persistent_runner_locked(
     Ok(None)
 }
 
+const ACTION_TIMEOUT_ENV: &str = "XLSYNTH_BVC_ACTION_TIMEOUT_SECONDS";
+
+pub(crate) fn configured_action_timeout_seconds() -> Result<u64> {
+    parse_action_timeout_seconds(std::env::var_os(ACTION_TIMEOUT_ENV).as_deref())
+}
+
+fn parse_action_timeout_seconds(value: Option<&std::ffi::OsStr>) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_ACTION_TIMEOUT_SECONDS);
+    };
+    value
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=86_400).contains(seconds))
+        .with_context(|| format!("{ACTION_TIMEOUT_ENV} must be an integer from 1 to 86400"))
+}
+
 pub(crate) fn execute_persistent_runner_script(
     image: &str,
     mounts: &[DockerMount],
@@ -2736,7 +2753,7 @@ pub(crate) fn execute_persistent_runner_script(
         env,
         script,
         run_hint,
-        DEFAULT_ACTION_TIMEOUT_SECONDS,
+        configured_action_timeout_seconds()?,
     )
 }
 
@@ -2753,7 +2770,7 @@ pub(crate) fn execute_yosys_persistent_runner_script(
         env,
         script,
         run_hint,
-        DEFAULT_ACTION_TIMEOUT_SECONDS,
+        configured_action_timeout_seconds()?,
         PersistentRunnerFamily::Yosys,
     )
 }
@@ -2982,11 +2999,17 @@ fn execute_persistent_runner_script_with_timeout_and_family(
             .unwrap_or("no stderr/stdout details");
         let cleanup_summary = failure_retirement.retire_now();
         cleanup_request_files();
+        let timeout_prefix = if result.timed_out {
+            format!("TIMEOUT({timeout_secs}) ")
+        } else {
+            String::new()
+        };
+        let cause = root_cause
+            .strip_prefix(&timeout_prefix)
+            .unwrap_or(root_cause);
         bail!(
-            "persistent runner request failed (exit={:?}): {}\ncontainer cleanup: {}\ncommand:\n{}\nstdout:\n{}\nstderr:\n{}",
+            "{timeout_prefix}persistent runner request failed (exit={:?}): {cause}\ncontainer cleanup: {cleanup_summary}\ncommand:\n{}\nstdout:\n{}\nstderr:\n{}",
             result.exit_code,
-            root_cause,
-            cleanup_summary,
             result.command_argv.join(" "),
             result.stdout_tail,
             result.stderr_tail
@@ -3164,6 +3187,34 @@ mod tests {
             nanos
         ));
         root
+    }
+
+    #[test]
+    fn action_timeout_accepts_only_bounded_seconds() {
+        assert_eq!(parse_action_timeout_seconds(None).unwrap(), 900);
+        for seconds in [1, 7200, 86400] {
+            let value = OsString::from(seconds.to_string());
+            assert_eq!(parse_action_timeout_seconds(Some(&value)).unwrap(), seconds);
+        }
+        for value in [
+            "",
+            "0",
+            "86401",
+            "-1",
+            "1.5",
+            "invalid",
+            "18446744073709551616",
+        ] {
+            let error = parse_action_timeout_seconds(Some(value.as_ref())).unwrap_err();
+            assert!(error.to_string().contains(ACTION_TIMEOUT_ENV));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(
+                parse_action_timeout_seconds(Some(std::ffi::OsStr::from_bytes(b"\xff"))).is_err()
+            );
+        }
     }
 
     #[test]
@@ -4189,6 +4240,7 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
             ScopedEnvVar::set(crate::BVC_ENABLE_INCREMENTAL_IR_CORPUS_UPSERT_ENV, "0");
         let _single_driver_runner = ScopedEnvVar::set(PERSISTENT_RUNNER_DRIVER_POOL_SIZE_ENV, "1");
         let _single_yosys_runner = ScopedEnvVar::set(PERSISTENT_RUNNER_YOSYS_POOL_SIZE_ENV, "1");
+        let _action_timeout = ScopedEnvVar::set(ACTION_TIMEOUT_ENV, "7200");
 
         let repo_root = std::env::current_dir().context("getting repo root")?;
         let store_root = make_temp_store_root("queue-drain-persistent-runners");
@@ -4540,13 +4592,12 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
         let protocol_image = image_a.clone();
         let protocol_output = timeout_output.clone();
         let protocol_request = thread::spawn(move || {
-            execute_persistent_runner_script_with_timeout(
+            execute_persistent_runner_script(
                 &protocol_image,
                 &[DockerMount::read_write(&protocol_output, "/outputs")?],
                 &BTreeMap::new(),
                 "touch /store-root/.staging/protocol-failure-started; sleep 30",
                 "protocol-failure-retirement",
-                30,
             )
         });
         let protocol_deadline = Instant::now() + Duration::from_secs(5);
@@ -4567,6 +4618,13 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
             }
         }
         let request_id = request_id.context("protocol-failure heartbeat never became active")?;
+        let request: PersistentRunnerRequest = serde_json::from_slice(&fs::read(
+            runner_a_paths
+                .jobs_dir
+                .join(&request_id)
+                .join("request.json"),
+        )?)?;
+        assert_eq!(request.timeout_secs, 7200);
         fs::write(
             runner_a_paths
                 .results_dir
