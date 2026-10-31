@@ -4,15 +4,19 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
-use crate::app;
+mod maintenance_gate;
+
+use maintenance_gate::MaintenanceGate;
+
 use crate::store::ArtifactStore;
+use crate::{app, queue};
 
 const FINITE_WORKER_MAX_CONSECUTIVE_ERRORS: usize = 3;
 
@@ -80,21 +84,25 @@ pub(crate) fn run_workers(
     }
 
     let started = Instant::now();
-    let drained_actions = Arc::new(AtomicUsize::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut handles = Vec::with_capacity(workers);
+    let drained_actions = AtomicUsize::new(0);
     let max_consecutive_errors = exit_when_idle.then_some(FINITE_WORKER_MAX_CONSECUTIVE_ERRORS);
 
-    for worker_index in 0..workers {
-        let store = store.clone();
-        let repo_root = repo_root.clone();
-        let drained_actions = drained_actions.clone();
-        let stop = stop.clone();
-        let shutdown = shutdown.clone();
-        let worker_id = format!("{}:runner-{}", worker_id_prefix, worker_index);
-        handles.push(thread::spawn(move || {
+    let result = run_worker_pool(
+        workers,
+        |worker_index, pool| {
+            let worker_id = format!("{}:runner-{}", worker_id_prefix, worker_index);
+            let mut retry_reclaim = false;
+            let mut reclaim = || {
+                if reclaim_expired {
+                    pool.reclaim_gate
+                        .run_with_retry(&mut retry_reclaim, poll_interval, || {
+                            queue::reclaim_expired_running_leases(&store)
+                        })?;
+                }
+                Ok(())
+            };
             worker_loop(
-                &stop,
+                pool,
                 &shutdown,
                 &drained_actions,
                 &worker_id,
@@ -102,41 +110,32 @@ pub(crate) fn run_workers(
                 exit_when_idle,
                 max_consecutive_errors,
                 || {
-                    app::drain_queue(
+                    app::drain_queue_with_reclaim(
                         &store,
                         &repo_root,
                         Some(batch_size),
                         &worker_id,
                         lease_seconds,
-                        reclaim_expired,
+                        &mut reclaim,
                         Some(&shutdown),
                     )
                 },
-                || queue_is_idle(&store),
+                || {
+                    pool.idle_gate
+                        .run_if_due(Instant::now(), poll_interval, || queue_is_idle(&store))
+                        .unwrap_or(false)
+                },
             )
-        }));
-    }
-
-    let mut worker_error = None;
-    for handle in handles {
-        let result = handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("worker thread panicked"));
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) | Err(err) => {
-                stop.store(true, Ordering::Relaxed);
-                if worker_error.is_none() {
-                    worker_error = Some(err);
-                }
-            }
-        }
-    }
-
+        },
+        || {
+            !exit_when_idle
+                || shutdown.load(Ordering::Relaxed)
+                || workers == 1
+                || queue_is_idle(&store)
+        },
+    );
     store.flush_durable()?;
-    if let Some(error) = worker_error {
-        return Err(error);
-    }
+    result?;
     Ok(RunWorkersSummary {
         workers,
         worker_id_prefix: worker_id_prefix.to_string(),
@@ -157,8 +156,90 @@ pub(crate) fn run_workers(
     })
 }
 
+#[derive(Default)]
+struct WorkerPoolState {
+    reclaim_gate: MaintenanceGate,
+    idle_gate: MaintenanceGate,
+    stop_requested: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl WorkerPoolState {
+    fn stop_requested(&self) -> bool {
+        *self.stop_requested.lock().unwrap()
+    }
+
+    fn request_stop(&self) {
+        *self.stop_requested.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+
+    fn wait_for_poll(&self, interval: Duration) {
+        let requested = self.stop_requested.lock().unwrap();
+        drop(
+            self.wake
+                .wait_timeout_while(requested, interval, |stop| !*stop)
+                .unwrap(),
+        );
+    }
+}
+
+// Wake polling peers on every exit, including unwinding. The parent may
+// already be joining a different worker.
+struct WakePeersOnExit<'a>(&'a WorkerPoolState);
+
+impl Drop for WakePeersOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.request_stop();
+    }
+}
+
+fn run_worker_pool(
+    workers: usize,
+    run: impl Fn(usize, &WorkerPoolState) -> Result<()> + Sync,
+    finished: impl Fn() -> bool,
+) -> Result<()> {
+    loop {
+        let pool = WorkerPoolState::default();
+        let run_one = &|index| {
+            let _wake_peers = WakePeersOnExit(&pool);
+            run(index, &pool)
+        };
+        thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let mut first_error = None;
+            for index in 0..workers {
+                match thread::Builder::new().spawn_scoped(scope, move || run_one(index)) {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => {
+                        pool.request_stop();
+                        first_error =
+                            Some(anyhow::Error::new(error).context("starting queue worker"));
+                        break;
+                    }
+                }
+            }
+            for handle in handles {
+                let result = handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("worker thread panicked")));
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        })?;
+        // A peer can publish pending work between an idle scan's pending and
+        // running walks, or enqueue a follow-up as it finishes its last batch.
+        // Verify once the pool has joined, when all such writes are visible.
+        if finished() {
+            return Ok(());
+        }
+    }
+}
+
 fn worker_loop(
-    stop: &AtomicBool,
+    stop: &WorkerPoolState,
     shutdown: &AtomicBool,
     drained_actions: &AtomicUsize,
     worker_id: &str,
@@ -170,37 +251,35 @@ fn worker_loop(
 ) -> Result<()> {
     let mut consecutive_errors = 0_usize;
     loop {
-        if stop.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed) {
+        if stop.stop_requested() || shutdown.load(Ordering::Relaxed) {
             return Ok(());
         }
         match drain() {
             Ok(0) => {
                 consecutive_errors = 0;
                 if exit_when_idle && queue_is_idle() {
-                    stop.store(true, Ordering::Relaxed);
                     return Ok(());
                 }
-                thread::sleep(poll_interval);
+                stop.wait_for_poll(poll_interval);
             }
             Ok(drained) => {
                 consecutive_errors = 0;
                 drained_actions.fetch_add(drained, Ordering::Relaxed);
                 if exit_when_idle && queue_is_idle() {
-                    stop.store(true, Ordering::Relaxed);
+                    return Ok(());
                 }
             }
             Err(err) => {
                 consecutive_errors += 1;
                 eprintln!("run-workers ({worker_id}) error: {err:#}");
                 if max_consecutive_errors.is_some_and(|maximum| consecutive_errors >= maximum) {
-                    stop.store(true, Ordering::Relaxed);
                     return Err(err).with_context(|| {
                         format!(
                             "run-workers ({worker_id}) stopped after {consecutive_errors} consecutive errors"
                         )
                     });
                 }
-                thread::sleep(poll_interval);
+                stop.wait_for_poll(poll_interval);
             }
         }
     }
@@ -273,6 +352,246 @@ mod tests {
     }
 
     #[test]
+    fn run_workers_recovers_preexisting_leases_and_drains() {
+        use crate::model::{
+            ActionSpec, ArtifactRef, ArtifactType, DriverRuntimeSpec, OutputFile, Provenance,
+        };
+        use sha2::{Digest, Sha256};
+
+        for dead_local_owner in [false, true] {
+            if dead_local_owner && !cfg!(target_os = "linux") {
+                continue;
+            }
+            let (store, root) = make_test_store("recover-lease");
+            let fixture = |action: ActionSpec, artifact_type: ArtifactType, bytes: &[u8]| {
+                let id = crate::executor::compute_action_id(&action).unwrap();
+                let relpath = "payload/input";
+                let provenance = Provenance {
+                    schema_version: crate::ACTION_SCHEMA_VERSION,
+                    action_id: id.clone(),
+                    created_utc: chrono::Utc::now(),
+                    action,
+                    dependencies: Vec::new(),
+                    output_artifact: ArtifactRef {
+                        action_id: id.clone(),
+                        artifact_type,
+                        relpath: relpath.into(),
+                    },
+                    output_files: vec![OutputFile {
+                        path: relpath.into(),
+                        bytes: bytes.len() as u64,
+                        sha256: format!("{:x}", Sha256::digest(bytes)),
+                    }],
+                    commands: Vec::new(),
+                    details: serde_json::json!({}),
+                    suggested_next_actions: Vec::new(),
+                };
+                let staged = store.staging_dir().join(&id);
+                fs::create_dir_all(staged.join("payload")).unwrap();
+                fs::write(staged.join(relpath), bytes).unwrap();
+                fs::write(
+                    staged.join("provenance.pb"),
+                    crate::proto::encode_provenance(&provenance).unwrap(),
+                )
+                .unwrap();
+                store.promote_staging_action_dir(&id, &staged).unwrap();
+                id
+            };
+            let ir = b"package test\n\nfn main(x: bits[1]) -> bits[1] { ret identity.2: bits[1] = identity(x, id=2) }\n";
+            let ir_id = fixture(
+                ActionSpec::ImportIrPackageFile {
+                    source_sha256: format!("{:x}", Sha256::digest(ir)),
+                    top_fn_name: Some("main".into()),
+                },
+                ArtifactType::IrPackageFile,
+                ir,
+            );
+            let runtime = DriverRuntimeSpec {
+                driver_version: "0.31.0".into(),
+                source_revision: None,
+                release_platform: "ubuntu2004".into(),
+                docker_image: "xlsynth-bvc-driver:0.31.0".into(),
+                dockerfile: "docker/xlsynth-driver.Dockerfile".into(),
+                dockerfile_sha256: "d".repeat(64),
+                docker_image_id: "e".repeat(64),
+                release_cache_input_sha256: "f".repeat(64),
+            };
+            let lhs = fixture(
+                ActionSpec::DriverAigToStats {
+                    aig_action_id: "a".repeat(64),
+                    version: "v0.37.0".into(),
+                    runtime: runtime.clone(),
+                },
+                ArtifactType::AigStatsFile,
+                br#"{"and_nodes":12,"depth":3}"#,
+            );
+            let rhs = fixture(
+                ActionSpec::DriverAigToStats {
+                    aig_action_id: "b".repeat(64),
+                    version: "v0.37.0".into(),
+                    runtime,
+                },
+                ArtifactType::AigStatsFile,
+                br#"{"and_nodes":8,"depth":4}"#,
+            );
+            let id = queue::enqueue_action(
+                &store,
+                ActionSpec::AigStatDiff {
+                    opt_ir_action_id: ir_id,
+                    g8r_aig_stats_action_id: lhs,
+                    yosys_abc_aig_stats_action_id: rhs,
+                },
+            )
+            .unwrap();
+            let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".into());
+            let owner = if dead_local_owner {
+                format!("{host}:{}:0:retired-worker", u32::MAX)
+            } else {
+                "retired-remote-worker".into()
+            };
+            let lease = queue::claim_next_pending_item(
+                &store,
+                &owner,
+                if dead_local_owner { 900 } else { -1 },
+            )
+            .unwrap()
+            .unwrap();
+            assert!(store.running_queue_path(&id).is_file());
+            assert!(!store.pending_queue_path(&id).exists());
+            drop(lease);
+            let summary = run_workers(
+                store.clone(),
+                root.clone(),
+                4,
+                "recovery-test",
+                60,
+                Duration::from_millis(1),
+                4,
+                true,
+                true,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            assert_eq!(summary.exit_reason, "idle");
+            assert_eq!(summary.drained_actions, 1);
+            assert!(queue_is_idle(&store));
+            let result = store.load_provenance(&id).unwrap();
+            let output: serde_json::Value = serde_json::from_slice(
+                &fs::read(store.resolve_artifact_ref_path(&result.output_artifact)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(output["g8r_stats"]["and_nodes"], 12);
+            assert_eq!(output["yosys_abc_stats"]["and_nodes"], 8);
+            assert!(!store.running_queue_path(&id).exists());
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn maintenance_failure_preserves_finite_worker_errors() {
+        let (store, root) = make_test_store("maintenance-error");
+        let id = queue::enqueue_action(
+            &store,
+            crate::model::ActionSpec::ImportIrPackageFile {
+                source_sha256: "a".repeat(64),
+                top_fn_name: None,
+            },
+        )
+        .unwrap();
+        queue::claim_next_pending_item(&store, "expired", -1)
+            .unwrap()
+            .unwrap();
+        // Force reclamation to fail opening its lock, even for privileged test users.
+        let lock = store.queue_transition_lock_path(&id);
+        fs::remove_file(&lock).unwrap();
+        fs::create_dir(lock).unwrap();
+        let result = run_workers(
+            store,
+            root.clone(),
+            2,
+            "maintenance-error",
+            60,
+            Duration::from_millis(1),
+            4,
+            true,
+            true,
+            Arc::new(AtomicBool::new(false)),
+        );
+        fs::remove_dir_all(root).unwrap();
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("3 consecutive errors"), "{error}");
+        assert!(error.contains("opening queue transition lock"), "{error}");
+    }
+
+    #[test]
+    fn idle_pool_resumes_work_published_by_a_finishing_peer() {
+        let draining = std::sync::Barrier::new(2);
+        let pending = AtomicBool::new(false);
+        let drained = AtomicUsize::new(0);
+        let checks = AtomicUsize::new(0);
+        run_worker_pool(
+            2,
+            |index, stop| {
+                worker_loop(
+                    stop,
+                    &AtomicBool::new(false),
+                    &drained,
+                    "idle-test",
+                    Duration::from_millis(1),
+                    true,
+                    Some(3),
+                    || {
+                        if checks.load(Ordering::Relaxed) == 0 {
+                            // Both workers are in a drain. One sees idle before
+                            // its peer finishes publishing a follow-up.
+                            draining.wait();
+                            if index == 1 {
+                                stop.wait_for_poll(Duration::from_secs(5));
+                                assert!(stop.stop_requested());
+                                pending.store(true, Ordering::Relaxed);
+                            }
+                            Ok(0)
+                        } else {
+                            Ok(usize::from(pending.swap(false, Ordering::Relaxed)))
+                        }
+                    },
+                    || !pending.load(Ordering::Relaxed),
+                )
+            },
+            || {
+                checks.fetch_add(1, Ordering::Relaxed);
+                !pending.load(Ordering::Relaxed)
+            },
+        )
+        .unwrap();
+        assert_eq!(drained.load(Ordering::Relaxed), 1);
+        assert_eq!(checks.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn worker_panic_wakes_polling_peer_before_join() {
+        let polling = std::sync::Barrier::new(2);
+        let woke = AtomicBool::new(false);
+        let error = run_worker_pool(
+            2,
+            |index, stop| {
+                polling.wait();
+                if index == 1 {
+                    panic!("injected worker panic");
+                }
+                stop.wait_for_poll(Duration::from_secs(5));
+                woke.store(stop.stop_requested(), Ordering::Relaxed);
+                Ok(())
+            },
+            || panic!("retried after worker panic"),
+        )
+        .unwrap_err();
+        assert!(woke.load(Ordering::Relaxed));
+        assert_eq!(error.to_string(), "worker thread panicked");
+    }
+
+    #[test]
     fn queue_has_pb_files_ignores_non_pb_files() {
         let (store, root) = make_test_store("queue-count");
         let queue_dir = store.queue_pending_dir();
@@ -289,7 +608,7 @@ mod tests {
 
     #[test]
     fn shutdown_finishes_current_drain_without_starting_another() {
-        let stop = AtomicBool::new(false);
+        let stop = WorkerPoolState::default();
         let shutdown = AtomicBool::new(false);
         let drained = AtomicUsize::new(0);
         let invocations = AtomicUsize::new(0);
@@ -323,7 +642,7 @@ mod tests {
             let root = PathBuf::from(root);
             let shutdown = Arc::new(AtomicBool::new(false));
             let _signals = WorkerShutdownSignals::install(&shutdown).unwrap();
-            let stop = AtomicBool::new(false);
+            let stop = WorkerPoolState::default();
             let drained = AtomicUsize::new(0);
             let invocations = AtomicUsize::new(0);
             worker_loop(
@@ -430,7 +749,7 @@ mod tests {
 
     #[test]
     fn finite_worker_stops_after_persistent_errors() {
-        let stop = AtomicBool::new(false);
+        let stop = WorkerPoolState::default();
         let drained = AtomicUsize::new(0);
         let attempts = AtomicUsize::new(0);
         let error = worker_loop(
@@ -449,7 +768,6 @@ mod tests {
         )
         .expect_err("finite worker should stop");
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
-        assert!(stop.load(Ordering::Relaxed));
         assert!(
             error
                 .to_string()
@@ -459,7 +777,7 @@ mod tests {
 
     #[test]
     fn finite_worker_resets_error_count_after_success() {
-        let stop = AtomicBool::new(false);
+        let stop = WorkerPoolState::default();
         let drained = AtomicUsize::new(0);
         let attempts = AtomicUsize::new(0);
         worker_loop(
