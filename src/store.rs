@@ -512,7 +512,9 @@ struct SledArtifactBackend {
 
 /// Bounded, process-local memoization of validated protobuf rows. Every lookup still reads Sled
 /// and compares the exact row bytes: deletion, replacement and corruption cannot be masked by a
-/// positive cache entry. No failures or missing records are cached.
+/// positive cache entry. No failures or missing records are cached. The byte budget charges encoded
+/// data, owned keys and fixed entry storage; decoded nested allocations and allocator slack are not
+/// included, so it is not a strict retained-heap limit.
 #[derive(Debug, Default)]
 struct ValidatedProvenanceCache {
     entries: HashMap<String, (sled::IVec, Arc<Provenance>)>,
@@ -521,7 +523,6 @@ struct ValidatedProvenanceCache {
 }
 
 impl ValidatedProvenanceCache {
-    const CAPACITY: usize = 16_384;
     const MAX_BYTES: usize = 64 * 1024 * 1024;
 
     fn get(&self, key: &str, bytes: &sled::IVec) -> Option<Arc<Provenance>> {
@@ -531,26 +532,38 @@ impl ValidatedProvenanceCache {
     }
 
     fn insert(&mut self, key: &str, bytes: sled::IVec, provenance: Arc<Provenance>) {
-        if bytes.len() > Self::MAX_BYTES {
+        let charge = Self::entry_charge(key, &bytes);
+        if charge > Self::MAX_BYTES {
             return;
         }
         if let Some((old_bytes, old_provenance)) = self.entries.get_mut(key) {
-            self.byte_len -= old_bytes.len();
-            self.byte_len += bytes.len();
+            self.byte_len -= Self::entry_charge(key, old_bytes);
+            self.byte_len += charge;
             *old_bytes = bytes;
             *old_provenance = provenance;
         } else {
-            self.byte_len += bytes.len();
+            self.byte_len += charge;
             self.insertion_order.push_back(key.to_owned());
             self.entries.insert(key.to_owned(), (bytes, provenance));
         }
-        while self.entries.len() > Self::CAPACITY || self.byte_len > Self::MAX_BYTES {
+        while self.byte_len > Self::MAX_BYTES {
             if let Some(oldest) = self.insertion_order.pop_front() {
                 if let Some((removed, _)) = self.entries.remove(&oldest) {
-                    self.byte_len -= removed.len();
+                    self.byte_len -= Self::entry_charge(&oldest, &removed);
                 }
             }
         }
+    }
+
+    fn entry_charge(key: &str, bytes: &sled::IVec) -> usize {
+        // Map slot, FIFO slot, decoded object and Arc counters provide a positive minimum charge.
+        const FIXED_BYTES: usize = std::mem::size_of::<(String, sled::IVec, Arc<Provenance>)>()
+            + std::mem::size_of::<String>()
+            + std::mem::size_of::<Provenance>()
+            + std::mem::size_of::<[usize; 2]>();
+        FIXED_BYTES
+            .saturating_add(key.len().saturating_mul(2))
+            .saturating_add(bytes.len())
     }
 }
 
@@ -4324,39 +4337,180 @@ mod tests {
     }
 
     #[test]
-    fn validated_provenance_cache_is_bounded_and_replacements_do_not_grow_it() {
+    fn validated_provenance_cache_retains_large_small_record_working_set() {
+        let mut cache = ValidatedProvenanceCache::default();
+        let mut records = Vec::new();
+        for i in 0..32_769 {
+            let p = Arc::new(make_test_provenance(
+                &format!("{i:064x}"),
+                "payload/result.txt",
+                5,
+            ));
+            let bytes: sled::IVec = crate::proto::encode_provenance(&p).unwrap().into();
+            cache.insert(&p.action_id, bytes.clone(), p.clone());
+            records.push((p, bytes));
+        }
+        assert!(cache.byte_len < ValidatedProvenanceCache::MAX_BYTES);
+        assert_eq!(cache.entries.len(), records.len());
+        assert_eq!(cache.insertion_order.len(), records.len());
+        for (p, bytes) in records {
+            assert!(Arc::ptr_eq(&cache.get(&p.action_id, &bytes).unwrap(), &p));
+        }
+    }
+
+    #[test]
+    fn validated_provenance_cache_charges_keys_and_nonzero_fixed_storage() {
+        let empty: sled::IVec = Vec::new().into();
+        let fixed = ValidatedProvenanceCache::entry_charge("", &empty);
+        assert!(fixed >= std::mem::size_of::<Provenance>());
+        assert!(fixed > 0);
+        assert_eq!(
+            ValidatedProvenanceCache::entry_charge("abc", &empty),
+            fixed + 6
+        );
+        let bytes: sled::IVec = vec![0; 7].into();
+        assert_eq!(
+            ValidatedProvenanceCache::entry_charge("abc", &bytes),
+            fixed + 13
+        );
+    }
+
+    #[test]
+    fn validated_provenance_cache_replacements_preserve_fifo_and_accounting() {
         let mut cache = ValidatedProvenanceCache::default();
         let p = Arc::new(make_test_provenance(
             &"d".repeat(64),
             "payload/result.txt",
             5,
         ));
-        let bytes: sled::IVec = crate::proto::encode_provenance(&p).unwrap().into();
-        for i in 0..=ValidatedProvenanceCache::CAPACITY {
-            cache.insert(&i.to_string(), bytes.clone(), p.clone());
+        let original: sled::IVec = crate::proto::encode_provenance(&p).unwrap().into();
+        cache.insert("first", original.clone(), p.clone());
+        cache.insert("second", original.clone(), p.clone());
+        let second_charge = ValidatedProvenanceCache::entry_charge("second", &original);
+        for len in [0, 1024, 1, 4096, 0, original.len()] {
+            let changed: sled::IVec = vec![0; len].into();
+            cache.insert("first", changed.clone(), p.clone());
+            assert_eq!(cache.entries.len(), 2);
+            assert_eq!(
+                cache
+                    .insertion_order
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["first", "second"]
+            );
+            assert_eq!(
+                cache.byte_len,
+                second_charge + ValidatedProvenanceCache::entry_charge("first", &changed)
+            );
+            assert!(cache.get("first", &changed).is_some());
         }
-        assert_eq!(cache.entries.len(), ValidatedProvenanceCache::CAPACITY);
-        assert!(cache.get("0", &bytes).is_none());
-        let key = ValidatedProvenanceCache::CAPACITY.to_string();
-        for _ in 0..10 {
-            cache.insert(&key, bytes.clone(), p.clone());
+        // A hit and a replacement both preserve insertion order, even when growth causes eviction.
+        assert!(cache.get("second", &original).is_some());
+        let filling: sled::IVec =
+            vec![
+                0;
+                ValidatedProvenanceCache::MAX_BYTES
+                    - ValidatedProvenanceCache::entry_charge("second", &Vec::new().into())
+            ]
+            .into();
+        cache.insert("second", filling.clone(), p);
+        assert_eq!(cache.byte_len, ValidatedProvenanceCache::MAX_BYTES);
+        assert_eq!(
+            cache
+                .insertion_order
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["second"]
+        );
+        assert!(cache.get("first", &original).is_none());
+        assert!(cache.get("second", &filling).is_some());
+    }
+
+    #[test]
+    fn validated_provenance_cache_evicts_by_charged_bytes_and_rejects_oversize() {
+        let mut cache = ValidatedProvenanceCache::default();
+        let p = Arc::new(make_test_provenance(
+            &"d".repeat(64),
+            "payload/result.txt",
+            5,
+        ));
+        // The encoded bytes alone fit; fixed storage and the two owned keys force FIFO eviction.
+        let half: sled::IVec = vec![0; ValidatedProvenanceCache::MAX_BYTES / 2].into();
+        cache.insert("first", half.clone(), p.clone());
+        assert!(cache.get("first", &half).is_some());
+        cache.insert("second", half.clone(), p.clone());
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.get("first", &half).is_none());
+        assert!(cache.get("second", &half).is_some());
+        let retained_charge = ValidatedProvenanceCache::entry_charge("second", &half);
+        assert_eq!(cache.byte_len, retained_charge);
+        let oversized: sled::IVec = vec![0; ValidatedProvenanceCache::MAX_BYTES].into();
+        cache.insert("new", oversized.clone(), p.clone());
+        cache.insert("second", oversized.clone(), p);
+        assert_eq!(cache.byte_len, retained_charge);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.insertion_order.len(), 1);
+        assert!(cache.get("new", &oversized).is_none());
+        assert!(cache.get("second", &oversized).is_none());
+        assert!(cache.get("second", &half).is_some());
+    }
+
+    #[test]
+    fn validated_provenance_cache_matches_uncached_validation() {
+        fn property(operations: Vec<(u8, u8)>) -> bool {
+            let backend = SledArtifactBackend {
+                db_path: PathBuf::new(),
+                db: Mutex::new(None),
+                materialization_lock: RwLock::new(()),
+                validated_provenance: Mutex::default(),
+            };
+            for (slot, variant) in operations.into_iter().take(256) {
+                let mut p = make_test_provenance(
+                    &format!("{:064x}", slot % 8),
+                    "payload/result.txt",
+                    u64::from(variant),
+                );
+                p.created_utc = chrono::DateTime::from_timestamp(0, 0).unwrap();
+                let key = if variant % 4 == 1 {
+                    "f".repeat(64)
+                } else {
+                    p.action_id.clone()
+                };
+                let bytes: sled::IVec = if variant % 4 == 2 {
+                    vec![0xff].into()
+                } else {
+                    crate::proto::encode_provenance(&p).unwrap().into()
+                };
+                let reference =
+                    SledArtifactBackend::decode_keyed_provenance(key.as_bytes(), &bytes)
+                        .map(|p| crate::proto::encode_provenance(&p).unwrap())
+                        .map_err(|e| format!("{e:#}"));
+                let cached = backend
+                    .validated_provenance(&key, bytes)
+                    .map(|p| crate::proto::encode_provenance(&p).unwrap())
+                    .map_err(|e| format!("{e:#}"));
+                if reference != cached {
+                    return false;
+                }
+                let cache = backend.validated_provenance.lock().unwrap();
+                let expected_charge: usize = cache
+                    .entries
+                    .iter()
+                    .map(|(key, (bytes, _))| ValidatedProvenanceCache::entry_charge(key, bytes))
+                    .sum();
+                if cache.byte_len != expected_charge
+                    || cache.entries.len() != cache.insertion_order.len()
+                {
+                    return false;
+                }
+            }
+            true
         }
-        assert_eq!(
-            cache.insertion_order.len(),
-            ValidatedProvenanceCache::CAPACITY
-        );
-        assert_eq!(
-            cache.byte_len,
-            bytes.len() * ValidatedProvenanceCache::CAPACITY
-        );
-        assert!(cache.get(&key, &bytes).is_some());
-        // Exercise the byte limit independently of the entry limit.
-        let large: sled::IVec = vec![0; ValidatedProvenanceCache::MAX_BYTES / 2 + 1].into();
-        cache.insert("large-a", large.clone(), p.clone());
-        cache.insert("large-b", large.clone(), p);
-        assert!(cache.byte_len <= ValidatedProvenanceCache::MAX_BYTES);
-        assert!(cache.get("large-a", &large).is_none());
-        assert!(cache.get("large-b", &large).is_some());
+        quickcheck::QuickCheck::new()
+            .tests(100)
+            .quickcheck(property as fn(Vec<(u8, u8)>) -> bool);
     }
 
     #[test]
@@ -4391,6 +4545,145 @@ mod tests {
             uncached.as_millis(),
             start.elapsed().as_millis()
         );
+    }
+
+    #[test]
+    #[ignore = "manual provenance working-set benchmark"]
+    fn benchmark_validated_provenance_cache_working_set() {
+        // Preserve the count-limited policy as a test-only reference, including its encoded-only budget.
+        #[derive(Default)]
+        struct CountLimitedCache {
+            entries: HashMap<String, (sled::IVec, Arc<Provenance>)>,
+            insertion_order: VecDeque<String>,
+            byte_len: usize,
+        }
+        impl CountLimitedCache {
+            fn get(&self, key: &str, bytes: &sled::IVec) -> Option<Arc<Provenance>> {
+                self.entries
+                    .get(key)
+                    .and_then(|(cached, p)| (cached == bytes).then(|| p.clone()))
+            }
+            fn insert(&mut self, key: &str, bytes: sled::IVec, p: Arc<Provenance>) {
+                if bytes.len() > ValidatedProvenanceCache::MAX_BYTES {
+                    return;
+                }
+                if let Some((old_bytes, old_p)) = self.entries.get_mut(key) {
+                    self.byte_len -= old_bytes.len();
+                    self.byte_len += bytes.len();
+                    *old_bytes = bytes;
+                    *old_p = p;
+                } else {
+                    self.byte_len += bytes.len();
+                    self.insertion_order.push_back(key.to_owned());
+                    self.entries.insert(key.to_owned(), (bytes, p));
+                }
+                while self.entries.len() > 16_384
+                    || self.byte_len > ValidatedProvenanceCache::MAX_BYTES
+                {
+                    if let Some(oldest) = self.insertion_order.pop_front() {
+                        if let Some((removed, _)) = self.entries.remove(&oldest) {
+                            self.byte_len -= removed.len();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Three consumers per dependency, ordered by stable synthetic action hashes as in a queue scan.
+        // Dataset construction and sorting are outside the timed regions; both policies use the same rows.
+        let mut records = Vec::new();
+        let mut scan_order = Vec::new();
+        for i in 0..32_769 {
+            let mut p = make_test_provenance(&format!("{i:064x}"), "payload/result.txt", 5);
+            p.created_utc = chrono::DateTime::from_timestamp(0, 0).unwrap();
+            for role in 0..3 {
+                let consumer: [u8; 32] =
+                    Sha256::digest(format!("consumer/{role}/{}", p.action_id).as_bytes()).into();
+                scan_order.push((consumer, i));
+            }
+            let bytes: sled::IVec = crate::proto::encode_provenance(&p).unwrap().into();
+            records.push((p.action_id, bytes));
+        }
+        scan_order.sort_unstable();
+        let scan_order: Vec<usize> = scan_order.into_iter().map(|(_, i)| i).collect();
+        let encoded_bytes: usize = records.iter().map(|(_, bytes)| bytes.len()).sum();
+        let charged_bytes: usize = records
+            .iter()
+            .map(|(key, bytes)| ValidatedProvenanceCache::entry_charge(key, bytes))
+            .sum();
+        assert!(charged_bytes < ValidatedProvenanceCache::MAX_BYTES);
+        eprintln!(
+            "provenance working set: records={} lookups_per_scan={} encoded_bytes={} charged_bytes={} fixed_bytes={}",
+            records.len(),
+            scan_order.len(),
+            encoded_bytes,
+            charged_bytes,
+            ValidatedProvenanceCache::entry_charge("", &Vec::new().into())
+        );
+        let reference = Mutex::new(CountLimitedCache::default());
+        let candidate = Mutex::new(ValidatedProvenanceCache::default());
+        for scan in 0..4 {
+            // Alternate policy order while retaining each policy's state across scans.
+            for old_policy in if scan % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            } {
+                let mut hits = 0usize;
+                let mut misses = 0usize;
+                let start = Instant::now();
+                for &index in &scan_order {
+                    let (key, bytes) = &records[index];
+                    let cached = if old_policy {
+                        reference.lock().unwrap().get(key, bytes)
+                    } else {
+                        candidate.lock().unwrap().get(key, bytes)
+                    };
+                    let p = if let Some(p) = cached {
+                        hits += 1;
+                        p
+                    } else {
+                        misses += 1;
+                        let p = Arc::new(
+                            SledArtifactBackend::decode_keyed_provenance(key.as_bytes(), bytes)
+                                .unwrap(),
+                        );
+                        if old_policy {
+                            reference
+                                .lock()
+                                .unwrap()
+                                .insert(key, bytes.clone(), p.clone());
+                        } else {
+                            candidate
+                                .lock()
+                                .unwrap()
+                                .insert(key, bytes.clone(), p.clone());
+                        }
+                        p
+                    };
+                    std::hint::black_box(p);
+                }
+                let elapsed = start.elapsed();
+                assert_eq!(hits + misses, scan_order.len());
+                if !old_policy {
+                    assert_eq!(misses, if scan == 0 { records.len() } else { 0 });
+                } else {
+                    assert!(misses > 0);
+                }
+                eprintln!(
+                    "provenance working set: policy={} scan={} hits={} misses={} elapsed_us={}",
+                    if old_policy {
+                        "count-limited"
+                    } else {
+                        "byte-budget"
+                    },
+                    scan,
+                    hits,
+                    misses,
+                    elapsed.as_micros()
+                );
+            }
+        }
     }
 
     #[test]
