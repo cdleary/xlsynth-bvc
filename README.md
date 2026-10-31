@@ -23,8 +23,9 @@ From the checkout root, you can generate both the raw and optimized XLS IR for
 a concrete DSLX function. This Bash example uses the release's standard-library
 `float32::add`. It requires Cargo, Docker, Python 3 with `requests`, `jq`, and
 network access to fetch the release assets and prepare the driver image.
-On SELinux-enforcing hosts, the worker script (`scripts/persistent_runner_worker.py`)
-and the private store need container-accessible labels such as `container_file_t`.
+On SELinux-enforcing hosts, the private store, including its cached worker
+script under `.worker-scripts/`, needs a container-accessible label such as
+`container_file_t`.
 
 `--driver-version` selects the xlsynth-driver crate. `--version` selects the
 XLS tool and stdlib release (DSO). Set `crate_version` to a key in the
