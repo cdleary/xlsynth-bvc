@@ -4028,21 +4028,7 @@ mod tests {
         runtime: &DriverRuntimeSpec,
         structural_hash: &str,
         seed: &str,
-    ) -> Provenance {
-        write_loss_history_for_hash_with_frontend(
-            store,
-            runtime,
-            structural_hash,
-            seed,
-            YosysVerilogFrontend::Builtin,
-        )
-    }
-
-    fn write_loss_history_for_hash_with_frontend(
-        store: &ArtifactStore,
-        runtime: &DriverRuntimeSpec,
-        structural_hash: &str,
-        seed: &str,
+        use_system_verilog: bool,
         frontend: YosysVerilogFrontend,
     ) -> Provenance {
         let source_opt = write_provenance_record(
@@ -4079,10 +4065,24 @@ mod tests {
             Vec::new(),
         );
 
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
+            .expect("resolve the statistics runtime used for diff suggestions");
         let g8r_stats_action = ActionSpec::DriverAigToStats {
-            aig_action_id: test_action_id(&format!("g8r-aig-{seed}")),
+            aig_action_id: compute_action_id(&ActionSpec::DriverIrToG8rAig {
+                ir_action_id: k_bool_action_id.clone(),
+                top_fn_name: Some("foo".to_string()),
+                fraig: false,
+                lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: driver_ir2g8r_execution_recipe_revision(
+                    &runtime.driver_version,
+                ),
+                version: "v0.39.0".to_string(),
+                runtime: runtime.clone(),
+            })
+            .expect("compute g8r AIG action id"),
             version: "v0.39.0".to_string(),
-            runtime: runtime.clone(),
+            runtime: stats_runtime.clone(),
         };
         let g8r_stats_action_id =
             compute_action_id(&g8r_stats_action).expect("compute g8r stats action id");
@@ -4104,6 +4104,22 @@ mod tests {
             )],
         );
 
+        let codegen = ActionSpec::IrFnToCombinationalVerilog {
+            ir_action_id: k_bool_action_id.clone(),
+            top_fn_name: Some("foo".to_string()),
+            use_system_verilog,
+            version: "v0.39.0".to_string(),
+            runtime: runtime.clone(),
+        };
+        let codegen_id = compute_action_id(&codegen).expect("compute codegen id");
+        write_provenance_record(
+            store,
+            codegen,
+            make_artifact(&codegen_id, ArtifactType::VerilogFile, "payload/foo.v"),
+            json!({}),
+            Vec::new(),
+            Vec::new(),
+        );
         let yosys_runtime = match &frontend {
             YosysVerilogFrontend::Builtin => crate::runtime::test_yosys_runtime(),
             YosysVerilogFrontend::Slang { revision } => YosysRuntimeSpec {
@@ -4112,9 +4128,9 @@ mod tests {
             },
         };
         let yosys_aig_action = ActionSpec::ComboVerilogToYosysAbcAig {
-            verilog_action_id: test_action_id(&format!("verilog-{seed}")),
+            verilog_action_id: codegen_id,
             verilog_top_module_name: Some("foo".to_string()),
-            frontend,
+            frontend: frontend.clone(),
             yosys_script_ref: ScriptRef {
                 path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
                 sha256: "0".repeat(64),
@@ -4137,9 +4153,9 @@ mod tests {
         );
 
         let yosys_stats_action = ActionSpec::DriverAigToStats {
-            aig_action_id: yosys_aig_action_id,
+            aig_action_id: yosys_aig_action_id.clone(),
             version: "v0.39.0".to_string(),
-            runtime: runtime.clone(),
+            runtime: stats_runtime,
         };
         let yosys_stats_action_id =
             compute_action_id(&yosys_stats_action).expect("compute yosys stats action id");
@@ -4161,12 +4177,24 @@ mod tests {
             )],
         );
 
+        let suggested_diff = build_aig_stat_diff_suggestion_for_stats_action(
+            store,
+            repo_root,
+            &yosys_stats_action_id,
+            &yosys_aig_action_id,
+        )
+        .expect("look up matching g8r stats for the Yosys completion");
         let diff_action = ActionSpec::AigStatDiff {
             opt_ir_action_id: k_bool_action_id,
             g8r_aig_stats_action_id: g8r_stats_action_id,
             yosys_abc_aig_stats_action_id: yosys_stats_action_id,
         };
         let diff_action_id = compute_action_id(&diff_action).expect("compute diff action id");
+        assert_eq!(
+            suggested_diff.as_ref().map(|diff| diff.action_id.as_str()),
+            (!use_system_verilog && matches!(frontend, YosysVerilogFrontend::Builtin))
+                .then_some(diff_action_id.as_str()),
+        );
         write_provenance_record(
             store,
             diff_action,
@@ -4568,7 +4596,14 @@ mod tests {
         assert_eq!(first.enqueued_count, 0);
         assert_eq!(first.skipped_not_previously_lossy_k_bool_count, 1);
 
-        let diff = write_loss_history_for_hash(&store, &runtime, &structural_hash, "update");
+        let diff = write_loss_history_for_hash(
+            &store,
+            &runtime,
+            &structural_hash,
+            "update",
+            false,
+            YosysVerilogFrontend::Builtin,
+        );
         let ActionSpec::AigStatDiff {
             opt_ir_action_id,
             g8r_aig_stats_action_id,
@@ -4646,8 +4681,8 @@ mod tests {
     }
 
     #[test]
-    fn slang_aig_stat_diff_does_not_update_k_bool_previous_loss_cache() {
-        let (store, root) = make_test_store("reject-slang-kbool-loss-cache");
+    fn noncanonical_yosys_recipe_does_not_update_k_bool_previous_loss_cache() {
+        let (store, root) = make_test_store("reject-noncanonical-kbool-loss-cache");
         let runtime = test_runtime();
         let structural_hash = "d".repeat(64);
 
@@ -4656,27 +4691,36 @@ mod tests {
                 .expect("prime empty previous-loss cache")
                 .is_empty()
         );
-        let diff = write_loss_history_for_hash_with_frontend(
-            &store,
-            &runtime,
-            &structural_hash,
-            "slang",
-            YosysVerilogFrontend::Slang {
-                revision: "a".repeat(40),
-            },
-        );
+        for (seed, frontend) in [
+            ("sv-builtin", YosysVerilogFrontend::Builtin),
+            (
+                "sv-slang",
+                YosysVerilogFrontend::Slang {
+                    revision: "a".repeat(40),
+                },
+            ),
+        ] {
+            let diff = write_loss_history_for_hash(
+                &store,
+                &runtime,
+                &structural_hash,
+                seed,
+                true,
+                frontend,
+            );
+            assert_eq!(
+                lossy_k_bool_source_structural_hash_for_aig_stat_diff(&store, &diff),
+                None
+            );
+            note_completed_action_for_previous_loss_k_cone_policy(&store, &diff.action_id)
+                .expect("ignore noncanonical diff for previous-loss cache");
+        }
 
         assert!(
             !load_previously_lossy_k_bool_source_structural_hashes(&store, 3)
                 .expect("scan previous-loss history")
                 .contains(&structural_hash)
         );
-        assert_eq!(
-            lossy_k_bool_source_structural_hash_for_aig_stat_diff(&store, &diff),
-            None
-        );
-        note_completed_action_for_previous_loss_k_cone_policy(&store, &diff.action_id)
-            .expect("ignore slang diff for previous-loss cache");
         assert!(
             !load_complete_previously_lossy_k_bool_source_hashes(&store, 3)
                 .expect("load cached previous-loss hashes")

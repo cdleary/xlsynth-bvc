@@ -1177,8 +1177,11 @@ pub(crate) fn run_ir_dir_corpus(
     if recipe_preset == CorpusRecipePreset::G8rAbcStats && fraig {
         bail!("recipe preset `g8r-abc-stats` requires --fraig=false");
     }
-    if fraig && matches!(recipe_preset, CorpusRecipePreset::G8rAbcVsYabcAigDiff) {
-        bail!("g8r-abc-vs-yabc-aig-diff requires --fraig=false for a matched ABC comparison");
+    if fraig && recipe_preset.is_matched_abc() {
+        bail!(
+            "omit --fraig for matched ABC recipe `{}`",
+            recipe_preset_label(recipe_preset)
+        );
     }
 
     fs::create_dir_all(output_dir)
@@ -1245,7 +1248,9 @@ pub(crate) fn run_ir_dir_corpus(
                 }
             }
         };
-        let yosys_runtime = yosys.into_runtime(repo_root, None)?;
+        let slang_commit = (recipe_preset == CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff)
+            .then(|| crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string());
+        let yosys_runtime = yosys.into_runtime(repo_root, slang_commit)?;
         (driver_runtime, stats_runtime, yosys_runtime)
     };
     if manifest_path.exists() {
@@ -1524,8 +1529,8 @@ pub(crate) fn run_ir_dir_corpus(
     let joined_dir = output_dir.join(IR_DIR_CORPUS_JOINED_DIR);
     fs::create_dir_all(&joined_dir)
         .with_context(|| format!("creating joined dir: {}", joined_dir.display()))?;
-    let joined_jsonl_path = joined_dir.join(format!("{}.jsonl", recipe_preset_name));
-    let joined_csv_path = joined_dir.join(format!("{}.csv", recipe_preset_name));
+    let joined_jsonl_path = joined_output_path(output_dir, recipe_preset, "jsonl");
+    let joined_csv_path = joined_output_path(output_dir, recipe_preset, "csv");
 
     write_corpus_manifest_atomic(&manifest_path, &manifest)?;
     write_samples_jsonl(&samples_path, &sample_records)?;
@@ -1824,8 +1829,8 @@ fn build_ir_dir_corpus_status_report(
         + sample_counts.get("pending").copied().unwrap_or(0);
     let eta_seconds = estimate_eta_seconds(active_remaining_samples, sample_rate.per_hour);
 
-    let joined_jsonl_path = joined_output_path(output_dir, &manifest.recipe_preset, "jsonl");
-    let joined_csv_path = joined_output_path(output_dir, &manifest.recipe_preset, "csv");
+    let joined_jsonl_path = joined_output_path(output_dir, recipe_preset, "jsonl");
+    let joined_csv_path = joined_output_path(output_dir, recipe_preset, "csv");
     if refresh_public_outputs {
         let joined_rows = build_joined_rows(&store, &sample_records)?;
         export_leaf_artifacts(&store, output_dir, &sample_records)?;
@@ -2051,10 +2056,15 @@ fn ensure_sample_count_key(counts: &mut BTreeMap<String, usize>, key: &str) {
     counts.entry(key.to_string()).or_insert(0);
 }
 
-fn joined_output_path(output_dir: &Path, recipe_preset: &str, extension: &str) -> PathBuf {
+pub(crate) fn joined_output_path(
+    output_dir: &Path,
+    recipe_preset: CorpusRecipePreset,
+    extension: &str,
+) -> PathBuf {
+    let label = recipe_preset_label(recipe_preset);
     output_dir
         .join(IR_DIR_CORPUS_JOINED_DIR)
-        .join(format!("{}.{}", recipe_preset, extension))
+        .join(format!("{label}.{extension}"))
 }
 
 fn is_sled_lock_error(err: &anyhow::Error) -> bool {
@@ -2430,7 +2440,7 @@ fn build_action_plan(
     yosys_script_ref: &crate::model::ScriptRef,
 ) -> Result<CorpusActionPlan> {
     let is_g8r_abc_stats = recipe_preset == CorpusRecipePreset::G8rAbcStats;
-    let matched_abc = matches!(recipe_preset, CorpusRecipePreset::G8rAbcVsYabcAigDiff);
+    let matched_abc = recipe_preset.is_matched_abc();
     if matched_abc && fraig {
         bail!("matched ABC comparison cannot enable driver FRAIG");
     }
@@ -2467,7 +2477,11 @@ fn build_action_plan(
     let combo_verilog_action = ActionSpec::IrFnToCombinationalVerilog {
         ir_action_id: import_ir_action_id.clone(),
         top_fn_name: Some(sample.top_fn_name.clone()),
-        use_system_verilog: false,
+        use_system_verilog: matches!(
+            recipe_preset,
+            CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff
+                | CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff
+        ),
         version: version.to_string(),
         runtime: driver_runtime.clone(),
     };
@@ -2482,7 +2496,15 @@ fn build_action_plan(
         ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id: combo_verilog_action_id.clone(),
             verilog_top_module_name: Some(sample.top_fn_name.clone()),
-            frontend: YosysVerilogFrontend::Builtin,
+            frontend: if recipe_preset == CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff {
+                YosysVerilogFrontend::Slang {
+                    revision: yosys_runtime.slang_commit.clone().context(
+                        "Slang recipe requires a pinned Yosys runtime with slang_commit",
+                    )?,
+                }
+            } else {
+                YosysVerilogFrontend::Builtin
+            },
             yosys_script_ref: yosys_script_ref.clone(),
             runtime: yosys_runtime.clone(),
         }
@@ -3436,14 +3458,28 @@ fn export_leaf_artifacts(
             )?;
         }
         if sample.combo_verilog_status != "not_planned" {
+            let system_verilog = matches!(
+                parse_recipe_preset_label(&sample.preset)?,
+                CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff
+                    | CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff
+            );
             copy_artifact_if_present(
                 store,
                 &ArtifactRef {
                     action_id: sample.combo_verilog_action_id.clone(),
                     artifact_type: ArtifactType::VerilogFile,
-                    relpath: COMBO_VERILOG_RELPATH.to_string(),
+                    relpath: if system_verilog {
+                        "payload/result.sv"
+                    } else {
+                        COMBO_VERILOG_RELPATH
+                    }
+                    .to_string(),
                 },
-                &sample_dir.join("combo.v"),
+                &sample_dir.join(if system_verilog {
+                    "combo.sv"
+                } else {
+                    "combo.v"
+                }),
             )?;
         }
         copy_artifact_if_present(
@@ -3584,6 +3620,17 @@ fn count_statuses(samples: &[IrDirCorpusSampleRecord]) -> BTreeMap<String, usize
     counts
 }
 
+impl CorpusRecipePreset {
+    pub(crate) fn is_matched_abc(self) -> bool {
+        matches!(
+            self,
+            Self::G8rAbcVsYabcAigDiff
+                | Self::G8rAbcVsYabcSystemVerilogAigDiff
+                | Self::G8rAbcVsYabcSlangAigDiff
+        )
+    }
+}
+
 fn recipe_preset_label(recipe_preset: CorpusRecipePreset) -> &'static str {
     recipe_preset_spec(recipe_preset).label
 }
@@ -3602,6 +3649,14 @@ fn recipe_preset_spec(recipe_preset: CorpusRecipePreset) -> CorpusRecipePresetSp
             label: "g8r-abc-vs-yabc-aig-diff",
             yosys_script: "flows/yosys_to_aig.ys",
         },
+        CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff => CorpusRecipePresetSpec {
+            label: "g8r-abc-vs-yabc-system-verilog-aig-diff",
+            yosys_script: "flows/yosys_to_aig.ys",
+        },
+        CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff => CorpusRecipePresetSpec {
+            label: "g8r-abc-vs-yabc-slang-aig-diff",
+            yosys_script: "flows/yosys_to_aig.ys",
+        },
         CorpusRecipePreset::G8rAbcStats => CorpusRecipePresetSpec {
             label: "g8r-abc-stats",
             yosys_script: "flows/yosys_to_aig.ys",
@@ -3609,12 +3664,16 @@ fn recipe_preset_spec(recipe_preset: CorpusRecipePreset) -> CorpusRecipePresetSp
     }
 }
 
-fn parse_recipe_preset_label(label: &str) -> Result<CorpusRecipePreset> {
+pub(crate) fn parse_recipe_preset_label(label: &str) -> Result<CorpusRecipePreset> {
     match label {
         "g8r-vs-yabc-aig-diff" => Ok(CorpusRecipePreset::G8rVsYabcAigDiff),
         "g8r-vs-yabc-no-fraig-aig-diff" => Ok(CorpusRecipePreset::G8rVsYabcNoFraigAigDiff),
         "g8r-abc-stats" => Ok(CorpusRecipePreset::G8rAbcStats),
         "g8r-abc-vs-yabc-aig-diff" => Ok(CorpusRecipePreset::G8rAbcVsYabcAigDiff),
+        "g8r-abc-vs-yabc-system-verilog-aig-diff" => {
+            Ok(CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff)
+        }
+        "g8r-abc-vs-yabc-slang-aig-diff" => Ok(CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff),
         other => bail!("unsupported corpus recipe preset in manifest: {}", other),
     }
 }
@@ -4913,57 +4972,90 @@ mod tests {
             top_fn_name: "cone".into(),
         };
         let script = sample_yosys_script_ref();
-        let build = |fraig| {
-            build_action_plan(
-                &sample,
+        for (recipe_preset, system_verilog, expected_frontend) in [
+            (
                 CorpusRecipePreset::G8rAbcVsYabcAigDiff,
-                fraig,
-                "v0.39.0",
-                &sample_driver_runtime(),
-                &sample_stats_runtime(),
-                &sample_yosys_runtime(),
-                &script,
-            )
-        };
-        let plan = build(false).expect("matched action plan");
-        let g8r_abc_id = plan.g8r_abc_aig_action_id.as_ref().expect("G8r ABC action");
-        assert_eq!(plan.planned_actions().len(), 8);
-        assert!(
-            matches!(&plan.g8r_raw_stats_action, Some(ActionSpec::DriverAigToStats { aig_action_id, .. })
-            if aig_action_id == &plan.g8r_aig_action_id)
-        );
-        assert!(matches!(
-            &plan.g8r_aig_action,
-            ActionSpec::DriverIrToG8rAig {
-                fraig: false,
-                lowering_mode: crate::model::G8rLoweringMode::FrontendNoPrepRewrite,
-                ..
+                false,
+                YosysVerilogFrontend::Builtin,
+            ),
+            (
+                CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff,
+                true,
+                YosysVerilogFrontend::Builtin,
+            ),
+            (
+                CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff,
+                true,
+                YosysVerilogFrontend::Slang {
+                    revision: "a".repeat(40),
+                },
+            ),
+        ] {
+            let mut yosys_runtime = sample_yosys_runtime();
+            if let YosysVerilogFrontend::Slang { revision } = &expected_frontend {
+                yosys_runtime.slang_commit = Some(revision.clone());
             }
-        ));
-        assert!(matches!(
-            &plan.g8r_abc_aig_action,
-            Some(ActionSpec::AigToYosysAbcAig { aig_action_id, yosys_script_ref, .. })
-                if aig_action_id == &plan.g8r_aig_action_id && yosys_script_ref.sha256 == script.sha256
-        ));
-        assert!(matches!(
-            &plan.g8r_stats_action,
-            ActionSpec::DriverAigToStats { aig_action_id, .. } if aig_action_id == g8r_abc_id
-        ));
-        assert!(matches!(
-            &plan.yosys_abc_aig_action,
-            ActionSpec::ComboVerilogToYosysAbcAig { yosys_script_ref, .. }
-                if yosys_script_ref.sha256 == script.sha256
-        ));
-        assert!(
-            format!("{:#}", build(true).expect_err("FRAIG is incompatible"))
-                .contains("cannot enable driver FRAIG")
-        );
-        assert_eq!(
-            parse_recipe_preset_label("g8r-abc-vs-yabc-aig-diff")
-                .map(recipe_preset_label)
-                .expect("parse new preset"),
-            "g8r-abc-vs-yabc-aig-diff"
-        );
+            let build = |fraig| {
+                build_action_plan(
+                    &sample,
+                    recipe_preset,
+                    fraig,
+                    "v0.39.0",
+                    &sample_driver_runtime(),
+                    &sample_stats_runtime(),
+                    &yosys_runtime,
+                    &script,
+                )
+            };
+            let plan = build(false).expect("matched action plan");
+            assert!(matches!(
+                &plan.combo_verilog_action,
+                ActionSpec::IrFnToCombinationalVerilog { use_system_verilog, .. }
+                    if *use_system_verilog == system_verilog
+            ));
+            let g8r_abc_id = plan.g8r_abc_aig_action_id.as_ref().expect("G8r ABC action");
+            assert_eq!(plan.planned_actions().len(), 8);
+            assert!(
+                matches!(&plan.g8r_raw_stats_action, Some(ActionSpec::DriverAigToStats { aig_action_id, .. })
+            if aig_action_id == &plan.g8r_aig_action_id)
+            );
+            assert!(matches!(
+                &plan.g8r_aig_action,
+                ActionSpec::DriverIrToG8rAig {
+                    fraig: false,
+                    lowering_mode: crate::model::G8rLoweringMode::FrontendNoPrepRewrite,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                &plan.g8r_abc_aig_action,
+                Some(ActionSpec::AigToYosysAbcAig { aig_action_id, yosys_script_ref, runtime })
+                    if aig_action_id == &plan.g8r_aig_action_id
+                        && yosys_script_ref.sha256 == script.sha256
+                        && runtime == &yosys_runtime
+            ));
+            assert!(matches!(
+                &plan.g8r_stats_action,
+                ActionSpec::DriverAigToStats { aig_action_id, .. } if aig_action_id == g8r_abc_id
+            ));
+            assert!(matches!(
+                &plan.yosys_abc_aig_action,
+                ActionSpec::ComboVerilogToYosysAbcAig { yosys_script_ref, frontend, runtime, .. }
+                    if yosys_script_ref.sha256 == script.sha256
+                        && *frontend == expected_frontend
+                        && runtime == &yosys_runtime
+            ));
+            assert!(
+                format!("{:#}", build(true).expect_err("FRAIG is incompatible"))
+                    .contains("cannot enable driver FRAIG")
+            );
+            assert_eq!(
+                parse_recipe_preset_label(recipe_preset_label(recipe_preset))
+                    .map(recipe_preset_label)
+                    .expect("parse new preset"),
+                recipe_preset_label(recipe_preset)
+            );
+        }
     }
 
     #[test]
@@ -5137,11 +5229,25 @@ mod tests {
 
     #[test]
     fn matched_abc_corpus_exports_enqueued_branch_and_refreshes() {
-        let (root, output_dir, summary) =
-            run_enqueue_corpus_for_recipe(CorpusRecipePreset::G8rAbcVsYabcAigDiff, None);
+        for preset in [
+            CorpusRecipePreset::G8rAbcVsYabcAigDiff,
+            CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff,
+            CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff,
+        ] {
+            check_matched_abc_enqueue_and_refresh(preset);
+        }
+    }
+
+    fn check_matched_abc_enqueue_and_refresh(preset: CorpusRecipePreset) {
+        let (root, output_dir, summary) = run_enqueue_corpus_for_recipe(preset, None);
         let manifest = read_status_manifest(&output_dir);
         let rows = read_samples_jsonl(&output_dir);
-        assert_eq!(summary.recipe_preset, "g8r-abc-vs-yabc-aig-diff");
+        assert_eq!(summary.recipe_preset, recipe_preset_label(preset));
+        assert_eq!(
+            manifest.yosys_runtime.slang_commit.as_deref(),
+            (preset == CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff)
+                .then_some(crate::DEFAULT_YOSYS_SLANG_COMMIT)
+        );
         assert_eq!(summary.enqueued_actions, 8);
         assert_eq!(rows[0].g8r_raw_stats_status.as_deref(), Some("pending"));
         assert!(rows[0].g8r_raw_stats_action_id.is_some());
@@ -5153,8 +5259,9 @@ mod tests {
             .expect("ABC action ID");
         assert!(!abc_id.is_empty());
         assert_eq!(rows[0].g8r_abc_aig_status.as_deref(), Some("pending"));
-        let csv = fs::read_to_string(output_dir.join("joined/g8r-abc-vs-yabc-aig-diff.csv"))
-            .expect("joined CSV");
+        let csv =
+            fs::read_to_string(output_dir.join(format!("joined/{}.csv", summary.recipe_preset)))
+                .expect("joined CSV");
         assert!(
             csv.lines()
                 .next()

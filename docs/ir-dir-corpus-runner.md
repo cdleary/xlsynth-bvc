@@ -38,7 +38,7 @@ Current supported flags:
 - `--input-dir <dir>`
 - `--output-dir <dir>`
 - `--execution-mode enqueue|run`
-- `--recipe-preset g8r-vs-yabc-aig-diff|g8r-vs-yabc-no-fraig-aig-diff|g8r-abc-stats|g8r-abc-vs-yabc-aig-diff`
+- `--recipe-preset <preset>` selects one of the recipes below
 - `--top-fn-policy infer-single-package|explicit|from-filename`
 - `--top-fn-name <name>` when policy is `explicit`
 - `--fraig`
@@ -71,7 +71,7 @@ Public outputs are written directly into `OUTPUT_DIR/`:
 - `joined/g8r-vs-yabc-no-fraig-aig-diff.jsonl`
 - `joined/g8r-abc-stats.csv`
 - `joined/g8r-abc-stats.jsonl`
-- `joined/g8r-abc-vs-yabc-aig-diff.csv` and `.jsonl` for matched ABC runs
+- `joined/<recipe-preset>.csv` and `.jsonl` for matched ABC runs
 - `artifacts/<sample_id>/...` for copied leaf outputs when available
 
 The summary JSON includes the exact `--store-dir` and `--artifacts-via-sled` paths for the
@@ -119,6 +119,17 @@ Current presets:
 - `g8r-vs-yabc-aig-diff`
 - `g8r-vs-yabc-no-fraig-aig-diff`
 - `g8r-abc-stats`
+- `g8r-abc-vs-yabc-aig-diff` generates Verilog and uses Yosys's builtin reader
+- `g8r-abc-vs-yabc-system-verilog-aig-diff` generates SystemVerilog and uses `read_verilog -sv`
+- `g8r-abc-vs-yabc-slang-aig-diff` generates SystemVerilog and uses the pinned `read_slang` frontend
+
+The three matched ABC recipes use the same Yosys image and flow script for both branches
+of each comparison. The SystemVerilog recipes export the generated source as `combo.sv`.
+
+The historical Yosys/ABC comparison uses generated Verilog, the builtin reader, and
+the canonical flow script. Results from the SystemVerilog recipes are available in
+their respective joined files and reports. On stores that previously indexed those
+results, run `rebuild-web-indices` once to refresh the historical comparisons.
 
 The two diagnostic comparison presets expand each sample as:
 
