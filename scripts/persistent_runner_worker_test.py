@@ -17,6 +17,42 @@ from unittest import mock
 import persistent_runner_worker as worker
 
 
+class InboxWakeupTest(unittest.TestCase):
+    def test_polling_fallback_checks_the_authoritative_inbox(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inbox, processing = root / "inbox", root / "processing"
+            self.assertIsNone(worker.watch_inbox(inbox))
+            inbox.mkdir()
+            processing.mkdir()
+            (inbox / "ready.json").write_text("{}")
+            with mock.patch.object(worker.time, "sleep") as sleep:
+                self.assertFalse(worker.wait_for_inbox(None, 0.2))
+                sleep.assert_called_once_with(0.2)
+            self.assertEqual(worker.claim_request(inbox, processing), processing / "ready.json")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux rename notifications")
+    def test_queued_rename_survives_until_the_worker_waits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inbox, processing = root / "inbox", root / "processing"
+            inbox.mkdir()
+            processing.mkdir()
+            fd = worker.watch_inbox(inbox)
+            self.assertIsNotNone(fd)
+            self.addCleanup(os.close, fd)
+            (root / "temp").write_text("partial")
+            (root / "temp").replace(inbox / "unrelated")
+            self.assertTrue(worker.wait_for_inbox(fd, 0))
+            self.assertIsNone(worker.claim_request(inbox, processing))
+            (root / "temp").write_text("complete")
+            (root / "temp").replace(inbox / "ready.json")
+            self.assertTrue(worker.wait_for_inbox(fd, 0))
+            self.assertFalse(worker.wait_for_inbox(fd, 0))
+            request = worker.claim_request(inbox, processing)
+            self.assertEqual(request.read_text(), "complete")
+
+
 class PreparedDriverToolsTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
