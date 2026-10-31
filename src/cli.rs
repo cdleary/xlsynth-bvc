@@ -558,6 +558,10 @@ pub enum CorpusRecipePreset {
     G8rVsYabcNoFraigAigDiff,
     G8rAbcStats,
     G8rAbcVsYabcAigDiff,
+    /// Matched ABC comparison with SystemVerilog codegen and builtin parsing.
+    G8rAbcVsYabcSystemVerilogAigDiff,
+    /// Matched ABC comparison with SystemVerilog codegen and the pinned Slang frontend.
+    G8rAbcVsYabcSlangAigDiff,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
