@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,10 @@ use crate::proto::{
 };
 use crate::store::ArtifactStore;
 
+mod pending_record_cache;
+
+use pending_record_cache::{PendingRecord, PendingRecordCache};
+
 static QUEUE_LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A scheduling hint, never an authority for queue state or lease ownership. Share one sorted
@@ -36,6 +41,7 @@ pub(crate) struct PendingPathCache {
     refresh: Mutex<()>,
     claim_cursor: AtomicUsize,
     compatible_cursor: AtomicUsize,
+    records: PendingRecordCache,
 }
 
 #[derive(Debug, Default)]
@@ -155,6 +161,7 @@ impl PendingPathCache {
         drop(state);
         // Releasing a large old path vector can itself be expensive.
         drop(retired);
+        self.records.retain(&view);
         Ok(view)
     }
 
@@ -935,6 +942,35 @@ fn requeue_pending_action_with_canonical_identity(
     Ok(None)
 }
 
+/// Reuse canonical metadata only while the fresh record bytes and dependency
+/// aliases agree. Lease acquisition independently rereads and validates the record.
+fn canonical_action_for_scan<'a>(
+    store: &ArtifactStore,
+    path: &Path,
+    record: &'a PendingRecord,
+) -> Result<Option<Cow<'a, ActionSpec>>> {
+    if record.canonical_id == record.action_id {
+        let mut unchanged = true;
+        for dependency in action_dependency_action_ids(&record.action) {
+            if load_queue_identity_alias(store, dependency)?.is_some() {
+                unchanged = false;
+                break;
+            }
+        }
+        if unchanged {
+            return Ok(Some(Cow::Borrowed(&record.action)));
+        }
+    }
+    requeue_pending_action_with_canonical_identity(
+        store,
+        path,
+        &record.action_id,
+        record.priority,
+        record.action.clone(),
+    )
+    .map(|action| action.map(Cow::Owned))
+}
+
 pub(crate) fn claim_next_pending_item(
     store: &ArtifactStore,
     worker_id: &str,
@@ -993,25 +1029,21 @@ pub(crate) fn claim_next_pending_item(
                 });
             }
         };
-        let (action_id, enqueued_utc, priority, action) =
-            match parse_queue_work_item(&bytes, &pending_path) {
-                Ok(parsed) => parsed,
-                Err(err) => {
-                    quarantine_corrupt_queue_file(
-                        &pending_path,
-                        &format!("parse error while scanning pending queue: {:#}", err),
-                    )?;
-                    continue;
-                }
-            };
-        let Some(action) = requeue_pending_action_with_canonical_identity(
-            store,
-            &pending_path,
-            &action_id,
-            priority,
-            action,
-        )?
-        else {
+        let record = match store
+            .pending_path_cache
+            .records
+            .decode(&pending_path, bytes)
+        {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                quarantine_corrupt_queue_file(
+                    &pending_path,
+                    &format!("parse error while scanning pending queue: {:#}", err),
+                )?;
+                continue;
+            }
+        };
+        let Some(action) = canonical_action_for_scan(store, &pending_path, &record)? else {
             continue;
         };
         match classify_action_readiness(store, &action)? {
@@ -1020,9 +1052,9 @@ pub(crate) fn claim_next_pending_item(
                     &mut ready_candidates,
                     ReadyCandidate {
                         pending_path,
-                        action_id,
-                        enqueued_utc,
-                        queue_priority: priority,
+                        action_id: record.action_id.clone(),
+                        enqueued_utc: record.enqueued_utc,
+                        queue_priority: record.priority,
                         action_priority: action_scheduler_priority(&action),
                     },
                     MAX_READY_CANDIDATES_PER_CLAIM,
@@ -1032,9 +1064,9 @@ pub(crate) fn claim_next_pending_item(
             ActionReadiness::Blocked { .. } => {
                 try_write_dependency_canceled_record(
                     store,
-                    &action_id,
-                    enqueued_utc,
-                    action,
+                    &record.action_id,
+                    record.enqueued_utc,
+                    action.into_owned(),
                     worker_id,
                 )?;
                 continue;
@@ -1047,9 +1079,13 @@ pub(crate) fn claim_next_pending_item(
     }
     ready_candidates.sort_by(cmp_ready_candidate);
     for candidate in ready_candidates {
-        if let Some(claimed) =
-            try_claim_pending_item(store, &candidate.pending_path, worker_id, lease_seconds)?
-        {
+        if let Some(claimed) = try_claim_pending_item(
+            store,
+            &candidate.pending_path,
+            worker_id,
+            lease_seconds,
+            None,
+        )? {
             return Ok(Some(claimed));
         }
     }
@@ -1121,31 +1157,27 @@ pub(crate) fn claim_compatible_pending_items(
                 });
             }
         };
-        let (action_id, enqueued_utc, priority, action) =
-            match parse_queue_work_item(&bytes, &pending_path) {
-                Ok(parsed) => parsed,
-                Err(err) => {
-                    quarantine_corrupt_queue_file(
-                        &pending_path,
-                        &format!("parse error while scanning pending queue: {:#}", err),
-                    )?;
-                    continue;
-                }
-            };
-        let Some(action) = requeue_pending_action_with_canonical_identity(
-            store,
-            &pending_path,
-            &action_id,
-            priority,
-            action,
-        )?
-        else {
+        let record = match store
+            .pending_path_cache
+            .records
+            .decode(&pending_path, bytes)
+        {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                quarantine_corrupt_queue_file(
+                    &pending_path,
+                    &format!("parse error while scanning pending queue: {:#}", err),
+                )?;
+                continue;
+            }
+        };
+        let Some(action) = canonical_action_for_scan(store, &pending_path, &record)? else {
             continue;
         };
         if action_batch_key(&action).as_ref() != Some(batch_key) {
             continue;
         }
-        if priority != required_queue_priority {
+        if record.priority != required_queue_priority {
             continue;
         }
         match classify_action_readiness(store, &action)? {
@@ -1154,9 +1186,9 @@ pub(crate) fn claim_compatible_pending_items(
                     &mut ready_candidates,
                     ReadyCandidate {
                         pending_path,
-                        action_id,
-                        enqueued_utc,
-                        queue_priority: priority,
+                        action_id: record.action_id.clone(),
+                        enqueued_utc: record.enqueued_utc,
+                        queue_priority: record.priority,
                         action_priority: action_scheduler_priority(&action),
                     },
                     limit,
@@ -1166,9 +1198,9 @@ pub(crate) fn claim_compatible_pending_items(
             ActionReadiness::Blocked { .. } => {
                 try_write_dependency_canceled_record(
                     store,
-                    &action_id,
-                    enqueued_utc,
-                    action,
+                    &record.action_id,
+                    record.enqueued_utc,
+                    action.into_owned(),
                     worker_id,
                 )?;
             }
@@ -1181,9 +1213,13 @@ pub(crate) fn claim_compatible_pending_items(
         if claimed.len() >= limit {
             break;
         }
-        if let Some(running) =
-            try_claim_pending_item(store, &candidate.pending_path, worker_id, lease_seconds)?
-        {
+        if let Some(running) = try_claim_pending_item(
+            store,
+            &candidate.pending_path,
+            worker_id,
+            lease_seconds,
+            Some(required_queue_priority),
+        )? {
             claimed.push(running);
         }
     }
@@ -1308,11 +1344,12 @@ pub(crate) fn load_canceled_root_failed_action_id(
     Ok(Some(canceled.root_failed_action_id))
 }
 
-pub(crate) fn try_claim_pending_item(
+fn try_claim_pending_item(
     store: &ArtifactStore,
     pending_path: &Path,
     worker_id: &str,
     lease_seconds: i64,
+    required_priority: Option<i32>,
 ) -> Result<Option<QueueRunningWithPath>> {
     let action_id = match queue_action_id_from_path(pending_path) {
         Some(v) => v,
@@ -1347,6 +1384,17 @@ pub(crate) fn try_claim_pending_item(
         remove_file_if_exists(&running_path)?;
         return Ok(None);
     }
+    // The candidate may have been promoted since the compatible scan. Check the
+    // reserved inode while the pending link still exists so it can be claimed later.
+    let parsed = fs::read(&running_path)
+        .with_context(|| format!("reading claimed queue item: {}", running_path.display()))
+        .and_then(|bytes| parse_queue_work_item(&bytes, &running_path));
+    if let (Some(required), Ok((_, _, priority, _))) = (required_priority, &parsed)
+        && *priority != required
+    {
+        remove_file_if_exists(&running_path)?;
+        return Ok(None);
+    }
     match fs::remove_file(pending_path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1358,10 +1406,7 @@ pub(crate) fn try_claim_pending_item(
         }
     }
 
-    let bytes = fs::read(&running_path)
-        .with_context(|| format!("reading claimed queue item: {}", running_path.display()))?;
-    let (action_id_from_file, enqueued_utc, priority, action) =
-        parse_queue_work_item(&bytes, &running_path)?;
+    let (action_id_from_file, enqueued_utc, priority, action) = parsed?;
     if action_id_from_file != action_id {
         bail!(
             "claimed queue action id mismatch in {}: path={} file={}",
@@ -2343,14 +2388,15 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn make_test_store() -> (ArtifactStore, PathBuf) {
+        static NEXT_STORE: AtomicUsize = AtomicUsize::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock before epoch")
             .as_nanos();
+        let sequence = NEXT_STORE.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "xlsynth-bvc-queue-test-{}-{}",
+            "xlsynth-bvc-queue-test-{}-{nanos}-{sequence}",
             std::process::id(),
-            nanos
         ));
         let store = ArtifactStore::new(root.clone());
         store.ensure_layout().expect("ensure store layout");
@@ -2899,6 +2945,182 @@ mod tests {
     }
 
     #[test]
+    fn cached_scan_observes_dependency_alias_added_by_another_writer() {
+        let (store, root) = make_test_store();
+        let old_dependency = write_completed_provenance(&store, &"1".repeat(64));
+        let new_dependency = write_completed_provenance(&store, &"2".repeat(64));
+        let action = ActionSpec::DriverAigToStats {
+            aig_action_id: old_dependency.clone(),
+            version: "v0.31.0".into(),
+            runtime: sample_runtime(),
+        };
+        let id = enqueue_action(&store, action.clone()).unwrap();
+        let path = store.pending_queue_path(&id);
+        let record = store
+            .pending_path_cache
+            .records
+            .decode(&path, fs::read(&path).unwrap())
+            .unwrap();
+        assert!(matches!(
+            canonical_action_for_scan(&store, &path, &record).unwrap(),
+            Some(Cow::Borrowed(_))
+        ));
+        write_queue_identity_alias(&store, &old_dependency, &new_dependency).unwrap();
+        assert!(
+            canonical_action_for_scan(&store, &path, &record)
+                .unwrap()
+                .is_none()
+        );
+        let mut expected = action;
+        replace_action_dependency_ids(
+            &mut expected,
+            &BTreeMap::from([(old_dependency, new_dependency)]),
+        );
+        let new_id = crate::executor::compute_action_id(&expected).unwrap();
+        assert!(!path.exists());
+        assert!(store.pending_queue_path(&new_id).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lease_claim_rereads_record_after_cached_scan() {
+        let (store, root) = make_test_store();
+        let id = enqueue_action(&store, terminal_test_action()).unwrap();
+        let path = store.pending_queue_path(&id);
+        let record = store
+            .pending_path_cache
+            .records
+            .decode(&path, fs::read(&path).unwrap())
+            .unwrap();
+        let promoted_priority = record.priority + 1;
+        enqueue_action_with_priority(&store, terminal_test_action(), promoted_priority).unwrap();
+        assert!(
+            try_claim_pending_item(&store, &path, "cached-scan", 60, Some(record.priority))
+                .unwrap()
+                .is_none()
+        );
+        assert!(path.exists());
+        assert!(!store.running_queue_path(&id).exists());
+        let claimed = claim_next_pending_item(&store, "cached-scan", 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.running.priority, promoted_priority);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "read-only record decoding benchmark; set BVC_QUEUE_BENCH_DIR to a frozen queue snapshot"]
+    fn benchmark_pending_record_decoding() {
+        let root =
+            PathBuf::from(std::env::var_os("BVC_QUEUE_BENCH_DIR").expect("frozen queue records"));
+        let paths = list_queue_files(&root).unwrap();
+        assert!(!paths.is_empty());
+        let rounds = 8;
+        let cache = PendingRecordCache::default();
+        let start = Instant::now();
+        for path in &paths {
+            cache.decode(path, fs::read(path).unwrap()).unwrap();
+        }
+        let cold = start.elapsed();
+        // Both sides see warm filesystem pages; alternate order to reduce drift.
+        for (phase, cached) in [false, true, true, false].into_iter().enumerate() {
+            let start = Instant::now();
+            for _ in 0..rounds {
+                for path in &paths {
+                    let bytes = fs::read(path).unwrap();
+                    if cached {
+                        std::hint::black_box(cache.decode(path, bytes).unwrap());
+                    } else {
+                        let (_, _, _, action) = parse_queue_work_item(&bytes, path).unwrap();
+                        std::hint::black_box(crate::executor::compute_action_id(&action).unwrap());
+                    }
+                }
+            }
+            eprintln!(
+                "record decoding: phase={phase} cached={cached} records={} rounds={rounds} cold_ms={} elapsed_ms={}",
+                paths.len(),
+                cold.as_millis(),
+                start.elapsed().as_millis()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "read-only record-cache scaling benchmark; set BVC_QUEUE_BENCH_DIR to a frozen queue snapshot"]
+    fn benchmark_pending_record_cache_contention() {
+        let root =
+            PathBuf::from(std::env::var_os("BVC_QUEUE_BENCH_DIR").expect("frozen queue records"));
+        let mut paths = list_queue_files(&root).unwrap();
+        paths.sort_unstable();
+        assert!(!paths.is_empty());
+        let cache = PendingRecordCache::default();
+        for path in &paths {
+            cache.decode(path, fs::read(path).unwrap()).unwrap();
+        }
+        let pending = PendingPaths {
+            snapshot: Arc::new(paths.clone()),
+            additions: Vec::new(),
+        };
+        for readers in [1, 8, 32] {
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(6);
+            let (counts, refresh_us) = thread::scope(|scope| {
+                let refresh = scope.spawn(|| {
+                    let mut timings = Vec::new();
+                    while Instant::now() < deadline {
+                        let start = Instant::now();
+                        cache.retain(&pending);
+                        timings.push(start.elapsed().as_micros());
+                        // Stress reconciliation more frequently than normal snapshots.
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                    timings
+                });
+                let workers: Vec<_> = (0..readers)
+                    .map(|reader| {
+                        let paths = &paths;
+                        let cache = &cache;
+                        scope.spawn(move || {
+                            let mut count = 0usize;
+                            let mut sampled_us = Vec::new();
+                            while Instant::now() < deadline {
+                                let path = &paths[(count + reader) % paths.len()];
+                                let start = Instant::now();
+                                std::hint::black_box(
+                                    cache.decode(path, fs::read(path).unwrap()).unwrap(),
+                                );
+                                if count % 64 == 0 {
+                                    sampled_us.push(start.elapsed().as_micros());
+                                }
+                                count += 1;
+                            }
+                            (count, sampled_us)
+                        })
+                    })
+                    .collect();
+                (
+                    workers
+                        .into_iter()
+                        .map(|worker| worker.join().unwrap())
+                        .collect::<Vec<_>>(),
+                    refresh.join().unwrap(),
+                )
+            });
+            let count: usize = counts.iter().map(|row| row.0).sum();
+            let mut latencies: Vec<_> = counts.into_iter().flat_map(|row| row.1).collect();
+            latencies.sort_unstable();
+            eprintln!(
+                "record cache contention: readers={readers} records={} reads={count} elapsed_ms={} sampled_p95_us={} sampled_max_us={} reconcile_max_us={}",
+                paths.len(),
+                started.elapsed().as_millis(),
+                latencies[latencies.len() * 95 / 100],
+                latencies.last().unwrap(),
+                refresh_us.iter().max().unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn claim_next_pending_item_moves_record_to_running() {
         let (store, root) = make_test_store();
         let action = ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
@@ -2969,8 +3191,14 @@ mod tests {
             let claim_pending = pending_path.clone();
             let claim = thread::spawn(move || {
                 claim_barrier.wait();
-                try_claim_pending_item(claim_store.as_ref(), &claim_pending, "race-worker", 60)
-                    .expect("claim transition")
+                try_claim_pending_item(
+                    claim_store.as_ref(),
+                    &claim_pending,
+                    "race-worker",
+                    60,
+                    None,
+                )
+                .expect("claim transition")
             });
 
             let cancel_store = store.clone();
