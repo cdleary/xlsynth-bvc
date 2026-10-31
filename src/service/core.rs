@@ -201,7 +201,7 @@ where
     F: Fn(&Provenance) -> bool,
 {
     let mut selected: Option<Provenance> = None;
-    store.for_each_provenance(|provenance| {
+    store.for_each_semantic_candidate(input_ir_structural_hash, |provenance| {
         if !matcher(&provenance) {
             return Ok(std::ops::ControlFlow::Continue(()));
         }
