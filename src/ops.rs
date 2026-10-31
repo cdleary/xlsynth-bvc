@@ -11,8 +11,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
-use crate::app;
+mod maintenance_gate;
+
+use maintenance_gate::MaintenanceGate;
+
 use crate::store::ArtifactStore;
+use crate::{app, queue};
 
 const FINITE_WORKER_MAX_CONSECUTIVE_ERRORS: usize = 3;
 
@@ -83,6 +87,8 @@ pub(crate) fn run_workers(
     let drained_actions = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::with_capacity(workers);
+    let reclaim_gate = Arc::new(MaintenanceGate::default());
+    let idle_gate = Arc::new(MaintenanceGate::default());
     let max_consecutive_errors = exit_when_idle.then_some(FINITE_WORKER_MAX_CONSECUTIVE_ERRORS);
 
     for worker_index in 0..workers {
@@ -91,6 +97,8 @@ pub(crate) fn run_workers(
         let drained_actions = drained_actions.clone();
         let stop = stop.clone();
         let shutdown = shutdown.clone();
+        let reclaim_gate = reclaim_gate.clone();
+        let idle_gate = idle_gate.clone();
         let worker_id = format!("{}:runner-{}", worker_id_prefix, worker_index);
         handles.push(thread::spawn(move || {
             worker_loop(
@@ -102,17 +110,34 @@ pub(crate) fn run_workers(
                 exit_when_idle,
                 max_consecutive_errors,
                 || {
+                    if reclaim_expired {
+                        if let Some(result) =
+                            reclaim_gate.run_if_due(Instant::now(), poll_interval, || {
+                                queue::reclaim_expired_running_leases(&store)
+                            })
+                        {
+                            if result.is_err() {
+                                // Retain the ordinary per-worker error/retry path.
+                                reclaim_gate.disable();
+                            }
+                            result?;
+                        }
+                    }
                     app::drain_queue(
                         &store,
                         &repo_root,
                         Some(batch_size),
                         &worker_id,
                         lease_seconds,
-                        reclaim_expired,
+                        false,
                         Some(&shutdown),
                     )
                 },
-                || queue_is_idle(&store),
+                || {
+                    idle_gate
+                        .run_if_due(Instant::now(), poll_interval, || queue_is_idle(&store))
+                        .unwrap_or(false)
+                },
             )
         }));
     }
@@ -270,6 +295,173 @@ mod tests {
         assert_eq!(summary.drained_actions, 0);
 
         fs::remove_dir_all(root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn run_workers_recovers_preexisting_leases_and_drains() {
+        use crate::model::{
+            ActionSpec, ArtifactRef, ArtifactType, DriverRuntimeSpec, OutputFile, Provenance,
+        };
+        use sha2::{Digest, Sha256};
+
+        for dead_local_owner in [false, true] {
+            if dead_local_owner && !cfg!(target_os = "linux") {
+                continue;
+            }
+            let (store, root) = make_test_store("recover-lease");
+            let fixture = |action: ActionSpec, artifact_type: ArtifactType, bytes: &[u8]| {
+                let id = crate::executor::compute_action_id(&action).unwrap();
+                let relpath = "payload/input";
+                let provenance = Provenance {
+                    schema_version: crate::ACTION_SCHEMA_VERSION,
+                    action_id: id.clone(),
+                    created_utc: chrono::Utc::now(),
+                    action,
+                    dependencies: Vec::new(),
+                    output_artifact: ArtifactRef {
+                        action_id: id.clone(),
+                        artifact_type,
+                        relpath: relpath.into(),
+                    },
+                    output_files: vec![OutputFile {
+                        path: relpath.into(),
+                        bytes: bytes.len() as u64,
+                        sha256: format!("{:x}", Sha256::digest(bytes)),
+                    }],
+                    commands: Vec::new(),
+                    details: serde_json::json!({}),
+                    suggested_next_actions: Vec::new(),
+                };
+                let staged = store.staging_dir().join(&id);
+                fs::create_dir_all(staged.join("payload")).unwrap();
+                fs::write(staged.join(relpath), bytes).unwrap();
+                fs::write(
+                    staged.join("provenance.pb"),
+                    crate::proto::encode_provenance(&provenance).unwrap(),
+                )
+                .unwrap();
+                store.promote_staging_action_dir(&id, &staged).unwrap();
+                id
+            };
+            let ir = b"package test\n\nfn main(x: bits[1]) -> bits[1] { ret identity.2: bits[1] = identity(x, id=2) }\n";
+            let ir_id = fixture(
+                ActionSpec::ImportIrPackageFile {
+                    source_sha256: format!("{:x}", Sha256::digest(ir)),
+                    top_fn_name: Some("main".into()),
+                },
+                ArtifactType::IrPackageFile,
+                ir,
+            );
+            let runtime = DriverRuntimeSpec {
+                driver_version: "0.31.0".into(),
+                source_revision: None,
+                release_platform: "ubuntu2004".into(),
+                docker_image: "xlsynth-bvc-driver:0.31.0".into(),
+                dockerfile: "docker/xlsynth-driver.Dockerfile".into(),
+                dockerfile_sha256: "d".repeat(64),
+                docker_image_id: "e".repeat(64),
+                release_cache_input_sha256: "f".repeat(64),
+            };
+            let lhs = fixture(
+                ActionSpec::DriverAigToStats {
+                    aig_action_id: "a".repeat(64),
+                    version: "v0.37.0".into(),
+                    runtime: runtime.clone(),
+                },
+                ArtifactType::AigStatsFile,
+                br#"{"and_nodes":12,"depth":3}"#,
+            );
+            let rhs = fixture(
+                ActionSpec::DriverAigToStats {
+                    aig_action_id: "b".repeat(64),
+                    version: "v0.37.0".into(),
+                    runtime,
+                },
+                ArtifactType::AigStatsFile,
+                br#"{"and_nodes":8,"depth":4}"#,
+            );
+            let id = queue::enqueue_action(
+                &store,
+                ActionSpec::AigStatDiff {
+                    opt_ir_action_id: ir_id,
+                    g8r_aig_stats_action_id: lhs,
+                    yosys_abc_aig_stats_action_id: rhs,
+                },
+            )
+            .unwrap();
+            let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".into());
+            let owner = if dead_local_owner {
+                format!("{host}:{}:0:retired-worker", u32::MAX)
+            } else {
+                "retired-remote-worker".into()
+            };
+            let lease = queue::claim_next_pending_item(
+                &store,
+                &owner,
+                if dead_local_owner { 900 } else { -1 },
+            )
+            .unwrap()
+            .unwrap();
+            assert!(store.running_queue_path(&id).is_file());
+            assert!(!store.pending_queue_path(&id).exists());
+            drop(lease);
+            let summary = run_workers(
+                store.clone(),
+                root.clone(),
+                4,
+                "recovery-test",
+                60,
+                Duration::from_millis(1),
+                4,
+                true,
+                true,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            assert_eq!(summary.exit_reason, "idle");
+            assert_eq!(summary.drained_actions, 1);
+            assert!(queue_is_idle(&store));
+            let result = store.load_provenance(&id).unwrap();
+            let output: serde_json::Value = serde_json::from_slice(
+                &fs::read(store.resolve_artifact_ref_path(&result.output_artifact)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(output["g8r_stats"]["and_nodes"], 12);
+            assert_eq!(output["yosys_abc_stats"]["and_nodes"], 8);
+            assert!(!store.running_queue_path(&id).exists());
+            drop(store);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn maintenance_failure_preserves_finite_worker_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let (store, root) = make_test_store("maintenance-error");
+        let running = store.queue_running_dir();
+        fs::set_permissions(&running, fs::Permissions::from_mode(0)).unwrap();
+        if fs::read_dir(&running).is_ok() {
+            // Privileged test users can bypass directory permissions.
+            fs::set_permissions(&running, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let result = run_workers(
+            store,
+            root.clone(),
+            2,
+            "maintenance-error",
+            60,
+            Duration::from_millis(1),
+            4,
+            true,
+            true,
+            Arc::new(AtomicBool::new(false)),
+        );
+        fs::set_permissions(&running, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(format!("{:#}", result.unwrap_err()).contains("3 consecutive errors"));
     }
 
     #[test]
