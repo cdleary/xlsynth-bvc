@@ -3003,6 +3003,19 @@ fn select_persistent_runner(
     Ok(None)
 }
 
+fn configured_action_timeout_seconds() -> Result<u64> {
+    const NAME: &str = "XLSYNTH_BVC_ACTION_TIMEOUT_SECONDS";
+    let Some(value) = std::env::var_os(NAME) else {
+        return Ok(DEFAULT_ACTION_TIMEOUT_SECONDS);
+    };
+    let seconds = value
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=86_400).contains(seconds))
+        .with_context(|| format!("{NAME} must be an integer from 1 to 86400"))?;
+    Ok(seconds)
+}
+
 pub(crate) fn execute_persistent_runner_script(
     image: &str,
     mounts: &[DockerMount],
@@ -3016,7 +3029,7 @@ pub(crate) fn execute_persistent_runner_script(
         env,
         script,
         run_hint,
-        DEFAULT_ACTION_TIMEOUT_SECONDS,
+        configured_action_timeout_seconds()?,
     )
 }
 
@@ -3033,7 +3046,7 @@ pub(crate) fn execute_yosys_persistent_runner_script(
         env,
         script,
         run_hint,
-        DEFAULT_ACTION_TIMEOUT_SECONDS,
+        configured_action_timeout_seconds()?,
         PersistentRunnerFamily::Yosys,
     )
 }
