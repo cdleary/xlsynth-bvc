@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import re
+import select
 import signal
 import shutil
 import socket
@@ -17,7 +18,7 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TextIO
+from typing import BinaryIO, TextIO
 
 
 SCHEMA_VERSION = 2
@@ -121,6 +122,46 @@ def list_inbox_requests(inbox_dir: Path) -> list[Path]:
             if path.is_file() and path.suffix == ".json"
         ]
     )
+
+
+def watch_inbox(directory: Path) -> BinaryIO | None:
+    """Watch atomic inbox publication when Linux filesystem events are available."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None)
+        initialize, add_watch = libc.inotify_init1, libc.inotify_add_watch
+    except (ImportError, AttributeError, OSError):
+        return None
+    fd = initialize(os.O_CLOEXEC | os.O_NONBLOCK)
+    if fd < 0:
+        return None
+    in_moved_to = 0x80
+    if add_watch(fd, os.fsencode(directory), in_moved_to) < 0:
+        os.close(fd)
+        return None
+    return os.fdopen(fd, "rb", buffering=0)
+
+
+def wait_for_inbox(watch: BinaryIO | None, interval: float) -> bool:
+    """Wake on a rename or the normal retirement and request polling interval."""
+    if watch is None or watch.closed:
+        time.sleep(interval)
+        return False
+    try:
+        poller = select.poll()
+        poller.register(watch, select.POLLIN)
+        if not poller.poll(round(interval * 1000)):
+            return False
+        if watch.read(4096):
+            return True
+    except OSError:
+        pass
+    # Poll may already have waited. Rescan now, then sleep on subsequent waits.
+    watch.close()
+    return False
 
 
 def claim_request(inbox_dir: Path, processing_dir: Path) -> Path | None:
@@ -459,6 +500,7 @@ def main() -> int:
 
     idle_since_monotonic = time.monotonic()
     retirement_lock = None
+    inbox_events = watch_inbox(inbox_dir)
     try:
         while True:
             sync_cache_symlink(store_root)
@@ -469,12 +511,14 @@ def main() -> int:
                 )
                 if retirement_lock is not None:
                     break
-                time.sleep(0.2)
+                wait_for_inbox(inbox_events, 0.2)
                 continue
             if not process_request(request_path, results_dir, archive_dir, heartbeat_state):
                 break
             idle_since_monotonic = time.monotonic()
     finally:
+        if inbox_events is not None:
+            inbox_events.close()
         stop_event.set()
         heartbeat_thread.join()
         if retirement_lock is not None:

@@ -15,6 +15,62 @@ from unittest import mock
 import persistent_runner_worker as worker
 
 
+class InboxWakeupTest(unittest.TestCase):
+    def test_polling_fallback_checks_the_authoritative_inbox(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inbox, processing = root / "inbox", root / "processing"
+            self.assertIsNone(worker.watch_inbox(inbox))
+            inbox.mkdir()
+            processing.mkdir()
+            self.assertIsNone(worker.claim_request(inbox, processing))
+
+            def publish(_interval):
+                worker.write_json_atomic(inbox / "ready.json", {})
+
+            with mock.patch.object(worker.time, "sleep", side_effect=publish) as sleep:
+                self.assertFalse(worker.wait_for_inbox(None, 0.2))
+                sleep.assert_called_once_with(0.2)
+            self.assertEqual(worker.claim_request(inbox, processing), processing / "ready.json")
+
+    def test_watch_read_failure_rescans_before_polling_fallback(self):
+        reader, writer = os.pipe()
+        with (
+            os.fdopen(reader, "rb", buffering=0) as watch,
+            os.fdopen(writer, "wb", buffering=0) as pipe,
+            mock.patch.object(watch, "read", side_effect=OSError("watch failed")) as read,
+            mock.patch.object(worker.time, "sleep") as sleep,
+        ):
+            pipe.write(b"hint")
+            self.assertFalse(worker.wait_for_inbox(watch, 0.2))
+            read.assert_called_once()
+            self.assertTrue(watch.closed)
+            sleep.assert_not_called()
+            self.assertFalse(worker.wait_for_inbox(watch, 0.2))
+            sleep.assert_called_once_with(0.2)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux rename notifications")
+    def test_queued_rename_survives_until_the_worker_waits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inbox, processing = root / "inbox", root / "processing"
+            inbox.mkdir()
+            processing.mkdir()
+            watch = worker.watch_inbox(inbox)
+            self.assertIsNotNone(watch)
+            self.addCleanup(watch.close)
+            (root / "temp").write_text("partial")
+            (root / "temp").replace(inbox / "unrelated")
+            self.assertTrue(worker.wait_for_inbox(watch, 0))
+            self.assertIsNone(worker.claim_request(inbox, processing))
+            (root / "temp").write_text("complete")
+            (root / "temp").replace(inbox / "ready.json")
+            self.assertTrue(worker.wait_for_inbox(watch, 0))
+            self.assertFalse(worker.wait_for_inbox(watch, 0))
+            request = worker.claim_request(inbox, processing)
+            self.assertEqual(request.read_text(), "complete")
+
+
 class IdleRetirementTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
