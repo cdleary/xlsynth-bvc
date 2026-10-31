@@ -1373,6 +1373,7 @@ exit 1
             "g8r-abc-vs-yabc-aig-diff",
             "g8r-abc-vs-yabc-system-verilog-aig-diff",
             "g8r-abc-vs-yabc-slang-aig-diff",
+            "g8r-abc-vs-yabc-slang-bounded-aig-diff",
         ] {
             let output_dir = root.join(preset);
             let (comparison, status, row) = comparison_fixture(preset, &cone_name, &digest);

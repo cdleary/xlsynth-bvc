@@ -340,16 +340,13 @@ cargo run --bin xlsynth_bvc -- \
 
 Current CLI notes:
 
-- Implemented presets:
-  `g8r-vs-yabc-aig-diff`, `g8r-vs-yabc-no-fraig-aig-diff`, and `g8r-abc-stats`.
+- For a matched SystemVerilog comparison with a SAT conflict budget, select
+  `--recipe-preset g8r-abc-vs-yabc-slang-bounded-aig-diff`. See the
+  [corpus recipe list](docs/ir-dir-corpus-runner.md#implemented-preset).
 - `--top-fn-policy` supports `infer-single-package`, `explicit`, and `from-filename`.
 - `infer-single-package` expects exactly one unambiguous top function in each IR file. For
   multi-function packages, use `explicit` or `from-filename`.
-- Each preset has a fixed canonical Yosys script. `--yosys-script` may be omitted, but if you pass
-  it explicitly it must match the selected preset:
-  `flows/yosys_to_aig.ys` for `g8r-vs-yabc-aig-diff`,
-  `flows/abc_ablate_no_fraig.ys` for `g8r-vs-yabc-no-fraig-aig-diff`, and
-  `flows/yosys_to_aig.ys` for `g8r-abc-stats`.
+- Each preset selects its canonical Yosys script. An explicit `--yosys-script` must match it.
 - `sample_id` is stable for a fixed corpus relpath and currently uses
   `<sanitized_basename>-<sha256(normalized_source_relpath)[0:12]>`; content identity remains
   separately visible as `source_sha256`.
