@@ -1463,7 +1463,9 @@ pub(crate) fn drain_queue(
     if lease_seconds <= 0 {
         bail!("--lease-seconds must be > 0, got {}", lease_seconds);
     }
+    let preparation_started = Instant::now();
     maybe_prepare_queue_runtime_environment(store, repo_root)?;
+    log::debug!(target: "bvc_timing", "queue_prepare_us={}", preparation_started.elapsed().as_micros());
     if reclaim_expired {
         reclaim_expired_running_leases(store)?;
     }
@@ -1483,7 +1485,9 @@ pub(crate) fn drain_queue(
             break;
         }
 
+        let claim_started = Instant::now();
         let claimed = claim_next_pending_item(store, worker_id, lease_seconds)?;
+        log::debug!(target: "bvc_timing", "claim_us={} claimed={}", claim_started.elapsed().as_micros(), claimed.is_some());
         let Some(running) = claimed else {
             break;
         };

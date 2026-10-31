@@ -639,7 +639,8 @@ fn driver_release_cache_is_ready(
     if !cache_dir.join(DRIVER_RELEASE_CACHE_READY_FILE).is_file() {
         return false;
     }
-    match validate_driver_release_cache(cache_dir, version, platform, expected_input_sha256) {
+    match validate_driver_release_cache_cached(cache_dir, version, platform, expected_input_sha256)
+    {
         Ok(()) => true,
         Err(err) => {
             eprintln!(
@@ -650,6 +651,140 @@ fn driver_release_cache_is_ready(
             false
         }
     }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheFileIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    mode: u32,
+    bytes: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+fn driver_release_cache_snapshot(cache_dir: &Path) -> Result<Vec<CacheFileIdentity>> {
+    use std::os::unix::fs::MetadataExt;
+    WalkDir::new(cache_dir)
+        .sort_by_file_name()
+        .into_iter()
+        .map(|entry| {
+            let entry = entry.context("walking validated release cache")?;
+            if !entry.file_type().is_file() && !entry.file_type().is_dir() {
+                bail!(
+                    "release cache contains non-regular entry: {}",
+                    entry.path().display()
+                );
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            Ok(CacheFileIdentity {
+                path: entry.path().strip_prefix(cache_dir)?.to_path_buf(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                mode: metadata.mode(),
+                bytes: metadata.len(),
+                modified: (metadata.mtime(), metadata.mtime_nsec()),
+                changed: (metadata.ctime(), metadata.ctime_nsec()),
+            })
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn release_cache_timestamps_settled(snapshot: &[CacheFileIdentity]) -> bool {
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    // Filesystems may quantize successive ctime updates to the same tick. Do
+    // not memoize a generation until later writes must receive a newer tick.
+    snapshot.iter().all(|file| {
+        [file.modified, file.changed]
+            .into_iter()
+            .all(|(seconds, nanos)| {
+                seconds >= 0
+                    && (0..1_000_000_000).contains(&nanos)
+                    && now
+                        .checked_sub(Duration::new(seconds as u64, nanos as u32))
+                        .is_some_and(|age| age >= Duration::from_secs(1))
+            })
+    })
+}
+
+#[cfg(unix)]
+type ReleaseValidationKey = (PathBuf, String, String, String);
+#[cfg(unix)]
+type ReleaseValidationEntry = Arc<Mutex<Option<Vec<CacheFileIdentity>>>>;
+
+#[cfg(unix)]
+#[derive(Default)]
+struct DriverReleaseValidationCache {
+    entries: Mutex<BTreeMap<ReleaseValidationKey, ReleaseValidationEntry>>,
+}
+
+#[cfg(unix)]
+impl DriverReleaseValidationCache {
+    fn validate(
+        &self,
+        cache_dir: &Path,
+        version: &str,
+        platform: &str,
+        expected_input_sha256: &str,
+    ) -> Result<()> {
+        let key = (
+            cache_dir.to_path_buf(),
+            version.to_string(),
+            platform.to_string(),
+            expected_input_sha256.to_string(),
+        );
+        let entry = self
+            .entries
+            .lock()
+            .map_err(|_| anyhow!("release validation map poisoned"))?
+            .entry(key)
+            .or_default()
+            .clone();
+        let mut validated = entry
+            .lock()
+            .map_err(|_| anyhow!("release validation lock poisoned"))?;
+        // ctime and inode identity detect edits even when size and mtime are preserved.
+        let before = driver_release_cache_snapshot(cache_dir)?;
+        if validated.as_ref() == Some(&before) && release_cache_timestamps_settled(&before) {
+            return Ok(());
+        }
+        *validated = None;
+        validate_driver_release_cache(cache_dir, version, platform, expected_input_sha256)?;
+        let after = driver_release_cache_snapshot(cache_dir)?;
+        if before != after {
+            bail!(
+                "release cache changed during validation: {}",
+                cache_dir.display()
+            );
+        }
+        if release_cache_timestamps_settled(&after) {
+            *validated = Some(after);
+        }
+        Ok(())
+    }
+}
+
+fn validate_driver_release_cache_cached(
+    cache_dir: &Path,
+    version: &str,
+    platform: &str,
+    expected_input_sha256: &str,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        static CACHE: OnceLock<DriverReleaseValidationCache> = OnceLock::new();
+        CACHE
+            .get_or_init(DriverReleaseValidationCache::default)
+            .validate(cache_dir, version, platform, expected_input_sha256)
+    }
+    #[cfg(not(unix))]
+    validate_driver_release_cache(cache_dir, version, platform, expected_input_sha256)
 }
 
 fn write_cache_manifest_atomic(
@@ -1363,18 +1498,36 @@ fn yosys_image_build_args(
 
 const DOCKER_INSPECTION_INTERVAL: Duration = Duration::from_secs(1);
 
-#[derive(Default)]
-struct ImageValidationCache {
-    images: Mutex<BTreeMap<String, Arc<Mutex<Option<Instant>>>>>,
+type RuntimeIdentityResult<T> = std::result::Result<T, String>;
+
+struct RuntimeIdentityEntry<T> {
+    generation: std::sync::atomic::AtomicU64,
+    checked: Mutex<Option<(Instant, RuntimeIdentityResult<T>)>>,
 }
 
-impl ImageValidationCache {
+impl<T> Default for RuntimeIdentityEntry<T> {
+    fn default() -> Self {
+        Self {
+            generation: std::sync::atomic::AtomicU64::new(0),
+            checked: Mutex::new(None),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RuntimeIdentityCache<T> {
+    images: Mutex<BTreeMap<String, Arc<RuntimeIdentityEntry<T>>>>,
+}
+
+type ImageValidationCache = RuntimeIdentityCache<()>;
+
+impl<T: Clone> RuntimeIdentityCache<T> {
     fn validate(
         &self,
         key: &str,
         now: impl Fn() -> Instant,
-        inspect: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
+        inspect: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         let entry = self
             .images
             .lock()
@@ -1383,19 +1536,46 @@ impl ImageValidationCache {
             .or_default()
             .clone();
         // Only callers checking this image wait for Docker; the map lock is free.
+        let joined_generation = entry.generation.load(Ordering::Acquire);
         let mut checked = entry
+            .checked
             .lock()
             .map_err(|_| anyhow!("image validation lock poisoned"))?;
-        if checked
-            .is_some_and(|at| now().saturating_duration_since(at) < DOCKER_INSPECTION_INTERVAL)
-        {
-            return Ok(());
+        if let Some((at, result)) = checked.as_ref() {
+            match result {
+                Ok(value) if now().saturating_duration_since(*at) < DOCKER_INSPECTION_INTERVAL => {
+                    return Ok(value.clone());
+                }
+                // Callers waiting for the same failed attempt share its error.
+                // A fresh call retries immediately, including after image repair.
+                Err(message) if joined_generation != entry.generation.load(Ordering::Acquire) => {
+                    bail!("{message}");
+                }
+                _ => {}
+            }
         }
         *checked = None;
-        inspect()?;
-        *checked = Some(now());
-        Ok(())
+        let result = inspect();
+        *checked = Some((
+            now(),
+            result
+                .as_ref()
+                .cloned()
+                .map_err(|error| format!("{error:#}")),
+        ));
+        entry.generation.fetch_add(1, Ordering::Release);
+        result
     }
+}
+
+fn runtime_engine_identity() -> String {
+    format!(
+        "{:?}/{:?}/{:?}/{:?}",
+        std::env::var_os("DOCKER_HOST"),
+        std::env::var_os("DOCKER_CONTEXT"),
+        std::env::var_os("CONTAINER_HOST"),
+        std::env::var_os("PATH")
+    )
 }
 
 fn validate_pinned_image(
@@ -1406,13 +1586,7 @@ fn validate_pinned_image(
     static CACHE: OnceLock<ImageValidationCache> = OnceLock::new();
     // Labels are immutable for a content ID. Recheck presence at a bounded
     // interval, and keep different engines and expected identities separate.
-    let key = format!(
-        "{:?}/{:?}/{:?}/{:?}/{image}/{fingerprint}",
-        std::env::var_os("DOCKER_HOST"),
-        std::env::var_os("DOCKER_CONTEXT"),
-        std::env::var_os("CONTAINER_HOST"),
-        std::env::var_os("PATH"),
-    );
+    let key = format!("{}/{image}/{fingerprint}", runtime_engine_identity());
     CACHE
         .get_or_init(ImageValidationCache::default)
         .validate(&key, Instant::now, inspect)
@@ -1559,18 +1733,37 @@ pub(crate) fn bind_driver_runtime_image(
     }
     #[cfg(not(test))]
     {
-        ensure_driver_image(repo_root, &runtime)?;
-        let fingerprint = driver_runtime_fingerprint(&runtime)?;
-        let build_ref =
-            fingerprint_qualified_image_ref(&runtime.docker_image, "driver", &fingerprint)?;
-        let image_id = inspect_image_id(&build_ref)?
-            .with_context(|| format!("driver image `{build_ref}` disappeared after preparation"))?;
-        let content_ref = docker_image_content_ref(&image_id)?;
-        require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
-        require_driver_source_labels(&content_ref, &runtime)?;
-        runtime.docker_image_id = image_id;
+        static CACHE: OnceLock<RuntimeIdentityCache<String>> = OnceLock::new();
+        let key = format!(
+            "{}/{:?}/driver/{}/{}",
+            runtime_engine_identity(),
+            repo_root,
+            runtime.docker_image,
+            driver_runtime_fingerprint(&runtime)?
+        );
+        runtime.docker_image_id = CACHE.get_or_init(RuntimeIdentityCache::default).validate(
+            &key,
+            Instant::now,
+            || bind_driver_runtime_image_uncached(repo_root, &runtime),
+        )?;
         Ok(runtime)
     }
+}
+
+#[cfg(not(test))]
+fn bind_driver_runtime_image_uncached(
+    repo_root: &Path,
+    runtime: &DriverRuntimeSpec,
+) -> Result<String> {
+    ensure_driver_image(repo_root, runtime)?;
+    let fingerprint = driver_runtime_fingerprint(runtime)?;
+    let build_ref = fingerprint_qualified_image_ref(&runtime.docker_image, "driver", &fingerprint)?;
+    let image_id = inspect_image_id(&build_ref)?
+        .with_context(|| format!("driver image `{build_ref}` disappeared after preparation"))?;
+    let content_ref = docker_image_content_ref(&image_id)?;
+    require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
+    require_driver_source_labels(&content_ref, runtime)?;
+    Ok(image_id)
 }
 
 pub(crate) fn bind_yosys_runtime_image(
@@ -1590,20 +1783,39 @@ pub(crate) fn bind_yosys_runtime_image(
     }
     #[cfg(not(test))]
     {
-        ensure_yosys_image(repo_root, &runtime)?;
-        let fingerprint = yosys_runtime_fingerprint(&runtime)?;
-        let build_ref =
-            fingerprint_qualified_image_ref(&runtime.docker_image, "yosys", &fingerprint)?;
-        let image_id = inspect_image_id(&build_ref)?
-            .with_context(|| format!("Yosys image `{build_ref}` disappeared after preparation"))?;
-        let content_ref = docker_image_content_ref(&image_id)?;
-        require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
-        if !image_has_python3(&content_ref)? {
-            bail!("prepared Yosys image `{content_ref}` lacks python3");
-        }
-        runtime.docker_image_id = image_id;
+        static CACHE: OnceLock<RuntimeIdentityCache<String>> = OnceLock::new();
+        let key = format!(
+            "{}/{:?}/yosys/{}/{}",
+            runtime_engine_identity(),
+            repo_root,
+            runtime.docker_image,
+            yosys_runtime_fingerprint(&runtime)?
+        );
+        runtime.docker_image_id = CACHE.get_or_init(RuntimeIdentityCache::default).validate(
+            &key,
+            Instant::now,
+            || bind_yosys_runtime_image_uncached(repo_root, &runtime),
+        )?;
         Ok(runtime)
     }
+}
+
+#[cfg(not(test))]
+fn bind_yosys_runtime_image_uncached(
+    repo_root: &Path,
+    runtime: &YosysRuntimeSpec,
+) -> Result<String> {
+    ensure_yosys_image(repo_root, runtime)?;
+    let fingerprint = yosys_runtime_fingerprint(runtime)?;
+    let build_ref = fingerprint_qualified_image_ref(&runtime.docker_image, "yosys", &fingerprint)?;
+    let image_id = inspect_image_id(&build_ref)?
+        .with_context(|| format!("Yosys image `{build_ref}` disappeared after preparation"))?;
+    let content_ref = docker_image_content_ref(&image_id)?;
+    require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
+    if !image_has_python3(&content_ref)? {
+        bail!("prepared Yosys image `{content_ref}` lacks python3");
+    }
+    Ok(image_id)
 }
 
 /// Process-local capability cache, not evidence about image existence or runtime identity.
@@ -1795,6 +2007,8 @@ struct PersistentRunnerResult {
     stdout_tail: String,
     stderr_tail: String,
     command_argv: Vec<String>,
+    #[serde(default)]
+    timings_us: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -2852,6 +3066,7 @@ fn execute_persistent_runner_script_with_timeout_and_family(
     timeout_secs: u64,
     family: PersistentRunnerFamily,
 ) -> Result<CommandTrace> {
+    let timing_started = Instant::now();
     let repo_root = std::env::current_dir().context("getting current directory")?;
     let store_root = infer_store_root_from_mounts(mounts)?;
     let request_seq = DOCKER_RUN_NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2865,6 +3080,7 @@ fn execute_persistent_runner_script_with_timeout_and_family(
         }
         thread::sleep(Duration::from_millis(100));
     };
+    let selected_at = Instant::now();
     let (runner, result_path, command_argv, writebacks) = {
         let job_root = runner.paths.jobs_dir.join(&request_id);
         fs::create_dir_all(&job_root).with_context(|| {
@@ -2938,6 +3154,7 @@ fn execute_persistent_runner_script_with_timeout_and_family(
         ];
         (runner, result_path, command_argv, writebacks)
     };
+    let published_at = Instant::now();
     let mut failure_retirement = PersistentRunnerFailureRetirement::new(&runner);
     // Selection checked the container identity under the slot reservation.
     // Heartbeat, result identity, and deadlines are still checked every poll.
@@ -2992,6 +3209,7 @@ fn execute_persistent_runner_script_with_timeout_and_family(
         }
         thread::sleep(Duration::from_millis(100));
     };
+    let result_received_at = Instant::now();
 
     let cleanup_request_files = || {
         fs::remove_file(&result_path).ok();
@@ -3069,10 +3287,21 @@ fn execute_persistent_runner_script_with_timeout_and_family(
         thread::sleep(Duration::from_millis(100));
     }
 
+    let idle_at = Instant::now();
     let writeback_result = writebacks.iter().try_for_each(sync_external_writeback);
     cleanup_request_files();
     writeback_result?;
     failure_retirement.disarm();
+    log::debug!(target: "bvc_timing",
+        "runner image={} action={} reserve_us={} publish_us={} result_us={} idle_us={} writeback_us={} worker_prepare_us={} worker_command_us={} worker_cleanup_us={} total_us={}",
+        image, run_hint, selected_at.duration_since(timing_started).as_micros(),
+        published_at.duration_since(selected_at).as_micros(),
+        result_received_at.duration_since(published_at).as_micros(),
+        idle_at.duration_since(result_received_at).as_micros(), idle_at.elapsed().as_micros(),
+        result.timings_us.get("prepare").copied().unwrap_or(0),
+        result.timings_us.get("command").copied().unwrap_or(0),
+        result.timings_us.get("cleanup").copied().unwrap_or(0),
+        timing_started.elapsed().as_micros());
 
     Ok(CommandTrace {
         argv: command_argv,
@@ -3631,6 +3860,200 @@ mod tests {
             "a cache mutation after prior validation must be detected"
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_release_validation_matches_reference_under_mutation() {
+        fn property(operations: Vec<u8>) -> bool {
+            let root = make_temp_store_root("cache-validation-property");
+            let store = ArtifactStore::new(root.clone());
+            store.ensure_layout().unwrap();
+            let version = "v0.39.0";
+            let platform = crate::DEFAULT_RELEASE_PLATFORM;
+            let digest = driver_release_cache_input_sha256(
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+                version,
+                platform,
+            )
+            .unwrap();
+            seed_fake_driver_release_cache(&store, version, platform).unwrap();
+            let dir = store.driver_release_cache_dir(&digest).unwrap();
+            let tool = dir.join("delay_info_main");
+            let ready = dir.join(DRIVER_RELEASE_CACHE_READY_FILE);
+            let tool_bytes = fs::read(&tool).unwrap();
+            let ready_bytes = fs::read(&ready).unwrap();
+            let cache = DriverReleaseValidationCache::default();
+            let check = || {
+                let expected =
+                    validate_driver_release_cache(&dir, version, platform, &digest).is_ok();
+                assert_eq!(
+                    expected,
+                    validate_driver_release_cache(&dir, version, platform, &digest).is_ok()
+                );
+                expected == cache.validate(&dir, version, platform, &digest).is_ok()
+            };
+            let mut equivalent = check() && check();
+            for operation in operations.into_iter().take(32) {
+                match operation % 7 {
+                    0 => {}
+                    1 => {
+                        let modified = fs::metadata(&tool).unwrap().modified().unwrap();
+                        let mut bytes = tool_bytes.clone();
+                        bytes[0] ^= 1;
+                        fs::write(&tool, bytes).unwrap();
+                        fs::File::options()
+                            .write(true)
+                            .open(&tool)
+                            .unwrap()
+                            .set_times(fs::FileTimes::new().set_modified(modified))
+                            .unwrap();
+                    }
+                    2 => fs::write(&tool, &tool_bytes).unwrap(),
+                    3 => fs::write(&ready, b"invalid manifest").unwrap(),
+                    4 => fs::write(&ready, &ready_bytes).unwrap(),
+                    5 => fs::write(dir.join("unexpected-file"), b"extra").unwrap(),
+                    _ => {
+                        fs::remove_file(dir.join("unexpected-file")).ok();
+                    }
+                }
+                equivalent &= check();
+            }
+            fs::remove_dir_all(root).unwrap();
+            equivalent
+        }
+        quickcheck::QuickCheck::new()
+            .tests(200)
+            .quickcheck(property as fn(Vec<u8>) -> bool);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settled_release_cache_reuse_rejects_same_length_mutation() {
+        let root = make_temp_store_root("cache-validation-settled");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().unwrap();
+        let version = "v0.39.0";
+        let platform = crate::DEFAULT_RELEASE_PLATFORM;
+        let digest = driver_release_cache_input_sha256(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            version,
+            platform,
+        )
+        .unwrap();
+        seed_fake_driver_release_cache(&store, version, platform).unwrap();
+        let dir = store.driver_release_cache_dir(&digest).unwrap();
+        thread::sleep(Duration::from_millis(1100));
+        let cache = DriverReleaseValidationCache::default();
+        cache.validate(&dir, version, platform, &digest).unwrap();
+        assert!(
+            cache
+                .entries
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_some()
+        );
+        cache.validate(&dir, version, platform, &digest).unwrap();
+        let tool = dir.join("delay_info_main");
+        let modified = fs::metadata(&tool).unwrap().modified().unwrap();
+        let mut bytes = fs::read(&tool).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&tool, bytes).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&tool)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(cache.validate(&dir, version, platform, &digest).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_identity_cache_shares_concurrent_failures_but_retries_fresh_calls() {
+        let cache = RuntimeIdentityCache::<String>::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let ready = std::sync::Barrier::new(16);
+        thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        ready.wait();
+                        cache.validate("missing-image", Instant::now, || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            thread::sleep(Duration::from_millis(100));
+                            bail!("image unavailable");
+                        })
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let error = handle
+                    .join()
+                    .expect("lookup thread")
+                    .expect_err("missing image");
+                assert_eq!(error.to_string(), "image unavailable");
+            }
+        });
+        let failed_attempts = calls.load(Ordering::SeqCst);
+        assert!(failed_attempts < 16, "overlapping failures must coalesce");
+        assert_eq!(
+            cache
+                .validate("missing-image", Instant::now, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok("repaired-image".to_string())
+                })
+                .expect("a fresh call retries immediately"),
+            "repaired-image"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), failed_attempts + 1);
+    }
+
+    #[test]
+    fn runtime_identity_cache_keeps_values_separate_and_rechecks_expiry() {
+        let cache = RuntimeIdentityCache::<String>::default();
+        let start = Instant::now();
+        assert_eq!(
+            cache
+                .validate("one", || start, || Ok("first".to_string()))
+                .unwrap(),
+            "first"
+        );
+        assert_eq!(
+            cache
+                .validate("one", || start, || panic!("cached identity"))
+                .unwrap(),
+            "first"
+        );
+        assert_eq!(
+            cache
+                .validate("two", || start, || Ok("second".to_string()))
+                .unwrap(),
+            "second"
+        );
+        let later = start + DOCKER_INSPECTION_INTERVAL;
+        assert_eq!(
+            cache
+                .validate("one", || later, || Ok("retagged".to_string()))
+                .unwrap(),
+            "retagged"
+        );
+        let expired = later + DOCKER_INSPECTION_INTERVAL;
+        assert!(
+            cache
+                .validate("one", || expired, || bail!("removed"))
+                .is_err()
+        );
+        assert!(
+            cache
+                .validate("one", || expired, || bail!("still absent"))
+                .is_err()
+        );
     }
 
     #[test]
