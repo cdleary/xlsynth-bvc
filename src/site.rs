@@ -4032,7 +4032,7 @@ fn normalized_absolute_path(path: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn reject_site_output_overlap(
+pub(crate) fn reject_site_output_overlap(
     out_dir: &Path,
     snapshot_dir: &Path,
     protected_roots: &[(&str, &Path)],
@@ -4841,7 +4841,7 @@ fn atomic_exchange_site_directories(current: &Path, replacement: &Path) -> Resul
     target_os = "redox",
     target_vendor = "apple"
 ))]
-fn atomic_install_site_directory(replacement: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn atomic_install_site_directory(replacement: &Path, destination: &Path) -> Result<()> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
 
     renameat_with(CWD, replacement, CWD, destination, RenameFlags::NOREPLACE).with_context(|| {
@@ -4859,7 +4859,7 @@ fn atomic_install_site_directory(replacement: &Path, destination: &Path) -> Resu
     target_os = "redox",
     target_vendor = "apple"
 )))]
-fn atomic_install_site_directory(replacement: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn atomic_install_site_directory(replacement: &Path, destination: &Path) -> Result<()> {
     bail!(
         "atomic no-replace static-site installation is unsupported on this platform: {} -> {}",
         replacement.display(),

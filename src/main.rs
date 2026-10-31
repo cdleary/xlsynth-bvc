@@ -20,6 +20,7 @@ mod corpus_scheduling;
 mod downstream_cache;
 mod dslx_corpus;
 mod executor;
+mod ir_archive;
 mod model;
 mod ops;
 mod proto;

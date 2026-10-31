@@ -23,6 +23,27 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Fetch verified IR archives and seed canonical IR-import roots (no synthesis).
+    ImportIrArchives {
+        /// A generated local site, as an alternative to --url.
+        #[arg(
+            long,
+            value_name = "DIR",
+            conflicts_with = "url",
+            required_unless_present = "url"
+        )]
+        site_dir: Option<PathBuf>,
+        /// Immutable published site URL; the index is fetched from ir/index.pb.
+        #[arg(
+            long,
+            conflicts_with = "site_dir",
+            required_unless_present = "site_dir"
+        )]
+        url: Option<String>,
+        /// New destination for downloaded archives and inputs/<corpus>/ roots.
+        #[arg(long, value_name = "DIR")]
+        out_dir: PathBuf,
+    },
     /// Seed a downstream cache from completed canonical actions in this store.
     SeedDownstreamCache {
         #[arg(long, value_name = "DIR")]

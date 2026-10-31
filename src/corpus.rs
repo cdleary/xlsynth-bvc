@@ -2541,6 +2541,32 @@ fn build_action_plan(
     })
 }
 
+/// Import downloaded IR through the same canonical root used by corpus replay.
+pub(crate) fn import_ir_root(
+    store: &ArtifactStore,
+    source_path: &Path,
+    source_sha256: &str,
+    top_fn_name: &str,
+) -> Result<()> {
+    let sample = CorpusSampleSpec {
+        sample_id: top_fn_name.into(),
+        logical_name: top_fn_name.into(),
+        source_path: source_path.into(),
+        source_relpath: source_path
+            .file_name()
+            .context("IR root filename")?
+            .to_string_lossy()
+            .into(),
+        source_sha256: source_sha256.into(),
+        top_fn_name: top_fn_name.into(),
+    };
+    let action = ActionSpec::ImportIrPackageFile {
+        source_sha256: source_sha256.into(),
+        top_fn_name: Some(top_fn_name.into()),
+    };
+    ensure_imported_ir_action(store, &sample, &action)
+}
+
 fn ensure_imported_ir_action(
     store: &ArtifactStore,
     sample: &CorpusSampleSpec,

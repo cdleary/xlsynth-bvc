@@ -43,6 +43,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     cache.compile_protos(&["proto/xlsynth/bvc/cache/v1/cache.proto"], &["proto"])?;
     println!("cargo:rerun-if-changed=proto/xlsynth/bvc/cache/v1/cache.proto");
 
+    let mut ir_archive = prost_build::Config::new();
+    ir_archive.protoc_executable(&protoc);
+    ir_archive.compile_protos(
+        &["proto/xlsynth/bvc/ir_archive/v1/archive.proto"],
+        &["proto"],
+    )?;
+    println!("cargo:rerun-if-changed=proto/xlsynth/bvc/ir_archive/v1/archive.proto");
+
     let campaign_text = fs::read("campaigns/release-qor-v1.textproto")?;
     let mut child = Command::new(&protoc)
         .args([

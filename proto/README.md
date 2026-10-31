@@ -14,6 +14,9 @@ static-publication boundaries.
   format changes therefore do not trigger evaluation-store migrations.
 - A package-version change is distinct from an operational record-version or
   action-identity-version change.
+- Portable IR download indexes use `xlsynth.bvc.ir_archive.v1`, also generated
+  separately. They identify exact-byte IR blobs and selected-function roots,
+  not completed synthesis actions or their original generation pipelines.
 - Disposable downstream execution caches use `xlsynth.bvc.cache.v1`, generated
   separately from the store descriptor. Entries embed canonical provenance;
   reuse receipts are canonical action payloads. Cache keys carry an explicit

@@ -204,6 +204,66 @@ fn builds_complete_matching_releases_with_bounded_deterministic_shards() {
 }
 
 #[test]
+fn corpus_download_seeds_canonical_roots_and_rejects_rehashed_archive_tampering() {
+    let root = Fixture::new();
+    let run = fixture_run(&root.0, "0.74.0", 3);
+    let options = root.options();
+    build(&options, &[], &[run], &[], 100_000).unwrap();
+    let index_path = options.out_dir.join(crate::ir_archive::INDEX);
+    let mut index =
+        crate::ir_archive::wire::IrArchiveIndex::decode(fs::read(&index_path).unwrap().as_slice())
+            .unwrap();
+    assert_eq!((index.buckets.len(), index.roots.len()), (256, 3));
+    let store = ArtifactStore::new_with_sled(root.0.join("seeded"), root.0.join("seeded.sled"));
+    store.ensure_layout().unwrap();
+    crate::ir_archive::import(
+        &store,
+        Some(&options.out_dir),
+        None,
+        &root.0.join("download"),
+        &[],
+    )
+    .unwrap();
+    for input in &index.roots {
+        let action = ActionSpec::ImportIrPackageFile {
+            source_sha256: hex::encode(&input.source_sha256),
+            top_fn_name: Some(input.top_fn_name.clone()),
+        };
+        let provenance = store.load_provenance(&id(&action).unwrap()).unwrap();
+        assert_eq!(
+            crate::proto::action_spec_to_proto(&provenance.action).unwrap(),
+            crate::proto::action_spec_to_proto(&action).unwrap()
+        );
+        assert_eq!(
+            provenance.output_artifact.artifact_type,
+            ArtifactType::IrPackageFile
+        );
+    }
+    let bucket = index
+        .buckets
+        .iter_mut()
+        .find(|b| !b.blobs.is_empty())
+        .unwrap();
+    let archive = crate::ir_archive::archive_path(&bucket.prefix);
+    let altered = b"not a published IR archive";
+    fs::write(options.out_dir.join(&archive), altered).unwrap();
+    bucket.archive_bytes = altered.len() as u64;
+    bucket.archive_sha256 = Sha256::digest(altered).to_vec();
+    fs::write(&index_path, index.encode_to_vec()).unwrap();
+    let manifest_path = options.out_dir.join(STATIC_SITE_MANIFEST_FILENAME);
+    let mut manifest =
+        pb::StaticSiteManifest::decode(fs::read(&manifest_path).unwrap().as_slice()).unwrap();
+    for file in &mut manifest.files {
+        let path = file.relpath.as_ref().unwrap().value.clone();
+        if path == archive || path == crate::ir_archive::INDEX {
+            *file = publication_file(&options.out_dir, &path).unwrap();
+        }
+    }
+    fs::write(manifest_path, manifest.encode_to_vec()).unwrap();
+    assert!(verify_static_site(&options.out_dir).is_err());
+}
+
+#[test]
 fn rejects_incomplete_or_forged_operational_inputs() {
     let root = Fixture::new();
     let run = fixture_run(&root.0, "0.74.0", 1);
@@ -443,15 +503,23 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
         base_url: "/nested/".into(),
         overwrite: false,
     };
-    let summary = super::super::site_dashboard::build(
-        &options,
-        &[],
-        &[root.0.join("candidate")],
-        &[run, newer],
-        &[],
-        100_000,
-    )
-    .unwrap();
+    // This older metric fixture claims the real pinned input digests but only
+    // stores synthetic IR. Download generation must not invent matching bytes.
+    assert!(
+        super::super::site_dashboard::build(
+            &options,
+            &[],
+            &[root.0.join("candidate")],
+            &[run.clone(), newer.clone()],
+            &[],
+            100_000,
+        )
+        .is_err()
+    );
+    assert!(!options.out_dir.exists());
+    let summary =
+        super::super::site_dashboard::build(&options, &[], &[], &[run, newer], &[], 100_000)
+            .unwrap();
     let data: serde_json::Value =
         serde_json::from_slice(&fs::read(options.out_dir.join("dashboard.json")).unwrap()).unwrap();
     assert_eq!(
@@ -488,7 +556,7 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
     let reused = super::super::site_dashboard::build(
         &reused_options,
         &[],
-        &[root.0.join("candidate")],
+        &[],
         &[],
         &[options.out_dir.join("corpus")],
         100_000,

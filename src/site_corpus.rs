@@ -638,6 +638,7 @@ pub(super) fn build_in_place(
     target: usize,
 ) -> Result<BuildStaticSiteSummary> {
     let origins = provenance::Index::from_snapshot(&options.snapshot_dir)?;
+    let mut archives = crate::ir_archive::Builder::default();
     let mut site = wire::CorpusSite {
         record_version: 1,
         generations: vec![],
@@ -667,6 +668,11 @@ pub(super) fn build_in_place(
                 bail!("corpus releases do not contain the same exact inputs");
             }
             generation.shards.clear();
+            if site.generations.is_empty() {
+                for sample in &samples {
+                    add_archive_root(&mut archives, sample)?;
+                }
+            }
             write_shards(&options.out_dir, &mut generation, &samples, target)?;
             site.generations.push(generation);
             Ok(())
@@ -696,6 +702,7 @@ pub(super) fn build_in_place(
     let bytes = site.encode_to_vec();
     let snapshot_id = sha256_hex(&bytes);
     write_file(&options.out_dir, MANIFEST, &bytes)?;
+    archives.write(&options.out_dir)?;
     let files = actual_site_relpaths(&options.out_dir)?
         .iter()
         .map(|p| publication_file(&options.out_dir, p))
@@ -724,6 +731,22 @@ pub(super) fn build_in_place(
         file_count: manifest.files.len(),
         total_bytes,
     })
+}
+
+fn add_archive_root(
+    archives: &mut crate::ir_archive::Builder,
+    sample: &wire::Sample,
+) -> Result<()> {
+    let input = required(&sample.input, "archive input")?;
+    archives.add(
+        crate::ir_archive::wire::IrArchiveRoot {
+            corpus: "full-corpus".into(),
+            source_relpath: input.source_relpath.clone(),
+            source_sha256: input.source_sha256.clone(),
+            top_fn_name: input.top_fn_name.clone(),
+        },
+        sample.input_ir.as_bytes(),
+    )
 }
 
 pub(super) fn verify_hosting_budget(site_dir: &Path) -> Result<()> {
@@ -779,6 +802,7 @@ pub(super) fn verify_projection(site_dir: &Path, manifest: &pb::StaticSiteManife
         bail!("corpus browser catalog does not match protobuf evidence");
     }
     let mut versions = BTreeSet::new();
+    let mut archives = crate::ir_archive::Builder::default();
     let mut common_runtime: Option<ProgressionRuntimeIdentity> = None;
     for generation in &site.generations {
         canonical_version(&generation.crate_version)?;
@@ -817,6 +841,9 @@ pub(super) fn verify_projection(site_dir: &Path, manifest: &pb::StaticSiteManife
                 bail!("invalid corpus shard protobuf");
             }
             for sample in &evidence.samples {
+                if generation.crate_version == site.generations[0].crate_version {
+                    add_archive_root(&mut archives, sample)?;
+                }
                 if prior_id.as_ref().is_some_and(|id| id >= &sample.sample_id) {
                     bail!("corpus samples are duplicated or unsorted");
                 }
@@ -862,6 +889,7 @@ pub(super) fn verify_projection(site_dir: &Path, manifest: &pb::StaticSiteManife
     {
         bail!("corpus generations are unsorted");
     }
+    expected.extend(archives.verify(site_dir)?);
     if actual_site_relpaths(site_dir)? != expected {
         bail!("corpus site has unexpected or missing files");
     }
