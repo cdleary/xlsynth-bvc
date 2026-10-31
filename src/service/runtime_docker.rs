@@ -1654,7 +1654,7 @@ pub(crate) fn ensure_yosys_image(
         let content_ref = docker_image_content_ref(&runtime.docker_image_id)?;
         validate_pinned_image(&content_ref, &fingerprint, || {
             require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
-            if !image_has_python3(&content_ref)? {
+            if !inspected_image_has_python3(&content_ref)? {
                 bail!("pinned Yosys image `{content_ref}` lacks python3");
             }
             Ok(())
@@ -1755,11 +1755,17 @@ fn bind_driver_runtime_image_uncached(
     repo_root: &Path,
     runtime: &DriverRuntimeSpec,
 ) -> Result<String> {
-    ensure_driver_image(repo_root, runtime)?;
+    checked_runtime_dockerfile(repo_root, &runtime.dockerfile, &runtime.dockerfile_sha256)?;
     let fingerprint = driver_runtime_fingerprint(runtime)?;
     let build_ref = fingerprint_qualified_image_ref(&runtime.docker_image, "driver", &fingerprint)?;
-    let image_id = inspect_image_id(&build_ref)?
-        .with_context(|| format!("driver image `{build_ref}` disappeared after preparation"))?;
+    // Resolve the mutable tag once, then validate and execute that content ID.
+    let image_id = if let Some(image_id) = inspect_image_id(&build_ref)? {
+        image_id
+    } else {
+        ensure_driver_image(repo_root, runtime)?;
+        inspect_image_id(&build_ref)?
+            .with_context(|| format!("driver image `{build_ref}` disappeared after preparation"))?
+    };
     let content_ref = docker_image_content_ref(&image_id)?;
     require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
     require_driver_source_labels(&content_ref, runtime)?;
@@ -1805,14 +1811,20 @@ fn bind_yosys_runtime_image_uncached(
     repo_root: &Path,
     runtime: &YosysRuntimeSpec,
 ) -> Result<String> {
-    ensure_yosys_image(repo_root, runtime)?;
+    checked_runtime_dockerfile(repo_root, &runtime.dockerfile, &runtime.dockerfile_sha256)?;
     let fingerprint = yosys_runtime_fingerprint(runtime)?;
     let build_ref = fingerprint_qualified_image_ref(&runtime.docker_image, "yosys", &fingerprint)?;
-    let image_id = inspect_image_id(&build_ref)?
-        .with_context(|| format!("Yosys image `{build_ref}` disappeared after preparation"))?;
+    // Resolve the mutable tag once, then validate and execute that content ID.
+    let image_id = if let Some(image_id) = inspect_image_id(&build_ref)? {
+        image_id
+    } else {
+        ensure_yosys_image(repo_root, runtime)?;
+        inspect_image_id(&build_ref)?
+            .with_context(|| format!("Yosys image `{build_ref}` disappeared after preparation"))?
+    };
     let content_ref = docker_image_content_ref(&image_id)?;
     require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
-    if !image_has_python3(&content_ref)? {
+    if !inspected_image_has_python3(&content_ref)? {
         bail!("prepared Yosys image `{content_ref}` lacks python3");
     }
     Ok(image_id)
@@ -1837,11 +1849,19 @@ impl PythonImageProbeCache {
             return Ok(false);
         };
         let content_ref = docker_image_content_ref(&image_id)?;
+        self.has_python3_at_id(&content_ref, probe)
+    }
+
+    fn has_python3_at_id(
+        &self,
+        content_ref: &str,
+        probe: impl FnOnce(&str) -> Result<bool>,
+    ) -> Result<bool> {
         let validated = self
             .images
             .lock()
             .map_err(|_| anyhow!("Python image probe cache lock poisoned"))?
-            .entry(content_ref.clone())
+            .entry(content_ref.to_string())
             .or_default()
             .clone();
         let mut validated = validated
@@ -1852,17 +1872,26 @@ impl PythonImageProbeCache {
         }
         // Probe the resolved ID, never the possibly retagged input. Only success
         // is reusable: transient Docker failures and negative probes must retry.
-        let available = probe(&content_ref)?;
+        let available = probe(content_ref)?;
         *validated = available;
         Ok(available)
     }
 }
 
-fn image_has_python3(image: &str) -> Result<bool> {
+fn python_image_probe_cache() -> &'static PythonImageProbeCache {
     static CACHE: OnceLock<PythonImageProbeCache> = OnceLock::new();
-    CACHE
-        .get_or_init(PythonImageProbeCache::default)
-        .has_python3(image, inspect_image_id, probe_image_has_python3)
+    CACHE.get_or_init(PythonImageProbeCache::default)
+}
+
+fn image_has_python3(image: &str) -> Result<bool> {
+    python_image_probe_cache().has_python3(image, inspect_image_id, probe_image_has_python3)
+}
+
+/// The caller has just inspected this content ID, so presence is already known.
+/// Only the intrinsic capability is cached; mutable references still resolve.
+fn inspected_image_has_python3(content_ref: &str) -> Result<bool> {
+    let content_ref = docker_image_content_ref(content_ref)?;
+    python_image_probe_cache().has_python3_at_id(&content_ref, probe_image_has_python3)
 }
 
 fn probe_image_has_python3(image: &str) -> Result<bool> {
@@ -2039,6 +2068,8 @@ struct SelectedPersistentRunner {
     runner_instance_id: String,
     container_name: String,
     container_id: String,
+    container_cache_key: String,
+    container_checked_at: Instant,
     paths: PersistentRunnerPaths,
     _slot_guard: PersistentRunnerSlotGuard,
 }
@@ -2046,6 +2077,7 @@ struct SelectedPersistentRunner {
 struct PersistentRunnerFailureRetirement {
     container_name: String,
     container_id: String,
+    container_cache_key: String,
     armed: bool,
 }
 
@@ -2054,11 +2086,13 @@ impl PersistentRunnerFailureRetirement {
         Self {
             container_name: runner.container_name.clone(),
             container_id: runner.container_id.clone(),
+            container_cache_key: runner.container_cache_key.clone(),
             armed: true,
         }
     }
 
     fn retire_now(&mut self) -> String {
+        persistent_runner_identity_cache().forget(&self.container_cache_key);
         match cleanup_persistent_runner_container_if_id(&self.container_name, &self.container_id) {
             Ok(true) => {
                 self.armed = false;
@@ -2079,6 +2113,9 @@ impl PersistentRunnerFailureRetirement {
 
 impl Drop for PersistentRunnerFailureRetirement {
     fn drop(&mut self) {
+        if self.armed {
+            persistent_runner_identity_cache().forget(&self.container_cache_key);
+        }
         if self.armed
             && let Err(error) =
                 cleanup_persistent_runner_container_if_id(&self.container_name, &self.container_id)
@@ -2656,6 +2693,57 @@ fn count_json_files(path: &Path) -> Result<usize> {
     Ok(count)
 }
 
+/// A successful request and matching idle acknowledgement confirm the same
+/// runner incarnation. Reuse that evidence briefly, keeping Docker checks for
+/// stalled work and cache expiry so disappearance cannot be hidden by reuse.
+#[derive(Clone)]
+struct PersistentRunnerIdentity {
+    runner_instance_id: String,
+    container_id: String,
+    checked_at: Instant,
+}
+
+#[derive(Default)]
+struct PersistentRunnerIdentityCache {
+    entries: Mutex<BTreeMap<String, PersistentRunnerIdentity>>,
+}
+
+impl PersistentRunnerIdentityCache {
+    fn get(
+        &self,
+        key: &str,
+        runner_instance_id: &str,
+        now: Instant,
+    ) -> Option<PersistentRunnerIdentity> {
+        let entries = self.entries.lock().ok()?;
+        entries
+            .get(key)
+            .filter(|identity| {
+                identity.runner_instance_id == runner_instance_id
+                    && now.saturating_duration_since(identity.checked_at)
+                        < DOCKER_INSPECTION_INTERVAL
+            })
+            .cloned()
+    }
+
+    fn remember(&self, key: &str, identity: PersistentRunnerIdentity) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(key.to_string(), identity);
+        }
+    }
+
+    fn forget(&self, key: &str) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(key);
+        }
+    }
+}
+
+fn persistent_runner_identity_cache() -> &'static PersistentRunnerIdentityCache {
+    static CACHE: OnceLock<PersistentRunnerIdentityCache> = OnceLock::new();
+    CACHE.get_or_init(PersistentRunnerIdentityCache::default)
+}
+
 #[derive(Debug)]
 struct DockerContainerState {
     running: bool,
@@ -2750,6 +2838,11 @@ fn persistent_runner_is_idle(paths: &PersistentRunnerPaths) -> Result<bool> {
 }
 
 fn cleanup_persistent_runner_container(container_name: &str) -> Result<()> {
+    persistent_runner_identity_cache().forget(&format!(
+        "{}/{}",
+        runtime_engine_identity(),
+        container_name
+    ));
     let output = Command::new("docker")
         .args(["rm", "-f", container_name])
         .output()
@@ -2961,8 +3054,29 @@ fn select_persistent_runner(
                 continue;
             }
             let container_name = persistent_runner_container_name(image, &runner_key);
-            let state = inspect_container_state(&container_name)?;
+            let observed_instance = read_persistent_runner_heartbeat(&paths)?
+                .map(|heartbeat| heartbeat.runner_instance_id)
+                .unwrap_or_default();
+            let container_cache_key = format!("{}/{}", runtime_engine_identity(), container_name);
+            let cached = persistent_runner_identity_cache().get(
+                &container_cache_key,
+                &observed_instance,
+                Instant::now(),
+            );
+            let cache_hit = cached.is_some();
+            let (state, mut container_checked_at) = if let Some(identity) = cached {
+                (
+                    Some(DockerContainerState {
+                        running: true,
+                        id: identity.container_id,
+                    }),
+                    identity.checked_at,
+                )
+            } else {
+                (inspect_container_state(&container_name)?, Instant::now())
+            };
             let running = state.as_ref().is_some_and(|state| state.running);
+            let reused = running && idle;
             let container_id = if let Some(state) = state.filter(|s| s.running && idle) {
                 state.id
             } else {
@@ -2982,19 +3096,38 @@ fn select_persistent_runner(
                     &container_name,
                     &paths,
                 )?;
-                docker_container_id(&container_name)?
-                    .context("new persistent runner disappeared during selection")?
+                let container_id = docker_container_id(&container_name)?
+                    .context("new persistent runner disappeared during selection")?;
+                container_checked_at = Instant::now();
+                container_id
             };
             let heartbeat = read_persistent_runner_heartbeat(&paths)?
                 .context("selected persistent runner is missing its heartbeat")?;
             if heartbeat.runner_instance_id.is_empty() {
                 bail!("selected persistent runner is missing its instance identity");
             }
+            if reused && heartbeat.runner_instance_id != observed_instance {
+                persistent_runner_identity_cache().forget(&container_cache_key);
+                continue;
+            }
+            persistent_runner_identity_cache().remember(
+                &container_cache_key,
+                PersistentRunnerIdentity {
+                    runner_instance_id: heartbeat.runner_instance_id.clone(),
+                    container_id: container_id.clone(),
+                    checked_at: container_checked_at,
+                },
+            );
+            log::debug!(target: "bvc_timing",
+                "runner_identity_reuse container={} hit={} checked_age_us={}",
+                container_name, cache_hit, container_checked_at.elapsed().as_micros());
             return Ok(Some(SelectedPersistentRunner {
                 runner_key,
                 runner_instance_id: heartbeat.runner_instance_id,
                 container_id,
                 container_name,
+                container_cache_key,
+                container_checked_at,
                 paths,
                 _slot_guard: slot_guard,
             }));
@@ -3169,9 +3302,10 @@ fn execute_persistent_runner_script_with_timeout_and_family(
     };
     let published_at = Instant::now();
     let mut failure_retirement = PersistentRunnerFailureRetirement::new(&runner);
-    // Selection checked the container identity under the slot reservation.
-    // Heartbeat, result identity, and deadlines are still checked every poll.
-    let mut last_container_check = Instant::now();
+    // Keep the age of selection evidence: borrowing a cached identity must not
+    // postpone disappearance detection. Result identity and deadlines are checked
+    // on every poll, independently of the bounded Docker inspection interval.
+    let mut last_container_check = runner.container_checked_at;
 
     let deadline = Instant::now()
         + Duration::from_secs(timeout_secs + PERSISTENT_RUNNER_REQUEST_TIMEOUT_GRACE_SECS);
@@ -3305,6 +3439,14 @@ fn execute_persistent_runner_script_with_timeout_and_family(
     cleanup_request_files();
     writeback_result?;
     failure_retirement.disarm();
+    persistent_runner_identity_cache().remember(
+        &runner.container_cache_key,
+        PersistentRunnerIdentity {
+            runner_instance_id: runner.runner_instance_id.clone(),
+            container_id: runner.container_id.clone(),
+            checked_at: idle_at,
+        },
+    );
     log::debug!(target: "bvc_timing",
         "runner image={} action={} reserve_us={} publish_us={} result_us={} idle_us={} writeback_us={} worker_prepare_us={} worker_command_us={} worker_cleanup_us={} total_us={}",
         image, run_hint, selected_at.duration_since(timing_started).as_micros(),
@@ -3571,6 +3713,113 @@ mod tests {
                 "unrelated image inspection was blocked"
             );
         });
+    }
+
+    #[test]
+    fn runner_identity_reuse_expires_and_rejects_a_new_incarnation() {
+        let cache = PersistentRunnerIdentityCache::default();
+        let start = Instant::now();
+        let identity = PersistentRunnerIdentity {
+            runner_instance_id: "first-instance".into(),
+            container_id: "first-container".into(),
+            checked_at: start,
+        };
+        cache.remember("engine/runner", identity.clone());
+        assert_eq!(
+            cache
+                .get("engine/runner", "first-instance", start)
+                .unwrap()
+                .container_id,
+            "first-container"
+        );
+        assert!(
+            cache
+                .get("other-engine/runner", "first-instance", start)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get("engine/runner", "replacement-instance", start)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(
+                    "engine/runner",
+                    "first-instance",
+                    start + DOCKER_INSPECTION_INTERVAL
+                )
+                .is_none()
+        );
+        // Reading cached evidence cannot refresh its age and postpone a stalled
+        // request's Docker check. An authenticated completion may refresh it.
+        let checked = cache.get("engine/runner", "first-instance", start).unwrap();
+        assert_eq!(checked.checked_at, start);
+        let completed = start + Duration::from_secs(10);
+        cache.remember(
+            "engine/runner",
+            PersistentRunnerIdentity {
+                checked_at: completed,
+                ..identity
+            },
+        );
+        assert_eq!(
+            cache
+                .get("engine/runner", "first-instance", completed)
+                .unwrap()
+                .checked_at,
+            completed
+        );
+        cache.forget("engine/runner");
+        assert!(
+            cache
+                .get("engine/runner", "first-instance", completed)
+                .is_none()
+        );
+        cache.remember(
+            "engine/runner",
+            PersistentRunnerIdentity {
+                runner_instance_id: "replacement-instance".into(),
+                container_id: "replacement-container".into(),
+                checked_at: completed,
+            },
+        );
+        assert!(
+            cache
+                .get("engine/runner", "first-instance", completed)
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .get("engine/runner", "replacement-instance", completed)
+                .unwrap()
+                .container_id,
+            "replacement-container"
+        );
+    }
+
+    #[test]
+    fn inspected_python_capability_reuses_success_without_resolving_again() -> Result<()> {
+        let cache = PythonImageProbeCache::default();
+        let content_ref = docker_image_content_ref(&"a".repeat(64))?;
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..3 {
+            assert!(cache.has_python3_at_id(&content_ref, |image| {
+                assert_eq!(image, content_ref);
+                calls.set(calls.get() + 1);
+                Ok(true)
+            })?);
+        }
+        assert_eq!(calls.get(), 1);
+        // A mutable reference must still resolve even when this ID was probed.
+        assert!(!cache.has_python3("mutable:tag", |_| Ok(None), |_| panic!("missing image"))?);
+        assert!(
+            !cache.has_python3_at_id(&docker_image_content_ref(&"b".repeat(64))?, |_| Ok(false))?
+        );
+        assert!(
+            cache.has_python3_at_id(&docker_image_content_ref(&"b".repeat(64))?, |_| Ok(true))?
+        );
+        Ok(())
     }
 
     #[test]
