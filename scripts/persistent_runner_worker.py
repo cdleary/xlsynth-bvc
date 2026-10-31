@@ -13,9 +13,11 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, TextIO
@@ -24,6 +26,7 @@ from typing import BinaryIO, TextIO
 SCHEMA_VERSION = 2
 HEARTBEAT_INTERVAL_SECS = 1.0
 OUTPUT_TAIL_MAX_BYTES = 256 * 1024
+DRIVER_CACHE_MOUNT = "/cache-input"
 DRIVER_PROBED_SUBCOMMANDS = [
     "aig2ir",
     "ir-equiv",
@@ -79,37 +82,131 @@ def ensure_mount_target(target: str, source: str) -> None:
     os.symlink(source, target)
 
 
-def write_heartbeat(
-    heartbeat_path: Path,
-    instance_id: str,
-    runner_key: str,
-    state_fn,
-) -> None:
-    state, current_request_id, idle_since_unix_seconds = state_fn()
-    write_json_atomic(
-        heartbeat_path,
-        {
+class HeartbeatPublisher:
+    def __init__(self, path: Path, instance_id: str, runner_key: str, started_utc: str):
+        self.path = path
+        self.lock = threading.Lock()
+        self.payload = {
             "schema_version": SCHEMA_VERSION,
             "runner_instance_id": instance_id,
             "runner_key": runner_key,
-            "state": state,
-            "current_request_id": current_request_id,
-            "idle_since_unix_seconds": idle_since_unix_seconds,
-            "started_utc": state_fn.started_utc,
-            "last_heartbeat_utc": utc_now(),
-        },
-    )
+            "state": "idle",
+            "current_request_id": None,
+            "idle_since_unix_seconds": int(time.time()),
+            "started_utc": started_utc,
+        }
+
+    def publish(self) -> None:
+        # Serialize the snapshot and publication so a delayed writer cannot
+        # overwrite a newer transition with an old busy/idle state.
+        with self.lock:
+            write_json_atomic(self.path, {**self.payload, "last_heartbeat_utc": utc_now()})
+
+    def transition(self, state: str, request_id: str | None = None) -> None:
+        with self.lock:
+            self.payload.update(
+                state=state,
+                current_request_id=request_id,
+                idle_since_unix_seconds=int(time.time()) if state == "idle" else None,
+            )
+            write_json_atomic(self.path, {**self.payload, "last_heartbeat_utc": utc_now()})
 
 
 def heartbeat_thread_fn(
-    heartbeat_path: Path,
-    instance_id: str,
-    runner_key: str,
-    state_fn,
+    heartbeat: HeartbeatPublisher,
     stop_event: threading.Event,
 ) -> None:
     while not stop_event.wait(HEARTBEAT_INTERVAL_SECS):
-        write_heartbeat(heartbeat_path, instance_id, runner_key, state_fn)
+        heartbeat.publish()
+
+
+def tree_identity(root: Path) -> tuple:
+    entries = []
+    for path in [root, *sorted(root.rglob("*"))]:
+        info = path.lstat()
+        entries.append((
+            str(path.relative_to(root)), info.st_dev, info.st_ino, info.st_mode,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+            os.readlink(path) if path.is_symlink() else None,
+        ))
+    return tuple(entries)
+
+
+class PreparedDriverTools:
+    def __init__(self, target: Path):
+        self.target = target
+        self.source_identity = None
+        self.prepared_identity = None
+        self.checked_at_ns = 0
+
+    def prepare(self, source: Path, version: str, platform: str) -> Path:
+        source = source.resolve(strict=True)
+        checked_at_ns = time.time_ns()
+        identity = (str(source), version, platform, tree_identity(source))
+        if self.source_identity == identity and self.target.is_dir():
+            if tree_identity(self.target) == self.prepared_identity:
+                # A same-tick edit can predate this request. Trust metadata
+                # only if it had already settled at the previous validation.
+                cutoff = min(self.checked_at_ns, checked_at_ns) - 1_000_000_000
+                settled = all(max(entry[5], entry[6]) < cutoff
+                              for entry in (*identity[3], *self.prepared_identity))
+                if settled or all(
+                    files_equal(source / path.relative_to(self.target), path)
+                    for path in self.target.rglob("*")
+                    if not path.is_symlink() and path.is_file()
+                ):
+                    self.checked_at_ns = checked_at_ns
+                    return self.target
+        self.source_identity = None
+        self.prepared_identity = None
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        # Only a complete copy becomes visible at the execution path. A failed
+        # preparation leaves no reusable in-memory validation record.
+        with tempfile.TemporaryDirectory(prefix=".xlsynth-tools-", dir=self.target.parent) as tmp:
+            staging = Path(tmp) / "release"
+            shutil.copytree(source, staging, copy_function=shutil.copy2)
+            for ext in ["so", "dylib"]:
+                library = staging / f"libxls-{platform}.{ext}"
+                if library.is_file():
+                    alias = staging / f"libxls-{version}-{platform}.{ext}"
+                    remove_existing_target(alias)
+                    alias.symlink_to(library.name)
+            if tree_identity(source) != identity[3]:
+                raise RuntimeError("driver tool cache changed during preparation")
+            remove_existing_target(self.target)
+            os.replace(staging, self.target)
+        self.prepared_identity = tree_identity(self.target)
+        self.source_identity = identity
+        self.checked_at_ns = checked_at_ns
+        return self.target
+
+
+def files_equal(left: Path, right: Path) -> bool:
+    with left.open("rb") as a, right.open("rb") as b:
+        while True:
+            chunk = a.read(1024 * 1024)
+            if chunk != b.read(1024 * 1024):
+                return False
+            if not chunk:
+                return True
+
+
+@contextmanager
+def limit_tool_preparation(seconds: float):
+    # The worker prepares tools on its main thread. Interrupt a slow copy even
+    # if it would consume the host's entire result-publication grace period.
+    def expired(*_):
+        raise subprocess.TimeoutExpired("driver tool preparation", seconds)
+
+    if seconds <= 0:
+        expired()
+    previous = signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def list_inbox_requests(inbox_dir: Path) -> list[Path]:
@@ -278,7 +375,8 @@ def process_request(
     request_path: Path,
     results_dir: Path,
     archive_dir: Path,
-    heartbeat_state,
+    heartbeat: HeartbeatPublisher,
+    driver_tools: PreparedDriverTools,
 ) -> bool:
     request = json.loads(request_path.read_text(encoding="utf-8"))
     if request.get("schema_version") != SCHEMA_VERSION:
@@ -292,9 +390,7 @@ def process_request(
     instance_id = request["runner_instance_id"]
     container_name = request["container_name"]
     timeout_secs = int(request["timeout_secs"])
-    heartbeat_state["state"] = "busy"
-    heartbeat_state["current_request_id"] = request_id
-    heartbeat_state["idle_since_unix_seconds"] = None
+    heartbeat.transition("busy", request_id)
 
     job_root = Path(request["job_root"])
     stdout_log = job_root / "stdout.log"
@@ -305,6 +401,12 @@ def process_request(
     exit_code = None
     timed_out = False
     error = None
+    preparation_started = time.monotonic_ns()
+    deadline = preparation_started + timeout_secs * 1_000_000_000
+    preparation_finished = None
+
+    def remaining_seconds():
+        return (deadline - time.monotonic_ns()) / 1_000_000_000
 
     try:
         for mount in request["mounts"]:
@@ -313,9 +415,19 @@ def process_request(
 
         env = os.environ.copy()
         env.update(request["env"])
+        env.pop("BVC_PREPARED_XLSYNTH_TOOLS", None)
         env["BVC_PERSISTENT_RUNNER_REQUEST_ID"] = request_id
+        if (DRIVER_CACHE_MOUNT in mounted_targets and "XLSYNTH_VERSION" in env
+                and "XLSYNTH_PLATFORM" in env):
+            with limit_tool_preparation(remaining_seconds()):
+                env["BVC_PREPARED_XLSYNTH_TOOLS"] = str(driver_tools.prepare(
+                    Path(DRIVER_CACHE_MOUNT), env["XLSYNTH_VERSION"], env["XLSYNTH_PLATFORM"]
+                ))
+        preparation_finished = time.monotonic_ns()
 
         with stdout_log.open("wb") as stdout_file, stderr_log.open("wb") as stderr_file:
+            if remaining_seconds() <= 0:
+                raise subprocess.TimeoutExpired(request["script"], timeout_secs)
             proc = subprocess.Popen(
                 ["bash", "-lc", request["script"]],
                 stdout=stdout_file,
@@ -324,49 +436,22 @@ def process_request(
                 cwd="/",
                 start_new_session=True,
             )
-            stop_event = threading.Event()
-
-            def running_state():
-                return (
-                    heartbeat_state["state"],
-                    heartbeat_state["current_request_id"],
-                    heartbeat_state["idle_since_unix_seconds"],
-                )
-
-            running_state.started_utc = heartbeat_state["started_utc"]
-            thread = threading.Thread(
-                target=heartbeat_thread_fn,
-                args=(
-                    Path(request["heartbeat_path"]),
-                    instance_id,
-                    runner_key,
-                    running_state,
-                    stop_event,
-                ),
-                daemon=True,
-            )
-            thread.start()
             try:
-                proc.wait(timeout=timeout_secs)
+                proc.wait(timeout=remaining_seconds())
                 exit_code = proc.returncode
             except subprocess.TimeoutExpired:
-                timed_out = True
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 exit_code = proc.wait()
-            finally:
-                stop_event.set()
-                thread.join(timeout=2.0)
+                raise
 
-        if timed_out:
-            error = (
-                f"TIMEOUT({timeout_secs}) persistent runner command exceeded "
-                f"{timeout_secs} seconds"
-            )
-        elif exit_code != 0:
+        if exit_code != 0:
             error = f"persistent runner command failed (exit={exit_code})"
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        error = f"TIMEOUT({timeout_secs}) persistent runner request exceeded {timeout_secs} seconds"
     except Exception as exc:
         error = f"persistent runner worker exception: {exc}"
         if exit_code is None:
@@ -376,8 +461,20 @@ def process_request(
             stderr_file.write(b"\nworker exception:\n")
             stderr_file.write(traceback.format_exc().encode("utf-8", errors="replace"))
     finally:
+        command_finished = time.monotonic_ns()
+        if preparation_finished is None:
+            preparation_finished = command_finished
         for target in reversed(mounted_targets):
-            remove_existing_target(Path(target))
+            try:
+                remove_existing_target(Path(target))
+            except OSError as exc:
+                error = error or f"persistent runner mount cleanup failed: {exc}"
+    try:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        os.replace(request_path, archive_dir / request_path.name)
+    except OSError as exc:
+        error = error or f"persistent runner request archival failed: {exc}"
+    cleanup_finished = time.monotonic_ns()
 
     stdout_tail = read_tail(stdout_log, OUTPUT_TAIL_MAX_BYTES)
     stderr_tail = read_tail(stderr_log, OUTPUT_TAIL_MAX_BYTES)
@@ -397,20 +494,16 @@ def process_request(
         "stdout_tail": stdout_tail,
         "stderr_tail": stderr_tail,
         "command_argv": ["bash", "-lc", request["script"]],
+        "timings_us": {
+            "prepare": (preparation_finished - preparation_started) // 1000,
+            "command": (command_finished - preparation_finished) // 1000,
+            "cleanup": (cleanup_finished - command_finished) // 1000,
+        },
     }
-    write_result(results_dir / f"{request_id}.json", result)
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    archived_request = archive_dir / request_path.name
-    try:
-        os.replace(request_path, archived_request)
-    except OSError:
-        pass
     retire = error is not None
-    heartbeat_state["state"] = "retired" if retire else "idle"
-    heartbeat_state["current_request_id"] = None
-    heartbeat_state["idle_since_unix_seconds"] = (
-        None if retire else int(time.time())
-    )
+    heartbeat.transition("retired" if retire else "idle")
+    # Result publication is the completion barrier for cleanup and runner state.
+    write_result(results_dir / f"{request_id}.json", result)
     return not retire
 
 
@@ -443,21 +536,8 @@ def main() -> int:
     sync_cache_symlink(store_root)
 
     started_utc = utc_now()
-    heartbeat_state = {
-        "state": "idle",
-        "current_request_id": None,
-        "started_utc": started_utc,
-        "idle_since_unix_seconds": int(time.time()),
-    }
-
-    def state_fn():
-        return (
-            heartbeat_state["state"],
-            heartbeat_state["current_request_id"],
-            heartbeat_state["idle_since_unix_seconds"],
-        )
-
-    state_fn.started_utc = started_utc
+    heartbeat = HeartbeatPublisher(heartbeat_path, args.runner_instance_id, args.runner_key, started_utc)
+    driver_tools = PreparedDriverTools(Path("/tmp/xlsynth-release"))
     write_json_atomic(
         live_path,
         {
@@ -475,17 +555,12 @@ def main() -> int:
     except subprocess.CalledProcessError as error:
         # Script requests can still run. The host retries missing capability evidence.
         print(f"driver capability probe failed: {error}", file=sys.stderr)
+    heartbeat.publish()
 
     stop_event = threading.Event()
     heartbeat_thread = threading.Thread(
         target=heartbeat_thread_fn,
-        args=(
-            heartbeat_path,
-            args.runner_instance_id,
-            args.runner_key,
-            state_fn,
-            stop_event,
-        ),
+        args=(heartbeat, stop_event),
         daemon=True,
     )
     heartbeat_thread.start()
@@ -505,7 +580,7 @@ def main() -> int:
                     break
                 wait_for_inbox(inbox_events, 0.2)
                 continue
-            if not process_request(request_path, results_dir, archive_dir, heartbeat_state):
+            if not process_request(request_path, results_dir, archive_dir, heartbeat, driver_tools):
                 break
             idle_since_monotonic = time.monotonic()
     finally:
@@ -517,11 +592,7 @@ def main() -> int:
             # Do not let a final background heartbeat overwrite this terminal
             # state, or let a new host select us in the interval before exit.
             with retirement_lock:
-                heartbeat_state["state"] = "retired"
-                heartbeat_state["idle_since_unix_seconds"] = None
-                write_heartbeat(
-                    heartbeat_path, args.runner_instance_id, args.runner_key, state_fn
-                )
+                heartbeat.transition("retired")
     return 0
 
 

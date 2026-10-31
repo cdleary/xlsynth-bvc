@@ -4,10 +4,12 @@
 import fcntl
 import json
 import os
+import random
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -69,6 +71,250 @@ class InboxWakeupTest(unittest.TestCase):
             self.assertFalse(worker.wait_for_inbox(watch, 0))
             request = worker.claim_request(inbox, processing)
             self.assertEqual(request.read_text(), "complete")
+
+
+class PreparedDriverToolsTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.source = self.root / "source"
+        self.source.mkdir()
+        (self.source / "tool").write_bytes(b"original")
+        (self.source / "libxls-x64.so").write_bytes(b"library")
+        self.tools = worker.PreparedDriverTools(self.root / "prepared")
+
+    def test_reuse_and_mutation_match_fresh_copy(self):
+        # Preparation replaces any versioned file with the generated alias.
+        (self.source / "libxls-v1-x64.so").write_bytes(b"superseded")
+        target = self.tools.prepare(self.source, "v1", "x64")
+        inode = (target / "tool").stat().st_ino
+        with mock.patch.object(worker.shutil, "copytree", side_effect=AssertionError("unexpected copy")):
+            self.assertEqual(self.tools.prepare(self.source, "v1", "x64"), target)
+        self.assertEqual((target / "tool").stat().st_ino, inode)
+        self.assertEqual((target / "libxls-v1-x64.so").read_bytes(), b"library")
+        # Same length and restored mtime still change inode ctime.
+        original = (self.source / "tool").stat()
+        (self.source / "tool").write_bytes(b"modified")
+        os.utime(self.source / "tool", ns=(original.st_atime_ns, original.st_mtime_ns))
+        self.tools.prepare(self.source, "v1", "x64")
+        self.assertEqual((target / "tool").read_bytes(), b"modified")
+        (target / "tool").write_bytes(b"tampered")
+        self.tools.prepare(self.source, "v1", "x64")
+        self.assertEqual((target / "tool").read_bytes(), b"modified")
+
+    def test_version_and_source_identity_are_not_interchangeable(self):
+        self.tools.prepare(self.source, "v1", "x64")
+        target = self.tools.prepare(self.source, "v2", "x64")
+        self.assertFalse((target / "libxls-v1-x64.so").exists())
+        self.assertEqual((target / "libxls-v2-x64.so").read_bytes(), b"library")
+        other = self.root / "other"
+        worker.shutil.copytree(self.source, other)
+        (other / "tool").write_bytes(b"another")
+        self.tools.prepare(other, "v2", "x64")
+        self.assertEqual((target / "tool").read_bytes(), b"another")
+
+    def test_same_tick_edit_before_first_settled_reuse(self):
+        # Model a filesystem on which the copy and edit share a timestamp tick.
+        identity = worker.tree_identity
+
+        def coarse_identity(root):
+            return tuple((*entry[:5], 0, 0, entry[7]) for entry in identity(root))
+
+        with (mock.patch.object(worker, "tree_identity", side_effect=coarse_identity),
+              mock.patch.object(worker.time, "time_ns", return_value=0) as clock):
+            target = self.tools.prepare(self.source, "v1", "x64")
+            (target / "tool").write_bytes(b"tampered")
+            clock.return_value = 2_000_000_000
+            self.tools.prepare(self.source, "v1", "x64")
+            self.assertEqual((target / "tool").read_bytes(), b"original")
+
+    def test_failed_copy_does_not_publish_or_reuse_partial_state(self):
+        target = self.tools.prepare(self.source, "v1", "x64")
+        (self.source / "tool").write_bytes(b"replacement")
+        with mock.patch.object(worker.shutil, "copytree", side_effect=OSError("copy interrupted")):
+            with self.assertRaises(OSError):
+                self.tools.prepare(self.source, "v1", "x64")
+        self.assertEqual((target / "tool").read_bytes(), b"original")
+        self.tools.prepare(self.source, "v1", "x64")
+        self.assertEqual((target / "tool").read_bytes(), b"replacement")
+        self.assertEqual(list(self.root.glob(".xlsynth-tools-*")), [])
+
+    def test_generated_requests_match_fresh_preparation(self):
+        rng = random.Random(71029)
+        for _ in range(200):
+            operation = rng.randrange(4)
+            if operation == 0:
+                (self.source / "tool").write_bytes(bytes(rng.randrange(256) for _ in range(8)))
+            elif operation == 1 and self.tools.target.exists():
+                (self.tools.target / "tool").write_bytes(b"modified")
+            elif operation == 2:
+                (self.source / "extra").write_bytes(b"extra")
+            else:
+                (self.source / "extra").unlink(missing_ok=True)
+            version = "v{}".format(rng.randrange(3))
+            target = self.tools.prepare(self.source, version, "x64")
+            expected = {str(p.relative_to(self.source)): p.read_bytes()
+                        for p in self.source.rglob("*") if p.is_file()}
+            expected["libxls-{}-x64.so".format(version)] = b"library"
+            actual = {str(p.relative_to(target)): p.read_bytes()
+                      for p in target.rglob("*") if p.is_file()}
+            self.assertEqual(actual, expected)
+
+
+class HeartbeatPublicationTest(unittest.TestCase):
+    def test_delayed_background_writer_cannot_overwrite_completion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "heartbeat.json"
+            heartbeat = worker.HeartbeatPublisher(path, "instance", "runner", worker.utc_now())
+            heartbeat.transition("busy", "request")
+            publishing = threading.Event()
+            release = threading.Event()
+            original_write = worker.write_json_atomic
+
+            def delayed_write(path, payload):
+                if threading.current_thread().name == "background":
+                    publishing.set()
+                    self.assertTrue(release.wait(5))
+                original_write(path, payload)
+
+            with mock.patch.object(worker, "write_json_atomic", side_effect=delayed_write):
+                background = threading.Thread(target=heartbeat.publish, name="background")
+                background.start()
+                self.assertTrue(publishing.wait(5))
+                completion = threading.Thread(target=lambda: heartbeat.transition("idle"))
+                completion.start()
+                release.set()
+                background.join(5)
+                completion.join(5)
+                self.assertFalse(background.is_alive() or completion.is_alive())
+            self.assertEqual(json.loads(path.read_text())["state"], "idle")
+            self.assertIsNone(json.loads(path.read_text())["current_request_id"])
+
+
+class ProcessRequestTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        for directory in ["job", "source", "processing", "archive"]:
+            (self.root / directory).mkdir()
+        self.mount = self.root / "cache-input"
+        patch = mock.patch.object(worker, "DRIVER_CACHE_MOUNT", str(self.mount))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.tools = worker.PreparedDriverTools(self.root / "tools")
+        self.heartbeat = worker.HeartbeatPublisher(
+            self.root / "heartbeat.json", "instance", "runner", worker.utc_now()
+        )
+        self.request_path = self.root / "processing/request.json"
+
+    def run_request(self, **overrides):
+        request = {
+            "schema_version": worker.SCHEMA_VERSION,
+            "request_id": "request", "request_token": "token",
+            "runner_key": "runner", "runner_instance_id": "instance",
+            "container_name": "container", "timeout_secs": 5,
+            "job_root": str(self.root / "job"), "heartbeat_path": str(self.heartbeat.path),
+            "mounts": [{"source_path": str(self.root / "source"), "target_path": str(self.mount)}],
+            "env": {"XLSYNTH_VERSION": "v1", "XLSYNTH_PLATFORM": "x64"},
+            "script": "printf completed",
+            **overrides,
+        }
+        self.request_path.write_text(json.dumps(request))
+        reusable = worker.process_request(
+            self.request_path, self.root / "results", self.root / "archive", self.heartbeat, self.tools
+        )
+        return reusable, json.loads((self.root / "results/request.json").read_text())
+
+    def test_short_request_publishes_idle_without_a_heartbeat_tick(self):
+        original_write_result = worker.write_result
+
+        def publish_completed_result(path, payload):
+            state = json.loads(self.heartbeat.path.read_text())
+            self.assertEqual(state["state"], "idle")
+            self.assertIsNone(state["current_request_id"])
+            self.assertTrue((self.root / "archive/request.json").is_file())
+            self.assertFalse(self.request_path.exists())
+            self.assertFalse(self.mount.is_symlink())
+            original_write_result(path, payload)
+
+        with mock.patch.object(worker, "write_result", side_effect=publish_completed_result):
+            reusable, result = self.run_request()
+        self.assertTrue(reusable)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["stdout_tail"], "completed")
+
+    def test_command_gets_only_time_left_after_preparation(self):
+        with (mock.patch.object(worker.time, "monotonic_ns", return_value=0) as clock,
+              mock.patch.object(worker.subprocess, "Popen") as launch):
+            def finish_preparation(*args):
+                clock.return_value = 3_000_000_000
+                return self.tools.target
+
+            launch.return_value.returncode = 0
+            with mock.patch.object(self.tools, "prepare", side_effect=finish_preparation):
+                reusable, result = self.run_request(timeout_secs=5)
+            launch.return_value.wait.assert_called_once_with(timeout=2.0)
+        self.assertTrue(reusable)
+        self.assertEqual(result["timings_us"]["prepare"], 3_000_000)
+
+    def test_timeout_interrupts_cold_copy_and_skips_command(self):
+        def slow_copy(source, staging, **kwargs):
+            staging.mkdir()
+            (staging / "tool").write_bytes(b"partial")
+            time.sleep(2)
+            self.fail("copy should have been interrupted")
+
+        with (mock.patch.object(worker.shutil, "copytree", side_effect=slow_copy),
+              mock.patch.object(worker.subprocess, "Popen") as launch):
+            reusable, result = self.run_request(timeout_secs=1)
+            launch.assert_not_called()
+        self.assertFalse(reusable)
+        self.assertTrue(result["timed_out"])
+        self.assertTrue(result["error"].startswith("TIMEOUT(1)"))
+        self.assertEqual(result["timings_us"]["command"], 0)
+        self.assertFalse(self.tools.target.exists())
+        self.assertEqual(list(self.root.glob(".xlsynth-tools-*")), [])
+        self.assertFalse(self.mount.is_symlink())
+        self.assertTrue((self.root / "archive/request.json").is_file())
+        self.assertEqual(json.loads(self.heartbeat.path.read_text())["state"], "retired")
+
+    def test_command_timeout_kills_running_process(self):
+        reusable, result = self.run_request(mounts=[], timeout_secs=1, script="exec sleep 5")
+        self.assertFalse(reusable)
+        self.assertTrue(result["timed_out"])
+        self.assertLess(result["exit_code"], 0)
+        self.assertEqual(json.loads(self.heartbeat.path.read_text())["state"], "retired")
+
+    def test_archive_failure_retires_worker_and_publishes_failure(self):
+        (self.root / "archive/request.json").mkdir()
+        reusable, result = self.run_request()
+        self.assertFalse(reusable)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("archival failed", result["error"])
+        self.assertEqual(json.loads(self.heartbeat.path.read_text())["state"], "retired")
+        self.assertTrue(self.request_path.is_file())
+
+    def test_mount_cleanup_continues_after_failure_and_retires_worker(self):
+        mounts = [
+            {"source_path": str(self.root / "source"), "target_path": str(self.root / name)}
+            for name in ["first", "second"]
+        ]
+        remove = worker.remove_existing_target
+
+        def fail_last_unmount(path):
+            if path == self.root / "second" and path.is_symlink():
+                raise OSError("injected unlink failure")
+            remove(path)
+
+        with mock.patch.object(worker, "remove_existing_target", side_effect=fail_last_unmount):
+            reusable, result = self.run_request(mounts=mounts)
+        self.assertFalse(reusable)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("mount cleanup failed", result["error"])
+        self.assertFalse((self.root / "first").is_symlink())
+        self.assertEqual(json.loads(self.heartbeat.path.read_text())["state"], "retired")
 
 
 class IdleRetirementTest(unittest.TestCase):

@@ -2428,6 +2428,7 @@ dependencies = [
  "flate2",
  "fs2",
  "hex",
+ "libc",
  "log",
  "prost",
  "prost-build",
