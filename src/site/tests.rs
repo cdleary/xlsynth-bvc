@@ -19,13 +19,19 @@ use crate::versioning::{
 use chrono::Utc;
 use serde_json::json;
 use std::io::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn temp_root() -> PathBuf {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    std::env::temp_dir().join(format!("xlsynth-bvc-site-{}-{nanos}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "xlsynth-bvc-site-{}-{nanos}-{id}",
+        std::process::id()
+    ))
 }
 
 fn test_repo_root() -> PathBuf {
