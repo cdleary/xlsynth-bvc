@@ -1194,6 +1194,7 @@ pub(crate) fn run_ir_dir_corpus(
             CorpusRecipePreset::G8rAbcVsYabcAigDiff
                 | CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff
                 | CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff
+                | CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff
         )
     {
         bail!("g8r-abc-vs-yabc-aig-diff requires --fraig=false for a matched ABC comparison");
@@ -1271,7 +1272,7 @@ pub(crate) fn run_ir_dir_corpus(
                 }
             }
         };
-        let slang_commit = (recipe_preset == CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff)
+        let slang_commit = recipe_preset_uses_slang(recipe_preset)
             .then(|| crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string());
         let yosys_runtime = yosys.into_runtime(repo_root, slang_commit)?;
         (driver_runtime, stats_runtime, yosys_runtime)
@@ -2463,6 +2464,7 @@ fn build_action_plan(
         CorpusRecipePreset::G8rAbcVsYabcAigDiff
             | CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff
             | CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff
+            | CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff
     );
     if matched_abc && fraig {
         bail!("matched ABC comparison cannot enable driver FRAIG");
@@ -2504,6 +2506,7 @@ fn build_action_plan(
             recipe_preset,
             CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff
                 | CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff
+                | CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff
         ),
         version: version.to_string(),
         runtime: driver_runtime.clone(),
@@ -2519,7 +2522,7 @@ fn build_action_plan(
         ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id: combo_verilog_action_id.clone(),
             verilog_top_module_name: Some(sample.top_fn_name.clone()),
-            frontend: if recipe_preset == CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff {
+            frontend: if recipe_preset_uses_slang(recipe_preset) {
                 YosysVerilogFrontend::Slang {
                     revision: crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string(),
                 }
@@ -3483,6 +3486,7 @@ fn export_leaf_artifacts(
                 parse_recipe_preset_label(&sample.preset)?,
                 CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff
                     | CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff
+                    | CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff
             );
             copy_artifact_if_present(
                 store,
@@ -3641,6 +3645,14 @@ fn count_statuses(samples: &[IrDirCorpusSampleRecord]) -> BTreeMap<String, usize
     counts
 }
 
+fn recipe_preset_uses_slang(recipe_preset: CorpusRecipePreset) -> bool {
+    matches!(
+        recipe_preset,
+        CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff
+            | CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff
+    )
+}
+
 fn recipe_preset_label(recipe_preset: CorpusRecipePreset) -> &'static str {
     recipe_preset_spec(recipe_preset).label
 }
@@ -3667,6 +3679,10 @@ fn recipe_preset_spec(recipe_preset: CorpusRecipePreset) -> CorpusRecipePresetSp
             label: "g8r-abc-vs-yabc-slang-aig-diff",
             yosys_script: "flows/yosys_to_aig.ys",
         },
+        CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff => CorpusRecipePresetSpec {
+            label: "g8r-abc-vs-yabc-slang-bounded-aig-diff",
+            yosys_script: "flows/abc_bounded_fraig.ys",
+        },
         CorpusRecipePreset::G8rAbcStats => CorpusRecipePresetSpec {
             label: "g8r-abc-stats",
             yosys_script: "flows/yosys_to_aig.ys",
@@ -3684,6 +3700,9 @@ fn parse_recipe_preset_label(label: &str) -> Result<CorpusRecipePreset> {
             Ok(CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff)
         }
         "g8r-abc-vs-yabc-slang-aig-diff" => Ok(CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff),
+        "g8r-abc-vs-yabc-slang-bounded-aig-diff" => {
+            Ok(CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff)
+        }
         other => bail!("unsupported corpus recipe preset in manifest: {}", other),
     }
 }
@@ -4990,9 +5009,10 @@ mod tests {
             CorpusRecipePreset::G8rAbcVsYabcAigDiff,
             CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff,
             CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff,
+            CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff,
         ] {
             let mut yosys_runtime = sample_yosys_runtime();
-            if recipe_preset == CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff {
+            if recipe_preset_uses_slang(recipe_preset) {
                 yosys_runtime.slang_commit = Some(crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string());
             }
             let build = |fraig| {
@@ -5010,7 +5030,7 @@ mod tests {
             let plan = build(false).expect("matched action plan");
             assert!(matches!(&plan.combo_verilog_action,
             ActionSpec::IrFnToCombinationalVerilog { use_system_verilog, .. }
-            if *use_system_verilog == matches!(recipe_preset, CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff | CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff)));
+            if *use_system_verilog == matches!(recipe_preset, CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff | CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff | CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff)));
             let g8r_abc_id = plan.g8r_abc_aig_action_id.as_ref().expect("G8r ABC action");
             assert_eq!(plan.planned_actions().len(), 8);
             assert!(
@@ -5038,7 +5058,7 @@ mod tests {
                 &plan.yosys_abc_aig_action,
                 ActionSpec::ComboVerilogToYosysAbcAig { yosys_script_ref, frontend, .. }
                     if yosys_script_ref.sha256 == script.sha256
-                    && *frontend == if recipe_preset == CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff {
+                    && *frontend == if recipe_preset_uses_slang(recipe_preset) {
                         YosysVerilogFrontend::Slang { revision: crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string() }
                     } else {
                         YosysVerilogFrontend::Builtin

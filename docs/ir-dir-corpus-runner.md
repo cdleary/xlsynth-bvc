@@ -497,3 +497,17 @@ The missing layer is:
 - a stable per-sample manifest/export bundle
 
 That is now the bridge from "directory of IR files" to "batch g8r vs yabc diff stats".
+
+### Bounded ABC effort for large SystemVerilog functions
+
+`--recipe-preset g8r-abc-vs-yabc-slang-bounded-aig-diff` uses pinned Slang
+and `flows/abc_bounded_fraig.ys` for both ABC branches. The flow limits
+`&fraig -x` to 1,000 SAT conflicts per candidate node. Candidates that cannot
+be proved within the budget are left unmerged; the remaining mapping flow is
+unchanged. This is an effort bound, not a wall-clock timeout.
+
+Use a separate output directory for this recipe. Its explicit recipe label and
+script digest distinguish its measurements from the default flow; results can
+differ because less SAT sweeping can change later mapping choices. Compare
+compiler revisions with the same recipe and budget. Raw g8r statistics and its
+post-ABC branch still share a single g8r lowering.

@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Limit effort spent proving individual SAT-sweeping candidates in large circuits.
+# An exhausted budget skips a merge; it does not weaken the required proof.
+
+proc
+opt
+techmap
+abc -g AND -script "+strash;&get -n;&fraig -x -C 1000;&put;scorr;dc2;dretime;strash;&get -n;&dch -f;&nf;&put"
+clean
