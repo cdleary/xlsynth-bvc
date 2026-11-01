@@ -632,11 +632,36 @@ pub(crate) fn build(
             ChildNavigation::PreviousVersions,
         )?;
         install_child_navigation(&staging.out_dir.join("corpus"), ChildNavigation::Corpus)?;
-        finish(&staging.out_dir, &base_url)
+        finish(&staging.out_dir, &base_url, progression)
     })
 }
 
-fn finish(out: &Path, base_url: &str) -> Result<BuildStaticSiteSummary> {
+fn finish(out: &Path, base_url: &str, progression: &[PathBuf]) -> Result<BuildStaticSiteSummary> {
+    let mut archives = archive_roots(out)?;
+    for root in progression_archive_roots(&out.join("history"))? {
+        let sample_id = crate::corpus::sample_id_for_relpath(&root.source_relpath);
+        let mut found = false;
+        for run in progression {
+            let path = run.join("artifacts").join(&sample_id).join("input.ir");
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("reading progression archive root"),
+            };
+            if Sha256::digest(&bytes).as_slice() == root.source_sha256 {
+                archives.add(root.clone(), &bytes)?;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            bail!(
+                "progression archive input is missing: {}",
+                root.source_relpath
+            );
+        }
+    }
+    archives.write(out)?;
     let dashboard = wire::DashboardSite {
         record_version: 1,
         history_manifest: Some(publication_file(
@@ -689,6 +714,72 @@ fn finish(out: &Path, base_url: &str) -> Result<BuildStaticSiteSummary> {
     })
 }
 
+fn archive_roots(out: &Path) -> Result<crate::ir_archive::Builder> {
+    let mut roots = crate::ir_archive::Builder::default();
+    roots.extend_from_site(&out.join("corpus"))?;
+    Ok(roots)
+}
+
+fn progression_archive_roots(
+    history: &Path,
+) -> Result<Vec<crate::ir_archive::wire::IrArchiveRoot>> {
+    let catalog = decode_canonical_browser_catalog(&fs::read(history.join("catalog.json"))?)?;
+    let mut roots = BTreeMap::new();
+    for record in catalog.progression_evidence {
+        let bytes = fs::read(history.join(normalized_relpath(&record.url)?))?;
+        if bytes.len() as u64 != record.bytes || sha256_hex(&bytes) != record.sha256 {
+            bail!("IR archive progression evidence checksum mismatch");
+        }
+        let evidence = pb::FixedCorpusProgressionRunEvidence::decode(bytes.as_slice())?;
+        if evidence.encode_to_vec() != bytes {
+            bail!("noncanonical IR archive progression evidence");
+        }
+        for sample in evidence.samples {
+            let action = sample
+                .action_graph
+                .context("missing progression IR action graph")?
+                .import_ir
+                .context("missing progression IR import")?;
+            let ActionSpec::ImportIrPackageFile {
+                source_sha256,
+                top_fn_name: Some(top_fn_name),
+            } = crate::proto::action_spec_from_proto(&action)?
+            else {
+                bail!("progression archive input is not a canonical IR root");
+            };
+            let root = crate::ir_archive::wire::IrArchiveRoot {
+                corpus: evidence.cohort_id.clone(),
+                source_relpath: format!(
+                    "{}.ir",
+                    digest_hex(&sample.structural_hash, "archive structural hash")?
+                ),
+                source_sha256: crate::proto::digest_from_hex(
+                    &source_sha256,
+                    "archive input SHA-256",
+                )?
+                .value,
+                top_fn_name,
+            };
+            if root.source_sha256
+                != sample
+                    .source_sha256
+                    .context("missing progression source SHA-256")?
+                    .value
+            {
+                bail!("progression IR archive root differs from its sample input identity");
+            }
+            let key = (root.corpus.clone(), root.source_relpath.clone());
+            if roots
+                .insert(key, root.clone())
+                .is_some_and(|prior| prior != root)
+            {
+                bail!("progression generations disagree about their frozen archive roots");
+            }
+        }
+    }
+    Ok(roots.into_values().collect())
+}
+
 pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -> Result<()> {
     let bytes = fs::read(out.join(MANIFEST))?;
     let dashboard = wire::DashboardSite::decode(bytes.as_slice())?;
@@ -736,6 +827,10 @@ pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -
             bail!("dashboard transition projection mismatch");
         }
     }
+    expected.extend(
+        archive_roots(out)?
+            .verify_including(out, &progression_archive_roots(&out.join("history"))?)?,
+    );
     if actual_site_relpaths(out)? != expected
         || fs::read(out.join("dashboard.json"))? != projection.dashboard
     {

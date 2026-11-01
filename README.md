@@ -256,6 +256,12 @@ latest results, a large fixed-population progression chart, and an index of ever
 release. Historical pages and full-corpus explorers retain separate, verified evidence roots.
 Building does not deploy or restart evaluations.
 
+Corpus sites and dashboards also publish 256 deterministic, hash-sharded IR
+archives. Use `import-ir-archives` to download and verify their protobuf index,
+restore portable corpus directories, and seed canonical IR-import cache roots
+without rerunning their original crate-generation pipelines. See
+[portable IR archives](docs/ir-archives.md) for commands and integrity checks.
+
 For later refreshes, reuse the previous dashboard's typed release evidence with
 `--corpus-evidence-dir ../previous-site/corpus` and pass only newly completed releases via
 `--corpus-run-dir`. This avoids reopening old evaluation stores; it regenerates the web assets

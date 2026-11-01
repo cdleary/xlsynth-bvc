@@ -562,6 +562,25 @@ pub(crate) fn run() -> Result<()> {
     store.ensure_layout()?;
 
     match command {
+        TopCommand::ImportIrArchives {
+            site_dir,
+            url,
+            out_dir,
+        } => {
+            let protected = [
+                ("resource checkout", repo_root.as_path()),
+                ("private store", store.root.as_path()),
+                ("artifact database", artifacts_via_sled.as_path()),
+            ];
+            let summary = crate::ir_archive::import(
+                &store,
+                site_dir.as_deref(),
+                url.as_deref(),
+                &out_dir,
+                &protected,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
         TopCommand::SeedDownstreamCache {
             cache_dir,
             action_id,
