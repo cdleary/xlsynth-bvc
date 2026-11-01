@@ -16,14 +16,14 @@ pub(super) const NAV_CSS_PATH: &str = "assets/navigation.css";
 const NAV_CSS: &[u8] = include_bytes!("site_assets/navigation.css");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ChildNavigation {
+pub(crate) enum ChildNavigation {
     PreviousVersions,
     Corpus,
 }
 
 // The existing composition protobuf supplies the navigation context. Standalone
 // builds have no parent composition and retain their standalone presentation.
-pub(super) fn child_navigation(site_dir: &Path) -> Result<Option<ChildNavigation>> {
+pub(crate) fn child_navigation(site_dir: &Path) -> Result<Option<ChildNavigation>> {
     let Some(parent) = site_dir.parent() else {
         return Ok(None);
     };
@@ -66,7 +66,7 @@ pub(super) fn child_parent_link(page: &str, url: &str) -> Result<bool> {
     .any(|link| link == url))
 }
 
-pub(super) fn child_asset(
+pub(crate) fn child_asset(
     kind: Option<ChildNavigation>,
     path: &str,
     bytes: &[u8],

@@ -411,6 +411,9 @@ or evaluation runs that produced the data. These principles are the intended nav
 - **Use descriptive language.** Titles name the analysis, and explanatory text states the
   methodology or interpretation. Avoid slogans, duplicate summaries, and navigation labels that
   require knowledge of the implementation.
+- **Human-readable download entry points.** IR downloads open `/ir/`, with corpus counts,
+  shard links, checksums, and cache-import instructions. Keep the canonical protobuf index
+  available from that page rather than making a binary format the primary navigation target.
 
 Snapshot and full-corpus evidence may retain separate validated storage roots. That internal
 separation does not justify competing homepages or redundant user-facing workflows.

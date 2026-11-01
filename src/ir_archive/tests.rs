@@ -34,7 +34,7 @@ impl Drop for Fixture {
     }
 }
 
-fn ir() -> &'static [u8] {
+pub(super) fn ir() -> &'static [u8] {
     b"package test\ntop fn f(x: bits[1] id=1) -> bits[1] {\n ret not.2: bits[1] = not(x, id=2)\n}\n"
 }
 
@@ -47,7 +47,7 @@ fn root(corpus: &str, path: &str) -> wire::IrArchiveRoot {
     }
 }
 
-fn fixture_builder() -> Builder {
+pub(super) fn fixture_builder() -> Builder {
     let mut builder = Builder::default();
     builder.add(root("full-corpus", "hash/f.ir"), ir()).unwrap();
     builder
@@ -81,7 +81,7 @@ fn archives_are_fixed_deterministic_and_deduplicated() {
         index.buckets.iter().map(|b| b.blobs.len()).sum::<usize>(),
         1
     );
-    assert_eq!(first.verify(&fixture.site()).unwrap().len(), 257);
+    assert_eq!(first.verify(&fixture.site()).unwrap().len(), 260);
     let mut reordered = Builder::default();
     reordered
         .add(root("whole-functions-v1", "structural.ir"), ir())
@@ -113,12 +113,29 @@ fn progression_download_roots_must_match_independent_evidence() {
             .verify_including(&fixture.site(), &[progression.clone()])
             .unwrap()
             .len(),
-        257
+        260
     );
     assert!(corpus.verify_including(&fixture.site(), &[]).is_err());
     let mut wrong = progression;
     wrong.source_sha256 = vec![0u8; 32];
     assert!(corpus.verify_including(&fixture.site(), &[wrong]).is_err());
+}
+
+#[test]
+fn download_page_and_assets_are_verified_and_required() {
+    let fixture = Fixture::new();
+    let builder = fixture_builder();
+    builder.write(&fixture.site()).unwrap();
+    let expected = page::files(&index(&fixture.site()));
+    for (path, bytes) in expected {
+        assert_eq!(fs::read(fixture.site().join(path)).unwrap(), bytes);
+        fs::write(fixture.site().join(path), b"altered page").unwrap();
+        assert!(builder.verify(&fixture.site()).is_err());
+        fs::remove_file(fixture.site().join(path)).unwrap();
+        assert!(builder.verify(&fixture.site()).is_err());
+        fs::write(fixture.site().join(path), bytes).unwrap();
+    }
+    builder.verify(&fixture.site()).unwrap();
 }
 
 #[test]

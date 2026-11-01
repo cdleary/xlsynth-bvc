@@ -264,6 +264,27 @@ fn corpus_download_seeds_canonical_roots_and_rejects_rehashed_archive_tampering(
 }
 
 #[test]
+fn rejects_rehashed_download_page_tampering() {
+    let root = Fixture::new();
+    let run = fixture_run(&root.0, "0.74.0", 1);
+    let options = root.options();
+    build(&options, &[], &[run], &[], 100_000).unwrap();
+    let page = "ir/index.html";
+    fs::write(options.out_dir.join(page), b"unrelated download page").unwrap();
+    let manifest_path = options.out_dir.join(STATIC_SITE_MANIFEST_FILENAME);
+    let mut manifest =
+        pb::StaticSiteManifest::decode(fs::read(&manifest_path).unwrap().as_slice()).unwrap();
+    let record = manifest
+        .files
+        .iter_mut()
+        .find(|f| f.relpath.as_ref().unwrap().value == page)
+        .unwrap();
+    *record = publication_file(&options.out_dir, page).unwrap();
+    fs::write(manifest_path, manifest.encode_to_vec()).unwrap();
+    assert!(verify_static_site(&options.out_dir).is_err());
+}
+
+#[test]
 fn rejects_incomplete_or_forged_operational_inputs() {
     let root = Fixture::new();
     let run = fixture_run(&root.0, "0.74.0", 1);
