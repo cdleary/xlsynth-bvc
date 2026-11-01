@@ -2,13 +2,22 @@
 
 # Portable IR corpus archives
 
-`build-static-site` automatically emits `ir/index.pb` and exactly 256
+`build-static-site` automatically emits a human-readable `ir/` download page,
+the machine-readable `ir/index.pb`, and exactly 256
 `ir/00.tar.zst` through `ir/ff.tar.zst` archives for a complete corpus site or
 all-versions dashboard. The dashboard's root download combines full-corpus
 inputs with whole-function and MFFC roots from its admitted, typed progression
 run evidence. A standalone corpus site's download covers its full-corpus inputs.
 The embedded `corpus/` site retains its
 independently verified full-corpus-only download.
+
+The dashboard and corpus explorer link to the download page. It shows the roots
+per corpus, deduplicated IR-file count, compressed download size, import instructions,
+and individual shard links with sizes and SHA-256 checksums. The archive list is
+static HTML and works without JavaScript; a small script fills the current site
+root into the example import command. The protobuf index remains directly
+downloadable from the page. Both page metadata and archive bytes are verified
+against the same canonical index, including for the embedded corpus-only download.
 
 Each exact IR byte string is stored once per download, regardless of how many
 releases, top functions, or populations reference it. The bucket is the first

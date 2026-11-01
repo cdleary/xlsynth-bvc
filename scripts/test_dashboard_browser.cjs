@@ -146,6 +146,7 @@ async function main(){
     await send('Page.navigate',{url:await evaluate("document.getElementById('input-link').href")});
   }else await send('Page.navigate',{url:await evaluate("document.getElementById('compare-link').href")});
   await waitFor("document.getElementById('corpus-site')?.dataset.rendered==='true'");
+  assert.equal(await evaluate("Array.from(document.querySelectorAll('footer a')).find(a=>a.textContent==='IR downloads').getAttribute('href')"),'ir/');
   assert.equal(await evaluate("document.getElementById('release').value"),last.version);
   assert.equal(await evaluate("document.getElementById('stage').value"),'raw');
   assert.equal(await evaluate("document.getElementById('reference').value"),'release');
@@ -154,6 +155,48 @@ async function main(){
   await shot('corpus-navigation');
   await send('Page.navigate',{url:await evaluate("Array.from(document.querySelectorAll('.bvc-navigation a')).find(a=>a.textContent==='All versions').href")});await ready();
   assert.equal(await evaluate('location.hash'),'#versions');
+  assert.equal(await evaluate("Array.from(document.querySelectorAll('footer a')).find(a=>a.textContent==='IR downloads').getAttribute('href')"),'ir/');
+  for(const relative of ['ir/','corpus/ir/index.html']){
+    const target=new URL(relative,url),siteRoot=new URL('../',target);
+    await send('Page.navigate',{url:target.href});
+    await waitFor(`location.pathname===${JSON.stringify(target.pathname)}&&document.readyState==='complete'&&document.getElementById('archives')!==null`);
+    const rows=await evaluate("Array.from(document.querySelectorAll('#archives tbody tr'),r=>({prefix:r.dataset.prefix,blobs:Number(r.dataset.blobs),bytes:Number(r.dataset.bytes),href:r.querySelector('a').getAttribute('href'),sha:r.querySelector('code').textContent}))");
+    assert.deepEqual(rows.map(r=>[r.prefix,r.href]),Array.from({length:256},(_,i)=>{const p=i.toString(16).padStart(2,'0');return [p,p+'.tar.zst']}));
+    const corpora=await evaluate("Array.from(document.querySelectorAll('#corpus-counts tr'),r=>[r.dataset.corpus,Number(r.dataset.roots)])");
+    const expectedCorpora=(relative.startsWith('corpus/')?data.trends.filter(t=>t.id==='full-corpus'):data.trends).map(t=>[t.id,t.count]).sort(([a],[b])=>a.localeCompare(b));
+    assert.deepEqual(corpora,expectedCorpora);
+    assert.equal(await evaluate("Number(document.getElementById('root-count').textContent.replaceAll(',',''))"),corpora.reduce((sum,[,n])=>sum+n,0));
+    assert.equal(await evaluate("Number(document.getElementById('blob-count').textContent.replaceAll(',',''))"),rows.reduce((sum,r)=>sum+r.blobs,0));
+    assert.equal(await evaluate("Number(document.getElementById('download-size').dataset.bytes)"),rows.reduce((sum,r)=>sum+r.bytes,0));
+    const command=[
+      'cargo run --release --bin xlsynth_bvc -- ',
+      '  --store-dir ../ir-cache/artifacts --artifacts-via-sled ../ir-cache/artifacts.sled ',
+      '  import-ir-archives ',
+      "  --url '"+siteRoot.href+"' ",
+      '  --out-dir ../downloaded-corpus',
+    ].join(String.fromCharCode(92,10));
+    assert.equal(await evaluate("document.getElementById('import-command').textContent"),command);
+    const html=await (await fetch(target)).text();
+    const staticPage=await evaluate(`(()=>{const doc=new DOMParser().parseFromString(${JSON.stringify(html)},'text/html');return {rows:doc.querySelectorAll('#archives tbody tr').length,command:doc.getElementById('import-command').textContent}})()`);
+    assert.deepEqual(staticPage,{rows:256,command:command.replace("'"+siteRoot.href+"'",'SITE_URL')});
+    assert.equal(await evaluate("document.querySelector('footer a').getAttribute('href')"),'index.pb');
+    assert.equal(await evaluate("document.querySelector('header a').href"),relative.startsWith('corpus/')?new URL('index.html',url).href:siteRoot.href);
+    for(const row of [rows[0],rows[127],rows[255]]){
+      const response=await fetch(new URL(row.href,target));assert.equal(response.status,200);
+      const bytes=Buffer.from(await response.arrayBuffer());
+      assert.equal(bytes.length,row.bytes);
+      assert.equal(require('node:crypto').createHash('sha256').update(bytes).digest('hex'),row.sha);
+    }
+    await shot(relative.startsWith('corpus/')?'corpus-ir-downloads':'ir-downloads-desktop');
+    await send('Emulation.setDeviceMetricsOverride',{width:390,height:1000,deviceScaleFactor:1,mobile:true});
+    assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true);
+    await evaluate("document.querySelector('#bucket-00 details').open=true");
+    assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true);
+    await shot(relative.startsWith('corpus/')?'corpus-ir-downloads-mobile':'ir-downloads-mobile');
+    await evaluate("document.getElementById('archives-title').scrollIntoView()");
+    await shot(relative.startsWith('corpus/')?'corpus-ir-archives-mobile':'ir-archives-mobile');
+    await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1180,deviceScaleFactor:1,mobile:false});
+  }
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({versions:data.versions.map(v=>v.crate_version),cohorts:data.trends.map(t=>({id:t.id,count:t.count,stages:Object.fromEntries(Object.entries(t.stages).map(([stage,series])=>[stage,{releases:series.points.length,unavailable:series.unavailable_versions}]))})),desktop:true,mobile:true,links:true,pointNavigation:true,errors},null,2));
 }

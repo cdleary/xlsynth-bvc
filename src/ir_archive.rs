@@ -18,6 +18,7 @@ pub(crate) mod wire {
 }
 
 pub(crate) const INDEX: &str = "ir/index.pb";
+mod page;
 const MAX_ASSET_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_EXPANDED_BUCKET_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_ROOT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -160,6 +161,9 @@ impl Builder {
         for (bucket, bytes) in index.buckets.iter().zip(packs) {
             fs::write(site.join(archive_path(&bucket.prefix)), bytes)?;
         }
+        for (path, bytes) in page::files(&index) {
+            fs::write(site.join(path), bytes)?;
+        }
         Ok(())
     }
 
@@ -175,6 +179,14 @@ impl Builder {
                 bail!("IR archive {path} differs from the site's verified IR roots");
             }
             paths.insert(path);
+        }
+        let navigation = crate::site::site_dashboard::child_navigation(site)?;
+        for (path, bytes) in page::files(&expected) {
+            let bytes = crate::site::site_dashboard::child_asset(navigation, path, &bytes)?;
+            if read_local(site, path, MAX_ASSET_BYTES)? != bytes {
+                bail!("IR download page {path} differs from its verified index or template");
+            }
+            paths.insert(path.into());
         }
         Ok(paths)
     }
