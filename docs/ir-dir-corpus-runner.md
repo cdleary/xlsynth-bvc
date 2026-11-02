@@ -167,13 +167,16 @@ cargo run --bin xlsynth_bvc -- \
 
 ## Exact Git Candidate Workflow
 
-Refresh the checked-in repository observation, then pass the resolved full commit rather than a
-mutable branch name:
+Use the observed head commit and the native XLS version mapped to the observed crate release.
 
 ```bash
 python3 scripts/sync_version_compat.py --update
-candidate_commit="$(jq -r '.head_commit' \
-  third_party/xlsynth-crate/repository_head_observation.json)"
+metadata_dir=third_party/xlsynth-crate
+observation="$metadata_dir/repository_head_observation.json"
+candidate_commit=$(jq -er '.head_commit' "$observation")
+crate_version=$(jq -er '.latest_crate_version' "$observation")
+dso_version=$(jq -er --arg v "$crate_version" '.[$v].xlsynth_release_version' \
+  "$metadata_dir/generated_version_compat.json")
 cargo run --bin xlsynth_bvc -- \
   run-ir-dir-corpus \
   --input-dir /tmp/xlsynth-bvc-fixed-ir-history-20260903/corpus \
@@ -181,7 +184,7 @@ cargo run --bin xlsynth_bvc -- \
   --execution-mode enqueue \
   --recipe-preset g8r-abc-stats \
   --top-fn-policy infer-single-package \
-  --version v0.54.7 \
+  --version "$dso_version" \
   --driver-git-commit "${candidate_commit}" \
   --scheduling-policy release-progression-ir-v1
 ```
