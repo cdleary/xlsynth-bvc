@@ -17,6 +17,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "DIR")]
     pub(crate) downstream_cache_dir: Option<PathBuf>,
 
+    /// Pin released auxiliary tools without changing the synthesis driver.
+    #[arg(long, global = true, value_name = "VERSION")]
+    pub(crate) aux_driver_version: Option<String>,
+
     #[command(subcommand)]
     pub(crate) command: TopCommand,
 }
@@ -554,6 +558,12 @@ pub enum CorpusRecipePreset {
     G8rVsYabcNoFraigAigDiff,
     G8rAbcStats,
     G8rAbcVsYabcAigDiff,
+    /// Matched ABC comparison with SystemVerilog codegen and builtin parsing.
+    G8rAbcVsYabcSystemVerilogAigDiff,
+    /// Matched ABC comparison with SystemVerilog codegen and the pinned Slang frontend.
+    G8rAbcVsYabcSlangAigDiff,
+    /// Slang comparison with bounded ABC SAT-sweeping effort.
+    G8rAbcVsYabcSlangBoundedAigDiff,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

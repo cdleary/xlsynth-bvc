@@ -5,6 +5,9 @@ use fs2::FileExt;
 use prost::Message;
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod directory_events;
+mod worker_script;
+
 const RUNTIME_FINGERPRINT_LABEL: &str = "org.xlsynth-bvc.runtime-fingerprint";
 const DRIVER_SOURCE_REPOSITORY_LABEL: &str = "org.xlsynth-bvc.driver-source-repository";
 const DRIVER_SOURCE_COMMIT_LABEL: &str = "org.xlsynth-bvc.driver-source-commit";
@@ -639,7 +642,8 @@ fn driver_release_cache_is_ready(
     if !cache_dir.join(DRIVER_RELEASE_CACHE_READY_FILE).is_file() {
         return false;
     }
-    match validate_driver_release_cache(cache_dir, version, platform, expected_input_sha256) {
+    match validate_driver_release_cache_cached(cache_dir, version, platform, expected_input_sha256)
+    {
         Ok(()) => true,
         Err(err) => {
             eprintln!(
@@ -650,6 +654,140 @@ fn driver_release_cache_is_ready(
             false
         }
     }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheFileIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    mode: u32,
+    bytes: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+fn driver_release_cache_snapshot(cache_dir: &Path) -> Result<Vec<CacheFileIdentity>> {
+    use std::os::unix::fs::MetadataExt;
+    WalkDir::new(cache_dir)
+        .sort_by_file_name()
+        .into_iter()
+        .map(|entry| {
+            let entry = entry.context("walking validated release cache")?;
+            if !entry.file_type().is_file() && !entry.file_type().is_dir() {
+                bail!(
+                    "release cache contains non-regular entry: {}",
+                    entry.path().display()
+                );
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            Ok(CacheFileIdentity {
+                path: entry.path().strip_prefix(cache_dir)?.to_path_buf(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                mode: metadata.mode(),
+                bytes: metadata.len(),
+                modified: (metadata.mtime(), metadata.mtime_nsec()),
+                changed: (metadata.ctime(), metadata.ctime_nsec()),
+            })
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn release_cache_timestamps_settled(snapshot: &[CacheFileIdentity]) -> bool {
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    // Filesystems may quantize successive ctime updates to the same tick. Do
+    // not memoize a generation until later writes must receive a newer tick.
+    snapshot.iter().all(|file| {
+        [file.modified, file.changed]
+            .into_iter()
+            .all(|(seconds, nanos)| {
+                seconds >= 0
+                    && (0..1_000_000_000).contains(&nanos)
+                    && now
+                        .checked_sub(Duration::new(seconds as u64, nanos as u32))
+                        .is_some_and(|age| age >= Duration::from_secs(1))
+            })
+    })
+}
+
+#[cfg(unix)]
+type ReleaseValidationKey = (PathBuf, String, String, String);
+#[cfg(unix)]
+type ReleaseValidationEntry = Arc<Mutex<Option<Vec<CacheFileIdentity>>>>;
+
+#[cfg(unix)]
+#[derive(Default)]
+struct DriverReleaseValidationCache {
+    entries: Mutex<BTreeMap<ReleaseValidationKey, ReleaseValidationEntry>>,
+}
+
+#[cfg(unix)]
+impl DriverReleaseValidationCache {
+    fn validate(
+        &self,
+        cache_dir: &Path,
+        version: &str,
+        platform: &str,
+        expected_input_sha256: &str,
+    ) -> Result<()> {
+        let key = (
+            cache_dir.to_path_buf(),
+            version.to_string(),
+            platform.to_string(),
+            expected_input_sha256.to_string(),
+        );
+        let entry = self
+            .entries
+            .lock()
+            .map_err(|_| anyhow!("release validation map poisoned"))?
+            .entry(key)
+            .or_default()
+            .clone();
+        let mut validated = entry
+            .lock()
+            .map_err(|_| anyhow!("release validation lock poisoned"))?;
+        // ctime and inode identity detect edits even when size and mtime are preserved.
+        let before = driver_release_cache_snapshot(cache_dir)?;
+        if validated.as_ref() == Some(&before) && release_cache_timestamps_settled(&before) {
+            return Ok(());
+        }
+        *validated = None;
+        validate_driver_release_cache(cache_dir, version, platform, expected_input_sha256)?;
+        let after = driver_release_cache_snapshot(cache_dir)?;
+        if before != after {
+            bail!(
+                "release cache changed during validation: {}",
+                cache_dir.display()
+            );
+        }
+        if release_cache_timestamps_settled(&after) {
+            *validated = Some(after);
+        }
+        Ok(())
+    }
+}
+
+fn validate_driver_release_cache_cached(
+    cache_dir: &Path,
+    version: &str,
+    platform: &str,
+    expected_input_sha256: &str,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        static CACHE: OnceLock<DriverReleaseValidationCache> = OnceLock::new();
+        CACHE
+            .get_or_init(DriverReleaseValidationCache::default)
+            .validate(cache_dir, version, platform, expected_input_sha256)
+    }
+    #[cfg(not(unix))]
+    validate_driver_release_cache(cache_dir, version, platform, expected_input_sha256)
 }
 
 fn write_cache_manifest_atomic(
@@ -1361,6 +1499,102 @@ fn yosys_image_build_args(
     Ok(args)
 }
 
+const DOCKER_INSPECTION_INTERVAL: Duration = Duration::from_secs(1);
+
+type RuntimeIdentityResult<T> = std::result::Result<T, String>;
+
+struct RuntimeIdentityEntry<T> {
+    generation: std::sync::atomic::AtomicU64,
+    checked: Mutex<Option<(Instant, RuntimeIdentityResult<T>)>>,
+}
+
+impl<T> Default for RuntimeIdentityEntry<T> {
+    fn default() -> Self {
+        Self {
+            generation: std::sync::atomic::AtomicU64::new(0),
+            checked: Mutex::new(None),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RuntimeIdentityCache<T> {
+    images: Mutex<BTreeMap<String, Arc<RuntimeIdentityEntry<T>>>>,
+}
+
+type ImageValidationCache = RuntimeIdentityCache<()>;
+
+impl<T: Clone> RuntimeIdentityCache<T> {
+    fn validate(
+        &self,
+        key: &str,
+        now: impl Fn() -> Instant,
+        inspect: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let entry = self
+            .images
+            .lock()
+            .map_err(|_| anyhow!("image validation cache lock poisoned"))?
+            .entry(key.to_string())
+            .or_default()
+            .clone();
+        // Only callers checking this image wait for Docker; the map lock is free.
+        let joined_generation = entry.generation.load(Ordering::Acquire);
+        let mut checked = entry
+            .checked
+            .lock()
+            .map_err(|_| anyhow!("image validation lock poisoned"))?;
+        if let Some((at, result)) = checked.as_ref() {
+            match result {
+                Ok(value) if now().saturating_duration_since(*at) < DOCKER_INSPECTION_INTERVAL => {
+                    return Ok(value.clone());
+                }
+                // Callers waiting for the same failed attempt share its error.
+                // A fresh call retries immediately, including after image repair.
+                Err(message) if joined_generation != entry.generation.load(Ordering::Acquire) => {
+                    bail!("{message}");
+                }
+                _ => {}
+            }
+        }
+        *checked = None;
+        let result = inspect();
+        *checked = Some((
+            now(),
+            result
+                .as_ref()
+                .cloned()
+                .map_err(|error| format!("{error:#}")),
+        ));
+        entry.generation.fetch_add(1, Ordering::Release);
+        result
+    }
+}
+
+fn runtime_engine_identity() -> String {
+    format!(
+        "{:?}/{:?}/{:?}/{:?}",
+        std::env::var_os("DOCKER_HOST"),
+        std::env::var_os("DOCKER_CONTEXT"),
+        std::env::var_os("CONTAINER_HOST"),
+        std::env::var_os("PATH")
+    )
+}
+
+fn validate_pinned_image(
+    image: &str,
+    fingerprint: &str,
+    inspect: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    static CACHE: OnceLock<ImageValidationCache> = OnceLock::new();
+    // Labels are immutable for a content ID. Recheck presence at a bounded
+    // interval, and keep different engines and expected identities separate.
+    let key = format!("{}/{image}/{fingerprint}", runtime_engine_identity());
+    CACHE
+        .get_or_init(ImageValidationCache::default)
+        .validate(&key, Instant::now, inspect)
+}
+
 pub(crate) fn ensure_driver_image(
     repo_root: &Path,
     runtime: &DriverRuntimeSpec,
@@ -1368,8 +1602,11 @@ pub(crate) fn ensure_driver_image(
     let fingerprint = driver_runtime_fingerprint(runtime)?;
     if !runtime.docker_image_id.is_empty() {
         let content_ref = docker_image_content_ref(&runtime.docker_image_id)?;
-        require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
-        require_driver_source_labels(&content_ref, runtime)?;
+        validate_pinned_image(&content_ref, &fingerprint, || {
+            require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
+            require_driver_source_labels(&content_ref, runtime)?;
+            Ok(())
+        })?;
         return Ok(None);
     }
 
@@ -1418,10 +1655,13 @@ pub(crate) fn ensure_yosys_image(
     let fingerprint = yosys_runtime_fingerprint(runtime)?;
     if !runtime.docker_image_id.is_empty() {
         let content_ref = docker_image_content_ref(&runtime.docker_image_id)?;
-        require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
-        if !image_has_python3(&content_ref)? {
-            bail!("pinned Yosys image `{content_ref}` lacks python3");
-        }
+        validate_pinned_image(&content_ref, &fingerprint, || {
+            require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
+            if !inspected_image_has_python3(&content_ref)? {
+                bail!("pinned Yosys image `{content_ref}` lacks python3");
+            }
+            Ok(())
+        })?;
         return Ok(None);
     }
 
@@ -1496,18 +1736,43 @@ pub(crate) fn bind_driver_runtime_image(
     }
     #[cfg(not(test))]
     {
-        ensure_driver_image(repo_root, &runtime)?;
-        let fingerprint = driver_runtime_fingerprint(&runtime)?;
-        let build_ref =
-            fingerprint_qualified_image_ref(&runtime.docker_image, "driver", &fingerprint)?;
-        let image_id = inspect_image_id(&build_ref)?
-            .with_context(|| format!("driver image `{build_ref}` disappeared after preparation"))?;
-        let content_ref = docker_image_content_ref(&image_id)?;
-        require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
-        require_driver_source_labels(&content_ref, &runtime)?;
-        runtime.docker_image_id = image_id;
+        static CACHE: OnceLock<RuntimeIdentityCache<String>> = OnceLock::new();
+        let key = format!(
+            "{}/{:?}/driver/{}/{}",
+            runtime_engine_identity(),
+            repo_root,
+            runtime.docker_image,
+            driver_runtime_fingerprint(&runtime)?
+        );
+        runtime.docker_image_id = CACHE.get_or_init(RuntimeIdentityCache::default).validate(
+            &key,
+            Instant::now,
+            || bind_driver_runtime_image_uncached(repo_root, &runtime),
+        )?;
         Ok(runtime)
     }
+}
+
+#[cfg(not(test))]
+fn bind_driver_runtime_image_uncached(
+    repo_root: &Path,
+    runtime: &DriverRuntimeSpec,
+) -> Result<String> {
+    checked_runtime_dockerfile(repo_root, &runtime.dockerfile, &runtime.dockerfile_sha256)?;
+    let fingerprint = driver_runtime_fingerprint(runtime)?;
+    let build_ref = fingerprint_qualified_image_ref(&runtime.docker_image, "driver", &fingerprint)?;
+    // Resolve the mutable tag once, then validate and execute that content ID.
+    let image_id = if let Some(image_id) = inspect_image_id(&build_ref)? {
+        image_id
+    } else {
+        ensure_driver_image(repo_root, runtime)?;
+        inspect_image_id(&build_ref)?
+            .with_context(|| format!("driver image `{build_ref}` disappeared after preparation"))?
+    };
+    let content_ref = docker_image_content_ref(&image_id)?;
+    require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
+    require_driver_source_labels(&content_ref, runtime)?;
+    Ok(image_id)
 }
 
 pub(crate) fn bind_yosys_runtime_image(
@@ -1527,20 +1792,45 @@ pub(crate) fn bind_yosys_runtime_image(
     }
     #[cfg(not(test))]
     {
-        ensure_yosys_image(repo_root, &runtime)?;
-        let fingerprint = yosys_runtime_fingerprint(&runtime)?;
-        let build_ref =
-            fingerprint_qualified_image_ref(&runtime.docker_image, "yosys", &fingerprint)?;
-        let image_id = inspect_image_id(&build_ref)?
-            .with_context(|| format!("Yosys image `{build_ref}` disappeared after preparation"))?;
-        let content_ref = docker_image_content_ref(&image_id)?;
-        require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
-        if !image_has_python3(&content_ref)? {
-            bail!("prepared Yosys image `{content_ref}` lacks python3");
-        }
-        runtime.docker_image_id = image_id;
+        static CACHE: OnceLock<RuntimeIdentityCache<String>> = OnceLock::new();
+        let key = format!(
+            "{}/{:?}/yosys/{}/{}",
+            runtime_engine_identity(),
+            repo_root,
+            runtime.docker_image,
+            yosys_runtime_fingerprint(&runtime)?
+        );
+        runtime.docker_image_id = CACHE.get_or_init(RuntimeIdentityCache::default).validate(
+            &key,
+            Instant::now,
+            || bind_yosys_runtime_image_uncached(repo_root, &runtime),
+        )?;
         Ok(runtime)
     }
+}
+
+#[cfg(not(test))]
+fn bind_yosys_runtime_image_uncached(
+    repo_root: &Path,
+    runtime: &YosysRuntimeSpec,
+) -> Result<String> {
+    checked_runtime_dockerfile(repo_root, &runtime.dockerfile, &runtime.dockerfile_sha256)?;
+    let fingerprint = yosys_runtime_fingerprint(runtime)?;
+    let build_ref = fingerprint_qualified_image_ref(&runtime.docker_image, "yosys", &fingerprint)?;
+    // Resolve the mutable tag once, then validate and execute that content ID.
+    let image_id = if let Some(image_id) = inspect_image_id(&build_ref)? {
+        image_id
+    } else {
+        ensure_yosys_image(repo_root, runtime)?;
+        inspect_image_id(&build_ref)?
+            .with_context(|| format!("Yosys image `{build_ref}` disappeared after preparation"))?
+    };
+    let content_ref = docker_image_content_ref(&image_id)?;
+    require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
+    if !inspected_image_has_python3(&content_ref)? {
+        bail!("prepared Yosys image `{content_ref}` lacks python3");
+    }
+    Ok(image_id)
 }
 
 /// Process-local capability cache, not evidence about image existence or runtime identity.
@@ -1562,11 +1852,19 @@ impl PythonImageProbeCache {
             return Ok(false);
         };
         let content_ref = docker_image_content_ref(&image_id)?;
+        self.has_python3_at_id(&content_ref, probe)
+    }
+
+    fn has_python3_at_id(
+        &self,
+        content_ref: &str,
+        probe: impl FnOnce(&str) -> Result<bool>,
+    ) -> Result<bool> {
         let validated = self
             .images
             .lock()
             .map_err(|_| anyhow!("Python image probe cache lock poisoned"))?
-            .entry(content_ref.clone())
+            .entry(content_ref.to_string())
             .or_default()
             .clone();
         let mut validated = validated
@@ -1577,17 +1875,26 @@ impl PythonImageProbeCache {
         }
         // Probe the resolved ID, never the possibly retagged input. Only success
         // is reusable: transient Docker failures and negative probes must retry.
-        let available = probe(&content_ref)?;
+        let available = probe(content_ref)?;
         *validated = available;
         Ok(available)
     }
 }
 
-fn image_has_python3(image: &str) -> Result<bool> {
+fn python_image_probe_cache() -> &'static PythonImageProbeCache {
     static CACHE: OnceLock<PythonImageProbeCache> = OnceLock::new();
-    CACHE
-        .get_or_init(PythonImageProbeCache::default)
-        .has_python3(image, inspect_image_id, probe_image_has_python3)
+    CACHE.get_or_init(PythonImageProbeCache::default)
+}
+
+fn image_has_python3(image: &str) -> Result<bool> {
+    python_image_probe_cache().has_python3(image, inspect_image_id, probe_image_has_python3)
+}
+
+/// The caller has just inspected this content ID, so presence is already known.
+/// Only the intrinsic capability is cached; mutable references still resolve.
+fn inspected_image_has_python3(content_ref: &str) -> Result<bool> {
+    let content_ref = docker_image_content_ref(content_ref)?;
+    python_image_probe_cache().has_python3_at_id(&content_ref, probe_image_has_python3)
 }
 
 fn probe_image_has_python3(image: &str) -> Result<bool> {
@@ -1618,10 +1925,7 @@ const PERSISTENT_RUNNER_DRIVER_POOL_SIZE_ENV: &str =
 const PERSISTENT_RUNNER_YOSYS_POOL_SIZE_ENV: &str = "XLSYNTH_BVC_YOSYS_PERSISTENT_RUNNER_POOL_SIZE";
 const PERSISTENT_RUNNER_IDLE_TTL_SECS_ENV: &str = "XLSYNTH_BVC_PERSISTENT_RUNNER_IDLE_TTL_SECS";
 const PERSISTENT_RUNNER_DEFAULT_IDLE_TTL_SECS: u64 = 15 * 60;
-const PERSISTENT_RUNNER_WORKER_SCRIPT: &str = "scripts/persistent_runner_worker.py";
 const PERSISTENT_RUNNER_SLOT_LOCK_FILENAME: &str = "slot.lock";
-static PERSISTENT_RUNNER_START_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-    std::sync::OnceLock::new();
 
 #[derive(Clone, Copy)]
 enum PersistentRunnerFamily {
@@ -1734,6 +2038,8 @@ struct PersistentRunnerResult {
     stdout_tail: String,
     stderr_tail: String,
     command_argv: Vec<String>,
+    #[serde(default)]
+    timings_us: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -1764,6 +2070,8 @@ struct SelectedPersistentRunner {
     runner_instance_id: String,
     container_name: String,
     container_id: String,
+    container_cache_key: String,
+    container_checked_at: Instant,
     paths: PersistentRunnerPaths,
     _slot_guard: PersistentRunnerSlotGuard,
 }
@@ -1771,6 +2079,7 @@ struct SelectedPersistentRunner {
 struct PersistentRunnerFailureRetirement {
     container_name: String,
     container_id: String,
+    container_cache_key: String,
     armed: bool,
 }
 
@@ -1779,11 +2088,13 @@ impl PersistentRunnerFailureRetirement {
         Self {
             container_name: runner.container_name.clone(),
             container_id: runner.container_id.clone(),
+            container_cache_key: runner.container_cache_key.clone(),
             armed: true,
         }
     }
 
     fn retire_now(&mut self) -> String {
+        persistent_runner_identity_cache().forget(&self.container_cache_key);
         match cleanup_persistent_runner_container_if_id(&self.container_name, &self.container_id) {
             Ok(true) => {
                 self.armed = false;
@@ -1804,6 +2115,9 @@ impl PersistentRunnerFailureRetirement {
 
 impl Drop for PersistentRunnerFailureRetirement {
     fn drop(&mut self) {
+        if self.armed {
+            persistent_runner_identity_cache().forget(&self.container_cache_key);
+        }
         if self.armed
             && let Err(error) =
                 cleanup_persistent_runner_container_if_id(&self.container_name, &self.container_id)
@@ -1814,15 +2128,6 @@ impl Drop for PersistentRunnerFailureRetirement {
             );
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct PersistentRunnerSlotStatus {
-    runner_key: String,
-    container_name: String,
-    paths: PersistentRunnerPaths,
-    running: bool,
-    idle: bool,
 }
 
 #[derive(Debug)]
@@ -1893,10 +2198,6 @@ impl Drop for PersistentRunnerSlotGuard {
     }
 }
 
-fn persistent_runner_start_lock() -> &'static std::sync::Mutex<()> {
-    PERSISTENT_RUNNER_START_LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
 fn sanitize_container_name_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
@@ -1914,10 +2215,10 @@ fn sanitize_container_name_component(value: &str) -> String {
 
 fn persistent_runner_key(image: &str, store_root: &Path) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"xlsynth-bvc/persistent-runner/v2\0");
+    hasher.update(b"xlsynth-bvc/persistent-runner/v3\0");
     hasher.update(PERSISTENT_RUNNER_SCHEMA_VERSION.to_le_bytes());
     hasher.update(persistent_runner_idle_ttl_secs().to_le_bytes());
-    hasher.update(include_bytes!("../../scripts/persistent_runner_worker.py"));
+    hasher.update(worker_script::EMBEDDED);
     hasher.update([0]);
     hasher.update(image.as_bytes());
     hasher.update([0]);
@@ -2077,11 +2378,18 @@ fn load_driver_runner_capabilities(
     let runner_key = persistent_runner_slot_key(&base_runner_key, pool_size, 0);
     let container_name = persistent_runner_container_name(&image, &runner_key);
     let runner_paths = PersistentRunnerPaths::new(&store.root, &runner_key);
-    let _guard = persistent_runner_start_lock()
-        .lock()
-        .map_err(|_| anyhow!("persistent runner start lock poisoned"))?;
-    // Keep the slot reserved through capability reads and any restart, not
-    // merely startup: the worker may now retire without a live host process.
+    // Capabilities belong to the immutable image and worker protocol in the
+    // runner key. Reading them needs no live container or repeated inspection.
+    // Invalid/incomplete metadata follows the startup/validation path below.
+    if runner_paths.capabilities_path.is_file()
+        && let Ok(capabilities) = read_persistent_runner_capabilities(&runner_paths)
+        && capabilities.runner_family == "driver"
+        && !capabilities.driver_subcommands.is_empty()
+    {
+        return Ok(capabilities);
+    }
+    // Reserve startup, metadata publication, and any restart. Immutable
+    // metadata above can be read while this slot is serving another request.
     let _slot_guard = PersistentRunnerSlotGuard::acquire(&runner_paths)?;
     ensure_persistent_runner_started_locked(
         repo_root,
@@ -2308,18 +2616,6 @@ fn sync_external_writeback(writeback: &ExternalWriteback) -> Result<()> {
     copy_path_recursive(&writeback.job_path, &writeback.host_path)
 }
 
-fn ensure_worker_script_path(repo_root: &Path) -> Result<PathBuf> {
-    let path = repo_root.join(PERSISTENT_RUNNER_WORKER_SCRIPT);
-    if !path.exists() {
-        bail!(
-            "persistent runner worker script not found: {}",
-            path.display()
-        );
-    }
-    path.canonicalize()
-        .with_context(|| format!("canonicalizing worker script path: {}", path.display()))
-}
-
 fn docker_container_is_running(container_name: &str) -> Result<bool> {
     let output = Command::new("docker")
         .args(["inspect", "--format", "{{.State.Running}}", container_name])
@@ -2387,6 +2683,112 @@ fn count_json_files(path: &Path) -> Result<usize> {
     Ok(count)
 }
 
+/// A successful request and matching idle acknowledgement confirm the same
+/// runner incarnation. Reuse that evidence briefly, keeping Docker checks for
+/// stalled work and cache expiry so disappearance cannot be hidden by reuse.
+#[derive(Clone)]
+struct PersistentRunnerIdentity {
+    runner_instance_id: String,
+    container_id: String,
+    checked_at: Instant,
+}
+
+#[derive(Default)]
+struct PersistentRunnerIdentityCache {
+    entries: Mutex<BTreeMap<String, PersistentRunnerIdentity>>,
+}
+
+impl PersistentRunnerIdentityCache {
+    fn get(
+        &self,
+        key: &str,
+        runner_instance_id: &str,
+        now: Instant,
+    ) -> Option<PersistentRunnerIdentity> {
+        let entries = self.entries.lock().ok()?;
+        entries
+            .get(key)
+            .filter(|identity| {
+                identity.runner_instance_id == runner_instance_id
+                    && now.saturating_duration_since(identity.checked_at)
+                        < DOCKER_INSPECTION_INTERVAL
+            })
+            .cloned()
+    }
+
+    fn remember(&self, key: &str, identity: PersistentRunnerIdentity) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(key.to_string(), identity);
+        }
+    }
+
+    fn forget(&self, key: &str) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(key);
+        }
+    }
+}
+
+fn persistent_runner_identity_cache() -> &'static PersistentRunnerIdentityCache {
+    static CACHE: OnceLock<PersistentRunnerIdentityCache> = OnceLock::new();
+    CACHE.get_or_init(PersistentRunnerIdentityCache::default)
+}
+
+#[derive(Debug)]
+struct DockerContainerState {
+    running: bool,
+    id: String,
+}
+
+fn inspect_container_state(container_name: &str) -> Result<Option<DockerContainerState>> {
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{.State.Running}} {{.Id}}",
+            container_name,
+        ])
+        .output()
+        .with_context(|| format!("inspecting docker container: {container_name}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.to_ascii_lowercase().contains("no such") {
+            return Ok(None);
+        }
+        bail!(
+            "failed inspecting container {container_name}: {}",
+            first_line(&stderr)
+        );
+    }
+    let text = String::from_utf8(output.stdout).context("decoding container state")?;
+    let fields: Vec<_> = text.split_whitespace().collect();
+    if fields.len() != 2 || !matches!(fields[0], "true" | "false") {
+        bail!("invalid container state for {container_name}: {text}");
+    }
+    Ok(Some(DockerContainerState {
+        running: fields[0] == "true",
+        id: fields[1].to_string(),
+    }))
+}
+
+fn check_persistent_runner_container(runner: &SelectedPersistentRunner) -> Result<()> {
+    let state = inspect_container_state(&runner.container_name)?
+        .filter(|s| s.running)
+        .with_context(|| {
+            format!(
+                "persistent runner container exited before producing result (container={})",
+                runner.container_name
+            )
+        })?;
+    if state.id != runner.container_id {
+        bail!(
+            "persistent runner container identity changed (container={})",
+            runner.container_name
+        );
+    }
+    Ok(())
+}
+
 fn persistent_runner_depth(paths: &PersistentRunnerPaths) -> Result<usize> {
     Ok(count_json_files(&paths.inbox_dir)? + count_json_files(&paths.processing_dir)?)
 }
@@ -2426,6 +2828,11 @@ fn persistent_runner_is_idle(paths: &PersistentRunnerPaths) -> Result<bool> {
 }
 
 fn cleanup_persistent_runner_container(container_name: &str) -> Result<()> {
+    persistent_runner_identity_cache().forget(&format!(
+        "{}/{}",
+        runtime_engine_identity(),
+        container_name
+    ));
     let output = Command::new("docker")
         .args(["rm", "-f", container_name])
         .output()
@@ -2508,7 +2915,7 @@ fn ensure_persistent_runner_started_locked(
             persistent_root.display()
         )
     })?;
-    let worker_script = ensure_worker_script_path(repo_root)?;
+    let worker_script = worker_script::materialize(&store_root, worker_script::EMBEDDED)?;
     let instance_id = new_persistent_runner_instance_id(runner_key);
     let runner_root_container = format!(
         "{}/{}/{}/{}",
@@ -2610,28 +3017,7 @@ fn ensure_persistent_runner_started_locked(
     );
 }
 
-fn persistent_runner_slot_status(
-    store_root: &Path,
-    image: &str,
-    base_runner_key: &str,
-    pool_size: usize,
-    slot: usize,
-) -> Result<PersistentRunnerSlotStatus> {
-    let runner_key = persistent_runner_slot_key(base_runner_key, pool_size, slot);
-    let container_name = persistent_runner_container_name(image, &runner_key);
-    let paths = PersistentRunnerPaths::new(store_root, &runner_key);
-    let running = docker_container_is_running(&container_name)?;
-    let idle = running && persistent_runner_is_idle(&paths)?;
-    Ok(PersistentRunnerSlotStatus {
-        runner_key,
-        container_name,
-        paths,
-        running,
-        idle,
-    })
-}
-
-fn select_persistent_runner_locked(
+fn select_persistent_runner(
     repo_root: &Path,
     store_root: &Path,
     image: &str,
@@ -2640,87 +3026,117 @@ fn select_persistent_runner_locked(
     let base_runner_key = persistent_runner_key(image, store_root);
     let pool_size = persistent_runner_pool_size(family);
 
-    // A slot reservation spans request publication, execution, result handling,
-    // writeback, and any container retirement. This deliberately permits no
-    // host-side queue behind a worker: a failed worker can only abandon the
-    // request whose caller owns its slot.
-    for slot in 0..pool_size {
-        let runner_key = persistent_runner_slot_key(&base_runner_key, pool_size, slot);
-        let paths = PersistentRunnerPaths::new(store_root, &runner_key);
-        let Some(slot_guard) = PersistentRunnerSlotGuard::try_acquire(&paths)? else {
-            continue;
-        };
-        let status =
-            persistent_runner_slot_status(store_root, image, &base_runner_key, pool_size, slot)?;
-        if !status.idle {
-            continue;
-        }
-        let heartbeat = read_persistent_runner_heartbeat(&status.paths)?
-            .context("idle persistent runner is missing its heartbeat")?;
-        if heartbeat.runner_instance_id.is_empty() {
-            bail!("idle persistent runner heartbeat is missing its instance identity");
-        }
-        return Ok(Some(SelectedPersistentRunner {
-            runner_key: status.runner_key,
-            runner_instance_id: heartbeat.runner_instance_id,
-            container_id: docker_container_id(&status.container_name)?
-                .context("idle persistent runner disappeared during selection")?,
-            container_name: status.container_name,
-            paths: status.paths,
-            _slot_guard: slot_guard,
-        }));
-    }
-
-    for slot in 0..pool_size {
-        let runner_key = persistent_runner_slot_key(&base_runner_key, pool_size, slot);
-        let paths = PersistentRunnerPaths::new(store_root, &runner_key);
-        let Some(slot_guard) = PersistentRunnerSlotGuard::try_acquire(&paths)? else {
-            continue;
-        };
-        let status =
-            persistent_runner_slot_status(store_root, image, &base_runner_key, pool_size, slot)?;
-        if status.running && status.idle {
-            let heartbeat = read_persistent_runner_heartbeat(&status.paths)?
-                .context("idle persistent runner is missing its heartbeat")?;
-            if heartbeat.runner_instance_id.is_empty() {
-                bail!("idle persistent runner heartbeat is missing its instance identity");
+    // A reservation spans startup, publication, execution, writeback, and
+    // retirement. No caller queues behind a busy worker, so failure can only
+    // abandon the request whose caller owns the slot. Independent slots need
+    // no process-wide dispatch lock.
+    for reuse_only in [true, false] {
+        for slot in 0..pool_size {
+            let runner_key = persistent_runner_slot_key(&base_runner_key, pool_size, slot);
+            let paths = PersistentRunnerPaths::new(store_root, &runner_key);
+            let Some(slot_guard) = PersistentRunnerSlotGuard::try_acquire(&paths)? else {
+                continue;
+            };
+            let idle = persistent_runner_is_idle(&paths)?;
+            // Uncreated slots have no idle heartbeat and need no Docker probe
+            // during the reuse pass. Retirement also holds the slot lock.
+            if reuse_only && !idle {
+                continue;
             }
+            let container_name = persistent_runner_container_name(image, &runner_key);
+            let observed_instance = read_persistent_runner_heartbeat(&paths)?
+                .map(|heartbeat| heartbeat.runner_instance_id)
+                .unwrap_or_default();
+            let container_cache_key = format!("{}/{}", runtime_engine_identity(), container_name);
+            let cached = persistent_runner_identity_cache().get(
+                &container_cache_key,
+                &observed_instance,
+                Instant::now(),
+            );
+            let cache_hit = cached.is_some();
+            let (state, mut container_checked_at) = if let Some(identity) = cached {
+                (
+                    Some(DockerContainerState {
+                        running: true,
+                        id: identity.container_id,
+                    }),
+                    identity.checked_at,
+                )
+            } else {
+                (inspect_container_state(&container_name)?, Instant::now())
+            };
+            let running = state.as_ref().is_some_and(|state| state.running);
+            let reused = running && idle;
+            let container_id = if let Some(state) = state.filter(|s| s.running && idle) {
+                state.id
+            } else {
+                if reuse_only {
+                    continue;
+                }
+                // An unreserved busy runner is orphaned work from an interrupted
+                // host. Retire it before accepting another request in this slot.
+                if running {
+                    cleanup_persistent_runner_container(&container_name)?;
+                }
+                ensure_persistent_runner_started_locked(
+                    repo_root,
+                    store_root,
+                    image,
+                    &runner_key,
+                    &container_name,
+                    &paths,
+                )?;
+                let container_id = docker_container_id(&container_name)?
+                    .context("new persistent runner disappeared during selection")?;
+                container_checked_at = Instant::now();
+                container_id
+            };
+            let heartbeat = read_persistent_runner_heartbeat(&paths)?
+                .context("selected persistent runner is missing its heartbeat")?;
+            if heartbeat.runner_instance_id.is_empty() {
+                bail!("selected persistent runner is missing its instance identity");
+            }
+            if reused && heartbeat.runner_instance_id != observed_instance {
+                persistent_runner_identity_cache().forget(&container_cache_key);
+                continue;
+            }
+            persistent_runner_identity_cache().remember(
+                &container_cache_key,
+                PersistentRunnerIdentity {
+                    runner_instance_id: heartbeat.runner_instance_id.clone(),
+                    container_id: container_id.clone(),
+                    checked_at: container_checked_at,
+                },
+            );
+            log::debug!(target: "bvc_timing",
+                "runner_identity_reuse container={} hit={} checked_age_us={}",
+                container_name, cache_hit, container_checked_at.elapsed().as_micros());
             return Ok(Some(SelectedPersistentRunner {
-                runner_key: status.runner_key,
+                runner_key,
                 runner_instance_id: heartbeat.runner_instance_id,
-                container_id: docker_container_id(&status.container_name)?
-                    .context("idle persistent runner disappeared during selection")?,
-                container_name: status.container_name,
-                paths: status.paths,
+                container_id,
+                container_name,
+                container_cache_key,
+                container_checked_at,
+                paths,
                 _slot_guard: slot_guard,
             }));
         }
-        if status.running {
-            // No live caller owns the cross-process slot lock, so a busy or
-            // retired worker is orphaned state from an interrupted host.
-            cleanup_persistent_runner_container(&status.container_name)?;
-        }
-        ensure_persistent_runner_started_locked(
-            repo_root,
-            store_root,
-            image,
-            &status.runner_key,
-            &status.container_name,
-            &status.paths,
-        )?;
-        let heartbeat = read_persistent_runner_heartbeat(&status.paths)?
-            .context("new persistent runner is missing its heartbeat")?;
-        return Ok(Some(SelectedPersistentRunner {
-            runner_key: status.runner_key,
-            runner_instance_id: heartbeat.runner_instance_id,
-            container_id: docker_container_id(&status.container_name)?
-                .context("new persistent runner disappeared during selection")?,
-            container_name: status.container_name,
-            paths: status.paths,
-            _slot_guard: slot_guard,
-        }));
     }
     Ok(None)
+}
+
+fn configured_action_timeout_seconds() -> Result<u64> {
+    const NAME: &str = "XLSYNTH_BVC_ACTION_TIMEOUT_SECONDS";
+    let Some(value) = std::env::var_os(NAME) else {
+        return Ok(DEFAULT_ACTION_TIMEOUT_SECONDS);
+    };
+    let seconds = value
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=86_400).contains(seconds))
+        .with_context(|| format!("{NAME} must be an integer from 1 to 86400"))?;
+    Ok(seconds)
 }
 
 pub(crate) fn execute_persistent_runner_script(
@@ -2736,7 +3152,7 @@ pub(crate) fn execute_persistent_runner_script(
         env,
         script,
         run_hint,
-        DEFAULT_ACTION_TIMEOUT_SECONDS,
+        configured_action_timeout_seconds()?,
     )
 }
 
@@ -2753,7 +3169,7 @@ pub(crate) fn execute_yosys_persistent_runner_script(
         env,
         script,
         run_hint,
-        DEFAULT_ACTION_TIMEOUT_SECONDS,
+        configured_action_timeout_seconds()?,
         PersistentRunnerFamily::Yosys,
     )
 }
@@ -2786,6 +3202,7 @@ fn execute_persistent_runner_script_with_timeout_and_family(
     timeout_secs: u64,
     family: PersistentRunnerFamily,
 ) -> Result<CommandTrace> {
+    let timing_started = Instant::now();
     let repo_root = std::env::current_dir().context("getting current directory")?;
     let store_root = infer_store_root_from_mounts(mounts)?;
     let request_seq = DOCKER_RUN_NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2793,17 +3210,13 @@ fn execute_persistent_runner_script_with_timeout_and_family(
         persistent_runner_request_identity(process_instance_id(), request_seq);
 
     let runner = loop {
-        let selected = {
-            let _guard = persistent_runner_start_lock()
-                .lock()
-                .map_err(|_| anyhow!("persistent runner start lock poisoned"))?;
-            select_persistent_runner_locked(&repo_root, &store_root, image, family)?
-        };
+        let selected = select_persistent_runner(&repo_root, &store_root, image, family)?;
         if let Some(runner) = selected {
             break runner;
         }
         thread::sleep(Duration::from_millis(100));
     };
+    let selected_at = Instant::now();
     let (runner, result_path, command_argv, writebacks) = {
         let job_root = runner.paths.jobs_dir.join(&request_id);
         fs::create_dir_all(&job_root).with_context(|| {
@@ -2877,10 +3290,17 @@ fn execute_persistent_runner_script_with_timeout_and_family(
         ];
         (runner, result_path, command_argv, writebacks)
     };
+    let published_at = Instant::now();
     let mut failure_retirement = PersistentRunnerFailureRetirement::new(&runner);
+    // Keep the age of selection evidence: borrowing a cached identity must not
+    // postpone disappearance detection. Result identity and deadlines are checked
+    // on every poll, independently of the bounded Docker inspection interval.
+    let mut last_container_check = runner.container_checked_at;
 
     let deadline = Instant::now()
         + Duration::from_secs(timeout_secs + PERSISTENT_RUNNER_REQUEST_TIMEOUT_GRACE_SECS);
+    // Register before checking the file so publication between check and wait is observable.
+    let mut events = directory_events::DirectoryEvents::watch(&runner.paths.results_dir);
     let result = loop {
         if result_path.exists() {
             let text = fs::read_to_string(&result_path).with_context(|| {
@@ -2890,21 +3310,9 @@ fn execute_persistent_runner_script_with_timeout_and_family(
                 format!("parsing runner result file: {}", result_path.display())
             })?;
         }
-        if !docker_container_is_running(&runner.container_name)? {
-            bail!(
-                "persistent runner container exited before producing result (container={} request_id={})",
-                runner.container_name,
-                request_id
-            );
-        }
-        if docker_container_id(&runner.container_name)?.as_deref()
-            != Some(runner.container_id.as_str())
-        {
-            bail!(
-                "persistent runner container identity changed before producing result (container={} request_id={})",
-                runner.container_name,
-                request_id
-            );
+        if last_container_check.elapsed() >= DOCKER_INSPECTION_INTERVAL {
+            check_persistent_runner_container(&runner)?;
+            last_container_check = Instant::now();
         }
         if read_persistent_runner_heartbeat(&runner.paths)?
             .is_some_and(|heartbeat| heartbeat.runner_instance_id != runner.runner_instance_id)
@@ -2938,8 +3346,9 @@ fn execute_persistent_runner_script_with_timeout_and_family(
                 cleanup_summary
             );
         }
-        thread::sleep(Duration::from_millis(100));
+        events.wait(Duration::from_millis(100));
     };
+    let result_received_at = Instant::now();
 
     let cleanup_request_files = || {
         fs::remove_file(&result_path).ok();
@@ -3003,14 +3412,9 @@ fn execute_persistent_runner_script_with_timeout_and_family(
         }) {
             break;
         }
-        if docker_container_id(&runner.container_name)?.as_deref()
-            != Some(runner.container_id.as_str())
-        {
-            bail!(
-                "persistent runner container identity changed after result publication (container={} request_id={})",
-                runner.container_name,
-                request_id
-            );
+        if last_container_check.elapsed() >= DOCKER_INSPECTION_INTERVAL {
+            check_persistent_runner_container(&runner)?;
+            last_container_check = Instant::now();
         }
         if Instant::now() >= idle_deadline {
             bail!(
@@ -3022,10 +3426,29 @@ fn execute_persistent_runner_script_with_timeout_and_family(
         thread::sleep(Duration::from_millis(100));
     }
 
+    let idle_at = Instant::now();
     let writeback_result = writebacks.iter().try_for_each(sync_external_writeback);
     cleanup_request_files();
     writeback_result?;
     failure_retirement.disarm();
+    persistent_runner_identity_cache().remember(
+        &runner.container_cache_key,
+        PersistentRunnerIdentity {
+            runner_instance_id: runner.runner_instance_id.clone(),
+            container_id: runner.container_id.clone(),
+            checked_at: idle_at,
+        },
+    );
+    log::debug!(target: "bvc_timing",
+        "runner image={} action={} reserve_us={} publish_us={} result_us={} idle_us={} writeback_us={} worker_prepare_us={} worker_command_us={} worker_cleanup_us={} total_us={}",
+        image, run_hint, selected_at.duration_since(timing_started).as_micros(),
+        published_at.duration_since(selected_at).as_micros(),
+        result_received_at.duration_since(published_at).as_micros(),
+        idle_at.duration_since(result_received_at).as_micros(), idle_at.elapsed().as_micros(),
+        result.timings_us.get("prepare").copied().unwrap_or(0),
+        result.timings_us.get("command").copied().unwrap_or(0),
+        result.timings_us.get("cleanup").copied().unwrap_or(0),
+        timing_started.elapsed().as_micros());
 
     Ok(CommandTrace {
         argv: command_argv,
@@ -3164,6 +3587,231 @@ mod tests {
             nanos
         ));
         root
+    }
+
+    #[test]
+    fn cached_image_validation_matches_fresh_validation() {
+        fn property(valid: Vec<bool>, requests: Vec<(u8, u16)>) -> bool {
+            if valid.is_empty() {
+                return true;
+            }
+            let cache = ImageValidationCache::default();
+            let mut now = Instant::now();
+            for (image, delay_ms) in requests {
+                now += Duration::from_millis(u64::from(delay_ms));
+                let image = usize::from(image) % valid.len();
+                // Immutable image identities have stable label expectations.
+                let reference = || {
+                    anyhow::ensure!(valid[image], "fingerprint mismatch");
+                    Ok(())
+                };
+                let expected = reference().is_ok();
+                assert_eq!(expected, reference().is_ok());
+                if cache
+                    .validate(&image.to_string(), || now, reference)
+                    .is_ok()
+                    != expected
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        quickcheck::QuickCheck::new()
+            .tests(1000)
+            .quickcheck(property as fn(Vec<bool>, Vec<(u8, u16)>) -> bool);
+    }
+
+    #[test]
+    fn image_validation_rechecks_expired_entries_and_retries_errors() -> Result<()> {
+        let cache = ImageValidationCache::default();
+        let now = Instant::now();
+        cache.validate("image/fingerprint", || now, || Ok(()))?;
+        cache.validate(
+            "image/fingerprint",
+            || now + DOCKER_INSPECTION_INTERVAL - Duration::from_nanos(1),
+            || panic!("valid entry must share the successful inspection"),
+        )?;
+        let expired = now + DOCKER_INSPECTION_INTERVAL;
+        assert!(
+            cache
+                .validate("image/fingerprint", || expired, || bail!("image missing"))
+                .is_err()
+        );
+        assert!(
+            cache
+                .validate("image/fingerprint", || expired, || bail!("daemon error"))
+                .is_err()
+        );
+        cache.validate("image/fingerprint", || expired, || Ok(()))?;
+        assert!(
+            cache
+                .validate("image/other-fingerprint", || expired, || bail!("mismatch"))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn image_validation_coalesces_concurrent_calls() {
+        let cache = ImageValidationCache::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(16);
+        thread::scope(|scope| {
+            for _ in 0..16 {
+                let cache = &cache;
+                let calls = &calls;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    cache
+                        .validate("image/fingerprint", Instant::now, || {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            Ok(())
+                        })
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn image_validation_does_not_block_other_images() {
+        let cache = ImageValidationCache::default();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (independent_tx, independent_rx) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            let cache = &cache;
+            scope.spawn(move || {
+                cache
+                    .validate("first", Instant::now, || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            scope.spawn(move || {
+                cache.validate("second", Instant::now, || Ok(())).unwrap();
+                independent_tx.send(()).unwrap();
+            });
+            let independent = independent_rx.recv_timeout(Duration::from_secs(5));
+            release_tx.send(()).unwrap();
+            assert!(
+                independent.is_ok(),
+                "unrelated image inspection was blocked"
+            );
+        });
+    }
+
+    #[test]
+    fn runner_identity_reuse_expires_and_rejects_a_new_incarnation() {
+        let cache = PersistentRunnerIdentityCache::default();
+        let start = Instant::now();
+        let identity = PersistentRunnerIdentity {
+            runner_instance_id: "first-instance".into(),
+            container_id: "first-container".into(),
+            checked_at: start,
+        };
+        cache.remember("engine/runner", identity.clone());
+        assert_eq!(
+            cache
+                .get("engine/runner", "first-instance", start)
+                .unwrap()
+                .container_id,
+            "first-container"
+        );
+        assert!(
+            cache
+                .get("other-engine/runner", "first-instance", start)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get("engine/runner", "replacement-instance", start)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(
+                    "engine/runner",
+                    "first-instance",
+                    start + DOCKER_INSPECTION_INTERVAL
+                )
+                .is_none()
+        );
+        // Reading cached evidence cannot refresh its age and postpone a stalled
+        // request's Docker check. An authenticated completion may refresh it.
+        let checked = cache.get("engine/runner", "first-instance", start).unwrap();
+        assert_eq!(checked.checked_at, start);
+        let completed = start + Duration::from_secs(10);
+        cache.remember(
+            "engine/runner",
+            PersistentRunnerIdentity {
+                checked_at: completed,
+                ..identity
+            },
+        );
+        assert_eq!(
+            cache
+                .get("engine/runner", "first-instance", completed)
+                .unwrap()
+                .checked_at,
+            completed
+        );
+        cache.forget("engine/runner");
+        assert!(
+            cache
+                .get("engine/runner", "first-instance", completed)
+                .is_none()
+        );
+        cache.remember(
+            "engine/runner",
+            PersistentRunnerIdentity {
+                runner_instance_id: "replacement-instance".into(),
+                container_id: "replacement-container".into(),
+                checked_at: completed,
+            },
+        );
+        assert!(
+            cache
+                .get("engine/runner", "first-instance", completed)
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .get("engine/runner", "replacement-instance", completed)
+                .unwrap()
+                .container_id,
+            "replacement-container"
+        );
+    }
+
+    #[test]
+    fn inspected_python_capability_reuses_success_without_resolving_again() -> Result<()> {
+        let cache = PythonImageProbeCache::default();
+        let content_ref = docker_image_content_ref(&"a".repeat(64))?;
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..3 {
+            assert!(cache.has_python3_at_id(&content_ref, |image| {
+                assert_eq!(image, content_ref);
+                calls.set(calls.get() + 1);
+                Ok(true)
+            })?);
+        }
+        assert_eq!(calls.get(), 1);
+        // A mutable reference must still resolve even when this ID was probed.
+        assert!(!cache.has_python3("mutable:tag", |_| Ok(None), |_| panic!("missing image"))?);
+        assert!(
+            !cache.has_python3_at_id(&docker_image_content_ref(&"b".repeat(64))?, |_| Ok(false))?
+        );
+        assert!(
+            cache.has_python3_at_id(&docker_image_content_ref(&"b".repeat(64))?, |_| Ok(true))?
+        );
+        Ok(())
     }
 
     #[test]
@@ -3466,6 +4114,200 @@ mod tests {
             "a cache mutation after prior validation must be detected"
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_release_validation_matches_reference_under_mutation() {
+        fn property(operations: Vec<u8>) -> bool {
+            let root = make_temp_store_root("cache-validation-property");
+            let store = ArtifactStore::new(root.clone());
+            store.ensure_layout().unwrap();
+            let version = "v0.39.0";
+            let platform = crate::DEFAULT_RELEASE_PLATFORM;
+            let digest = driver_release_cache_input_sha256(
+                Path::new(env!("CARGO_MANIFEST_DIR")),
+                version,
+                platform,
+            )
+            .unwrap();
+            seed_fake_driver_release_cache(&store, version, platform).unwrap();
+            let dir = store.driver_release_cache_dir(&digest).unwrap();
+            let tool = dir.join("delay_info_main");
+            let ready = dir.join(DRIVER_RELEASE_CACHE_READY_FILE);
+            let tool_bytes = fs::read(&tool).unwrap();
+            let ready_bytes = fs::read(&ready).unwrap();
+            let cache = DriverReleaseValidationCache::default();
+            let check = || {
+                let expected =
+                    validate_driver_release_cache(&dir, version, platform, &digest).is_ok();
+                assert_eq!(
+                    expected,
+                    validate_driver_release_cache(&dir, version, platform, &digest).is_ok()
+                );
+                expected == cache.validate(&dir, version, platform, &digest).is_ok()
+            };
+            let mut equivalent = check() && check();
+            for operation in operations.into_iter().take(32) {
+                match operation % 7 {
+                    0 => {}
+                    1 => {
+                        let modified = fs::metadata(&tool).unwrap().modified().unwrap();
+                        let mut bytes = tool_bytes.clone();
+                        bytes[0] ^= 1;
+                        fs::write(&tool, bytes).unwrap();
+                        fs::File::options()
+                            .write(true)
+                            .open(&tool)
+                            .unwrap()
+                            .set_times(fs::FileTimes::new().set_modified(modified))
+                            .unwrap();
+                    }
+                    2 => fs::write(&tool, &tool_bytes).unwrap(),
+                    3 => fs::write(&ready, b"invalid manifest").unwrap(),
+                    4 => fs::write(&ready, &ready_bytes).unwrap(),
+                    5 => fs::write(dir.join("unexpected-file"), b"extra").unwrap(),
+                    _ => {
+                        fs::remove_file(dir.join("unexpected-file")).ok();
+                    }
+                }
+                equivalent &= check();
+            }
+            fs::remove_dir_all(root).unwrap();
+            equivalent
+        }
+        quickcheck::QuickCheck::new()
+            .tests(200)
+            .quickcheck(property as fn(Vec<u8>) -> bool);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settled_release_cache_reuse_rejects_same_length_mutation() {
+        let root = make_temp_store_root("cache-validation-settled");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().unwrap();
+        let version = "v0.39.0";
+        let platform = crate::DEFAULT_RELEASE_PLATFORM;
+        let digest = driver_release_cache_input_sha256(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            version,
+            platform,
+        )
+        .unwrap();
+        seed_fake_driver_release_cache(&store, version, platform).unwrap();
+        let dir = store.driver_release_cache_dir(&digest).unwrap();
+        thread::sleep(Duration::from_millis(1100));
+        let cache = DriverReleaseValidationCache::default();
+        cache.validate(&dir, version, platform, &digest).unwrap();
+        assert!(
+            cache
+                .entries
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_some()
+        );
+        cache.validate(&dir, version, platform, &digest).unwrap();
+        let tool = dir.join("delay_info_main");
+        let modified = fs::metadata(&tool).unwrap().modified().unwrap();
+        let mut bytes = fs::read(&tool).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&tool, bytes).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&tool)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(cache.validate(&dir, version, platform, &digest).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_identity_cache_shares_concurrent_failures_but_retries_fresh_calls() {
+        let cache = RuntimeIdentityCache::<String>::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let ready = std::sync::Barrier::new(16);
+        thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        ready.wait();
+                        cache.validate("missing-image", Instant::now, || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            thread::sleep(Duration::from_millis(100));
+                            bail!("image unavailable");
+                        })
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let error = handle
+                    .join()
+                    .expect("lookup thread")
+                    .expect_err("missing image");
+                assert_eq!(error.to_string(), "image unavailable");
+            }
+        });
+        let failed_attempts = calls.load(Ordering::SeqCst);
+        assert!(failed_attempts < 16, "overlapping failures must coalesce");
+        assert_eq!(
+            cache
+                .validate("missing-image", Instant::now, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok("repaired-image".to_string())
+                })
+                .expect("a fresh call retries immediately"),
+            "repaired-image"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), failed_attempts + 1);
+    }
+
+    #[test]
+    fn runtime_identity_cache_keeps_values_separate_and_rechecks_expiry() {
+        let cache = RuntimeIdentityCache::<String>::default();
+        let start = Instant::now();
+        assert_eq!(
+            cache
+                .validate("one", || start, || Ok("first".to_string()))
+                .unwrap(),
+            "first"
+        );
+        assert_eq!(
+            cache
+                .validate("one", || start, || panic!("cached identity"))
+                .unwrap(),
+            "first"
+        );
+        assert_eq!(
+            cache
+                .validate("two", || start, || Ok("second".to_string()))
+                .unwrap(),
+            "second"
+        );
+        let later = start + DOCKER_INSPECTION_INTERVAL;
+        assert_eq!(
+            cache
+                .validate("one", || later, || Ok("retagged".to_string()))
+                .unwrap(),
+            "retagged"
+        );
+        let expired = later + DOCKER_INSPECTION_INTERVAL;
+        assert!(
+            cache
+                .validate("one", || expired, || bail!("removed"))
+                .is_err()
+        );
+        assert!(
+            cache
+                .validate("one", || expired, || bail!("still absent"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -4053,6 +4895,55 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
     }
 
     #[test]
+    #[ignore = "requires Docker and XLSYNTH_BVC_TEST_PROBE_IMAGE naming an existing image with Python"]
+    fn bound_runner_completes_consecutive_requests() -> Result<()> {
+        let _guard = docker_integration_test_lock()
+            .lock()
+            .map_err(|_| anyhow!("docker integration test lock poisoned"))?;
+        let _pool = ScopedEnvVar::set(PERSISTENT_RUNNER_DRIVER_POOL_SIZE_ENV, "1");
+        let _ttl = ScopedEnvVar::set(PERSISTENT_RUNNER_IDLE_TTL_SECS_ENV, "30");
+        let image_ref = std::env::var("XLSYNTH_BVC_TEST_PROBE_IMAGE")?;
+        let image = docker_image_content_ref(
+            &inspect_image_id(&image_ref)?.context("existing worker test image")?,
+        )?;
+        let store = ArtifactStore::new(make_temp_store_root("bound-worker"));
+        store.ensure_layout()?;
+        let key = persistent_runner_key(&image, &store.root);
+        let mut cleanup = DockerCleanup::new(Vec::new());
+        cleanup.add_container(persistent_runner_container_name(&image, &key));
+        let paths = PersistentRunnerPaths::new(&store.root, &key);
+        let output = store.staging_dir().join("output");
+        fs::create_dir_all(&output)?;
+        let digest = hex::encode(Sha256::digest(worker_script::EMBEDDED));
+        let mut instances = Vec::new();
+
+        for marker in ["first", "second"] {
+            let script = format!(
+                "set -eu\n[ \"$(sha256sum {} | cut -d' ' -f1)\" = {} ]\nif (touch {}/.worker-scripts/probe) 2>/dev/null; then exit 1; fi\nprintf %s {} > /outputs/result.txt",
+                worker_script_container_path(),
+                digest,
+                store_root_container_path(),
+                marker,
+            );
+            execute_persistent_runner_script_with_timeout(
+                &image,
+                &[DockerMount::read_write(&output, "/outputs")?],
+                &BTreeMap::new(),
+                &script,
+                "bound-worker",
+                20,
+            )?;
+            assert_eq!(fs::read_to_string(output.join("result.txt"))?, marker);
+            let heartbeat = read_persistent_runner_heartbeat(&paths)?.context("live worker")?;
+            instances.push(heartbeat.runner_instance_id);
+        }
+        assert_eq!(instances[0], instances[1]);
+        drop(cleanup);
+        fs::remove_dir_all(store.root)?;
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires docker"]
     fn persistent_runners_retire_without_host_activity_and_restart() -> Result<()> {
         let _guard = docker_integration_test_lock()
@@ -4114,40 +5005,96 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
                 cleanup.add_container(name.clone());
                 names.push(name);
             }
-            let mut reservations = Vec::new();
-            {
-                let _start = persistent_runner_start_lock().lock().unwrap();
-                for _ in 0..pool_size {
-                    reservations.push(
-                        select_persistent_runner_locked(
-                            &repo_root,
-                            &store.root,
-                            &image,
-                            PersistentRunnerFamily::Driver,
-                        )?
-                        .context("available slot")?,
-                    );
-                }
-            }
-            let first_instance = reservations[0].runner_instance_id.clone();
+            let start = std::sync::Barrier::new(pool_size);
+            let reservations = thread::scope(|scope| {
+                let handles: Vec<_> = (0..pool_size)
+                    .map(|_| {
+                        let start = &start;
+                        let repo_root = &repo_root;
+                        let store_root = &store.root;
+                        let image = &image;
+                        scope.spawn(move || {
+                            start.wait();
+                            select_persistent_runner(
+                                repo_root,
+                                store_root,
+                                image,
+                                PersistentRunnerFamily::Driver,
+                            )?
+                            .context("available slot")
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("reservation thread"))
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            assert_eq!(
+                reservations
+                    .iter()
+                    .map(|r| &r.container_id)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                pool_size,
+            );
+            assert!(
+                select_persistent_runner(
+                    &repo_root,
+                    &store.root,
+                    &image,
+                    PersistentRunnerFamily::Driver,
+                )?
+                .is_none()
+            );
+            let first_key = persistent_runner_slot_key(&base_key, pool_size, 0);
+            let first_instance = reservations
+                .iter()
+                .find(|runner| runner.runner_key == first_key)
+                .context("slot-zero reservation")?
+                .runner_instance_id
+                .clone();
             // Empty inboxes are not sufficient: a host may still be preparing
             // a request or copying its results while holding the reservation.
-            thread::sleep(Duration::from_secs(2));
-            for name in &names {
-                assert!(docker_container_is_running(name)?);
-            }
-            drop(reservations);
+            // Capability reads must not wait for that reservation to finish.
+            let (capabilities, running) = thread::scope(|scope| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let repo_root = &repo_root;
+                let store = &store;
+                let runtime = &runtime;
+                scope.spawn(move || {
+                    let _ = tx.send(load_driver_runner_capabilities(store, repo_root, runtime));
+                });
+                thread::sleep(Duration::from_secs(2));
+                let capabilities = rx.recv_timeout(Duration::from_secs(5));
+                let running = names
+                    .iter()
+                    .map(|name| docker_container_is_running(name))
+                    .collect::<Result<Vec<_>>>();
+                // Release even on timeout, so a broken implementation fails
+                // the assertion instead of leaving the test thread blocked.
+                drop(reservations);
+                (capabilities, running)
+            });
+            assert!(running?.into_iter().all(|running| running));
+            assert_eq!(
+                capabilities
+                    .context("capability query waited for busy slot")??
+                    .runner_family,
+                "driver"
+            );
             for name in &names {
                 wait_removed(name)?;
             }
 
-            // Capability probing must recreate a retired slot-zero runner.
+            // Immutable capabilities remain usable after idle retirement.
+            // Execution, rather than another capability query, restarts a slot.
             let capabilities = load_driver_runner_capabilities(&store, &repo_root, &runtime)?;
             assert_eq!(capabilities.runner_family, "driver");
-            let key = persistent_runner_slot_key(&base_key, pool_size, 0);
-            let paths = PersistentRunnerPaths::new(&store.root, &key);
-            let restarted = read_persistent_runner_heartbeat(&paths)?.context("new heartbeat")?;
-            assert_ne!(restarted.runner_instance_id, first_instance);
+            assert!(!capabilities.driver_subcommands.is_empty());
+            for name in &names {
+                assert!(docker_container_id(name)?.is_none());
+            }
 
             // A job longer than the idle timeout still completes and its
             // externally written result survives the subsequent retirement.
@@ -4161,6 +5108,10 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
                 "idle-retirement-active-job",
                 30,
             )?;
+            let key = persistent_runner_slot_key(&base_key, pool_size, 0);
+            let paths = PersistentRunnerPaths::new(&store.root, &key);
+            let restarted = read_persistent_runner_heartbeat(&paths)?.context("new heartbeat")?;
+            assert_ne!(restarted.runner_instance_id, first_instance);
             for name in &names {
                 wait_removed(name)?;
             }
@@ -4599,6 +5550,39 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
             required_docker_container_id(&container_a)?,
             container_a_id_after_timeout
         );
+
+        // A live reservation must detect removal and same-name replacement;
+        // its failure cleanup must leave the replacement container intact.
+        let selected = select_persistent_runner(
+            &repo_root,
+            &store.root,
+            &image_a,
+            PersistentRunnerFamily::Driver,
+        )?
+        .context("available replacement-test slot")?;
+        check_persistent_runner_container(&selected)?;
+        cleanup_persistent_runner_container(&selected.container_name)?;
+        assert!(check_persistent_runner_container(&selected).is_err());
+        ensure_persistent_runner_started_locked(
+            &repo_root,
+            &store.root,
+            &image_a,
+            &selected.runner_key,
+            &selected.container_name,
+            &selected.paths,
+        )?;
+        assert!(
+            check_persistent_runner_container(&selected)
+                .unwrap_err()
+                .to_string()
+                .contains("identity changed")
+        );
+        assert!(!cleanup_persistent_runner_container_if_id(
+            &selected.container_name,
+            &selected.container_id,
+        )?);
+        assert!(docker_container_is_running(&selected.container_name)?);
+        drop(selected);
 
         let delayed_text = fs::read_to_string(
             store.resolve_artifact_ref_path(&store.load_provenance(&delay_a_id)?.output_artifact),

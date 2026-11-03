@@ -201,7 +201,7 @@ where
     F: Fn(&Provenance) -> bool,
 {
     let mut selected: Option<Provenance> = None;
-    store.for_each_provenance(|provenance| {
+    store.for_each_semantic_candidate(input_ir_structural_hash, |provenance| {
         if !matcher(&provenance) {
             return Ok(std::ops::ControlFlow::Continue(()));
         }
@@ -301,7 +301,6 @@ pub(crate) fn compute_ir_fn_structural_hash(
     repo_root: &Path,
     ir_input_path: &Path,
     ir_top: Option<&str>,
-    version: &str,
     runtime: &DriverRuntimeSpec,
 ) -> Result<(String, CommandTrace)> {
     if !ir_input_path.exists() {
@@ -310,11 +309,16 @@ pub(crate) fn compute_ir_fn_structural_hash(
             ir_input_path.display()
         );
     }
-    let runtime_for_hash = resolve_driver_runtime_for_aig_stats(repo_root, runtime)?;
+    let runtime_for_hash = resolve_driver_runtime_for_aig_stats(
+        repo_root,
+        runtime,
+        store.aux_driver_version.as_deref(),
+    )?;
+    let version = resolve_xlsynth_version_for_driver(repo_root, &runtime_for_hash.driver_version)?;
     ensure_driver_release_cache(
         store,
         repo_root,
-        version,
+        &version,
         &runtime_for_hash.release_platform,
         &runtime_for_hash.release_cache_input_sha256,
     )?;
@@ -545,8 +549,11 @@ pub(crate) fn build_aig_stat_diff_suggestion_for_stats_action(
                 runtime: default_yosys_runtime(repo_root)?,
             };
             let yosys_aig_action_id = compute_action_id(&yosys_aig)?;
-            let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &runtime)
-                .unwrap_or(runtime.clone());
+            let stats_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+                repo_root,
+                &runtime,
+                store.aux_driver_version.as_deref(),
+            )?;
             let yosys_stats = ActionSpec::DriverAigToStats {
                 aig_action_id: yosys_aig_action_id,
                 version: version.clone(),
@@ -591,8 +598,11 @@ pub(crate) fn build_aig_stat_diff_suggestion_for_stats_action(
                 runtime: ctx.runtime.clone(),
             };
             let g8r_aig_action_id = compute_action_id(&g8r)?;
-            let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &ctx.runtime)
-                .unwrap_or(ctx.runtime.clone());
+            let stats_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+                repo_root,
+                &ctx.runtime,
+                store.aux_driver_version.as_deref(),
+            )?;
             let g8r_stats = ActionSpec::DriverAigToStats {
                 aig_action_id: g8r_aig_action_id,
                 version: ctx.version.clone(),

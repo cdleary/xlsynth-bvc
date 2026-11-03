@@ -136,6 +136,33 @@ cargo run --bin xlsynth_bvc -- discover-releases --after v0.37.0
 cargo run --bin xlsynth_bvc -- drain-queue --worker-id worker-a --lease-seconds 1800
 ```
 
+To pin auxiliary tools independently of the release being benchmarked, pass the global
+`--aux-driver-version` option to both enqueue and worker commands. For example, after building
+the release binary:
+
+```bash
+bvc_cmd=(target/release/xlsynth_bvc
+  --store-dir runs/pinned/store
+  --artifacts-via-sled runs/pinned/artifacts.sled
+  --aux-driver-version 0.74.0)
+"${bvc_cmd[@]}" enqueue-crate-version --crate-version 0.68.0
+"${bvc_cmd[@]}" run-workers --workers 4 --exit-when-idle
+```
+
+The synthesis driver remains 0.68.0. Statistics, structural hashing, IR/AIG equivalence helpers,
+and DSLX function listing use the pinned released driver with its own compatible native library.
+Suggested actions also honor the pin. An unavailable pin fails instead of falling back to another
+driver. Omit the option to retain automatic helper selection.
+
+The pin is process configuration: repeat it on each worker or other command that creates helper
+actions. Selected runtimes are recorded in action specifications and provenance. Existing queued
+or completed actions are unchanged; re-enqueue corrected suggestions to create new action IDs,
+and cancel obsolete queued actions separately when replacing an earlier run.
+
+For release-mode `run-ir-dir-corpus`, this option also selects the default statistics estimator.
+If `--stats-driver-version` is supplied, the two pins must agree. Git-candidate corpus runs retain
+their captured estimator and reject this override.
+
 ## IR Dir Corpus Runner
 
 `run-ir-dir-corpus` is the simple "command line build system with action enqueue" entrypoint for
@@ -360,8 +387,11 @@ cancels queued downstream dependents under `queue/canceled/` based on action
 dependency edges.
 It also claims only dependency-ready actions, so items do not run out of
 dependency order.
-Each action execution has a default 300-second timeout; timed-out actions are
-recorded as failed with an error prefix `TIMEOUT(300)`.
+Persistent driver and Yosys actions have a default 900-second timeout; timed-out
+actions are recorded as failed with an error prefix `TIMEOUT(900)`.
+Set `XLSYNTH_BVC_ACTION_TIMEOUT_SECONDS` to an integer from 1 to 86400 to allow
+larger actions to finish. This execution budget does not change action identities
+or invalidate completed outputs. Actions with an explicit timeout retain it.
 Before claiming work, `drain-queue` preflights runtime dependencies for pending
 actions (builds required Docker images and fills immutable
 `bvc-artifacts/driver-release-cache/by-input-sha256/<input-manifest-sha256>/`

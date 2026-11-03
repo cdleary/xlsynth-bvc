@@ -657,9 +657,8 @@ pub(crate) fn validate_action_spec(action: &pb::ActionSpec) -> Result<()> {
             )?;
             let runtime = required(&value.runtime, "aig_to_yosys_abc_aig.runtime")?;
             validate_yosys_runtime(runtime, "aig_to_yosys_abc_aig.runtime")?;
-            if runtime.slang_commit.is_some() {
-                bail!("aig_to_yosys_abc_aig.runtime.slang_commit must be absent");
-            }
+            // AIG input bypasses the Verilog frontend, but can share the pinned
+            // Slang-enabled image used by the other branch of a comparison.
             Ok(())
         }
         Kind::DriverAigToStats(value) => {

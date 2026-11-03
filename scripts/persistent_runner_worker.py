@@ -7,11 +7,13 @@ import json
 import os
 import platform
 import re
+import select
 import signal
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -78,37 +80,108 @@ def ensure_mount_target(target: str, source: str) -> None:
     os.symlink(source, target)
 
 
-def write_heartbeat(
-    heartbeat_path: Path,
-    instance_id: str,
-    runner_key: str,
-    state_fn,
-) -> None:
-    state, current_request_id, idle_since_unix_seconds = state_fn()
-    write_json_atomic(
-        heartbeat_path,
-        {
+class HeartbeatPublisher:
+    def __init__(self, path: Path, instance_id: str, runner_key: str, started_utc: str):
+        self.path = path
+        self.lock = threading.Lock()
+        self.payload = {
             "schema_version": SCHEMA_VERSION,
             "runner_instance_id": instance_id,
             "runner_key": runner_key,
-            "state": state,
-            "current_request_id": current_request_id,
-            "idle_since_unix_seconds": idle_since_unix_seconds,
-            "started_utc": state_fn.started_utc,
-            "last_heartbeat_utc": utc_now(),
-        },
-    )
+            "state": "idle",
+            "current_request_id": None,
+            "idle_since_unix_seconds": int(time.time()),
+            "started_utc": started_utc,
+        }
+
+    def publish(self) -> None:
+        # Serialize the snapshot and publication so a delayed writer cannot
+        # overwrite a newer transition with an old busy/idle state.
+        with self.lock:
+            write_json_atomic(self.path, {**self.payload, "last_heartbeat_utc": utc_now()})
+
+    def transition(self, state: str, request_id: str | None = None) -> None:
+        with self.lock:
+            self.payload.update(
+                state=state,
+                current_request_id=request_id,
+                idle_since_unix_seconds=int(time.time()) if state == "idle" else None,
+            )
+            write_json_atomic(self.path, {**self.payload, "last_heartbeat_utc": utc_now()})
 
 
 def heartbeat_thread_fn(
-    heartbeat_path: Path,
-    instance_id: str,
-    runner_key: str,
-    state_fn,
+    heartbeat: HeartbeatPublisher,
     stop_event: threading.Event,
 ) -> None:
     while not stop_event.wait(HEARTBEAT_INTERVAL_SECS):
-        write_heartbeat(heartbeat_path, instance_id, runner_key, state_fn)
+        heartbeat.publish()
+
+
+def tree_identity(root: Path) -> tuple:
+    entries = []
+    for path in [root, *sorted(root.rglob("*"))]:
+        info = path.lstat()
+        entries.append((
+            str(path.relative_to(root)), info.st_dev, info.st_ino, info.st_mode,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+            os.readlink(path) if path.is_symlink() else None,
+        ))
+    return tuple(entries)
+
+
+class PreparedDriverTools:
+    def __init__(self, target: Path):
+        self.target = target
+        self.source_identity = None
+        self.prepared_identity = None
+
+    def prepare(self, source: Path, version: str, platform: str) -> Path:
+        source = source.resolve(strict=True)
+        identity = (str(source), version, platform, tree_identity(source))
+        if self.source_identity == identity and self.target.is_dir():
+            if tree_identity(self.target) == self.prepared_identity:
+                cutoff = time.time_ns() - 1_000_000_000
+                settled = all(max(entry[5], entry[6]) < cutoff
+                              for entry in (*identity[3], *self.prepared_identity))
+                # During the filesystem timestamp tick, compare bytes rather
+                # than trusting metadata that can alias two rapid writes.
+                if settled or all(
+                    files_equal(path, self.target / path.relative_to(source))
+                    for path in source.rglob("*") if path.is_file()
+                ):
+                    return self.target
+        self.source_identity = None
+        self.prepared_identity = None
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        # Only a complete copy becomes visible at the execution path. A failed
+        # preparation leaves no reusable in-memory validation record.
+        with tempfile.TemporaryDirectory(prefix=".xlsynth-tools-", dir=self.target.parent) as tmp:
+            staging = Path(tmp) / "release"
+            shutil.copytree(source, staging, copy_function=shutil.copy2)
+            for ext in ["so", "dylib"]:
+                library = staging / f"libxls-{platform}.{ext}"
+                if library.is_file():
+                    alias = staging / f"libxls-{version}-{platform}.{ext}"
+                    remove_existing_target(alias)
+                    alias.symlink_to(library.name)
+            if tree_identity(source) != identity[3]:
+                raise RuntimeError("driver tool cache changed during preparation")
+            remove_existing_target(self.target)
+            os.replace(staging, self.target)
+        self.prepared_identity = tree_identity(self.target)
+        self.source_identity = identity
+        return self.target
+
+
+def files_equal(left: Path, right: Path) -> bool:
+    with left.open("rb") as a, right.open("rb") as b:
+        while True:
+            chunk = a.read(1024 * 1024)
+            if chunk != b.read(1024 * 1024):
+                return False
+            if not chunk:
+                return True
 
 
 def list_inbox_requests(inbox_dir: Path) -> list[Path]:
@@ -121,6 +194,42 @@ def list_inbox_requests(inbox_dir: Path) -> list[Path]:
             if path.is_file() and path.suffix == ".json"
         ]
     )
+
+
+def watch_inbox(directory: Path) -> int | None:
+    """Watch atomic inbox publication when Linux filesystem events are available."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None)
+        initialize, add_watch = libc.inotify_init1, libc.inotify_add_watch
+    except (ImportError, AttributeError, OSError):
+        return None
+    fd = initialize(os.O_CLOEXEC | os.O_NONBLOCK)
+    if fd < 0:
+        return None
+    in_moved_to = 0x80
+    if add_watch(fd, os.fsencode(directory), in_moved_to) < 0:
+        os.close(fd)
+        return None
+    return fd
+
+
+def wait_for_inbox(fd: int | None, interval: float) -> bool:
+    """Wake on a rename or the normal retirement and request polling interval."""
+    if fd is not None:
+        try:
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            if not poller.poll(round(interval * 1000)):
+                return False
+            return bool(os.read(fd, 4096))
+        except OSError:
+            pass
+    time.sleep(interval)
+    return False
 
 
 def claim_request(inbox_dir: Path, processing_dir: Path) -> Path | None:
@@ -244,7 +353,8 @@ def process_request(
     request_path: Path,
     results_dir: Path,
     archive_dir: Path,
-    heartbeat_state,
+    heartbeat: HeartbeatPublisher,
+    driver_tools: PreparedDriverTools,
 ) -> bool:
     request = json.loads(request_path.read_text(encoding="utf-8"))
     if request.get("schema_version") != SCHEMA_VERSION:
@@ -258,9 +368,7 @@ def process_request(
     instance_id = request["runner_instance_id"]
     container_name = request["container_name"]
     timeout_secs = int(request["timeout_secs"])
-    heartbeat_state["state"] = "busy"
-    heartbeat_state["current_request_id"] = request_id
-    heartbeat_state["idle_since_unix_seconds"] = None
+    heartbeat.transition("busy", request_id)
 
     job_root = Path(request["job_root"])
     stdout_log = job_root / "stdout.log"
@@ -271,6 +379,9 @@ def process_request(
     exit_code = None
     timed_out = False
     error = None
+    preparation_started = time.monotonic_ns()
+    preparation_finished = preparation_started
+    command_finished = preparation_started
 
     try:
         for mount in request["mounts"]:
@@ -279,7 +390,14 @@ def process_request(
 
         env = os.environ.copy()
         env.update(request["env"])
+        env.pop("BVC_PREPARED_XLSYNTH_TOOLS", None)
         env["BVC_PERSISTENT_RUNNER_REQUEST_ID"] = request_id
+        if ("/cache-input" in mounted_targets and "XLSYNTH_VERSION" in env
+                and "XLSYNTH_PLATFORM" in env):
+            env["BVC_PREPARED_XLSYNTH_TOOLS"] = str(driver_tools.prepare(
+                Path("/cache-input"), env["XLSYNTH_VERSION"], env["XLSYNTH_PLATFORM"]
+            ))
+        preparation_finished = time.monotonic_ns()
 
         with stdout_log.open("wb") as stdout_file, stderr_log.open("wb") as stderr_file:
             proc = subprocess.Popen(
@@ -290,28 +408,6 @@ def process_request(
                 cwd="/",
                 start_new_session=True,
             )
-            stop_event = threading.Event()
-
-            def running_state():
-                return (
-                    heartbeat_state["state"],
-                    heartbeat_state["current_request_id"],
-                    heartbeat_state["idle_since_unix_seconds"],
-                )
-
-            running_state.started_utc = heartbeat_state["started_utc"]
-            thread = threading.Thread(
-                target=heartbeat_thread_fn,
-                args=(
-                    Path(request["heartbeat_path"]),
-                    instance_id,
-                    runner_key,
-                    running_state,
-                    stop_event,
-                ),
-                daemon=True,
-            )
-            thread.start()
             try:
                 proc.wait(timeout=timeout_secs)
                 exit_code = proc.returncode
@@ -322,9 +418,6 @@ def process_request(
                 except ProcessLookupError:
                     pass
                 exit_code = proc.wait()
-            finally:
-                stop_event.set()
-                thread.join(timeout=2.0)
 
         if timed_out:
             error = (
@@ -342,8 +435,10 @@ def process_request(
             stderr_file.write(b"\nworker exception:\n")
             stderr_file.write(traceback.format_exc().encode("utf-8", errors="replace"))
     finally:
+        command_finished = time.monotonic_ns()
         for target in reversed(mounted_targets):
             remove_existing_target(Path(target))
+    cleanup_finished = time.monotonic_ns()
 
     stdout_tail = read_tail(stdout_log, OUTPUT_TAIL_MAX_BYTES)
     stderr_tail = read_tail(stderr_log, OUTPUT_TAIL_MAX_BYTES)
@@ -363,8 +458,12 @@ def process_request(
         "stdout_tail": stdout_tail,
         "stderr_tail": stderr_tail,
         "command_argv": ["bash", "-lc", request["script"]],
+        "timings_us": {
+            "prepare": (preparation_finished - preparation_started) // 1000,
+            "command": (command_finished - preparation_finished) // 1000,
+            "cleanup": (cleanup_finished - command_finished) // 1000,
+        },
     }
-    write_result(results_dir / f"{request_id}.json", result)
     archive_dir.mkdir(parents=True, exist_ok=True)
     archived_request = archive_dir / request_path.name
     try:
@@ -372,11 +471,9 @@ def process_request(
     except OSError:
         pass
     retire = error is not None
-    heartbeat_state["state"] = "retired" if retire else "idle"
-    heartbeat_state["current_request_id"] = None
-    heartbeat_state["idle_since_unix_seconds"] = (
-        None if retire else int(time.time())
-    )
+    heartbeat.transition("retired" if retire else "idle")
+    # Result publication is the completion barrier for cleanup and runner state.
+    write_result(results_dir / f"{request_id}.json", result)
     return not retire
 
 
@@ -409,21 +506,8 @@ def main() -> int:
     sync_cache_symlink(store_root)
 
     started_utc = utc_now()
-    heartbeat_state = {
-        "state": "idle",
-        "current_request_id": None,
-        "started_utc": started_utc,
-        "idle_since_unix_seconds": int(time.time()),
-    }
-
-    def state_fn():
-        return (
-            heartbeat_state["state"],
-            heartbeat_state["current_request_id"],
-            heartbeat_state["idle_since_unix_seconds"],
-        )
-
-    state_fn.started_utc = started_utc
+    heartbeat = HeartbeatPublisher(heartbeat_path, args.runner_instance_id, args.runner_key, started_utc)
+    driver_tools = PreparedDriverTools(Path("/tmp/xlsynth-release"))
     write_json_atomic(
         live_path,
         {
@@ -442,23 +526,19 @@ def main() -> int:
         args.runner_instance_id,
         args.image,
     )
+    heartbeat.publish()
 
     stop_event = threading.Event()
     heartbeat_thread = threading.Thread(
         target=heartbeat_thread_fn,
-        args=(
-            heartbeat_path,
-            args.runner_instance_id,
-            args.runner_key,
-            state_fn,
-            stop_event,
-        ),
+        args=(heartbeat, stop_event),
         daemon=True,
     )
     heartbeat_thread.start()
 
     idle_since_monotonic = time.monotonic()
     retirement_lock = None
+    inbox_events = watch_inbox(inbox_dir)
     try:
         while True:
             sync_cache_symlink(store_root)
@@ -469,23 +549,21 @@ def main() -> int:
                 )
                 if retirement_lock is not None:
                     break
-                time.sleep(0.2)
+                wait_for_inbox(inbox_events, 0.2)
                 continue
-            if not process_request(request_path, results_dir, archive_dir, heartbeat_state):
+            if not process_request(request_path, results_dir, archive_dir, heartbeat, driver_tools):
                 break
             idle_since_monotonic = time.monotonic()
     finally:
+        if inbox_events is not None:
+            os.close(inbox_events)
         stop_event.set()
         heartbeat_thread.join()
         if retirement_lock is not None:
             # Do not let a final background heartbeat overwrite this terminal
             # state, or let a new host select us in the interval before exit.
             with retirement_lock:
-                heartbeat_state["state"] = "retired"
-                heartbeat_state["idle_since_unix_seconds"] = None
-                write_heartbeat(
-                    heartbeat_path, args.runner_instance_id, args.runner_key, state_fn
-                )
+                heartbeat.transition("retired")
     return 0
 
 
