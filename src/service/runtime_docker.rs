@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod directory_events;
+
 use super::*;
 use fs2::FileExt;
 use prost::Message;
@@ -2881,6 +2883,8 @@ fn execute_persistent_runner_script_with_timeout_and_family(
 
     let deadline = Instant::now()
         + Duration::from_secs(timeout_secs + PERSISTENT_RUNNER_REQUEST_TIMEOUT_GRACE_SECS);
+    // Register before checking the file so publication between check and wait is observable.
+    let mut events = directory_events::DirectoryEvents::watch(&runner.paths.results_dir);
     let result = loop {
         if result_path.exists() {
             let text = fs::read_to_string(&result_path).with_context(|| {
@@ -2938,7 +2942,7 @@ fn execute_persistent_runner_script_with_timeout_and_family(
                 cleanup_summary
             );
         }
-        thread::sleep(Duration::from_millis(100));
+        events.wait(Duration::from_millis(100));
     };
 
     let cleanup_request_files = || {
@@ -4050,6 +4054,49 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
                     .output();
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires Docker and XLSYNTH_BVC_TEST_PROBE_IMAGE naming an existing image with Python"]
+    fn persistent_runner_completes_consecutive_requests() -> Result<()> {
+        let _guard = docker_integration_test_lock()
+            .lock()
+            .map_err(|_| anyhow!("docker integration test lock poisoned"))?;
+        let _pool = ScopedEnvVar::set(PERSISTENT_RUNNER_DRIVER_POOL_SIZE_ENV, "1");
+        let _ttl = ScopedEnvVar::set(PERSISTENT_RUNNER_IDLE_TTL_SECS_ENV, "30");
+        let image_ref = std::env::var("XLSYNTH_BVC_TEST_PROBE_IMAGE")?;
+        let image = docker_image_content_ref(
+            &inspect_image_id(&image_ref)?.context("existing worker test image")?,
+        )?;
+        let store = ArtifactStore::new(make_temp_store_root("consecutive-requests"));
+        store.ensure_layout()?;
+        // Dispatch infers the store root from a canonicalized Docker mount.
+        let key = persistent_runner_key(&image, &store.root.canonicalize()?);
+        let mut cleanup = DockerCleanup::new(Vec::new());
+        cleanup.add_container(persistent_runner_container_name(&image, &key));
+        let paths = PersistentRunnerPaths::new(&store.root, &key);
+        let output = store.staging_dir().join("output");
+        fs::create_dir_all(&output)?;
+        let mut instances = Vec::new();
+
+        for marker in ["first", "second"] {
+            let script = format!("printf %s {marker} > /outputs/result.txt");
+            execute_persistent_runner_script_with_timeout(
+                &image,
+                &[DockerMount::read_write(&output, "/outputs")?],
+                &BTreeMap::new(),
+                &script,
+                "consecutive-requests",
+                20,
+            )?;
+            assert_eq!(fs::read_to_string(output.join("result.txt"))?, marker);
+            let heartbeat = read_persistent_runner_heartbeat(&paths)?.context("live worker")?;
+            instances.push(heartbeat.runner_instance_id);
+        }
+        assert_eq!(instances[0], instances[1]);
+        drop(cleanup);
+        fs::remove_dir_all(store.root)?;
+        Ok(())
     }
 
     #[test]
