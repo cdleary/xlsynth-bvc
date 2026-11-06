@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 mod atomic_record_batch;
+mod semantic_candidate_index;
 pub(crate) use atomic_record_batch::MAX_ATOMIC_RECORD_BATCH;
 
 use crate::model::{ArtifactRef, Provenance, QueueFailed};
@@ -232,6 +233,11 @@ trait ArtifactBackend: std::fmt::Debug + Send + Sync {
     fn delete_failed_action_record(&self, store_root: &Path, action_id: &str) -> Result<bool>;
     fn action_exists(&self, store_root: &Path, action_id: &str) -> bool;
     fn load_provenance(&self, store_root: &Path, action_id: &str) -> Result<Provenance>;
+    fn load_optional_provenance(
+        &self,
+        store_root: &Path,
+        action_id: &str,
+    ) -> Result<Option<Provenance>>;
     fn write_provenance(&self, store_root: &Path, provenance: &Provenance) -> Result<()>;
     fn for_each_provenance(
         &self,
@@ -2466,17 +2472,28 @@ impl ArtifactBackend for SledArtifactBackend {
         }
     }
 
-    fn load_provenance(&self, _store_root: &Path, action_id: &str) -> Result<Provenance> {
+    fn load_provenance(&self, store_root: &Path, action_id: &str) -> Result<Provenance> {
+        self.load_optional_provenance(store_root, action_id)?
+            .ok_or_else(|| anyhow!("provenance not found for action {}", action_id))
+    }
+
+    fn load_optional_provenance(
+        &self,
+        _store_root: &Path,
+        action_id: &str,
+    ) -> Result<Option<Provenance>> {
         let db = self.open_db()?;
         let tree = db
             .open_tree(Self::TREE_PROVENANCE_BY_ACTION)
             .context("opening sled tree provenance_by_action")?;
-        let bytes = tree
+        let Some(bytes) = tree
             .get(action_id.as_bytes())
             .context("loading provenance row from sled")?
-            .ok_or_else(|| anyhow::anyhow!("provenance not found for action {}", action_id))?;
+        else {
+            return Ok(None);
+        };
         self.validated_provenance(action_id, bytes)
-            .map(|value| (*value).clone())
+            .map(|value| Some((*value).clone()))
             .context("validating loaded provenance row identity")
     }
 
@@ -2802,6 +2819,14 @@ impl ArtifactBackend for SnapshotArtifactBackend {
         false
     }
 
+    fn load_optional_provenance(
+        &self,
+        _store_root: &Path,
+        _action_id: &str,
+    ) -> Result<Option<Provenance>> {
+        Ok(None)
+    }
+
     fn load_provenance(&self, _store_root: &Path, action_id: &str) -> Result<Provenance> {
         bail!(
             "load_provenance is unavailable in snapshot read-only backend (action_id={})",
@@ -2959,6 +2984,7 @@ pub(crate) struct ArtifactStore {
     artifact_backend_selection: ArtifactBackendSelection,
     artifact_backend: Box<dyn ArtifactBackend>,
     list_cache_ttl: Duration,
+    semantic_candidates: semantic_candidate_index::SemanticCandidateIndex,
     provenance_cache: Mutex<Option<TimedCache<Vec<Provenance>>>>,
     failed_records_cache: Mutex<Option<TimedCache<Vec<QueueFailed>>>>,
     db_size_cache: Mutex<Option<TimedCache<u64>>>,
@@ -2966,6 +2992,10 @@ pub(crate) struct ArtifactStore {
     versions_summary_input_generation: AtomicU64,
     versions_summary_rebuild_lock: Mutex<()>,
     versions_summary_recipe_cache: Mutex<Option<TimedCache<(String, String)>>>,
+}
+
+fn semantic_input_hash(provenance: &Provenance) -> Option<&str> {
+    crate::service::details_input_ir_structural_hash(&provenance.details)
 }
 
 impl ArtifactStore {
@@ -3006,6 +3036,7 @@ impl ArtifactStore {
             artifact_backend_selection,
             artifact_backend,
             list_cache_ttl: Self::list_cache_ttl_from_env(),
+            semantic_candidates: Default::default(),
             provenance_cache: Mutex::new(None),
             failed_records_cache: Mutex::new(None),
             db_size_cache: Mutex::new(None),
@@ -3029,6 +3060,7 @@ impl ArtifactStore {
             artifact_backend_selection,
             artifact_backend,
             list_cache_ttl: Self::list_cache_ttl_from_env(),
+            semantic_candidates: Default::default(),
             provenance_cache: Mutex::new(None),
             failed_records_cache: Mutex::new(None),
             db_size_cache: Mutex::new(None),
@@ -3375,8 +3407,13 @@ impl ArtifactStore {
         staging_dir: &Path,
     ) -> Result<()> {
         self.mutate_versions_summary_input(|| {
-            self.artifact_backend
-                .promote_staging_action_dir(&self.root, action_id, staging_dir)
+            let result = self.artifact_backend.promote_staging_action_dir(
+                &self.root,
+                action_id,
+                staging_dir,
+            );
+            self.update_semantic_index_after_write(action_id);
+            result
         })
     }
 
@@ -3425,9 +3462,94 @@ impl ArtifactStore {
 
     pub(crate) fn write_provenance(&self, provenance: &Provenance) -> Result<()> {
         self.mutate_versions_summary_input(|| {
-            self.artifact_backend
-                .write_provenance(&self.root, provenance)
+            let result = self
+                .artifact_backend
+                .write_provenance(&self.root, provenance);
+            self.update_semantic_index_after_write(&provenance.action_id);
+            result
         })
+    }
+
+    /// The index narrows identities; current canonical bytes remain authoritative.
+    pub(crate) fn for_each_semantic_candidate(
+        &self,
+        input_hash: &str,
+        mut visitor: impl FnMut(Provenance) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
+        let mut scan = || {
+            self.for_each_provenance(|provenance| {
+                if semantic_input_hash(&provenance) == Some(input_hash) {
+                    visitor(provenance)
+                } else {
+                    Ok(ControlFlow::Continue(()))
+                }
+            })
+        };
+        if self.list_cache_ttl.is_zero() {
+            return scan();
+        }
+        let ids = match self.semantic_candidates.candidates(
+            input_hash,
+            self.list_cache_ttl,
+            |id| self.current_semantic_hash(id),
+            |index| self.scan_semantic_candidate_index(index),
+        ) {
+            Ok(ids) => ids,
+            Err(err) => {
+                // The ordered visitor may finish before reaching a malformed later row.
+                log::debug!("semantic index refresh failed, scanning for a candidate: {err:#}");
+                return scan();
+            }
+        };
+        for action_id in ids {
+            let Some(provenance) = self.semantic_candidates.read_current(&action_id, || {
+                self.artifact_backend
+                    .load_optional_provenance(&self.root, &action_id)
+            })?
+            else {
+                continue;
+            };
+            if semantic_input_hash(&provenance) == Some(input_hash)
+                && visitor(provenance)?.is_break()
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_semantic_candidate_index(
+        &self,
+        index: &mut semantic_candidate_index::Index,
+    ) -> Result<usize> {
+        let mut rows = 0;
+        self.for_each_provenance(|provenance| {
+            rows += 1;
+            index.record(&provenance.action_id, semantic_input_hash(&provenance));
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(rows)
+    }
+
+    fn current_semantic_hash(&self, action_id: &str) -> Result<Option<String>> {
+        let provenance = self
+            .artifact_backend
+            .load_optional_provenance(&self.root, action_id)?;
+        Ok(provenance
+            .as_ref()
+            .and_then(semantic_input_hash)
+            .map(str::to_owned))
+    }
+
+    // A backend error can occur during cleanup after the canonical row has committed.
+    fn update_semantic_index_after_write(&self, action_id: &str) {
+        if !self.list_cache_ttl.is_zero()
+            && let Err(err) = self
+                .semantic_candidates
+                .update(action_id, || self.current_semantic_hash(action_id))
+        {
+            warn!("unable to update semantic index for {action_id}, expiring it: {err:#}");
+        }
     }
 
     pub(crate) fn for_each_provenance(
@@ -3991,7 +4113,7 @@ mod tests {
             .expect("create staged payload");
         std::fs::write(&payload_path, payload).expect("write staged payload");
         let mut staged_provenance = provenance.clone();
-        staged_provenance.details = json!({"source_path": label});
+        staged_provenance.details["source_path"] = json!(label);
         staged_provenance.output_files = vec![OutputFile {
             path: "payload/result.txt".to_string(),
             bytes: payload.len() as u64,
@@ -5526,5 +5648,185 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+    #[test]
+    fn semantic_candidates_track_local_writes_and_validate_current_canonical_bytes() {
+        let hash = "1".repeat(64);
+        let replacement_hash = "2".repeat(64);
+        let external_hash = "3".repeat(64);
+        let new_external_hash = "4".repeat(64);
+        let root = make_test_root("xlsynth-bvc-semantic-candidates");
+        let db_path = root.with_extension("sled");
+        let backend = SledArtifactBackend {
+            db_path: db_path.clone(),
+            db: Mutex::new(None),
+            materialization_lock: RwLock::new(()),
+            validated_provenance: Mutex::default(),
+        };
+        let db = backend.open_db().expect("open test database");
+        let mut store = ArtifactStore::new_with_sled(root.clone(), db_path.clone());
+        store.artifact_backend = Box::new(backend);
+        store.list_cache_ttl = Duration::from_secs(60);
+        store.ensure_layout().expect("store layout");
+        let collect = |store: &ArtifactStore, hash: &str| -> Result<Vec<String>> {
+            let mut ids = Vec::new();
+            store.for_each_semantic_candidate(hash, |provenance| {
+                ids.push(provenance.action_id);
+                Ok(ControlFlow::Continue(()))
+            })?;
+            Ok(ids)
+        };
+        assert!(collect(&store, &hash).unwrap().is_empty());
+        let make = |seed: &str, bytes: u64| {
+            let mut provenance = make_test_provenance(seed, "payload/result.txt", bytes);
+            provenance.action = ActionSpec::DriverIrToOpt {
+                ir_action_id: seed.to_owned(),
+                top_fn_name: Some("main".into()),
+                version: "v0.37.0".into(),
+                runtime: DriverRuntimeSpec {
+                    driver_version: "v0.37.0".into(),
+                    source_revision: None,
+                    release_platform: "linux-x64".into(),
+                    docker_image: "xlsynth-driver:test".into(),
+                    dockerfile: "docker/xlsynth-driver.Dockerfile".into(),
+                    dockerfile_sha256: "d".repeat(64),
+                    docker_image_id: "e".repeat(64),
+                    release_cache_input_sha256: "f".repeat(64),
+                },
+            };
+            provenance.action_id = crate::executor::compute_action_id(&provenance.action).unwrap();
+            provenance.output_artifact.action_id = provenance.action_id.clone();
+            provenance
+        };
+        let mut inputs = Vec::new();
+        for (seed, text) in [("a", "first"), ("b", "second")] {
+            let mut provenance = make(&seed.repeat(64), text.len() as u64);
+            provenance.details = json!({"input_ir_fn_structural_hash": hash});
+            let staging = stage_test_sled_action(&store, &provenance, seed, text.as_bytes());
+            store
+                .promote_staging_action_dir(&provenance.action_id, &staging)
+                .unwrap();
+            inputs.push(provenance);
+        }
+        let mut expected = inputs
+            .iter()
+            .map(|p| p.action_id.clone())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(collect(&store, &hash).unwrap(), expected);
+        let chosen = crate::service::find_semantic_reuse_candidate(&store, &hash, |_| true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(chosen.action_id, expected[0]);
+
+        let tree = db
+            .open_tree(SledArtifactBackend::TREE_PROVENANCE_BY_ACTION)
+            .unwrap();
+        // Scan a transient replacement, then confirm the restored hash via a warm lookup.
+        let original = store.load_provenance(&inputs[0].action_id).unwrap();
+        let mut transient = original.clone();
+        transient.details = json!({"input_ir_fn_structural_hash": replacement_hash});
+        let ids = store
+            .semantic_candidates
+            .candidates(
+                &hash,
+                Duration::ZERO,
+                |id| store.current_semantic_hash(id),
+                |index| {
+                    let key = original.action_id.as_bytes();
+                    tree.insert(key, crate::proto::encode_provenance(&transient)?)?;
+                    let rows = store.scan_semantic_candidate_index(index)?;
+                    tree.insert(key, crate::proto::encode_provenance(&original)?)?;
+                    assert_eq!(collect(&store, &hash)?, expected);
+                    Ok(rows)
+                },
+            )
+            .unwrap();
+        assert_eq!(ids, expected);
+        tree.insert(b"z", b"invalid protobuf".as_slice()).unwrap();
+        store.semantic_candidates = Default::default();
+        for ttl in [Duration::ZERO, Duration::from_secs(60)] {
+            store.list_cache_ttl = ttl;
+            let chosen = crate::service::find_semantic_reuse_candidate(&store, &hash, |_| true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                chosen.action_id, expected[0],
+                "early match with TTL {ttl:?}"
+            );
+            assert!(
+                crate::service::find_semantic_reuse_candidate(&store, &hash, |_| false).is_err()
+            );
+        }
+        tree.remove(b"z").unwrap();
+        assert_eq!(collect(&store, &hash).unwrap(), expected);
+
+        let mut replacement = store.load_provenance(&inputs[0].action_id).unwrap();
+        // Force materialization cleanup to fail after the replacement commits to sled.
+        let materialized = store
+            .materialize_action_dir(&replacement.action_id)
+            .unwrap();
+        fs::remove_dir_all(&materialized).unwrap();
+        fs::write(&materialized, b"obstruct cleanup").unwrap();
+        replacement.details = json!({"input_ir_fn_structural_hash": external_hash});
+        let err = store.write_provenance(&replacement).unwrap_err();
+        assert!(err.to_string().contains("invalidating materialized action"));
+        assert_eq!(
+            collect(&store, &external_hash).unwrap(),
+            [replacement.action_id.clone()]
+        );
+        fs::remove_file(materialized).unwrap();
+
+        replacement.details = json!({"input_ir_fn_structural_hash": replacement_hash});
+        store.write_provenance(&replacement).unwrap();
+        assert_eq!(
+            collect(&store, &hash).unwrap(),
+            [inputs[1].action_id.clone()]
+        );
+        assert_eq!(
+            collect(&store, &replacement_hash).unwrap(),
+            [inputs[0].action_id.clone()]
+        );
+
+        replacement.details = json!({"input_ir_fn_structural_hash": external_hash});
+        tree.insert(
+            replacement.action_id.as_bytes(),
+            crate::proto::encode_provenance(&replacement).unwrap(),
+        )
+        .unwrap();
+        assert!(collect(&store, &replacement_hash).unwrap().is_empty());
+        assert_eq!(
+            collect(&store, &external_hash).unwrap(),
+            [replacement.action_id.clone()]
+        );
+
+        let mut external = make(&"c".repeat(64), 0);
+        external.details = json!({"input_ir_fn_structural_hash": new_external_hash});
+        tree.insert(
+            external.action_id.as_bytes(),
+            crate::proto::encode_provenance(&external).unwrap(),
+        )
+        .unwrap();
+        assert!(collect(&store, &new_external_hash).unwrap().is_empty());
+        store.list_cache_ttl = Duration::from_nanos(1);
+        assert_eq!(
+            collect(&store, &new_external_hash).unwrap(),
+            [external.action_id.clone()]
+        );
+        store.list_cache_ttl = Duration::from_secs(60);
+
+        tree.remove(replacement.action_id.as_bytes()).unwrap();
+        assert!(collect(&store, &external_hash).unwrap().is_empty());
+        tree.insert(
+            inputs[1].action_id.as_bytes(),
+            b"invalid protobuf".as_slice(),
+        )
+        .unwrap();
+        assert!(collect(&store, &hash).is_err());
+        drop(tree);
+        drop(store);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(db_path).unwrap();
     }
 }
