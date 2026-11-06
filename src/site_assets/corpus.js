@@ -3,21 +3,35 @@
 (() => {
   const names = row => row.function_names.length ? row.function_names.join(', ') : row.top_fn_name;
   const product = row => row.g8r_nodes * row.g8r_depth;
+  function metricComparison(current, previous, currentYosys, previousYosys) {
+    const percent = (value, reference) => Number.isFinite(value) && Number.isFinite(reference) && reference > 0 ? 100 * (value / reference - 1) : null;
+    const oldRelative = percent(previous, previousYosys), newRelative = percent(current, currentYosys);
+    return {old:previous,new:current,delta:Number.isFinite(current)&&Number.isFinite(previous)?current-previous:null,
+      percent:percent(current,previous),old_yosys:previousYosys??null,new_yosys:currentYosys,
+      old_vs_yosys_percent:oldRelative,new_vs_yosys_percent:newRelative,
+      relative_pp:oldRelative!==null&&newRelative!==null?newRelative-oldRelative:null};
+  }
   function stageRow(row, stage) {
     if(stage !== 'raw') return row;
     if(!Number.isFinite(row.raw_nodes) || !Number.isFinite(row.raw_depth)) throw Error('Missing pre-ABC measurements');
     return {...row,g8r_nodes:row.raw_nodes,g8r_depth:row.raw_depth,g8r_le:row.raw_le};
   }
   function pairRows(rows, baseline, stage = 'abc') {
-    if(stage === 'raw' && !baseline) throw Error('Pre-ABC comparisons require another release at the same stage');
     const lookup = baseline ? new Map(baseline.map(r => [r.sample_id, r])) : null;
+    if(new Set(rows.map(r=>r.sample_id)).size!==rows.length || (lookup && (lookup.size!==baseline.length || baseline.length!==rows.length))) throw Error('Release populations do not match');
     return rows.map(row => {
       const source = lookup?.get(row.sample_id), other = source ? stageRow(source, stage) : null;
-      if (lookup && (!other || other.source_sha256 !== row.source_sha256 || other.top_fn_name !== row.top_fn_name)) throw Error('Release inputs do not match');
+      if (lookup && (!other || other.source_sha256 !== row.source_sha256 || other.top_fn_name !== row.top_fn_name || other.source_relpath !== row.source_relpath)) throw Error('Release inputs do not match');
       row = stageRow(row, stage);
       const nodes = other ? other.g8r_nodes : row.yosys_nodes, depth = other ? other.g8r_depth : row.yosys_depth;
+      const metrics = Object.fromEntries(['nodes','depth','le','product'].map(metric=>{
+        const value = r=>metric==='product'?product(r):r[`g8r_${metric}`];
+        const yosys = r=>metric==='product'?r.yosys_nodes*r.yosys_depth:r[`yosys_${metric}`];
+        return [metric,metricComparison(value(row),other?value(other):yosys(row),yosys(row),other?yosys(other):null)];
+      }));
       return {...row, reference_nodes:nodes, reference_depth:depth, reference_le:other ? other.g8r_le : row.yosys_le,
-        cost:product(row), reference_cost:nodes*depth, change:product(row)-nodes*depth};
+        cost:product(row), reference_cost:nodes*depth, change:product(row)-nodes*depth,
+        metrics, change_percent:metrics.product.percent, relative_change_pp:metrics.product.relative_pp};
     });
   }
   function filterRows(rows, options) {
@@ -32,12 +46,19 @@
       {count:0,cost:0,reference:0,better:0,worse:0,unchanged:0});
   }
   const lossRows = rows => rows.filter(r => Number.isFinite(r.ir_node_count) && r.ir_node_count > 0 && Number.isFinite(r.change) && r.change > 0);
-  if (typeof module !== 'undefined') module.exports = {names,pairRows,filterRows,summarize,lossRows};
+  function comparisonCsv(rows) {
+    const metrics=['nodes','depth','product','le'], values=['old','new','delta','percent','old_yosys','new_yosys','old_vs_yosys_percent','new_vs_yosys_percent','relative_pp'];
+    const fields=['sample_id','source_relpath','source_sha256','top_fn_name','function_names','input_kinds','ir_node_count',...metrics.flatMap(m=>values.map(v=>`${m}_${v}`))];
+    const escape=value=>'"'+String(value??'').replaceAll('"','""')+'"';
+    return [fields,...rows.map(r=>[r.sample_id,r.source_relpath,r.source_sha256,r.top_fn_name,JSON.stringify(r.function_names),JSON.stringify(r.input_kinds),r.ir_node_count,...metrics.flatMap(m=>values.map(v=>r.metrics[m][v]))])].map(r=>r.map(escape).join(',')).join('\n')+'\n';
+  }
+  if (typeof module !== 'undefined') module.exports = {names,pairRows,filterRows,summarize,lossRows,metricComparison,comparisonCsv};
   if (typeof document === 'undefined') return;
   const byId = id => document.getElementById(id), fmt = n => n.toLocaleString(undefined,{maximumFractionDigits:3});
   const load = async url => {const r=await fetch(url);if(!r.ok)throw Error(`${url}: HTTP ${r.status}`);return r.json()};
   const state = {catalog:null, cache:new Map(), epoch:0, selected:0, selectedId:null, rows:[], rendering:false, pending:false};
   const color = row => row.change < 0 ? '#7de9ae' : row.change > 0 ? '#ff91ad' : '#9ca8b6';
+  const signed = (value, unit) => value===null?'undefined':`${value>0?'+':''}${fmt(value)}${unit}`;
   function layout(x,y,log=false) {
     return {paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'#111922',font:{color:'#dce7f0'},margin:{l:68,r:18,t:24,b:65},showlegend:false,
       xaxis:{title:x,type:log?'log':'linear',gridcolor:'#293847',zerolinecolor:'#789'},yaxis:{title:y,type:log?'log':'linear',gridcolor:'#293847',zerolinecolor:'#789'}};
@@ -46,7 +67,13 @@
     const token=++state.selected;
     state.selectedId=row.sample_id;
     const url=new URL(location.href);url.searchParams.set('sample',row.sample_id);history.replaceState(null,'',url);
-    byId('selected').textContent=`${names(row)} · evaluated top: ${row.top_fn_name} · kinds: ${row.input_kinds.join(', ')} (${row.provenance_source==='snapshot'?'snapshot provenance':'name-only classification'}) · ${row.source_relpath} · ${fmt(row.ir_node_count)} IR nodes · selected ${fmt(row.cost)} / reference ${fmt(row.reference_cost)} · Δ ${fmt(row.change)}`;
+    byId('selected').textContent=`${names(row)} · evaluated top: ${row.top_fn_name} · kinds: ${row.input_kinds.join(', ')} (${row.provenance_source==='snapshot'?'snapshot provenance':'name-only classification'}) · ${row.source_relpath} · ${fmt(row.ir_node_count)} IR nodes · selected ${fmt(row.cost)} / reference ${fmt(row.reference_cost)} · Δ ${fmt(row.change)} · direct ${signed(row.change_percent,'%')} · relative to Yosys ${signed(row.relative_change_pp,' pp')}`;
+    const details=byId('metric-details');details.replaceChildren();
+    for(const [name,m] of Object.entries(row.metrics)){
+      const tr=document.createElement('tr');
+      for(const value of [name,m.old,m.new,signed(m.percent,'%'),signed(m.old_vs_yosys_percent,'%'),signed(m.new_vs_yosys_percent,'%'),signed(m.relative_pp,' pp')]){const td=document.createElement('td');td.textContent=value===null?'undefined':typeof value==='number'?fmt(value):value;tr.append(td)}
+      details.append(tr);
+    }
     byId('ir').hidden=false; byId('ir').textContent='Loading verified IR…';
     try {const data=await load(row.ir_url);if(token===state.selected){if(typeof data[row.sample_id]!=='string')throw Error('IR is missing');byId('ir').textContent=data[row.sample_id]}}
     catch(e){if(token===state.selected)byId('ir').textContent=e.message}
@@ -75,8 +102,6 @@
     const token=state.epoch;byId('error').textContent='';byId('corpus-site').dataset.rendered='loading';
     byId('scope').textContent='Loading selected release…';
     const stage=byId('stage').value, stageLabel=stage==='raw'?'g8r (no FRAIG, pre-ABC)':'g8r+ABC';
-    byId('reference').querySelector('option[value="yosys"]').disabled=stage==='raw';
-    if(stage==='raw')byId('reference').value='release';
     byId('reference').querySelector('option[value="release"]').textContent=`Another release’s ${stageLabel}`;
     byId('baseline').disabled=byId('reference').value!=='release';
     const version=byId('release').value, baselineVersion=byId('baseline').value, compare=byId('reference').value;
@@ -89,13 +114,16 @@
     const rows=state.rows,s=summarize(rows),reference=baseline?`v${baselineVersion} ${stageLabel}`:'codegen+Yosys/ABC';
     byId('scope').textContent=`${fmt(s.count)} / ${fmt(state.catalog.sample_count)} inputs · v${version} ${stageLabel} versus ${reference}`;
     byId('coverage').textContent=`${state.catalog.generations.length} complete releases · ${fmt(state.catalog.sample_count)} identical frozen inputs each · ${stage==='raw'?'pre-ABC, no FRAIG':'post-ABC'} measurements · no partial samples`;
-    const pct=s.reference?`${((s.cost/s.reference-1)*100).toFixed(3)}%`:'undefined';
-    byId('summary').replaceChildren(...[[`Aggregate cost change`,pct],['Lower / higher cost',`${fmt(s.better)} / ${fmt(s.worse)}`],['Unchanged cost',fmt(s.unchanged)],['Filtered inputs',fmt(s.count)]].map(([label,value])=>{const card=document.createElement('div');card.className='card';const title=document.createElement('span');title.textContent=label;const number=document.createElement('strong');number.textContent=value;card.append(title,number);return card}));
+    const totals=metricComparison(s.cost,s.reference,rows.reduce((a,r)=>a+r.metrics.product.new_yosys,0),baseline?rows.reduce((a,r)=>a+r.metrics.product.old_yosys,0):null);
+    const cards=[['Aggregate direct change',signed(totals.percent,'%')],['Lower / higher cost',`${fmt(s.better)} / ${fmt(s.worse)}`],['Unchanged cost',fmt(s.unchanged)],['Filtered inputs',fmt(s.count)]];
+    if(baseline)cards.push(['A vs its Yosys',signed(totals.old_vs_yosys_percent,'%')],['B vs its Yosys',signed(totals.new_vs_yosys_percent,'%')],['Change relative to Yosys',signed(totals.relative_pp,' pp')]);
+    byId('summary').replaceChildren(...cards.map(([label,value])=>{const card=document.createElement('div');card.className='card';const title=document.createElement('span');title.textContent=label;const number=document.createElement('strong');number.textContent=value;card.append(title,number);return card}));
+    byId('metric-details').replaceChildren();
     ++state.selected;byId('selected').textContent='Click a point or outlier to inspect its verified source IR.';byId('ir').hidden=true;
     const body=byId('outliers');body.replaceChildren();
     for(const row of [...rows].filter(r=>r.change>0).sort((a,b)=>b.change-a.change||a.sample_id.localeCompare(b.sample_id)).slice(0,30)){
       const tr=document.createElement('tr'),first=document.createElement('td'),button=document.createElement('button');button.textContent=names(row);button.addEventListener('click',()=>void selectSample(row));first.append(button);tr.append(first);
-      for(const n of [row.cost,row.reference_cost,row.change]){const td=document.createElement('td');td.textContent=fmt(n);tr.append(td)}body.append(tr);
+      for(const n of [row.cost,row.reference_cost,row.change,signed(row.change_percent,'%'),signed(row.relative_change_pp,' pp')]){const td=document.createElement('td');td.textContent=typeof n==='number'?fmt(n):n;tr.append(td)}body.append(tr);
     }
     await scatter('loss',lossRows(rows),r=>r.ir_node_count,r=>r.change,'IR node count (log scale)',`Product loss vs ${reference} (log scale)`,true,false,'IR nodes: %{x}<br>Positive product loss: %{y}<extra></extra>');
     await scatter('product',rows,r=>r.reference_cost,r=>r.cost,`${reference} nodes × depth`,`v${version} nodes × depth`,true,true);
@@ -106,10 +134,13 @@
     const url=new URL(location.href);url.searchParams.set('release',version);url.searchParams.set('reference',compare);url.searchParams.set('baseline',baselineVersion);url.searchParams.set('stage',stage);history.replaceState(null,'',url);
     const selected=rows.find(r=>r.sample_id===state.selectedId);
     if(selected){await selectSample(selected);if(location.hash==='#input-detail')byId('input-detail').scrollIntoView({block:'start'});}
+    if(token!==state.epoch)return;
     byId('corpus-site').dataset.rendered='true';byId('corpus-site').dataset.sampleCount=String(rows.length);
+    byId('download').disabled=false;
   }
   async function requestRender(){
     ++state.epoch;state.pending=true;
+    byId('download').disabled=true;
     if(state.rendering)return;
     state.rendering=true;
     try {
@@ -126,6 +157,10 @@
     byId('baseline').value=versions.includes(query.get('baseline'))?query.get('baseline'):versions.at(-2)||versions[0];
     byId('reference').value=query.get('reference')==='release'?'release':'yosys';
     byId('stage').value=query.get('stage')==='raw'?'raw':'abc';
+    byId('download').addEventListener('click',()=>{
+      const url=URL.createObjectURL(new Blob([comparisonCsv(state.rows)],{type:'text/csv;charset=utf-8'}));
+      const link=document.createElement('a');link.href=url;link.download=`bvc-${byId('release').value}-${byId('stage').value}-vs-${byId('reference').value==='release'?byId('baseline').value:'yosys'}-${byId('kind').value}.csv`;link.click();URL.revokeObjectURL(url);
+    });
     for(const name of ['release','baseline','reference','stage','kind','search','max-ir','losses'])byId(name).addEventListener('change',requestRender);
     await requestRender();
   }

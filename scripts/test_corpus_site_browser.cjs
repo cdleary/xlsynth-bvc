@@ -65,7 +65,15 @@ const shot = async name => {
   const result = await send('Page.captureScreenshot', {format:'png'});
   fs.writeFileSync(path.join(screenshots, name + '.png'), Buffer.from(result.data, 'base64'));
 };
-const control = async (id, value) => evaluate(`document.getElementById(${JSON.stringify(id)}).value=${JSON.stringify(value)};document.getElementById(${JSON.stringify(id)}).dispatchEvent(new Event('change'))`);
+const control = async (id, value) => {
+  const disabled = await evaluate(`{
+    const element = document.getElementById(${JSON.stringify(id)});
+    element.value = ${JSON.stringify(value)};
+    element.dispatchEvent(new Event('change'));
+    document.getElementById('download').disabled
+  }`);
+  assert.equal(disabled, true, 'CSV download enabled while the comparison is pending');
+};
 const ready = () => waitFor("document.getElementById('corpus-site')?.dataset.rendered==='true'");
 async function checkPlots(rows) {
   const lengths = await evaluate("Object.fromEntries(['loss','product','le','nodes','delta'].map(id=>[id,document.getElementById(id).data[0].x.length]))");
@@ -107,6 +115,15 @@ async function main() {
   }
   await shot('corpus-desktop');
   const newest = versions.at(-1), baseline = versions[0];
+  await control('stage','raw');
+  await ready();
+  assert.equal(await evaluate("document.getElementById('reference').value"),'yosys');
+  assert.equal(await evaluate("document.querySelector('#reference option[value=yosys]').disabled"),false);
+  assert.equal(await evaluate("document.getElementById('baseline').disabled"),true);
+  assert.equal(await evaluate("document.getElementById('download').disabled"),false);
+  await checkPlots(pairRows(allRows.get(newest),null,'raw'));
+  await control('stage','abc');
+  await ready();
   await control('baseline', baseline);
   await control('reference', 'release');
   await ready();
@@ -116,7 +133,6 @@ async function main() {
   await control('stage','raw');
   await ready();
   assert.equal(await evaluate("document.getElementById('reference').value"),'release');
-  assert.equal(await evaluate("document.querySelector('#reference option[value=yosys]').disabled"),true);
   for(const version of versions){
     await control('release',version);await ready();
     await checkPlots(pairRows(allRows.get(version),allRows.get(baseline),'raw'));

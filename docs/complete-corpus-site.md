@@ -203,9 +203,11 @@ python3 -m http.server 8000 --bind 127.0.0.1 --directory ../bvc-site
 ```
 
 Open `http://127.0.0.1:8000/`. On the dashboard, select a cohort and AIG stage, then click a release
-point. In the full-corpus explorer, compare pre-ABC g8r with another release at the same stage,
-or compare g8r+ABC with another release or its matched codegen+Yosys/ABC reference. Filter by input
-kind, IR size, or positive product loss. Click a point/outlier to load its source IR. The cards include
+point. In the full-corpus explorer, compare either pre-ABC g8r or g8r+ABC with another release
+at the same stage or with the selected release's matched codegen+Yosys/ABC reference. When
+comparing releases, the table and filtered CSV show both the direct percentage change and the
+percentage-point change against each release's own reference. Filter by input kind, IR size,
+or positive product loss. Click a point/outlier to load its source IR. The cards include
 zero-cost inputs; logarithmic plots explicitly omit zero-valued points. Undefined graph logical
 effort is omitted only from that plot. In dashboard builds, the verified snapshot's structural
 index supplies original function names and input-kind membership. The join first matches the

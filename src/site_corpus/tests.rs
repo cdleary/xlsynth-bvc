@@ -3,12 +3,15 @@
 use super::*;
 use crate::model::{ArtifactRef, OutputFile, Provenance};
 use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "bvc-corpus-site-test-{}-{}",
+            "bvc-corpus-site-test-{}-{}-{id}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
