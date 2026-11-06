@@ -7,6 +7,8 @@ use fs2::FileExt;
 use prost::Message;
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod worker_script;
+
 const RUNTIME_FINGERPRINT_LABEL: &str = "org.xlsynth-bvc.runtime-fingerprint";
 const DRIVER_SOURCE_REPOSITORY_LABEL: &str = "org.xlsynth-bvc.driver-source-repository";
 const DRIVER_SOURCE_COMMIT_LABEL: &str = "org.xlsynth-bvc.driver-source-commit";
@@ -1620,7 +1622,6 @@ const PERSISTENT_RUNNER_DRIVER_POOL_SIZE_ENV: &str =
 const PERSISTENT_RUNNER_YOSYS_POOL_SIZE_ENV: &str = "XLSYNTH_BVC_YOSYS_PERSISTENT_RUNNER_POOL_SIZE";
 const PERSISTENT_RUNNER_IDLE_TTL_SECS_ENV: &str = "XLSYNTH_BVC_PERSISTENT_RUNNER_IDLE_TTL_SECS";
 const PERSISTENT_RUNNER_DEFAULT_IDLE_TTL_SECS: u64 = 15 * 60;
-const PERSISTENT_RUNNER_WORKER_SCRIPT: &str = "scripts/persistent_runner_worker.py";
 const PERSISTENT_RUNNER_SLOT_LOCK_FILENAME: &str = "slot.lock";
 static PERSISTENT_RUNNER_START_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
@@ -1916,10 +1917,10 @@ fn sanitize_container_name_component(value: &str) -> String {
 
 fn persistent_runner_key(image: &str, store_root: &Path) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"xlsynth-bvc/persistent-runner/v2\0");
+    hasher.update(b"xlsynth-bvc/persistent-runner/v3\0");
     hasher.update(PERSISTENT_RUNNER_SCHEMA_VERSION.to_le_bytes());
     hasher.update(persistent_runner_idle_ttl_secs().to_le_bytes());
-    hasher.update(include_bytes!("../../scripts/persistent_runner_worker.py"));
+    hasher.update(worker_script::EMBEDDED);
     hasher.update([0]);
     hasher.update(image.as_bytes());
     hasher.update([0]);
@@ -2310,18 +2311,6 @@ fn sync_external_writeback(writeback: &ExternalWriteback) -> Result<()> {
     copy_path_recursive(&writeback.job_path, &writeback.host_path)
 }
 
-fn ensure_worker_script_path(repo_root: &Path) -> Result<PathBuf> {
-    let path = repo_root.join(PERSISTENT_RUNNER_WORKER_SCRIPT);
-    if !path.exists() {
-        bail!(
-            "persistent runner worker script not found: {}",
-            path.display()
-        );
-    }
-    path.canonicalize()
-        .with_context(|| format!("canonicalizing worker script path: {}", path.display()))
-}
-
 fn docker_container_is_running(container_name: &str) -> Result<bool> {
     let output = Command::new("docker")
         .args(["inspect", "--format", "{{.State.Running}}", container_name])
@@ -2510,7 +2499,7 @@ fn ensure_persistent_runner_started_locked(
             persistent_root.display()
         )
     })?;
-    let worker_script = ensure_worker_script_path(repo_root)?;
+    let worker_script = worker_script::materialize(&store_root, worker_script::EMBEDDED)?;
     let instance_id = new_persistent_runner_instance_id(runner_key);
     let runner_root_container = format!(
         "{}/{}/{}/{}",
@@ -4130,6 +4119,8 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
         ensure_driver_image(&repo_root, &runtime)?;
         runtime.docker_image_id = inspect_image_id(&image_ref)?.context("test driver image")?;
         let image = docker_image_content_ref(&runtime.docker_image_id)?;
+        let empty_deployment = store_root.join("empty-deployment");
+        fs::create_dir(&empty_deployment)?;
         let expiring_key = persistent_runner_key(&image, &store.root);
         {
             let _disabled = ScopedEnvVar::set(PERSISTENT_RUNNER_IDLE_TTL_SECS_ENV, "0");
@@ -4188,8 +4179,9 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
                 wait_removed(name)?;
             }
 
-            // Capability probing must recreate a retired slot-zero runner.
-            let capabilities = load_driver_runner_capabilities(&store, &repo_root, &runtime)?;
+            // Restart with the embedded worker script from a deployment without a checkout.
+            let capabilities =
+                load_driver_runner_capabilities(&store, &empty_deployment, &runtime)?;
             assert_eq!(capabilities.runner_family, "driver");
             let key = persistent_runner_slot_key(&base_key, pool_size, 0);
             let paths = PersistentRunnerPaths::new(&store.root, &key);
@@ -4200,11 +4192,17 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
             // externally written result survives the subsequent retirement.
             let output = store.staging_dir().join(format!("idle-output-{pool_size}"));
             fs::create_dir_all(&output)?;
+            let script = format!(
+                "set -eu\n[ \"$(sha256sum {} | cut -d' ' -f1)\" = {} ]\nif (touch {}/.worker-scripts/probe) 2>/dev/null; then exit 1; fi\nsleep 2; printf completed > /outputs/result.txt",
+                worker_script_container_path(),
+                hex::encode(Sha256::digest(worker_script::EMBEDDED)),
+                store_root_container_path(),
+            );
             execute_persistent_runner_script_with_timeout(
                 &image,
                 &[DockerMount::read_write(&output, "/outputs")?],
                 &BTreeMap::new(),
-                "sleep 2; printf completed > /outputs/result.txt",
+                &script,
                 "idle-retirement-active-job",
                 30,
             )?;

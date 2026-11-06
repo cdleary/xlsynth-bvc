@@ -159,7 +159,8 @@ The host still validates artifacts and writes provenance using the normal finali
 The implemented runner key is the first 24 hex digits of a domain-separated SHA-256 over:
 
 - the runner protocol schema version
-- the checked-in worker script bytes
+- the idle timeout in seconds
+- the worker script bytes embedded in the executable
 - the immutable OCI image ID
 - the store root
 

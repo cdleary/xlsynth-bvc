@@ -179,7 +179,9 @@ recipe generations can therefore coexist and an older queued action remains
 replayable while its pinned image is retained locally.
 
 Persistent runners are keyed by immutable image ID, store root, protocol
-version, and the checked-in worker script bytes. A named container is reused
+version, idle timeout, and the worker script bytes embedded in the executable.
+At startup the host mounts those bytes read-only from a content-addressed
+file in the private store. A named container is reused
 only if Docker reports the expected image ID. Requests carry a process-
 incarnation-qualified ID and a full request token, and results are validated
 against both before writeback; failed results are cleaned up as well as
