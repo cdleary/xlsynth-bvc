@@ -186,8 +186,12 @@ Exact-commit mainline candidate on the pinned fixed-IR cohort:
 ```bash
 # Refresh and review the immutable main/latest observation first.
 python3 scripts/sync_version_compat.py --update
-candidate_commit="$(jq -r '.head_commit' \
-  third_party/xlsynth-crate/repository_head_observation.json)"
+metadata_dir=third_party/xlsynth-crate
+observation="$metadata_dir/repository_head_observation.json"
+candidate_commit=$(jq -er '.head_commit' "$observation")
+crate_version=$(jq -er '.latest_crate_version' "$observation")
+dso_version=$(jq -er --arg v "$crate_version" '.[$v].xlsynth_release_version' \
+  "$metadata_dir/generated_version_compat.json")
 
 cargo run --bin xlsynth_bvc -- \
   run-ir-dir-corpus \
@@ -196,7 +200,7 @@ cargo run --bin xlsynth_bvc -- \
   --execution-mode enqueue \
   --recipe-preset g8r-abc-stats \
   --top-fn-policy infer-single-package \
-  --version v0.54.7 \
+  --version "$dso_version" \
   --driver-git-commit "${candidate_commit}" \
   --scheduling-policy release-progression-ir-v1
 ```
