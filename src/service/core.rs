@@ -394,6 +394,7 @@ test -s /scratch/structural_hash.json
 #[derive(Debug, Clone)]
 pub(crate) struct VerilogDriverContext {
     pub(crate) ir_action_id: String,
+    pub(crate) use_system_verilog: bool,
     pub(crate) top_fn_name: Option<String>,
     pub(crate) version: String,
     pub(crate) runtime: DriverRuntimeSpec,
@@ -492,13 +493,14 @@ pub(crate) fn infer_verilog_driver_context(
         top_fn_name,
         version,
         runtime,
-        ..
+        use_system_verilog,
     } = provenance.action
     else {
         return Ok(None);
     };
     Ok(Some(VerilogDriverContext {
         ir_action_id,
+        use_system_verilog,
         top_fn_name,
         version,
         runtime,
@@ -566,18 +568,16 @@ pub(crate) fn build_aig_stat_diff_suggestion_for_stats_action(
                 diff,
             )?))
         }
-        ActionSpec::ComboVerilogToYosysAbcAig {
-            verilog_action_id,
-            frontend,
-            yosys_script_ref,
-            ..
-        } => {
-            if !is_canonical_builtin_yosys_source(&frontend, &yosys_script_ref) {
-                return Ok(None);
-            }
-            let Some(ctx) = infer_verilog_driver_context(store, &verilog_action_id)? else {
+        action @ ActionSpec::ComboVerilogToYosysAbcAig { .. } => {
+            let Some(verilog_action_id) = canonical_yosys_verilog_action_id(&action) else {
                 return Ok(None);
             };
+            let Some(ctx) = infer_verilog_driver_context(store, verilog_action_id)? else {
+                return Ok(None);
+            };
+            if ctx.use_system_verilog {
+                return Ok(None);
+            }
             let g8r = ActionSpec::DriverIrToG8rAig {
                 ir_action_id: ctx.ir_action_id.clone(),
                 top_fn_name: ctx.top_fn_name.clone(),
@@ -765,6 +765,20 @@ pub(crate) fn is_canonical_builtin_yosys_source(
     script_ref: &ScriptRef,
 ) -> bool {
     matches!(frontend, YosysVerilogFrontend::Builtin) && is_canonical_yosys_script_ref(script_ref)
+}
+
+pub(crate) fn canonical_yosys_verilog_action_id(action: &ActionSpec) -> Option<&str> {
+    match action {
+        ActionSpec::ComboVerilogToYosysAbcAig {
+            verilog_action_id,
+            frontend,
+            yosys_script_ref,
+            ..
+        } if is_canonical_builtin_yosys_source(frontend, yosys_script_ref) => {
+            Some(verilog_action_id)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn resolve_script_ref(repo_root: &Path, script_ref: &ScriptRef) -> Result<PathBuf> {

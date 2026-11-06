@@ -1746,14 +1746,13 @@ fn load_stats_nodes_and_levels(
     parsed
 }
 
-fn is_canonical_builtin_yosys_aig_action(action: &ActionSpec) -> bool {
+fn is_plain_verilog_codegen(provenance: &Provenance) -> bool {
     matches!(
-        action,
-        ActionSpec::ComboVerilogToYosysAbcAig {
-            frontend,
-            yosys_script_ref,
+        provenance.action,
+        ActionSpec::IrFnToCombinationalVerilog {
+            use_system_verilog: false,
             ..
-        } if is_canonical_builtin_yosys_source(frontend, yosys_script_ref)
+        }
     )
 }
 
@@ -1818,7 +1817,10 @@ fn collect_previously_lossy_k_bool_source_structural_hashes(
         else {
             continue;
         };
-        if !is_canonical_builtin_yosys_aig_action(&yosys_aig_provenance.action) {
+        if !canonical_yosys_verilog_action_id(&yosys_aig_provenance.action)
+            .and_then(|id| by_action_id.get(id).copied())
+            .is_some_and(is_plain_verilog_codegen)
+        {
             continue;
         }
         let Some((g8r_nodes, g8r_levels)) =
@@ -1892,7 +1894,8 @@ pub(crate) fn lossy_k_bool_source_structural_hash_for_aig_stat_diff(
         return None;
     };
     let yosys_aig_provenance = store.load_provenance(yosys_aig_action_id).ok()?;
-    if !is_canonical_builtin_yosys_aig_action(&yosys_aig_provenance.action) {
+    let verilog_action_id = canonical_yosys_verilog_action_id(&yosys_aig_provenance.action)?;
+    if !is_plain_verilog_codegen(&store.load_provenance(verilog_action_id).ok()?) {
         return None;
     }
 

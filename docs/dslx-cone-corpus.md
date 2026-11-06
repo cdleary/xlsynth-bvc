@@ -50,6 +50,10 @@ branch converts IR to combinational Verilog and applies that **same** Yosys/ABC 
 joined row includes AIG stats, action IDs, the script digest, and runtime versions for each pair.
 `--fraig` is rejected for this recipe.
 
+For SystemVerilog, select `g8r-abc-vs-yabc-system-verilog-aig-diff` for the builtin reader or
+`g8r-abc-vs-yabc-slang-aig-diff` for Slang, which supports nested arrays. The report reads
+`joined/<recipe-preset>.jsonl` for the recipe recorded in the comparison manifest.
+
 Ingest outputs include `sources/` snapshots, `optimized/` packages, raw extractor files and
 logs, one single-top `.ir` per unique cone in `cones/`, and `manifest.json`. Each occurrence
 in the manifest identifies its relative source path and function, extraction kind, cone digest,

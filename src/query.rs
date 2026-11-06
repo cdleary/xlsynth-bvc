@@ -3426,6 +3426,53 @@ fn build_ir_fn_corpus_g8r_vs_yosys_build_state(
     })
 }
 
+// This index pairs G8r statistics with builtin Yosys results. Its entity key
+// omits the runtime, so admitting the Slang recipe's ABC image could mix runs.
+fn is_canonical_g8r_abc_source(runtime: &YosysRuntimeSpec, script: &ScriptRef) -> bool {
+    runtime.slang_commit.is_none() && is_canonical_yosys_script_ref(script)
+}
+
+// The historical comparison keys omit the RTL language and frontend. Resolve
+// the generator as well as the Yosys action before admitting a measurement.
+fn release_verilog_source_context(verilog: &Provenance) -> Option<StdlibTrendSourceContext> {
+    let ActionSpec::IrFnToCombinationalVerilog {
+        ir_action_id,
+        top_fn_name,
+        use_system_verilog: false,
+        version,
+        runtime,
+    } = &verilog.action
+    else {
+        return None;
+    };
+    if runtime.source_revision.is_some() {
+        return None;
+    }
+    Some(StdlibTrendSourceContext {
+        ir_action_id: ir_action_id.clone(),
+        ir_top: top_fn_name
+            .clone()
+            .or_else(|| verilog.details.get("ir_top")?.as_str().map(str::to_owned)),
+        crate_version: normalize_tag_version(&runtime.driver_version).to_string(),
+        dso_version: normalize_tag_version(version).to_string(),
+    })
+}
+
+fn load_canonical_yosys_stats_source(
+    store: &ArtifactStore,
+    producer: &Provenance,
+) -> Result<Option<(StdlibTrendSourceContext, Option<String>)>> {
+    let Some(id) = canonical_yosys_verilog_action_id(&producer.action) else {
+        return Ok(None);
+    };
+    let verilog = store.load_provenance(id)?;
+    Ok(release_verilog_source_context(&verilog).map(|ctx| {
+        let structural_hash = structural_hash_from_details(&verilog.details)
+            .or_else(|| structural_hash_from_details(&producer.details));
+        (ctx, structural_hash)
+    }))
+}
+
 fn extract_ir_fn_corpus_g8r_abc_vs_codegen_source_context(
     provenance_by_action_id: &ProvenanceLookup<'_>,
     aig_action_id: &str,
@@ -3439,9 +3486,9 @@ fn extract_ir_fn_corpus_g8r_abc_vs_codegen_source_context(
         ActionSpec::AigToYosysAbcAig {
             aig_action_id: upstream_aig_action_id,
             yosys_script_ref,
-            ..
+            runtime,
         } => {
-            if !is_canonical_yosys_script_ref(yosys_script_ref) {
+            if !is_canonical_g8r_abc_source(runtime, yosys_script_ref) {
                 return None;
             }
             let g8r_provenance = provenance_by_action_id.get(upstream_aig_action_id.as_str())?;
@@ -3482,46 +3529,14 @@ fn extract_ir_fn_corpus_g8r_abc_vs_codegen_source_context(
                 structural_hash_hint,
             ))
         }
-        ActionSpec::ComboVerilogToYosysAbcAig {
-            verilog_action_id,
-            frontend,
-            yosys_script_ref,
-            ..
-        } => {
-            if !is_canonical_builtin_yosys_source(frontend, yosys_script_ref) {
-                return None;
-            }
-            let verilog_provenance = provenance_by_action_id.get(verilog_action_id.as_str())?;
-            let ActionSpec::IrFnToCombinationalVerilog {
-                ir_action_id,
-                top_fn_name,
-                version,
-                runtime,
-                ..
-            } = &verilog_provenance.action
-            else {
-                return None;
-            };
-            if runtime.source_revision.is_some() {
-                return None;
-            }
-            let structural_hash_hint = structural_hash_from_details(&verilog_provenance.details)
-                .or_else(|| structural_hash_from_details(&producer.details));
+        ActionSpec::ComboVerilogToYosysAbcAig { .. } => {
+            let id = canonical_yosys_verilog_action_id(&producer.action)?;
+            let verilog = provenance_by_action_id.get(id)?;
             Some((
                 IrFnCorpusStatsSourceKind::YosysAbc,
-                StdlibTrendSourceContext {
-                    ir_action_id: ir_action_id.clone(),
-                    ir_top: top_fn_name.clone().or_else(|| {
-                        verilog_provenance
-                            .details
-                            .get("ir_top")
-                            .and_then(|v| v.as_str())
-                            .map(|v| v.to_string())
-                    }),
-                    crate_version: normalize_tag_version(&runtime.driver_version).to_string(),
-                    dso_version: normalize_tag_version(version).to_string(),
-                },
-                structural_hash_hint,
+                release_verilog_source_context(verilog)?,
+                structural_hash_from_details(&verilog.details)
+                    .or_else(|| structural_hash_from_details(&producer.details)),
             ))
         }
         _ => None,
@@ -3774,43 +3789,19 @@ fn compute_ir_fn_corpus_stats_upsert_point(
                     structural_hash_from_details(&producer.details),
                 )
             }
-            ActionSpec::ComboVerilogToYosysAbcAig {
-                verilog_action_id,
-                frontend,
-                yosys_script_ref,
-                ..
-            } => {
-                if !is_canonical_builtin_yosys_source(frontend, yosys_script_ref) {
-                    return Ok(None);
-                }
-                let verilog_provenance = store.load_provenance(verilog_action_id)?;
-                let ActionSpec::IrFnToCombinationalVerilog {
-                    ir_action_id,
-                    top_fn_name,
-                    version,
-                    runtime,
-                    ..
-                } = &verilog_provenance.action
+            ActionSpec::ComboVerilogToYosysAbcAig { .. } => {
+                let Some((ctx, structural_hash)) =
+                    load_canonical_yosys_stats_source(store, &producer)?
                 else {
                     return Ok(None);
                 };
-                if runtime.source_revision.is_some() {
-                    return Ok(None);
-                }
                 (
                     IrFnCorpusStatsSourceKind::YosysAbc,
-                    ir_action_id.clone(),
-                    top_fn_name.clone().or_else(|| {
-                        verilog_provenance
-                            .details
-                            .get("ir_top")
-                            .and_then(|v| v.as_str())
-                            .map(|v| v.to_string())
-                    }),
-                    normalize_tag_version(&runtime.driver_version).to_string(),
-                    normalize_tag_version(version).to_string(),
-                    structural_hash_from_details(&verilog_provenance.details)
-                        .or_else(|| structural_hash_from_details(&producer.details)),
+                    ctx.ir_action_id,
+                    ctx.ir_top,
+                    ctx.crate_version,
+                    ctx.dso_version,
+                    structural_hash,
                 )
             }
             _ => return Ok(None),
@@ -3959,9 +3950,9 @@ fn compute_ir_fn_corpus_g8r_abc_vs_codegen_stats_upsert_point(
             ActionSpec::AigToYosysAbcAig {
                 aig_action_id: upstream_aig_action_id,
                 yosys_script_ref,
-                ..
+                runtime,
             } => {
-                if !is_canonical_yosys_script_ref(yosys_script_ref) {
+                if !is_canonical_g8r_abc_source(runtime, yosys_script_ref) {
                     return Ok(None);
                 }
                 let g8r_provenance = store.load_provenance(upstream_aig_action_id)?;
@@ -3999,43 +3990,19 @@ fn compute_ir_fn_corpus_g8r_abc_vs_codegen_stats_upsert_point(
                         .or_else(|| structural_hash_from_details(&producer.details)),
                 )
             }
-            ActionSpec::ComboVerilogToYosysAbcAig {
-                verilog_action_id,
-                frontend,
-                yosys_script_ref,
-                ..
-            } => {
-                if !is_canonical_builtin_yosys_source(frontend, yosys_script_ref) {
-                    return Ok(None);
-                }
-                let verilog_provenance = store.load_provenance(verilog_action_id)?;
-                let ActionSpec::IrFnToCombinationalVerilog {
-                    ir_action_id,
-                    top_fn_name,
-                    version,
-                    runtime,
-                    ..
-                } = &verilog_provenance.action
+            ActionSpec::ComboVerilogToYosysAbcAig { .. } => {
+                let Some((ctx, structural_hash)) =
+                    load_canonical_yosys_stats_source(store, &producer)?
                 else {
                     return Ok(None);
                 };
-                if runtime.source_revision.is_some() {
-                    return Ok(None);
-                }
                 (
                     IrFnCorpusStatsSourceKind::YosysAbc,
-                    ir_action_id.clone(),
-                    top_fn_name.clone().or_else(|| {
-                        verilog_provenance
-                            .details
-                            .get("ir_top")
-                            .and_then(|v| v.as_str())
-                            .map(|v| v.to_string())
-                    }),
-                    normalize_tag_version(&runtime.driver_version).to_string(),
-                    normalize_tag_version(version).to_string(),
-                    structural_hash_from_details(&verilog_provenance.details)
-                        .or_else(|| structural_hash_from_details(&producer.details)),
+                    ctx.ir_action_id,
+                    ctx.ir_top,
+                    ctx.crate_version,
+                    ctx.dso_version,
+                    structural_hash,
                 )
             }
             _ => return Ok(None),
@@ -5939,44 +5906,9 @@ pub(crate) fn extract_stdlib_trend_source_context(
                 dso_version: normalize_tag_version(version).to_string(),
             })
         }
-        (
-            StdlibTrendKind::YosysAbc,
-            ActionSpec::ComboVerilogToYosysAbcAig {
-                verilog_action_id,
-                frontend,
-                yosys_script_ref,
-                ..
-            },
-        ) => {
-            if !is_canonical_builtin_yosys_source(frontend, yosys_script_ref) {
-                return None;
-            }
-            let verilog_provenance = *provenance_by_action_id.get(verilog_action_id.as_str())?;
-            let ActionSpec::IrFnToCombinationalVerilog {
-                ir_action_id,
-                top_fn_name,
-                version,
-                runtime,
-                ..
-            } = &verilog_provenance.action
-            else {
-                return None;
-            };
-            if runtime.source_revision.is_some() {
-                return None;
-            }
-            Some(StdlibTrendSourceContext {
-                ir_action_id: ir_action_id.clone(),
-                ir_top: top_fn_name.clone().or_else(|| {
-                    verilog_provenance
-                        .details
-                        .get("ir_top")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                }),
-                crate_version: normalize_tag_version(&runtime.driver_version).to_string(),
-                dso_version: normalize_tag_version(version).to_string(),
-            })
+        (StdlibTrendKind::YosysAbc, _) => {
+            let id = canonical_yosys_verilog_action_id(&producer.action)?;
+            release_verilog_source_context(provenance_by_action_id.get(id)?)
         }
         _ => None,
     }
@@ -11324,6 +11256,224 @@ mod tests {
         assert_eq!(ctx.ir_top.as_deref(), Some("__float32__add"));
         assert_eq!(ctx.crate_version, "0.31.0");
         assert_eq!(ctx.dso_version, "0.35.0");
+    }
+
+    #[test]
+    fn historical_yosys_baselines_keep_plain_verilog_in_either_completion_order() {
+        use YosysVerilogFrontend::{Builtin, Slang};
+
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = make_script_ref(repo, crate::DEFAULT_YOSYS_FLOW_SCRIPT).unwrap();
+        let slang = Slang {
+            revision: crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string(),
+        };
+        for verilog_first in [true, false] {
+            let (store, root) = make_test_store("historical-yosys-baseline");
+            populate_ir_fn_corpus_structural_index(&store, repo, &root, false, 1).unwrap();
+            let ir_action_id = materialize_test_provenance(
+                &store,
+                "import",
+                ActionSpec::ImportIrPackageFile {
+                    source_sha256: "a".repeat(64),
+                    top_fn_name: Some("main".into()),
+                },
+                ArtifactType::IrPackageFile,
+                "payload/top.ir",
+            );
+            let top = Some("main".to_string());
+            let version = "0.35.0".to_string();
+            let record_source = |action, artifact_type, relpath| {
+                let id =
+                    materialize_test_provenance(&store, "source", action, artifact_type, relpath);
+                let mut provenance = store.load_provenance(&id).unwrap();
+                provenance.details =
+                    json!({INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY: "c".repeat(64)});
+                store.write_provenance(&provenance).unwrap();
+                id
+            };
+            let complete_stats = |aig_action_id| {
+                let id = materialize_test_provenance(
+                    &store,
+                    "stats",
+                    ActionSpec::DriverAigToStats {
+                        aig_action_id,
+                        version: version.clone(),
+                        runtime: test_runtime(),
+                    },
+                    ArtifactType::AigStatsFile,
+                    "payload/stats.json",
+                );
+                overwrite_test_artifact(
+                    &store,
+                    &id,
+                    ArtifactType::AigStatsFile,
+                    "payload/stats.json",
+                    r#"{"and_nodes":8,"depth":2}"#,
+                );
+                maybe_upsert_ir_fn_corpus_g8r_vs_yosys_index_for_completed_action(
+                    &store, repo, &id,
+                )
+                .unwrap();
+                maybe_upsert_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_index_for_completed_action(
+                    &store, repo, &id,
+                )
+                .unwrap();
+                id
+            };
+
+            for lowering_mode in [
+                G8rLoweringMode::Default,
+                G8rLoweringMode::FrontendNoPrepRewrite,
+            ] {
+                let g8r = record_source(
+                    ActionSpec::DriverIrToG8rAig {
+                        ir_action_id: ir_action_id.clone(),
+                        top_fn_name: top.clone(),
+                        fraig: false,
+                        lowering_mode: lowering_mode.clone(),
+                        execution_recipe_revision: 0,
+                        version: version.clone(),
+                        runtime: test_runtime(),
+                    },
+                    ArtifactType::AigFile,
+                    "payload/g8r.aig",
+                );
+                let aig = if lowering_mode == G8rLoweringMode::FrontendNoPrepRewrite {
+                    materialize_test_provenance(
+                        &store,
+                        "abc",
+                        ActionSpec::AigToYosysAbcAig {
+                            aig_action_id: g8r,
+                            yosys_script_ref: script.clone(),
+                            runtime: test_yosys_runtime(),
+                        },
+                        ArtifactType::AigFile,
+                        "payload/abc.aig",
+                    )
+                } else {
+                    g8r
+                };
+                complete_stats(aig);
+            }
+
+            let [verilog_codegen, sv_codegen] = [false, true].map(|use_system_verilog| {
+                record_source(
+                    ActionSpec::IrFnToCombinationalVerilog {
+                        ir_action_id: ir_action_id.clone(),
+                        top_fn_name: top.clone(),
+                        use_system_verilog,
+                        version: version.clone(),
+                        runtime: test_runtime(),
+                    },
+                    ArtifactType::VerilogFile,
+                    if use_system_verilog {
+                        "payload/top.sv"
+                    } else {
+                        "payload/top.v"
+                    },
+                )
+            });
+            let mut recipes = [
+                (&verilog_codegen, Builtin),
+                (&sv_codegen, Builtin),
+                (&sv_codegen, slang.clone()),
+            ];
+            if !verilog_first {
+                recipes.reverse();
+            }
+            let mut verilog_stats = None;
+            for (codegen_id, frontend) in recipes {
+                let runtime = YosysRuntimeSpec {
+                    slang_commit: match &frontend {
+                        Builtin => None,
+                        Slang { revision } => Some(revision.clone()),
+                    },
+                    ..test_yosys_runtime()
+                };
+                let aig = materialize_test_provenance(
+                    &store,
+                    "yosys",
+                    ActionSpec::ComboVerilogToYosysAbcAig {
+                        verilog_action_id: codegen_id.clone(),
+                        verilog_top_module_name: top.clone(),
+                        frontend,
+                        yosys_script_ref: script.clone(),
+                        runtime,
+                    },
+                    ArtifactType::AigFile,
+                    "payload/yosys.aig",
+                );
+                let id = complete_stats(aig);
+                if codegen_id == &verilog_codegen {
+                    verilog_stats = Some(id);
+                }
+            }
+
+            let expect_verilog = |dataset: Option<StdlibG8rVsYosysDataset>| {
+                let dataset = dataset.expect("historical index");
+                let [sample] = dataset.samples.as_slice() else {
+                    panic!("expected one matched sample")
+                };
+                assert_eq!(
+                    Some(&sample.yosys_abc_stats_action_id),
+                    verilog_stats.as_ref()
+                );
+            };
+            expect_verilog(load_ir_fn_corpus_g8r_vs_yosys_dataset_index(&store).unwrap());
+            expect_verilog(
+                load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index(&store).unwrap(),
+            );
+            rebuild_ir_fn_corpus_g8r_vs_yosys_dataset_index_only(&store, repo).unwrap();
+            rebuild_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_index_only(&store, repo)
+                .unwrap();
+            expect_verilog(load_ir_fn_corpus_g8r_vs_yosys_dataset_snapshot_index(&store).unwrap());
+            expect_verilog(
+                load_ir_fn_corpus_g8r_abc_vs_codegen_yosys_abc_dataset_snapshot_index(&store)
+                    .unwrap(),
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn canonical_g8r_abc_comparison_excludes_candidates_from_the_slang_runtime() {
+        let g8r = synthetic_provenance(
+            "g8r",
+            ActionSpec::DriverIrToG8rAig {
+                ir_action_id: "ir".into(),
+                top_fn_name: Some("top".into()),
+                fraig: false,
+                lowering_mode: G8rLoweringMode::FrontendNoPrepRewrite,
+                execution_recipe_revision: 0,
+                version: "0.35.0".into(),
+                runtime: test_runtime(),
+            },
+            ArtifactType::AigFile,
+        );
+        for slang_commit in [None, Some("a".repeat(40))] {
+            let canonical = slang_commit.is_none();
+            let abc = synthetic_provenance(
+                "abc",
+                ActionSpec::AigToYosysAbcAig {
+                    aig_action_id: g8r.action_id.clone(),
+                    yosys_script_ref: ScriptRef {
+                        path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.into(),
+                        sha256: "0".repeat(64),
+                    },
+                    runtime: YosysRuntimeSpec {
+                        slang_commit,
+                        ..test_yosys_runtime()
+                    },
+                },
+                ArtifactType::AigFile,
+            );
+            let records = [g8r.clone(), abc];
+            let source = extract_ir_fn_corpus_g8r_abc_vs_codegen_source_context(
+                &build_provenance_lookup(&records),
+                "abc",
+            );
+            assert_eq!(source.is_some(), canonical);
+        }
     }
 
     #[test]

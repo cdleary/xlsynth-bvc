@@ -12,6 +12,7 @@ use std::process::Command;
 use walkdir::WalkDir;
 
 use crate::cli::DslxCorpusIngestCli;
+use crate::corpus::{joined_output_path, parse_recipe_preset_label};
 use crate::model::{RawBoolConeManifestLine, RawMffcManifestLine};
 use crate::service::{infer_ir_top_function, parse_ir_fn_op_count_from_file};
 
@@ -856,10 +857,12 @@ pub(crate) fn render_report(
     let comparison: serde_json::Value =
         serde_json::from_slice(&fs::read(comparison_dir.join("manifest.json"))?)
             .context("reading IR comparison manifest")?;
-    if field(&comparison, "recipe_preset")? != "g8r-abc-vs-yabc-aig-diff" {
-        bail!("report requires the g8r-abc-vs-yabc-aig-diff recipe");
+    let preset_label = field(&comparison, "recipe_preset")?;
+    let preset = parse_recipe_preset_label(preset_label)?;
+    if !preset.is_matched_abc() {
+        bail!("report requires a matched ABC comparison recipe, got `{preset_label}`");
     }
-    let joined = read_jsonl(&comparison_dir.join("joined/g8r-abc-vs-yabc-aig-diff.jsonl"))?;
+    let joined = read_jsonl(&joined_output_path(comparison_dir, preset, "jsonl"))?;
     let statuses = read_jsonl(&comparison_dir.join("samples.jsonl"))?;
     validate_comparison_exports(&comparison, &statuses, &joined)?;
     let is_failed = |row: &&serde_json::Value| {
@@ -989,6 +992,7 @@ pub(crate) fn render_report(
         "ingest_failures": ingest.failures,
         "comparison_failures": failed_rows,
         "driver_version": ingest.driver_version,
+        "recipe_preset": preset_label,
     });
     let dataset = serde_json::json!({"coverage": coverage, "samples": samples});
     let dataset_text = serde_json::to_string(&dataset)?;
@@ -1017,6 +1021,7 @@ pub(crate) fn render_report(
 <body>
   <header>
     <h1>DSLX cone comparison</h1>
+    <p>Comparison recipe <code>{preset_label}</code></p>
     <p>Optimized DSLX IR → MFFCs and optional k-cones → G8r+ABC versus codegen+Yosys/ABC. Cone occurrences can overlap.</p>
   </header>
   <main>
@@ -1094,6 +1099,7 @@ mod tests {
     }
 
     fn comparison_fixture(
+        preset: &str,
         cone_name: &str,
         digest: &str,
     ) -> (serde_json::Value, serde_json::Value, serde_json::Value) {
@@ -1110,9 +1116,9 @@ mod tests {
         });
         let mut status = row.clone();
         status["status"] = serde_json::json!("done");
-        status["preset"] = serde_json::json!("g8r-abc-vs-yabc-aig-diff");
+        status["preset"] = serde_json::json!(preset);
         let manifest = serde_json::json!({
-            "recipe_preset": "g8r-abc-vs-yabc-aig-diff", "samples": [status],
+            "recipe_preset": preset, "samples": [status],
             "fraig": false, "dso_version": "v0.1", "yosys_script": "flows/yosys_to_aig.ys",
             "yosys_script_sha256": "script-digest", "driver_runtime": {"driver_version": "0.1"},
             "stats_runtime": {"driver_version": "0.1"}
@@ -1122,7 +1128,8 @@ mod tests {
 
     #[test]
     fn report_rejects_stale_duplicate_and_incomplete_exports() {
-        let (manifest, status, row) = comparison_fixture("mffc-example.ir", "digest");
+        let (manifest, status, row) =
+            comparison_fixture("g8r-abc-vs-yabc-aig-diff", "mffc-example.ir", "digest");
         validate_comparison_exports(&manifest, &[status.clone()], &[row.clone()]).unwrap();
         for name in [
             "g8r_abc_aig_action_id",
@@ -1331,15 +1338,11 @@ exit 1
 
     #[test]
     fn report_joins_cone_and_comparison_without_inlining_source_markup() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("bvc-report-test-{}-{stamp}", std::process::id()));
+        let root = temp_dir();
         let ingest_dir = root.join("ingest");
         let compare_dir = root.join("compare");
-        let output_dir = root.join("report");
+        let resource = root.join("resource");
+        fs::create_dir(&resource).unwrap();
         fs::create_dir_all(ingest_dir.join("cones")).expect("cone directory");
         fs::create_dir_all(compare_dir.join("joined")).expect("joined directory");
         let ir = b"package example\n\ntop fn cone(x: bits[1]) -> bits[1] {\n  ret x: bits[1] = identity(x)\n}\n";
@@ -1366,38 +1369,57 @@ exit 1
             serde_json::to_vec(&ingest).unwrap(),
         )
         .unwrap();
-        let (comparison, status, row) = comparison_fixture(&cone_name, &digest);
-        fs::write(
-            compare_dir.join("manifest.json"),
-            serde_json::to_vec(&comparison).unwrap(),
-        )
-        .unwrap();
-        fs::write(compare_dir.join("samples.jsonl"), format!("{status}\n")).unwrap();
-        fs::write(
-            compare_dir.join("joined/g8r-abc-vs-yabc-aig-diff.jsonl"),
-            format!("{row}\n"),
-        )
-        .unwrap();
-        let resource = root.join("resource");
-        fs::create_dir(&resource).unwrap();
-        let result = render_report(&resource, &ingest_dir, &compare_dir, &output_dir)
-            .expect("render report");
-        assert_eq!(result.completed_pairs, 1);
-        assert_eq!(
-            fs::read(output_dir.join("ir").join(&cone_name)).unwrap(),
-            ir
-        );
-        let html = fs::read_to_string(output_dir.join("index.html")).unwrap();
-        assert!(html.contains("\\u003cscript\\u003eunsafe\\u003c/script\\u003e"));
-        assert!(!html.contains("<script>unsafe</script>"));
-        assert!(!html.contains(&root.display().to_string()));
-        assert!(html.contains("G8r+ABC"));
-        let data: serde_json::Value =
-            serde_json::from_slice(&fs::read(output_dir.join("data.json")).unwrap()).unwrap();
-        assert_eq!(
-            data["samples"][0]["origins"][0]["function"],
-            "<script>unsafe</script>"
-        );
+        for preset in [
+            "g8r-abc-vs-yabc-aig-diff",
+            "g8r-abc-vs-yabc-system-verilog-aig-diff",
+            "g8r-abc-vs-yabc-slang-aig-diff",
+        ] {
+            let output_dir = root.join(preset);
+            let (comparison, status, row) = comparison_fixture(preset, &cone_name, &digest);
+            fs::write(
+                compare_dir.join("manifest.json"),
+                serde_json::to_vec(&comparison).unwrap(),
+            )
+            .unwrap();
+            fs::write(compare_dir.join("samples.jsonl"), format!("{status}\n")).unwrap();
+            let joined_path = compare_dir.join("joined").join(format!("{preset}.jsonl"));
+            fs::write(&joined_path, format!("{row}\n")).unwrap();
+            let result = render_report(&resource, &ingest_dir, &compare_dir, &output_dir)
+                .expect("render report");
+            assert_eq!(result.completed_pairs, 1);
+            assert_eq!(
+                fs::read(output_dir.join("ir").join(&cone_name)).unwrap(),
+                ir
+            );
+            let html = fs::read_to_string(output_dir.join("index.html")).unwrap();
+            assert!(html.contains("\\u003cscript\\u003eunsafe\\u003c/script\\u003e"));
+            assert!(!html.contains("<script>unsafe</script>"));
+            assert!(!html.contains(&root.display().to_string()));
+            assert!(html.contains("G8r+ABC"));
+            let data: serde_json::Value =
+                serde_json::from_slice(&fs::read(output_dir.join("data.json")).unwrap()).unwrap();
+            assert_eq!(data["coverage"]["recipe_preset"], preset);
+            assert_eq!(
+                data["samples"][0]["origins"][0]["function"],
+                "<script>unsafe</script>"
+            );
+            fs::remove_file(joined_path).unwrap();
+        }
+        for (preset, error) in [
+            ("g8r-abc-stats", "requires a matched ABC comparison"),
+            ("g8r-vs-yabc-aig-diff", "requires a matched ABC comparison"),
+            ("../other", "unsupported corpus recipe preset"),
+        ] {
+            fs::write(
+                compare_dir.join("manifest.json"),
+                serde_json::json!({"recipe_preset": preset}).to_string(),
+            )
+            .unwrap();
+            let output = root.join("rejected");
+            let err = render_report(&resource, &ingest_dir, &compare_dir, &output).unwrap_err();
+            assert!(err.to_string().contains(error), "{err:#}");
+            assert!(!output.exists());
+        }
         fs::remove_dir_all(root).expect("cleanup");
     }
 }
