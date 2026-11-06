@@ -1431,13 +1431,36 @@ pub(crate) fn drain_queue(
     reclaim_expired: bool,
     pause_claiming: Option<&AtomicBool>,
 ) -> Result<usize> {
+    drain_queue_with_reclaim(
+        store,
+        repo_root,
+        limit,
+        worker_id,
+        lease_seconds,
+        || {
+            if reclaim_expired {
+                reclaim_expired_running_leases(store)?;
+            }
+            Ok(())
+        },
+        pause_claiming,
+    )
+}
+
+pub(crate) fn drain_queue_with_reclaim(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    limit: Option<usize>,
+    worker_id: &str,
+    lease_seconds: i64,
+    reclaim: impl FnOnce() -> Result<()>,
+    pause_claiming: Option<&AtomicBool>,
+) -> Result<usize> {
     if lease_seconds <= 0 {
         bail!("--lease-seconds must be > 0, got {}", lease_seconds);
     }
     maybe_prepare_queue_runtime_environment(store, repo_root)?;
-    if reclaim_expired {
-        reclaim_expired_running_leases(store)?;
-    }
+    reclaim()?;
 
     let mut drained = 0_usize;
     let mut failed = 0_usize;
