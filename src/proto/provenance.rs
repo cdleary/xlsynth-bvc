@@ -557,8 +557,9 @@ fn details_to_proto(action: &model::ActionSpec, details: &Value) -> Result<pb::A
                 .and_then(|legacy| string(legacy, "ir_action_id").map(|id| (legacy, id)))
                 .map(|(legacy, ir_action_id)| {
                     let source_runtime = legacy
-                        .get("driver_runtime")
-                        .map(|v| runtime_from_json(v, "details.legacy_g8r_source.driver_runtime"))
+                        .get("source_runtime")
+                        .or_else(|| legacy.get("driver_runtime"))
+                        .map(|v| runtime_from_json(v, "details.legacy_g8r_source.source_runtime"))
                         .transpose()?;
                     Ok::<_, anyhow::Error>(pb::LegacyG8rStatsSourceDetails {
                         ir_action_id: Some(action_id_to_proto(
@@ -571,11 +572,12 @@ fn details_to_proto(action: &model::ActionSpec, details: &Value) -> Result<pb::A
                             .map(|v| {
                                 driver_runtime_to_proto(
                                     v,
-                                    "details.legacy_g8r_source.driver_runtime",
+                                    "details.legacy_g8r_source.source_runtime",
                                 )
                             })
                             .transpose()?,
-                        source_dso_version: string(legacy, "xlsynth_version")
+                        source_dso_version: string(legacy, "source_xlsynth_version")
+                            .or_else(|| string(legacy, "xlsynth_version"))
                             .map(|v| dso_version(&v)),
                     })
                 })
@@ -1049,6 +1051,32 @@ fn details_from_proto(action: &model::ActionSpec, value: &pb::ActionDetails) -> 
                 insert_common_json(&mut map, common)?;
             }
             map.insert("aig_stats_mode".into(), json!(details.aig_stats_mode));
+            if let Some(legacy) = &details.legacy_g8r_source {
+                let mut source = Map::new();
+                if let Some(id) = &legacy.ir_action_id {
+                    source.insert(
+                        "ir_action_id".into(),
+                        json!(action_id_to_hex(id, "legacy_g8r_source.ir_action_id")?),
+                    );
+                }
+                source.insert("fraig".into(), json!(legacy.fraig));
+                if let Some(runtime) = &legacy.source_runtime {
+                    source.insert(
+                        "source_runtime".into(),
+                        json!(driver_runtime_from_proto(
+                            runtime,
+                            "legacy_g8r_source.source_runtime"
+                        )?),
+                    );
+                }
+                if let Some(version) = &legacy.source_dso_version {
+                    source.insert(
+                        "source_xlsynth_version".into(),
+                        json!(crate::versioning::xlsynth_release_tag(&version.value)),
+                    );
+                }
+                map.insert("legacy_g8r_source".into(), Value::Object(source));
+            }
             if let Some(path) = &details.legacy_g8r_stats_relpath {
                 map.insert("legacy_g8r_stats_relpath".into(), json!(path.value));
             }

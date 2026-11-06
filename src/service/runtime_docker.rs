@@ -1002,9 +1002,6 @@ pub(crate) fn prepare_queue_runtime_environment(
             | ActionSpec::DriverIrEquiv {
                 version, runtime, ..
             }
-            | ActionSpec::DriverIrAigEquiv {
-                version, runtime, ..
-            }
             | ActionSpec::DriverIrToG8rAig {
                 version, runtime, ..
             }
@@ -1019,6 +1016,18 @@ pub(crate) fn prepare_queue_runtime_environment(
             } => {
                 driver_releases.insert((
                     version,
+                    runtime.release_platform.clone(),
+                    runtime.release_cache_input_sha256.clone(),
+                ));
+                driver_runtimes.insert(runtime);
+            }
+            ActionSpec::DriverIrAigEquiv {
+                version, runtime, ..
+            } => {
+                let effective_version =
+                    effective_xlsynth_version_for_runtime(repo_root, &version, &runtime);
+                driver_releases.insert((
+                    effective_version,
                     runtime.release_platform.clone(),
                     runtime.release_cache_input_sha256.clone(),
                 ));
