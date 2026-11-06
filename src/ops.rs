@@ -82,6 +82,7 @@ pub(crate) fn run_workers(
     if batch_size == 0 {
         bail!("--batch-size must be > 0");
     }
+    crate::service::configured_action_timeout_seconds()?;
 
     let started = Instant::now();
     let drained_actions = AtomicUsize::new(0);

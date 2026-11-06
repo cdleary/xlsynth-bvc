@@ -52,7 +52,7 @@ pub(crate) use corpus_structural::*;
 pub(crate) use public_projection::*;
 
 type ProvenanceLookup<'a> = BTreeMap<&'a str, &'a Provenance>;
-const VERSIONS_SUMMARY_INPUT_FINGERPRINT_DOMAIN: &[u8] = b"xlsynth-bvc/versions-summary-input/v1\0";
+const VERSIONS_SUMMARY_INPUT_FINGERPRINT_DOMAIN: &[u8] = b"xlsynth-bvc/versions-summary-input/v2\0";
 const VERSIONS_SUMMARY_RECIPE_CACHE_KEY_DOMAIN: &[u8] =
     b"xlsynth-bvc/versions-summary-recipe-cache-key/v1\0";
 const VERSIONS_SUMMARY_RESOLVED_RECIPE_FINGERPRINT_DOMAIN: &[u8] =
@@ -9166,12 +9166,19 @@ pub(crate) fn action_subject(action: &ActionSpec) -> String {
 }
 
 pub(crate) fn is_timeout_error(error: &str) -> bool {
-    error
-        .lines()
-        .map(str::trim_start)
-        .find(|line| !line.trim().is_empty())
-        .map(|line| line.starts_with("TIMEOUT("))
-        .unwrap_or(false)
+    let Some(header) = error.trim_start().lines().next() else {
+        return false;
+    };
+    if header.starts_with("TIMEOUT(") {
+        return true;
+    }
+    // Older workers' timeout messages were wrapped by the host before storage.
+    header
+        .strip_prefix("persistent runner request failed (exit=")
+        .and_then(|rest| rest.split_once("): "))
+        .is_some_and(|(_, cause)| {
+            cause.starts_with("TIMEOUT(") && cause.contains(") persistent runner command exceeded ")
+        })
 }
 
 pub(crate) fn html_escape(text: &str) -> String {
@@ -9250,6 +9257,22 @@ mod tests {
             docker_image_id: "e".repeat(64),
             release_cache_input_sha256: "f".repeat(64),
         }
+    }
+
+    #[test]
+    fn classifies_current_and_legacy_persistent_action_timeouts() {
+        assert!(is_timeout_error(
+            "\n  TIMEOUT(7200) persistent runner request failed (exit=Some(-9)): persistent runner command exceeded 7200 seconds"
+        ));
+        assert!(is_timeout_error(
+            "persistent runner request failed (exit=Some(-9)): TIMEOUT(900) persistent runner command exceeded 900 seconds"
+        ));
+        assert!(!is_timeout_error(
+            "persistent runner request failed (exit=Some(1)): persistent runner command failed\nstderr:\nTIMEOUT(1)"
+        ));
+        assert!(!is_timeout_error(
+            "persistent runner request failed (exit=Some(1)): TIMEOUT(1) from a tool"
+        ));
     }
 
     fn make_test_store(prefix: &str) -> (ArtifactStore, PathBuf) {
