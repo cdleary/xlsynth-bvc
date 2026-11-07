@@ -62,3 +62,8 @@ const rawOneSided={count:7,label:'raw-path one-sided measurements',href:'history
 assert.deepEqual(measurementLinks({...coverage,historical_abc_count:2,historical_abc_measurements:4,historical_raw_count:3,historical_raw_measurements:6}),[abcPair,rawPair]);
 assert.deepEqual(measurementLinks({...coverage,historical_abc_measurements:5,historical_raw_measurements:7}),[abcOneSided,rawOneSided]);
 assert.deepEqual(measurementLinks({...coverage,historical_abc_count:2,historical_abc_measurements:9,historical_raw_count:3,historical_raw_measurements:13}),[abcPair,abcOneSided,rawPair,rawOneSided]);
+const mappedCoverage={id:'whole-functions-v1',label:'Whole functions',measured:3,total:187,complete:false,url:'tech-mapped-asap7/?release=0.79.0&cohort=whole-functions-v1'};
+const mappedOnly={...coverage,full_count:0,cohorts:[],techmap_cohorts:[mappedCoverage]};
+assert.equal(resultHref(mappedOnly),mappedCoverage.url);
+assert.equal(measurementLinks(mappedOnly)[0].href,mappedCoverage.url);
+assert.equal(measurementLinks(mappedOnly)[0].count,3);

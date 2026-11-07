@@ -51,6 +51,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     println!("cargo:rerun-if-changed=proto/xlsynth/bvc/ir_archive/v1/archive.proto");
 
+    let mut techmap = prost_build::Config::new();
+    techmap.protoc_executable(&protoc);
+    techmap.compile_protos(&["proto/xlsynth/bvc/techmap/v1/techmap.proto"], &["proto"])?;
+    println!("cargo:rerun-if-changed=proto/xlsynth/bvc/techmap/v1/techmap.proto");
+
     let campaign_text = fs::read("campaigns/release-qor-v1.textproto")?;
     let mut child = Command::new(&protoc)
         .args([

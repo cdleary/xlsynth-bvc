@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: Apache-2.0
+syntax = "proto3";
+package xlsynth.bvc.techmap.v1;
+
+// Canonical handoff from mapping execution to static publication.
+message TechmapRun {
+  uint32 record_version = 1;
+  string crate_version = 2;
+  string dso_version = 3;
+  string cohort_id = 4;
+  uint64 expected_sample_count = 5;
+  bytes corpus_sha256 = 6;
+  bytes liberty_bundle_sha256 = 7;
+  bytes preparation_script_sha256 = 8;
+  string driver_image_id = 9;
+  string abc_image_id = 10;
+  double primary_input_transition_ps = 11;
+  double module_output_load_ff = 12;
+  repeated TechmapSample samples = 13;
+  bytes run_spec_sha256 = 14;
+  bool complete = 15;
+  string source_lowering_mode = 16;
+  bytes release_cache_input_sha256 = 17;
+  uint32 source_recipe_revision = 18;
+  string evaluator_image_id = 19;
+  string evaluator_crate_version = 20;
+  bytes evaluator_release_cache_input_sha256 = 21;
+}
+message TechmapSample {
+  string sample_id = 1;
+  string logical_name = 2;
+  string source_relpath = 3;
+  bytes source_ir_sha256 = 4;
+  string top_fn_name = 5;
+  bytes g8r_aig_sha256 = 6;
+  bytes abc_aig_sha256 = 7;
+  repeated TechmapPoint points = 8;
+  SampleStatus status = 9;
+  string error = 10;
+  bytes record_sha256 = 11;
+}
+enum SampleStatus {
+  SAMPLE_STATUS_UNSPECIFIED = 0;
+  SAMPLE_STATUS_PENDING = 1;
+  SAMPLE_STATUS_DONE = 2;
+  SAMPLE_STATUS_FAILED = 3;
+}
+message TechmapPoint {
+  string tool = 1;
+  string goal = 2;
+  double area = 3;
+  double delay_ps = 4;
+  uint64 cell_count = 5;
+  bytes mapped_netlist_sha256 = 6;
+  string mapped_netlist_relpath = 7;
+  string policy = 8;
+}
+
+message SourceArtifact {
+  uint32 record_version = 1;
+  string kind = 2;
+  bytes source_ir_sha256 = 3;
+  string top_fn_name = 4;
+  string driver_image_id = 5;
+  string abc_image_id = 6;
+  string dso_version = 7;
+  bytes artifact_sha256 = 8;
+  uint32 recipe_revision = 9;
+}

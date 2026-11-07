@@ -537,12 +537,13 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
             &[run.clone(), newer.clone()],
             &[],
             100_000,
+            &[],
         )
         .is_err()
     );
     assert!(!options.out_dir.exists());
     let summary =
-        super::super::site_dashboard::build(&options, &[], &[], &[run, newer], &[], 100_000)
+        super::super::site_dashboard::build(&options, &[], &[], &[run, newer], &[], 100_000, &[])
             .unwrap();
     let data: serde_json::Value =
         serde_json::from_slice(&fs::read(options.out_dir.join("dashboard.json")).unwrap()).unwrap();
@@ -584,9 +585,42 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
         &[],
         &[options.out_dir.join("corpus")],
         100_000,
+        &[],
     )
     .unwrap();
     assert_eq!(reused.snapshot_id, summary.snapshot_id);
+    let mapper_run = root.0.join("mapper-run");
+    fs::create_dir_all(&mapper_run).unwrap();
+    fs::write(
+        mapper_run.join("manifest.pb"),
+        super::super::site_techmap::tests::fixture("0.76.0").encode_to_vec(),
+    )
+    .unwrap();
+    let mut mapped_options = options.clone();
+    mapped_options.out_dir = root.0.join("mapped-dashboard");
+    super::super::site_dashboard::build(
+        &mapped_options,
+        &[],
+        &[],
+        &[],
+        &[options.out_dir.join("corpus")],
+        100_000,
+        &[mapper_run],
+    )
+    .unwrap();
+    assert!(verify_static_site(&mapped_options.out_dir).is_ok());
+    let mapped: serde_json::Value =
+        serde_json::from_slice(&fs::read(mapped_options.out_dir.join("dashboard.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        mapped["versions"].as_array().unwrap()[..3],
+        data["versions"].as_array().unwrap()[..]
+    );
+    assert_eq!(mapped["versions"][3]["crate_version"], "0.76.0");
+    assert_eq!(mapped["versions"][3]["full_count"], 0);
+    assert_eq!(mapped["versions"][3]["techmap_cohorts"][0]["measured"], 1);
+    assert_eq!(mapped["trends"], data["trends"]);
+    assert_eq!(mapped["techmap_url"], "tech-mapped-asap7/");
     // Even after rehashing, browser-only edits cannot change the transition evidence.
     let manifest_path = options.out_dir.join(STATIC_SITE_MANIFEST_FILENAME);
     let manifest_bytes = fs::read(&manifest_path).unwrap();
