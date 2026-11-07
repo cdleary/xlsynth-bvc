@@ -6182,11 +6182,16 @@ fn start_plain_static_server(directory: &Path) -> Result<(Child, std::net::Socke
     }
 }
 
+enum SmokePageContent {
+    Text(&'static str),
+    Html(&'static str),
+}
+
 fn run_browser_page(
     browser: &Path,
     profile_dir: &Path,
     url: &str,
-    expected_text: &str,
+    expected_content: &SmokePageContent,
     rendered_markers: &[(String, usize)],
     timeout: Duration,
 ) -> Result<()> {
@@ -6196,8 +6201,14 @@ fn run_browser_page(
         .with_context(|| format!("checking static smoke page status: {url}"))?
         .text()
         .with_context(|| format!("reading static smoke page: {url}"))?;
-    if !response.contains(expected_text) {
-        bail!("static HTTP response for {url} did not contain {expected_text:?}");
+    match expected_content {
+        SmokePageContent::Text(expected) if !response.contains(expected) => {
+            bail!("static HTTP response for {url} did not contain {expected:?}");
+        }
+        SmokePageContent::Html(expected) if response != *expected => {
+            bail!("static HTTP response for {url} differs from its canonical HTML resource");
+        }
+        _ => {}
     }
     let screenshot_name = format!("{}.png", &sha256_hex(url.as_bytes())[..16]);
     let screenshot_path = profile_dir.join(screenshot_name);
@@ -6413,7 +6424,7 @@ pub(crate) fn smoke_static_site(
     fs::create_dir_all(&profile_dir).context("creating temporary Chrome profile")?;
     let origin = format!("http://{address}");
     let timeout = Duration::from_secs(timeout_seconds);
-    let mut pages = if dashboard_mode {
+    let pages = if dashboard_mode {
         vec![("", "g8r cost by release", progression_markers)]
     } else if corpus_mode {
         vec![("", "IR corpus synthesis results", progression_markers)]
@@ -6441,6 +6452,10 @@ pub(crate) fn smoke_static_site(
             ("dataset.html", "Dataset explorer", Vec::new()),
         ]
     };
+    let mut pages = pages
+        .into_iter()
+        .map(|(path, expected, markers)| (path, SmokePageContent::Text(expected), markers))
+        .collect::<Vec<_>>();
     if dashboard_mode
         && site_dir
             .join(site_techmap::ROOT)
@@ -6449,7 +6464,7 @@ pub(crate) fn smoke_static_site(
     {
         pages.push((
             "tech-mapped-asap7/",
-            "Area and delay, together",
+            SmokePageContent::Html(include_str!("site_assets/techmap.html")),
             vec![("data-rendered=\"true\"".to_string(), 1)],
         ));
     }
