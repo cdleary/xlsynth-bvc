@@ -1186,6 +1186,8 @@ pub(crate) fn run_ir_dir_corpus(
             recipe_preset_label(recipe_preset)
         );
     }
+    let yosys_script = resolve_recipe_preset_yosys_script(recipe_preset, yosys_script)?;
+    let yosys_script_ref = make_script_ref(repo_root, yosys_script)?;
 
     fs::create_dir_all(output_dir)
         .with_context(|| format!("creating output dir: {}", output_dir.display()))?;
@@ -1251,7 +1253,8 @@ pub(crate) fn run_ir_dir_corpus(
                 }
             }
         };
-        let slang_commit = (recipe_preset == CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff)
+        let slang_commit = recipe_preset
+            .uses_slang()
             .then(|| crate::DEFAULT_YOSYS_SLANG_COMMIT.to_string());
         let yosys_runtime = yosys.into_runtime(repo_root, slang_commit)?;
         (driver_runtime, stats_runtime, yosys_runtime)
@@ -1273,8 +1276,6 @@ pub(crate) fn run_ir_dir_corpus(
         version.to_string()
     };
     let recipe_preset_name = recipe_preset_label(recipe_preset);
-    let yosys_script = resolve_recipe_preset_yosys_script(recipe_preset, yosys_script)?;
-    let yosys_script_ref = make_script_ref(repo_root, yosys_script)?;
     let samples = discover_corpus_samples(input_dir, output_dir, top_fn_policy, top_fn_name)?;
     if samples.is_empty() {
         bail!("no .ir files found under {}", input_dir.display());
@@ -2480,11 +2481,7 @@ fn build_action_plan(
     let combo_verilog_action = ActionSpec::IrFnToCombinationalVerilog {
         ir_action_id: import_ir_action_id.clone(),
         top_fn_name: Some(sample.top_fn_name.clone()),
-        use_system_verilog: matches!(
-            recipe_preset,
-            CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff
-                | CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff
-        ),
+        use_system_verilog: recipe_preset.uses_system_verilog(),
         version: version.to_string(),
         runtime: driver_runtime.clone(),
     };
@@ -2499,7 +2496,7 @@ fn build_action_plan(
         ActionSpec::ComboVerilogToYosysAbcAig {
             verilog_action_id: combo_verilog_action_id.clone(),
             verilog_top_module_name: Some(sample.top_fn_name.clone()),
-            frontend: if recipe_preset == CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff {
+            frontend: if recipe_preset.uses_slang() {
                 YosysVerilogFrontend::Slang {
                     revision: yosys_runtime.slang_commit.clone().context(
                         "Slang recipe requires a pinned Yosys runtime with slang_commit",
@@ -3461,11 +3458,7 @@ fn export_leaf_artifacts(
             )?;
         }
         if sample.combo_verilog_status != "not_planned" {
-            let system_verilog = matches!(
-                parse_recipe_preset_label(&sample.preset)?,
-                CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff
-                    | CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff
-            );
+            let system_verilog = parse_recipe_preset_label(&sample.preset)?.uses_system_verilog();
             copy_artifact_if_present(
                 store,
                 &ArtifactRef {
@@ -3625,11 +3618,17 @@ fn count_statuses(samples: &[IrDirCorpusSampleRecord]) -> BTreeMap<String, usize
 
 impl CorpusRecipePreset {
     pub(crate) fn is_matched_abc(self) -> bool {
+        self == Self::G8rAbcVsYabcAigDiff || self.uses_system_verilog()
+    }
+
+    fn uses_system_verilog(self) -> bool {
+        self == Self::G8rAbcVsYabcSystemVerilogAigDiff || self.uses_slang()
+    }
+
+    fn uses_slang(self) -> bool {
         matches!(
             self,
-            Self::G8rAbcVsYabcAigDiff
-                | Self::G8rAbcVsYabcSystemVerilogAigDiff
-                | Self::G8rAbcVsYabcSlangAigDiff
+            Self::G8rAbcVsYabcSlangAigDiff | Self::G8rAbcVsYabcSlangBoundedAigDiff
         )
     }
 }
@@ -3660,6 +3659,10 @@ fn recipe_preset_spec(recipe_preset: CorpusRecipePreset) -> CorpusRecipePresetSp
             label: "g8r-abc-vs-yabc-slang-aig-diff",
             yosys_script: "flows/yosys_to_aig.ys",
         },
+        CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff => CorpusRecipePresetSpec {
+            label: "g8r-abc-vs-yabc-slang-bounded-aig-diff",
+            yosys_script: "flows/abc_bounded_fraig.ys",
+        },
         CorpusRecipePreset::G8rAbcStats => CorpusRecipePresetSpec {
             label: "g8r-abc-stats",
             yosys_script: "flows/yosys_to_aig.ys",
@@ -3677,6 +3680,9 @@ pub(crate) fn parse_recipe_preset_label(label: &str) -> Result<CorpusRecipePrese
             Ok(CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff)
         }
         "g8r-abc-vs-yabc-slang-aig-diff" => Ok(CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff),
+        "g8r-abc-vs-yabc-slang-bounded-aig-diff" => {
+            Ok(CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff)
+        }
         other => bail!("unsupported corpus recipe preset in manifest: {}", other),
     }
 }
@@ -4974,7 +4980,6 @@ mod tests {
             source_sha256: "a".repeat(64),
             top_fn_name: "cone".into(),
         };
-        let script = sample_yosys_script_ref();
         for (recipe_preset, system_verilog, expected_frontend) in [
             (
                 CorpusRecipePreset::G8rAbcVsYabcAigDiff,
@@ -4993,7 +4998,16 @@ mod tests {
                     revision: "a".repeat(40),
                 },
             ),
+            (
+                CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff,
+                true,
+                YosysVerilogFrontend::Slang {
+                    revision: "a".repeat(40),
+                },
+            ),
         ] {
+            let path = resolve_recipe_preset_yosys_script(recipe_preset, None).unwrap();
+            let script = make_script_ref(Path::new(env!("CARGO_MANIFEST_DIR")), path).unwrap();
             let mut yosys_runtime = sample_yosys_runtime();
             if let YosysVerilogFrontend::Slang { revision } = &expected_frontend {
                 yosys_runtime.slang_commit = Some(revision.clone());
@@ -5059,6 +5073,66 @@ mod tests {
                 recipe_preset_label(recipe_preset)
             );
         }
+    }
+
+    #[test]
+    fn bounded_slang_recipe_separates_abc_results_and_reuses_lowering() {
+        let (ordinary_root, ordinary_dir, _) =
+            run_enqueue_corpus_for_recipe(CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff, None);
+        let (bounded_root, bounded_dir, _) = run_enqueue_corpus_for_recipe(
+            CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff,
+            None,
+        );
+        let ordinary = read_status_manifest(&ordinary_dir);
+        let bounded = read_status_manifest(&bounded_dir);
+        let expected = make_script_ref(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            "flows/abc_bounded_fraig.ys",
+        )
+        .unwrap();
+        assert_eq!(
+            bounded.recipe_preset,
+            "g8r-abc-vs-yabc-slang-bounded-aig-diff"
+        );
+        assert_eq!(bounded.yosys_script, expected.path);
+        assert_eq!(bounded.yosys_script_sha256, expected.sha256);
+        let flow =
+            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(&bounded.yosys_script))
+                .unwrap();
+        assert!(
+            flow.lines()
+                .any(|line| line.starts_with("abc ") && line.contains(";&fraig -x -C 10000;"))
+        );
+        assert_eq!(ordinary.yosys_script, crate::DEFAULT_YOSYS_FLOW_SCRIPT);
+        assert_ne!(bounded.yosys_script_sha256, ordinary.yosys_script_sha256);
+        assert_eq!(
+            bounded.yosys_runtime.slang_commit.as_deref(),
+            Some(crate::DEFAULT_YOSYS_SLANG_COMMIT)
+        );
+        let ordinary = &ordinary.samples[0];
+        let bounded = &bounded.samples[0];
+        assert_eq!(bounded.g8r_aig_action_id, ordinary.g8r_aig_action_id);
+        assert_eq!(
+            bounded.combo_verilog_action_id,
+            ordinary.combo_verilog_action_id
+        );
+        assert_ne!(
+            bounded.g8r_abc_aig_action_id,
+            ordinary.g8r_abc_aig_action_id
+        );
+        assert_ne!(
+            bounded.yosys_abc_aig_action_id,
+            ordinary.yosys_abc_aig_action_id
+        );
+
+        refresh_ir_dir_corpus_status(&bounded_dir, 1800, 10).unwrap();
+        let refreshed = read_status_manifest(&bounded_dir);
+        assert_eq!(
+            refreshed.samples[0].aig_stat_diff_action_id,
+            bounded.aig_stat_diff_action_id
+        );
+        fs::remove_dir_all(ordinary_root).unwrap();
+        fs::remove_dir_all(bounded_root).unwrap();
     }
 
     #[test]
@@ -5236,6 +5310,7 @@ mod tests {
             CorpusRecipePreset::G8rAbcVsYabcAigDiff,
             CorpusRecipePreset::G8rAbcVsYabcSystemVerilogAigDiff,
             CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff,
+            CorpusRecipePreset::G8rAbcVsYabcSlangBoundedAigDiff,
         ] {
             check_matched_abc_enqueue_and_refresh(preset);
         }
@@ -5248,13 +5323,17 @@ mod tests {
         assert_eq!(summary.recipe_preset, recipe_preset_label(preset));
         assert_eq!(
             manifest.yosys_runtime.slang_commit.as_deref(),
-            (preset == CorpusRecipePreset::G8rAbcVsYabcSlangAigDiff)
+            preset
+                .uses_slang()
                 .then_some(crate::DEFAULT_YOSYS_SLANG_COMMIT)
         );
         assert_eq!(summary.enqueued_actions, 8);
         assert_eq!(rows[0].g8r_raw_stats_status.as_deref(), Some("pending"));
         assert!(rows[0].g8r_raw_stats_action_id.is_some());
-        assert_eq!(manifest.yosys_script, "flows/yosys_to_aig.ys");
+        assert_eq!(
+            manifest.yosys_script,
+            recipe_preset_spec(preset).yosys_script
+        );
         assert_eq!(rows.len(), 1);
         let abc_id = rows[0]
             .g8r_abc_aig_action_id
@@ -5559,6 +5638,7 @@ mod tests {
         assert!(err_text.contains("g8r-vs-yabc-no-fraig-aig-diff"));
         assert!(err_text.contains("flows/abc_ablate_no_fraig.ys"));
         assert!(err_text.contains("flows/yosys_to_aig.ys"));
+        assert!(!output_dir.exists());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

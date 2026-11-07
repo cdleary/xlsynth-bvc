@@ -38,7 +38,7 @@ Current supported flags:
 - `--input-dir <dir>`
 - `--output-dir <dir>`
 - `--execution-mode enqueue|run`
-- `--recipe-preset <preset>` selects one of the recipes below
+- `--recipe-preset <preset>` (see [Implemented Preset](#implemented-preset))
 - `--top-fn-policy infer-single-package|explicit|from-filename`
 - `--top-fn-name <name>` when policy is `explicit`
 - `--fraig`
@@ -122,8 +122,9 @@ Current presets:
 - `g8r-abc-vs-yabc-aig-diff` generates Verilog and uses Yosys's builtin reader
 - `g8r-abc-vs-yabc-system-verilog-aig-diff` generates SystemVerilog and uses `read_verilog -sv`
 - `g8r-abc-vs-yabc-slang-aig-diff` generates SystemVerilog and uses the pinned `read_slang` frontend
+- `g8r-abc-vs-yabc-slang-bounded-aig-diff` uses Slang and limits conflicts per ABC SAT call
 
-The three matched ABC recipes use the same Yosys image and flow script for both branches
+The matched ABC recipes use the same Yosys image and flow script for both branches
 of each comparison. The SystemVerilog recipes export the generated source as `combo.sv`.
 
 The historical Yosys/ABC comparison uses generated Verilog, the builtin reader, and
@@ -175,6 +176,21 @@ cargo run --bin xlsynth_bvc -- \
   --version v0.39.0 \
   --driver-version 0.34.0
 ```
+
+### Bounded ABC effort for large SystemVerilog functions
+
+`g8r-abc-vs-yabc-slang-bounded-aig-diff` reads generated SystemVerilog with
+pinned Slang and runs `flows/abc_bounded_fraig.ys` on both ABC branches.
+`&fraig -x -C 10000` sets a budget of 10,000 conflicts for each SAT call during
+sweeping. Proving a candidate equivalent can take two calls, one for each
+direction. ABC skips the merge if it cannot prove equivalence. The worker's
+action timeout controls wall-clock time separately.
+
+Use a separate output directory and the same preset when comparing compiler
+revisions. The manifest records the recipe label and script digest. Raw g8r
+statistics and the post-ABC branch share the same g8r lowering. When draining
+the queue, set `BVC_DISABLE_AUTO_SUGGESTED_ENQUEUE=1` on the workers to run
+only the planned actions. Otherwise, suggestions can enqueue the default ABC flow too.
 
 ## Exact Git Candidate Workflow
 
