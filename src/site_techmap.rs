@@ -2,7 +2,7 @@
 
 //! Canonical technology-mapping runs -> reproducible, two-dimensional web view.
 use super::*;
-use crate::techmap_proto::wire::{SampleStatus, TechmapRun, TechmapSample};
+use crate::techmap_proto::wire::{PublicTechmapRun, SampleStatus, TechmapRun, TechmapSample};
 
 pub(super) const MANIFEST: &str = "techmap-site.pb";
 pub(super) const ROOT: &str = "tech-mapped-asap7";
@@ -188,7 +188,47 @@ fn decode_run(bytes: &[u8]) -> Result<TechmapRun> {
     Ok(run)
 }
 
-fn read_runs(run_dirs: &[PathBuf]) -> Result<Vec<TechmapRun>> {
+fn project_run(run: &TechmapRun) -> PublicTechmapRun {
+    let mut measurements = run.clone();
+    for sample in &mut measurements.samples {
+        for point in &mut sample.points {
+            point.mapped_netlist_relpath.clear();
+        }
+        sample.record_sha256.clear();
+        sample.record_sha256 = sha256(&sample.encode_to_vec());
+    }
+    PublicTechmapRun {
+        record_version: 1,
+        source_run_sha256: sha256(&run.encode_to_vec()),
+        measurements: Some(measurements),
+    }
+}
+
+fn decode_public_run(bytes: &[u8]) -> Result<PublicTechmapRun> {
+    let public = PublicTechmapRun::decode(bytes).context("decoding public mapping evidence")?;
+    if public.record_version != 1
+        || public.source_run_sha256.len() != 32
+        || public.encode_to_vec() != bytes
+    {
+        bail!("invalid public technology-mapping evidence");
+    }
+    let run = public
+        .measurements
+        .as_ref()
+        .context("missing public mapping measurements")?;
+    if run
+        .samples
+        .iter()
+        .flat_map(|sample| &sample.points)
+        .any(|point| !point.mapped_netlist_relpath.is_empty())
+    {
+        bail!("public technology-mapping evidence contains a private netlist locator");
+    }
+    decode_run(&run.encode_to_vec())?;
+    Ok(public)
+}
+
+fn read_runs(run_dirs: &[PathBuf]) -> Result<Vec<PublicTechmapRun>> {
     let mut runs = Vec::new();
     for dir in run_dirs {
         let path = dir.join("manifest.pb");
@@ -197,7 +237,33 @@ fn read_runs(run_dirs: &[PathBuf]) -> Result<Vec<TechmapRun>> {
         runs.push(decode_run(&bytes)?);
     }
     validate_run_set(&mut runs)?;
-    Ok(runs)
+    Ok(runs.iter().map(project_run).collect())
+}
+
+fn validate_public_run_set(runs: &mut [PublicTechmapRun]) -> Result<()> {
+    // Keep canonical ordering independent of the supplied publication order.
+    let mut measurements = runs
+        .iter()
+        .map(|run| {
+            run.measurements
+                .clone()
+                .context("missing public mapping measurements")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_run_set(&mut measurements)?;
+    runs.sort_by(|a, b| {
+        let a = a
+            .measurements
+            .as_ref()
+            .expect("validated public measurements");
+        let b = b
+            .measurements
+            .as_ref()
+            .expect("validated public measurements");
+        cmp_dotted_numeric_version(&a.crate_version, &b.crate_version)
+            .then(a.cohort_id.cmp(&b.cohort_id))
+    });
+    Ok(())
 }
 
 fn validate_run_set(runs: &mut [TechmapRun]) -> Result<()> {
@@ -406,30 +472,75 @@ fn seal_shard(shard: &mut TechmapRun) {
             .all(|s| s.status == SampleStatus::Done as i32);
 }
 
-fn evidence_shards(run: &TechmapRun) -> Result<Vec<Vec<u8>>> {
-    let header = run_header(run);
+fn public_header(run: &PublicTechmapRun) -> PublicTechmapRun {
+    PublicTechmapRun {
+        record_version: run.record_version,
+        source_run_sha256: run.source_run_sha256.clone(),
+        measurements: run.measurements.as_ref().map(run_header),
+    }
+}
+
+fn evidence_shards(run: &PublicTechmapRun) -> Result<Vec<Vec<u8>>> {
+    let header = public_header(run);
     let mut shard = header.clone();
     let mut estimated = shard.encoded_len();
     let mut shards = Vec::new();
-    for sample in &run.samples {
+    for sample in &run
+        .measurements
+        .as_ref()
+        .context("missing public mapping measurements")?
+        .samples
+    {
         let size = sample.encoded_len() + 10;
         if size + header.encoded_len() > SHARD_TARGET {
             bail!("technology mapping sample exceeds shard budget");
         }
-        if estimated + size > SHARD_TARGET && !shard.samples.is_empty() {
-            seal_shard(&mut shard);
+        if estimated + size > SHARD_TARGET
+            && !shard.measurements.as_ref().unwrap().samples.is_empty()
+        {
+            seal_shard(shard.measurements.as_mut().unwrap());
             shards.push(shard.encode_to_vec());
             shard = header.clone();
             estimated = shard.encoded_len();
         }
-        shard.samples.push(sample.clone());
+        shard
+            .measurements
+            .as_mut()
+            .unwrap()
+            .samples
+            .push(sample.clone());
         estimated += size;
     }
-    if !shard.samples.is_empty() || shards.is_empty() {
-        seal_shard(&mut shard);
+    if !shard.measurements.as_ref().unwrap().samples.is_empty() || shards.is_empty() {
+        seal_shard(shard.measurements.as_mut().unwrap());
         shards.push(shard.encode_to_vec());
     }
+    if shards.iter().any(|bytes| bytes.len() > SHARD_TARGET) {
+        bail!("public technology mapping evidence exceeds shard budget");
+    }
     Ok(shards)
+}
+
+fn merge_public_shard(
+    merged: &mut Option<PublicTechmapRun>,
+    mut shard: PublicTechmapRun,
+) -> Result<()> {
+    let run = merged.get_or_insert_with(|| public_header(&shard));
+    if public_header(&shard) != public_header(run) {
+        bail!("technology mapping shard public commitments or run specifications differ");
+    }
+    run.measurements
+        .as_mut()
+        .context("missing public mapping measurements")?
+        .samples
+        .append(
+            &mut shard
+                .measurements
+                .as_mut()
+                .context("missing public mapping measurements")?
+                .samples,
+        );
+    Ok(())
 }
 
 fn file_record(path: &str, bytes: &[u8]) -> pb::PublicationFile {
@@ -444,20 +555,24 @@ fn file_record(path: &str, bytes: &[u8]) -> pb::PublicationFile {
     }
 }
 
-fn generated_files(runs: &[TechmapRun]) -> Result<BTreeMap<String, Vec<u8>>> {
+fn generated_files(runs: &[PublicTechmapRun]) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut files = BTreeMap::new();
     let mut publications = Vec::new();
     let mut catalog = Vec::new();
-    for run in runs {
+    for public in runs {
+        let run = public
+            .measurements
+            .as_ref()
+            .context("missing public mapping measurements")?;
         let id = hex::encode(&run.run_spec_sha256);
         let mut records = Vec::new();
-        for (index, bytes) in evidence_shards(run)?.into_iter().enumerate() {
+        for (index, bytes) in evidence_shards(public)?.into_iter().enumerate() {
             let path = format!("data/{id}/{index:05}.pb");
             records.push(file_record(&path, &bytes));
             files.insert(path, bytes);
         }
         publications.push(site_corpus::wire::TechmapRunPublication {
-            source_manifest_sha256: sha256(&run.encode_to_vec()),
+            source_manifest_sha256: sha256(&public.encode_to_vec()),
             shards: records,
         });
         let samples = sample_views(run);
@@ -490,7 +605,7 @@ fn generated_files(runs: &[TechmapRun]) -> Result<BTreeMap<String, Vec<u8>>> {
         catalog.push(run_view(run, paths));
     }
     let evidence = site_corpus::wire::TechmapSite {
-        record_version: 1,
+        record_version: 2,
         runs: publications,
     }
     .encode_to_vec();
@@ -539,7 +654,7 @@ pub(super) fn build_leaf(out: &Path, base_url: &str, run_dirs: &[PathBuf]) -> Re
 pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -> Result<()> {
     let bytes = fs::read(out.join(MANIFEST))?;
     let site = site_corpus::wire::TechmapSite::decode(bytes.as_slice())?;
-    if site.record_version != 1
+    if site.record_version != 2
         || site.encode_to_vec() != bytes
         || digest_hex(&manifest.source_snapshot_id, "techmap identity")? != sha256_hex(&bytes)
     {
@@ -561,28 +676,33 @@ pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -
             if record.bytes > SHARD_TARGET as u64 || record != &publication_file(out, path)? {
                 bail!("invalid mapping evidence shard binding");
             }
-            let shard = decode_run(&fs::read(out.join(path))?)?;
-            if path != &format!("data/{}/{index:05}.pb", hex::encode(&shard.run_spec_sha256)) {
+            let shard = decode_public_run(&fs::read(out.join(path))?)?;
+            let measurements = shard
+                .measurements
+                .as_ref()
+                .context("missing public mapping measurements")?;
+            if path
+                != &format!(
+                    "data/{}/{index:05}.pb",
+                    hex::encode(&measurements.run_spec_sha256)
+                )
+            {
                 bail!("noncanonical mapping evidence path");
             }
-            let run = merged.get_or_insert_with(|| run_header(&shard));
-            if run_header(&shard) != run_header(run) {
-                bail!("technology mapping shard run specifications differ");
-            }
-            run.samples.extend(shard.samples);
+            merge_public_shard(&mut merged, shard)?;
         }
         let mut run = merged.context("missing mapping run")?;
-        seal_shard(&mut run);
+        seal_shard(run.measurements.as_mut().unwrap());
         let bytes = run.encode_to_vec();
         if sha256(&bytes) != publication.source_manifest_sha256 {
             bail!("technology mapping shards do not reconstruct their source manifest");
         }
-        runs.push(decode_run(&bytes)?);
+        runs.push(decode_public_run(&bytes)?);
     }
     if runs.is_empty() {
         bail!("empty technology mapping site");
     }
-    validate_run_set(&mut runs)?;
+    validate_public_run_set(&mut runs)?;
     let files = generated_files(&runs)?;
     if actual_site_relpaths(out)? != files.keys().cloned().collect() {
         bail!("technology mapping site topology mismatch");
@@ -692,7 +812,7 @@ pub(super) mod tests {
                     .collect::<Vec<_>>(),
                 vec!["area"]
             );
-            let files = generated_files(&[run]).unwrap();
+            let files = generated_files(&[project_run(&run)]).unwrap();
             let catalog: serde_json::Value =
                 serde_json::from_slice(&files["results.json"]).unwrap();
             assert_eq!(
@@ -717,7 +837,7 @@ pub(super) mod tests {
     #[test]
     fn final_projection_preserves_separate_area_and_delay_points() {
         let run = fixture("0.76.0");
-        let files = generated_files(&[run]).unwrap();
+        let files = generated_files(&[project_run(&run)]).unwrap();
         let data: serde_json::Value = serde_json::from_slice(&files["results.json"]).unwrap();
         assert_eq!(
             data["runs"][0]["supported_goals"],
@@ -739,6 +859,207 @@ pub(super) mod tests {
                 ("g8r", "delay")
             ]
         );
+    }
+
+    #[test]
+    fn public_evidence_removes_locators_and_preserves_measurements_and_source_commitment() {
+        for failed in [false, true] {
+            let mut local = fixture("0.76.0");
+            for (index, point) in local.samples[0].points.iter_mut().enumerate() {
+                point.mapped_netlist_relpath =
+                    format!("../../private/fictional-operator/cache/{index}/mapped.v");
+            }
+            if failed {
+                local.samples[0].status = SampleStatus::Failed as i32;
+                local.samples[0].error = "fictional mapping failure".into();
+                local.complete = false;
+            }
+            local.samples[0].record_sha256.clear();
+            local.samples[0].record_sha256 = sha256(&local.samples[0].encode_to_vec());
+            let original_bytes = local.encode_to_vec();
+            decode_run(&original_bytes).unwrap();
+
+            let public = project_run(&local);
+            assert_eq!(decode_public_run(&public.encode_to_vec()).unwrap(), public);
+            assert_eq!(public.source_run_sha256, sha256(&original_bytes));
+            assert_eq!(local.encode_to_vec(), original_bytes);
+            let measurements = public.measurements.as_ref().unwrap();
+            assert_eq!(measurements.run_spec_sha256, local.run_spec_sha256);
+            assert_ne!(
+                measurements.samples[0].record_sha256,
+                local.samples[0].record_sha256
+            );
+            let mut restored = measurements.clone();
+            for (point, original) in restored.samples[0]
+                .points
+                .iter_mut()
+                .zip(&local.samples[0].points)
+            {
+                assert!(point.mapped_netlist_relpath.is_empty());
+                point
+                    .mapped_netlist_relpath
+                    .clone_from(&original.mapped_netlist_relpath);
+            }
+            restored.samples[0]
+                .record_sha256
+                .clone_from(&local.samples[0].record_sha256);
+            assert_eq!(restored, local);
+
+            let files = generated_files(std::slice::from_ref(&public)).unwrap();
+            let site = site_corpus::wire::TechmapSite::decode(files[MANIFEST].as_slice()).unwrap();
+            assert_eq!(site.record_version, 2);
+            assert_eq!(
+                site.runs[0].source_manifest_sha256,
+                sha256(&project_run(&local).encode_to_vec())
+            );
+            for record in &site.runs[0].shards {
+                let shard =
+                    decode_public_run(&files[&record.relpath.as_ref().unwrap().value]).unwrap();
+                assert_eq!(shard.source_run_sha256, sha256(&original_bytes));
+                assert!(
+                    shard
+                        .measurements
+                        .unwrap()
+                        .samples
+                        .iter()
+                        .flat_map(|sample| &sample.points)
+                        .all(|point| point.mapped_netlist_relpath.is_empty())
+                );
+            }
+            let catalog: serde_json::Value =
+                serde_json::from_slice(&files["results.json"]).unwrap();
+            let path = catalog["runs"][0]["metric_shards"][0].as_str().unwrap();
+            let id = hex::encode(&local.run_spec_sha256);
+            assert_eq!(
+                files[path],
+                serde_json::to_vec(&SampleShard {
+                    schema_version: 1,
+                    run_spec_sha256: &id,
+                    samples: &sample_views(&local),
+                })
+                .unwrap()
+            );
+            assert_eq!(
+                serde_json::to_vec(&run_view(&local, vec![path.into()])).unwrap(),
+                serde_json::to_vec(&run_view(measurements, vec![path.into()])).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_private_locator_even_when_all_publication_hashes_are_recomputed() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "bvc-public-techmap-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("run")).unwrap();
+        fs::write(
+            root.join("run/manifest.pb"),
+            fixture("0.76.0").encode_to_vec(),
+        )
+        .unwrap();
+        let out = root.join(ROOT);
+        build_leaf(&out, "/tech-mapped-asap7/", &[root.join("run")]).unwrap();
+        verify_static_site(&out).unwrap();
+
+        let mut site = site_corpus::wire::TechmapSite::decode(
+            fs::read(out.join(MANIFEST)).unwrap().as_slice(),
+        )
+        .unwrap();
+        let publication = &mut site.runs[0];
+        let path = publication.shards[0]
+            .relpath
+            .as_ref()
+            .unwrap()
+            .value
+            .clone();
+        let mut forged = decode_public_run(&fs::read(out.join(&path)).unwrap()).unwrap();
+        let sample = &mut forged.measurements.as_mut().unwrap().samples[0];
+        sample.points[0].mapped_netlist_relpath =
+            "../../private/fictional-operator/cache/mapped.v".into();
+        sample.record_sha256.clear();
+        sample.record_sha256 = sha256(&sample.encode_to_vec());
+        // The measurements and every outer binding are internally consistent;
+        // the public-boundary locator rule must independently reject this file.
+        decode_run(&forged.measurements.as_ref().unwrap().encode_to_vec()).unwrap();
+        let bytes = forged.encode_to_vec();
+        fs::write(out.join(&path), &bytes).unwrap();
+        publication.source_manifest_sha256 = sha256(&bytes);
+        publication.shards[0] = file_record(&path, &bytes);
+        let site_bytes = site.encode_to_vec();
+        fs::write(out.join(MANIFEST), &site_bytes).unwrap();
+        fs::write(out.join("evidence.pb"), &site_bytes).unwrap();
+        let mut manifest = pb::StaticSiteManifest::decode(
+            fs::read(out.join(STATIC_SITE_MANIFEST_FILENAME))
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        manifest.source_snapshot_id = Some(pb::Sha256Digest {
+            value: sha256(&site_bytes),
+        });
+        manifest.files = actual_site_relpaths(&out)
+            .unwrap()
+            .iter()
+            .map(|p| publication_file(&out, p).unwrap())
+            .collect();
+        fs::write(
+            out.join(STATIC_SITE_MANIFEST_FILENAME),
+            manifest.encode_to_vec(),
+        )
+        .unwrap();
+        assert!(verify_static_site(&out).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_mixed_public_source_commitments_across_valid_shards() {
+        let mut local = fixture("0.76.0");
+        local.expected_sample_count = 2;
+        let mut second = local.samples[0].clone();
+        second.sample_id = "second-input".into();
+        second.source_relpath = "second.ir".into();
+        second.record_sha256.clear();
+        second.record_sha256 = sha256(&second.encode_to_vec());
+        local.samples.push(second);
+        local.run_spec_sha256.clear();
+        local.run_spec_sha256 = sha256(&run_header(&local).encode_to_vec());
+        decode_run(&local.encode_to_vec()).unwrap();
+        let public = project_run(&local);
+        let shards = public
+            .measurements
+            .as_ref()
+            .unwrap()
+            .samples
+            .iter()
+            .map(|sample| {
+                let mut shard = public_header(&public);
+                shard
+                    .measurements
+                    .as_mut()
+                    .unwrap()
+                    .samples
+                    .push(sample.clone());
+                decode_public_run(&shard.encode_to_vec()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut merged = None;
+        merge_public_shard(&mut merged, shards[0].clone()).unwrap();
+        merge_public_shard(&mut merged, shards[1].clone()).unwrap();
+        let mut merged = merged.unwrap();
+        seal_shard(merged.measurements.as_mut().unwrap());
+        assert_eq!(merged, public);
+
+        let mut forged = shards[1].clone();
+        forged.source_run_sha256 = vec![42; 32];
+        decode_public_run(&forged.encode_to_vec()).unwrap();
+        let mut merged = None;
+        merge_public_shard(&mut merged, shards[0].clone()).unwrap();
+        assert!(merge_public_shard(&mut merged, forged).is_err());
     }
 
     #[test]
@@ -800,7 +1121,7 @@ pub(super) mod tests {
         run.run_spec_sha256 = sha256(&run_header(&run).encode_to_vec());
         assert!(run.encoded_len() > SHARD_TARGET);
         assert!(decode_run(&run.encode_to_vec()).is_ok());
-        let files = generated_files(&[run]).unwrap();
+        let files = generated_files(&[project_run(&run)]).unwrap();
         let evidence = files
             .iter()
             .filter(|(p, _)| p.starts_with("data/"))
@@ -819,7 +1140,14 @@ pub(super) mod tests {
         );
         let samples = evidence
             .iter()
-            .map(|(_, bytes)| decode_run(bytes).unwrap().samples.len())
+            .map(|(_, bytes)| {
+                decode_public_run(bytes)
+                    .unwrap()
+                    .measurements
+                    .unwrap()
+                    .samples
+                    .len()
+            })
             .sum::<usize>();
         assert_eq!(samples, 8_000);
     }

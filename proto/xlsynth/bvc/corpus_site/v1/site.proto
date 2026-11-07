@@ -99,12 +99,13 @@ message DashboardSite {
   optional xlsynth.bvc.v1.PublicationFile techmap_manifest = 4;
 }
 
-// Binds canonical mapper-run evidence to its final browser projection.
+// Version 2 binds canonical PublicTechmapRun evidence to its browser projection.
 message TechmapSite {
   uint32 record_version = 1;
   repeated TechmapRunPublication runs = 2;
 }
 message TechmapRunPublication {
+  // SHA-256 of the complete PublicTechmapRun reconstructed from its shards.
   bytes source_manifest_sha256 = 1;
   repeated xlsynth.bvc.v1.PublicationFile shards = 2;
 }

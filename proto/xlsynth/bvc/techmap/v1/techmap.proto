@@ -26,6 +26,15 @@ message TechmapRun {
   string evaluator_crate_version = 20;
   bytes evaluator_release_cache_input_sha256 = 21;
 }
+
+// Canonical public evidence. The opaque source commitment binds the original
+// local TechmapRun; measurements omit private netlist locators and have fresh
+// sample record digests. Shards repeat this header and contain sample subsets.
+message PublicTechmapRun {
+  uint32 record_version = 1;
+  bytes source_run_sha256 = 2;
+  TechmapRun measurements = 3;
+}
 message TechmapSample {
   string sample_id = 1;
   string logical_name = 2;

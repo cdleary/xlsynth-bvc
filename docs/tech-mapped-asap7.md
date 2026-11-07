@@ -87,7 +87,10 @@ target/release/xlsynth_bvc smoke-static-site \
 Repeat `--techmap-run-dir` for each release/cohort. The renderer validates the typed evidence,
 rejects mixed libraries or evaluators, and preserves partial coverage explicitly. Published
 evidence and browser metric shards are bounded to 2 MiB each; the browser loads only the selected
-release and corpus.
+release and corpus. Published protobufs use a separate public projection that omits local mapped
+netlist paths and recomputes sample record digests. It retains an opaque SHA-256 commitment to the
+original execution manifest, while the publication binds the complete public projection. Local
+execution evidence and scientific browser measurements are unchanged.
 
 The comparison embeds Plotly's pinned strict bundle so full-corpus WebGL plots work under the
 page's content security policy. Browsers without WebGL show a deterministic overview of up to
