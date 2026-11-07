@@ -539,7 +539,7 @@ fn build_driver_release_cache_manifest(
     })
 }
 
-fn validate_driver_release_cache(
+pub(crate) fn validate_driver_release_cache(
     cache_dir: &Path,
     version: &str,
     platform: &str,

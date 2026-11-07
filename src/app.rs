@@ -152,6 +152,49 @@ pub(crate) fn run() -> Result<()> {
         command,
     } = Cli::parse();
     let repo_root = std::env::current_dir().context("getting current directory")?;
+    if let TopCommand::RunTechmapCorpus {
+        source_run_dir,
+        output_dir,
+        cohort,
+        version,
+        dso_version,
+        driver_image,
+        evaluator_image,
+        evaluator_version,
+        evaluator_dso_version,
+        evaluator_release_cache_dir,
+        abc_image,
+        release_cache_dir,
+        shared_cache_dir,
+        workers,
+        limit,
+        timeout_seconds,
+    } = &command
+    {
+        let summary = crate::techmap_corpus::run(
+            &repo_root,
+            &crate::techmap_corpus::RunTechmapCorpusOptions {
+                source_run_dir: source_run_dir.clone(),
+                output_dir: output_dir.clone(),
+                cohort: cohort.clone(),
+                version: version.clone(),
+                dso_version: dso_version.clone(),
+                driver_image: driver_image.clone(),
+                evaluator_image: evaluator_image.clone(),
+                evaluator_version: evaluator_version.clone(),
+                evaluator_dso_version: evaluator_dso_version.clone(),
+                evaluator_release_cache_dir: evaluator_release_cache_dir.clone(),
+                abc_image: abc_image.clone(),
+                release_cache_dir: release_cache_dir.clone(),
+                shared_cache_dir: shared_cache_dir.clone(),
+                workers: *workers,
+                limit: *limit,
+                timeout_seconds: *timeout_seconds,
+            },
+        )?;
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
     if let TopCommand::DslxCorpusIngest(opts) = &command {
         println!(
             "{}",
@@ -395,6 +438,7 @@ pub(crate) fn run() -> Result<()> {
         corpus_evidence_dirs,
         corpus_shard_bytes,
         progression_run_dirs,
+        techmap_run_dirs,
         candidate_run_dirs,
         base_url,
         overwrite,
@@ -406,6 +450,9 @@ pub(crate) fn run() -> Result<()> {
             ("artifact database", artifacts_via_sled.as_path()),
         ];
         let has_corpus = !corpus_run_dirs.is_empty() || !corpus_evidence_dirs.is_empty();
+        if !techmap_run_dirs.is_empty() && !(snapshot_dir.is_some() && has_corpus) {
+            bail!("--techmap-run-dir requires --snapshot-dir and corpus evidence or corpus runs");
+        }
         if snapshot_dir.is_some() && has_corpus {
             let progression = progression_run_dirs
                 .iter()
@@ -424,6 +471,7 @@ pub(crate) fn run() -> Result<()> {
                 corpus_run_dirs,
                 corpus_evidence_dirs,
                 *corpus_shard_bytes,
+                techmap_run_dirs,
             )?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
             return Ok(());
@@ -1145,6 +1193,9 @@ pub(crate) fn run() -> Result<()> {
         }
         TopCommand::RunIrDirCorpus { .. } => {
             unreachable!("run-ir-dir-corpus handled before shared store initialization")
+        }
+        TopCommand::RunTechmapCorpus { .. } => {
+            unreachable!("run-techmap-corpus handled before shared store initialization")
         }
         TopCommand::DslxCorpusIngest(..) | TopCommand::RenderDslxCorpusReport { .. } => {
             unreachable!("DSLX corpus commands handled before shared store initialization")
