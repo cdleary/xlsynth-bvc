@@ -68,6 +68,14 @@ canonical execution/publication handoff; `summary.json` is an operational progre
 refreshed once a minute. Local logs retain detailed tool failures. A run with failed inputs exits
 unsuccessfully and keeps its checkpoints for inspection and retry.
 
+External commands write into unique `.attempt-*` directories beneath each cache entry. The host
+validates successful outputs and publishes their canonical files and protobuf checkpoints while
+holding the cache lock. A command left running after interruption can only change its abandoned
+attempt; retries use new directories. Attempt directories retain operation logs for diagnosis.
+On restart, the runner removes containers labeled for the same output directory before starting
+replacements, and commands address immutable container IDs so delayed commands cannot attach to
+a replacement.
+
 ## Render the comparison
 
 Pass each run directory to a composed dashboard build alongside its existing historical inputs:

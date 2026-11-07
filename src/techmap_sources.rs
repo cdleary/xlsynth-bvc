@@ -136,6 +136,24 @@ fn finish(path: &Path, filename: &str, mut record: SourceArtifact) -> Result<Pat
     Ok(artifact)
 }
 
+fn publish(staging: &Path, directory: &Path, filename: &str) -> Result<PathBuf> {
+    // Container commands write only within their unique attempt directory. Publish
+    // from the host while holding the cache lock, with the record committed last.
+    let artifact = directory.join(filename);
+    fs::rename(staging.join(filename), &artifact)?;
+    fs::rename(staging.join("record.pb"), directory.join("record.pb"))?;
+    Ok(artifact)
+}
+
+fn staging_container_path(options: &SourcePreparation<'_>, staging: &Path) -> Result<String> {
+    let relative = staging.strip_prefix(options.cache_dir)?;
+    Ok(format!(
+        "{}/{}",
+        options.cache_container_root,
+        relative.display()
+    ))
+}
+
 fn driver_prelude(options: &SourcePreparation<'_>) -> String {
     let release = quoted(options.release_dir_container);
     format!(
@@ -160,7 +178,8 @@ pub(crate) fn prepare_sources(options: SourcePreparation<'_>) -> Result<Prepared
     let g8r_path = if cached(&native_dir, "g8r.aig", &native_record)? {
         native_dir.join("g8r.aig")
     } else {
-        let container_dir = format!("{}/{native_rel}", options.cache_container_root);
+        let staging = crate::techmap_corpus::attempt_directory(&native_dir)?;
+        let container_dir = staging_container_path(&options, &staging)?;
         let script = format!(
             "{}xlsynth-driver ir2g8r {} --top {} --fraig=false --aiger-out {} > {} 2>&1\n",
             driver_prelude(&options),
@@ -170,7 +189,8 @@ pub(crate) fn prepare_sources(options: SourcePreparation<'_>) -> Result<Prepared
             quoted(&format!("{container_dir}/lower.log")),
         );
         shell(options.driver_container, options.timeout_secs, &script)?;
-        finish(&native_dir, "g8r.aig", native_record)?
+        finish(&staging, "g8r.aig", native_record)?;
+        publish(&staging, &native_dir, "g8r.aig")?
     };
     drop(native_lock);
 
@@ -195,17 +215,18 @@ pub(crate) fn prepare_sources(options: SourcePreparation<'_>) -> Result<Prepared
             .open(baseline_dir.join(".lock"))?;
         baseline_lock.lock_exclusive()?;
         if !cached(&baseline_dir, "yosys_abc.aig", &baseline_record)? {
-            let container_dir = format!("{}/{baseline_rel}", options.cache_container_root);
+            let staging = crate::techmap_corpus::attempt_directory(&baseline_dir)?;
+            let container_dir = staging_container_path(&options, &staging)?;
             let toolchain = format!(
                 "[toolchain]\ntool_path = {:?}\n",
                 options.release_dir_container
             );
-            fs::write(baseline_dir.join("toolchain.toml"), toolchain)?;
+            fs::write(staging.join("toolchain.toml"), toolchain)?;
             let normalized_ir = crate::executor::rewrite_ir_package_top_function(
                 &fs::read_to_string(options.input_ir)?,
                 options.top_fn_name,
             )?;
-            fs::write(baseline_dir.join("input.with_top.ir"), normalized_ir)?;
+            fs::write(staging.join("input.with_top.ir"), normalized_ir)?;
             let script = format!(
                 "{}xlsynth-driver --toolchain {} ir2combo {} --delay_model unit --top {} --use_system_verilog false > {} 2> {}\n",
                 driver_prelude(&options),
@@ -220,14 +241,12 @@ pub(crate) fn prepare_sources(options: SourcePreparation<'_>) -> Result<Prepared
             // to the retained canonical source. The caller has verified the
             // source's top, ABC runtime, flow, and output AIG digest.
             if retained_baseline_matches(
-                &baseline_dir.join("combo.v"),
+                &staging.join("combo.v"),
                 options.source_combo_verilog_sha256,
             )? {
-                // An interrupted container may have left a root-owned output.
-                // Replace it through the writable cache directory instead of
-                // trying to truncate that existing file from the host.
-                copy_retained_baseline(options.source_abc_aig, &baseline_dir)?;
-                finish(&baseline_dir, "yosys_abc.aig", baseline_record)?;
+                copy_retained_baseline(options.source_abc_aig, &staging)?;
+                finish(&staging, "yosys_abc.aig", baseline_record)?;
+                publish(&staging, &baseline_dir, "yosys_abc.aig")?;
                 return Ok(PreparedSources {
                     g8r_path,
                     abc_path: baseline_dir.join("yosys_abc.aig"),
@@ -246,14 +265,15 @@ pub(crate) fn prepare_sources(options: SourcePreparation<'_>) -> Result<Prepared
                 "read_verilog {container_dir}/combo.v\nhierarchy -top {}\nproc\nopt\ntechmap\nabc -g AND\nclean\nwrite_aiger {container_dir}/yosys_abc.aig\n",
                 options.top_fn_name,
             );
-            fs::write(baseline_dir.join("map.ys"), flow)?;
+            fs::write(staging.join("map.ys"), flow)?;
             let script = format!(
                 "set -euo pipefail\nyosys -s {} > {} 2>&1\n",
                 quoted(&format!("{container_dir}/map.ys")),
                 quoted(&format!("{container_dir}/yosys.log"))
             );
             shell(options.abc_container, options.timeout_secs, &script)?;
-            finish(&baseline_dir, "yosys_abc.aig", baseline_record)?;
+            finish(&staging, "yosys_abc.aig", baseline_record)?;
+            publish(&staging, &baseline_dir, "yosys_abc.aig")?;
         }
         baseline_dir.join("yosys_abc.aig")
     };
@@ -336,6 +356,42 @@ mod tests {
         assert!(cached(&root, "g8r.aig", &record).unwrap());
         fs::write(root.join("g8r.aig"), b"aig 1 1 0 0 0\n").unwrap();
         assert!(cached(&root, "g8r.aig", &record).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delayed_source_writer_cannot_mutate_retry_publication() {
+        use std::io::Write;
+
+        let root = std::env::temp_dir().join(format!(
+            "bvc-source-delayed-writer-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let stale = crate::techmap_corpus::attempt_directory(&root).unwrap();
+        let retry = crate::techmap_corpus::attempt_directory(&root).unwrap();
+        let mut stale_output = fs::File::create(stale.join("g8r.aig")).unwrap();
+        let bytes = b"aig 0 0 0 0 0\n";
+        let record = SourceArtifact {
+            record_version: 1,
+            kind: "g8r-default".to_string(),
+            recipe_revision: 1,
+            ..Default::default()
+        };
+        fs::write(retry.join("g8r.aig"), bytes).unwrap();
+        finish(&retry, "g8r.aig", record.clone()).unwrap();
+        let canonical = publish(&retry, &root, "g8r.aig").unwrap();
+
+        // Both an already-running writer and an exec that starts after retry
+        // publication still target their obsolete attempt directory.
+        stale_output.write_all(b"interrupted writer").unwrap();
+        fs::write(stale.join("g8r.aig"), b"delayed writer").unwrap();
+        fs::write(stale.join("lower.log"), b"late diagnostics").unwrap();
+
+        assert_eq!(fs::read(canonical).unwrap(), bytes);
+        assert!(cached(&root, "g8r.aig", &record).unwrap());
+        assert!(stale.join("lower.log").is_file());
         fs::remove_dir_all(root).unwrap();
     }
 }

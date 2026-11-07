@@ -16,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -114,6 +114,27 @@ fn lock(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// External commands never receive canonical output paths. A killed host can
+/// leave a command running, so attempts are unique and retained, never reused or
+/// removed while a late writer could still hold an open file or start an exec.
+pub(crate) fn attempt_directory(parent: &Path) -> Result<PathBuf> {
+    static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+    fs::create_dir_all(parent)?;
+    loop {
+        let attempt = parent.join(format!(
+            ".attempt-{}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&attempt) {
+            Ok(()) => return Ok(attempt),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 fn command_output(command: &mut Command) -> Result<String> {
     let output = command.output().context("starting mapping command")?;
     if !output.status.success() {
@@ -141,11 +162,45 @@ struct Containers {
     evaluator: String,
 }
 
+const CONTAINER_OWNER_LABEL: &str = "org.xlsynth.bvc.asap7-output";
+
+fn container_owner(output: &Path) -> Result<String> {
+    Ok(hex::encode(sha(fs::canonicalize(output)?
+        .as_os_str()
+        .as_encoded_bytes())))
+}
+
+fn recover_container(name: &str, owner: &str) -> Result<()> {
+    let ids = command_output(Command::new("docker").args([
+        "ps",
+        "--all",
+        "--quiet",
+        "--no-trunc",
+        "--filter",
+        &format!("name=^/{name}$"),
+    ]))?;
+    for id in ids.lines() {
+        let observed = command_output(Command::new("docker").args([
+            "inspect",
+            "--format",
+            &format!("{{{{ index .Config.Labels {CONTAINER_OWNER_LABEL:?} }}}}"),
+            id,
+        ]))?;
+        if observed != owner {
+            bail!("mapping container name belongs to a different owner");
+        }
+        command_output(Command::new("docker").args(["rm", "--force", id]))?;
+    }
+    Ok(())
+}
+
 impl Drop for Containers {
     fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.driver, &self.abc, &self.evaluator])
-            .output();
+        for id in [&self.driver, &self.abc, &self.evaluator] {
+            if !id.is_empty() {
+                let _ = Command::new("docker").args(["rm", "-f", id]).output();
+            }
+        }
     }
 }
 
@@ -157,21 +212,33 @@ impl Containers {
         evaluator_id: &str,
         platform: &str,
     ) -> Result<Self> {
-        let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
-        let result = Self {
-            driver: format!("bvc-asap7-driver-{}-{nonce}", std::process::id()),
-            abc: format!("bvc-asap7-abc-{}-{nonce}", std::process::id()),
-            evaluator: format!("bvc-asap7-evaluator-{}-{nonce}", std::process::id()),
+        // The run lock is already held. Recover only containers labeled for
+        // this exact output, including idle containers left by a killed host.
+        // Execs address immutable IDs, so a delayed old Docker client cannot
+        // attach its command to a newly created replacement container.
+        let owner = container_owner(&options.output_dir)?;
+        let names =
+            ["driver", "abc", "evaluator"].map(|role| format!("bvc-asap7-{role}-{}", &owner[..32]));
+        for name in &names {
+            recover_container(name, &owner)?;
+        }
+        let mut result = Self {
+            driver: String::new(),
+            abc: String::new(),
+            evaluator: String::new(),
         };
-        for (name, image, release_cache) in [
-            (&result.driver, driver_id, &options.release_cache_dir),
-            (&result.abc, abc_id, &options.release_cache_dir),
+        for (index, (name, image, release_cache)) in [
+            (&names[0], driver_id, &options.release_cache_dir),
+            (&names[1], abc_id, &options.release_cache_dir),
             (
-                &result.evaluator,
+                &names[2],
                 evaluator_id,
                 &options.evaluator_release_cache_dir,
             ),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut command = Command::new("docker");
             command.args([
                 "run",
@@ -180,6 +247,8 @@ impl Containers {
                 "--network=none",
                 "--name",
                 name,
+                "--label",
+                &format!("{CONTAINER_OWNER_LABEL}={owner}"),
                 "--entrypoint",
                 "/bin/bash",
             ]);
@@ -198,7 +267,15 @@ impl Containers {
                 command.args(["--mount", &specification]);
             }
             command.args([image, "-c", "while :; do sleep 3600; done"]);
-            command_output(&mut command)?;
+            let id = command_output(&mut command)?;
+            if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("Docker returned an invalid mapping container identity");
+            }
+            match index {
+                0 => result.driver = id,
+                1 => result.abc = id,
+                _ => result.evaluator = id,
+            }
         }
         for (container, version, declared_version) in [
             (&result.driver, &options.dso_version, &options.version),
@@ -355,25 +432,27 @@ fn prepare_library(
     let _guard = lock(&directory.with_extension("lock"))?;
     fs::create_dir_all(&directory)?;
     if !directory.join("merged.lib").is_file() {
+        let attempt = attempt_directory(&directory)?;
         command_output(
             Command::new("python3")
                 .arg(&resources.preparation_script)
                 .arg(&resources.archive)
-                .arg(&directory),
+                .arg(&attempt),
         )?;
+        validate_liberty(&attempt.join("merged.lib"))?;
+        fs::rename(attempt.join("merged.lib"), directory.join("merged.lib"))?;
     }
     let liberty = directory.join("merged.lib");
-    let lib_sha = file_sha(&liberty)?;
-    if hex::encode(&lib_sha) != "9faa3906c56c021af6eb677ec14b2e5cc4a62cca6e547916e3c8c212b0ed8778" {
-        bail!("prepared ASAP7 library differs from the pinned deterministic merge");
-    }
+    let lib_sha = validate_liberty(&liberty)?;
     let proto_key = cache_key(&[b"timing-liberty-protobuf", driver_id.as_bytes(), &lib_sha]);
     let proto = directory.join(format!("{proto_key}.proto"));
     let proto_record = directory.join(format!("{proto_key}.record.pb"));
     if !proto.is_file() || !proto_record.is_file() {
-        let target = container_path(options, &proto)?;
+        let attempt = attempt_directory(&directory)?;
+        let staged_proto = attempt.join("library.proto");
+        let target = container_path(options, &staged_proto)?;
         let library = container_path(options, &liberty)?;
-        let log = directory.join(format!("{proto_key}.log"));
+        let log = attempt.join("lib2proto.log");
         let log = container_path(options, &log)?;
         let script = format!(
             "xlsynth-driver lib2proto {} --output {}.tmp.proto --include-timing --default-output-load 1 > {} 2>&1\nmv {}.tmp.proto {}\n",
@@ -388,6 +467,8 @@ fn prepare_library(
         } else {
             containers.execute(true, &script, options.timeout_seconds)?;
         }
+        file_sha(&staged_proto)?;
+        fs::rename(staged_proto, &proto)?;
     }
     let mut expected = TechmapSample {
         sample_id: proto_key,
@@ -406,6 +487,14 @@ fn prepare_library(
         atomic_write(&proto_record, &expected.encode_to_vec())?;
     }
     Ok((liberty, proto, archive_sha, script_sha))
+}
+
+fn validate_liberty(liberty: &Path) -> Result<Vec<u8>> {
+    let digest = file_sha(liberty)?;
+    if hex::encode(&digest) != "9faa3906c56c021af6eb677ec14b2e5cc4a62cca6e547916e3c8c212b0ed8778" {
+        bail!("prepared ASAP7 library differs from the pinned deterministic merge");
+    }
+    Ok(digest)
 }
 
 #[derive(Deserialize)]
@@ -535,11 +624,12 @@ impl Execution<'_> {
         let map_dir = self.options.shared_cache_dir.join("mapped").join(&map_key);
         let _map_guard = lock(&map_dir.with_extension("lock"))?;
         fs::create_dir_all(&map_dir)?;
-        let map_container = container_path(self.options, &map_dir)?;
         let input = container_path(self.options, aig)?;
         let liberty = container_path(self.options, self.liberty)?;
         let proto = container_path(self.options, self.proto)?;
         if !map_dir.join("netlist.sha256").is_file() {
+            let attempt = attempt_directory(&map_dir)?;
+            let map_container = container_path(self.options, &attempt)?;
             let script = if tool == "g8r" {
                 let timing_arguments = if crate::versioning::cmp_dotted_numeric_version(
                     self.options.version.trim_start_matches('v'),
@@ -560,14 +650,14 @@ impl Execution<'_> {
                     shell_quote(&map_container)
                 )
             } else if empty_aig(aig)? {
-                fs::write(map_dir.join("mapped.v"), b"module mapped(); endmodule\n")?;
+                fs::write(attempt.join("mapped.v"), b"module mapped(); endmodule\n")?;
                 fs::write(
-                    map_dir.join("map.log"),
+                    attempt.join("map.log"),
                     b"Empty AIGER: exact empty cell netlist.\n",
                 )?;
                 String::new()
             } else {
-                fs::write(map_dir.join("abc.constr"), b"set_load 1\n")?;
+                fs::write(attempt.join("abc.constr"), b"set_load 1\n")?;
                 let policy = if goal == "area" {
                     "map -S 10 -a"
                 } else {
@@ -589,13 +679,15 @@ impl Execution<'_> {
                     .with_context(|| {
                         format!(
                             "{tool} {goal} mapping; retained log {}",
-                            map_dir.join("map.log").display()
+                            attempt.join("map.log").display()
                         )
                     })?;
             }
+            let netlist_sha = file_sha(&attempt.join("mapped.v"))?;
+            fs::rename(attempt.join("mapped.v"), map_dir.join("mapped.v"))?;
             atomic_write(
                 &map_dir.join("netlist.sha256"),
-                hex::encode(file_sha(&map_dir.join("mapped.v"))?).as_bytes(),
+                hex::encode(netlist_sha).as_bytes(),
             )?;
         }
         let netlist_sha = file_sha(&map_dir.join("mapped.v"))?;
@@ -624,15 +716,14 @@ impl Execution<'_> {
                 relative_path(&self.options.output_dir, &eval_dir.join("mapped.v"))?;
             return Ok(point);
         }
-        if !eval_dir.join("mapped.v").exists()
-            && fs::hard_link(map_dir.join("mapped.v"), eval_dir.join("mapped.v")).is_err()
-        {
-            fs::copy(map_dir.join("mapped.v"), eval_dir.join("mapped.v"))?;
-        }
-        if file_sha(&eval_dir.join("mapped.v"))? != netlist_sha {
+        let attempt = attempt_directory(&eval_dir)?;
+        // Copy rather than link: an attempt must not share writable inodes with
+        // canonical cache entries, even if its command outlives this host.
+        fs::copy(map_dir.join("mapped.v"), attempt.join("mapped.v"))?;
+        if file_sha(&attempt.join("mapped.v"))? != netlist_sha {
             bail!("evaluation input differs from the requested mapped netlist");
         }
-        let eval_container = container_path(self.options, &eval_dir)?;
+        let eval_container = container_path(self.options, &attempt)?;
         let script = format!(
             "xlsynth-driver gv-stats --netlist {d}/mapped.v --liberty_proto {p} --primary_input_transition 10 --module_output_load 1 --json_out {d}/stats.json > {d}/stats.log 2>&1\n",
             d = shell_quote(&eval_container),
@@ -643,13 +734,19 @@ impl Execution<'_> {
             .with_context(|| {
                 format!(
                     "common {tool} {goal} evaluation; retained logs {}",
-                    eval_dir.display()
+                    attempt.display()
                 )
             })?;
         // Keep links portable relative to the run directory. Publication copies
         // verified assets as needed; host paths are never browser data.
-        let relative = relative_path(&self.options.output_dir, &eval_dir.join("mapped.v"))?;
-        let point = metrics(&eval_dir, tool, goal, relative)?;
+        let mut point = metrics(&attempt, tool, goal, String::new())?;
+        if point.mapped_netlist_sha256 != netlist_sha {
+            bail!("evaluation changed the requested mapped netlist");
+        }
+        fs::rename(attempt.join("mapped.v"), eval_dir.join("mapped.v"))?;
+        fs::rename(attempt.join("stats.json"), eval_dir.join("stats.json"))?;
+        point.mapped_netlist_relpath =
+            relative_path(&self.options.output_dir, &eval_dir.join("mapped.v"))?;
         let mut saved = TechmapSample {
             sample_id: eval_key,
             g8r_aig_sha256: if tool == "g8r" {
@@ -1274,6 +1371,103 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn killed_host_retry_isolated_from_open_and_delayed_orphan_writers() {
+        const CHILD_ROOT: &str = "BVC_TECHMAP_TEST_KILLED_HOST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let _guard = lock(&root.join("mapped.lock")).unwrap();
+            let attempt = attempt_directory(&root.join("mapped")).unwrap();
+            let child = Command::new("python3")
+                .args([
+                    "-c",
+                    r#"from pathlib import Path
+import sys, time
+attempt, root = map(Path, sys.argv[1:])
+with (attempt / 'mapped.v').open('wb') as output:
+    output.write(b'partial')
+    output.flush()
+    (root / 'writer-ready').write_text(str(attempt))
+    deadline = time.monotonic() + 15
+    while not (root / 'release-writer').exists():
+        if time.monotonic() >= deadline:
+            sys.exit('test parent did not release orphan writer')
+        time.sleep(0.01)
+    output.seek(0)
+    output.write(b'orphan through original open handle')
+    output.flush()
+(attempt / 'mapped.v').write_bytes(b'orphan through delayed pathname')
+(root / 'writer-done').write_text('done')
+"#,
+                ])
+                .arg(&attempt)
+                .arg(&root)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            // Deliberately leave an external writer alive when this test's
+            // parent kills the host process, as Docker exec does in production.
+            std::mem::forget(child);
+            std::thread::sleep(Duration::from_secs(15));
+            panic!("test parent did not kill the host");
+        }
+
+        fn wait_for(path: &Path) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !path.exists() {
+                assert!(Instant::now() < deadline, "external writer did not respond");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let fixture = Fixture::new();
+        let mut host = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "techmap_corpus::tests::killed_host_retry_isolated_from_open_and_delayed_orphan_writers",
+            ])
+            .env(CHILD_ROOT, &fixture.0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for(&fixture.0.join("writer-ready"));
+        host.kill().unwrap();
+        assert!(!host.wait().unwrap().success());
+
+        // A retry (possibly another run sharing this cache) can reacquire the
+        // lock after SIGKILL, but never reuses the orphan's writable attempt.
+        let _guard = lock(&fixture.0.join("mapped.lock")).unwrap();
+        let directory = fixture.0.join("mapped");
+        let retry = attempt_directory(&directory).unwrap();
+        let abandoned = PathBuf::from(fs::read_to_string(fixture.0.join("writer-ready")).unwrap());
+        assert_ne!(retry, abandoned);
+        let expected = b"successful retry netlist";
+        fs::write(retry.join("mapped.v"), expected).unwrap();
+        fs::rename(retry.join("mapped.v"), directory.join("mapped.v")).unwrap();
+        atomic_write(
+            &directory.join("netlist.sha256"),
+            hex::encode(sha(expected)).as_bytes(),
+        )
+        .unwrap();
+
+        fs::write(fixture.0.join("release-writer"), b"continue").unwrap();
+        wait_for(&fixture.0.join("writer-done"));
+        assert_eq!(fs::read(directory.join("mapped.v")).unwrap(), expected);
+        assert_eq!(
+            fs::read_to_string(directory.join("netlist.sha256")).unwrap(),
+            hex::encode(file_sha(&directory.join("mapped.v")).unwrap())
+        );
+        assert_eq!(
+            fs::read(abandoned.join("mapped.v")).unwrap(),
+            b"orphan through delayed pathname"
+        );
     }
 
     #[test]
