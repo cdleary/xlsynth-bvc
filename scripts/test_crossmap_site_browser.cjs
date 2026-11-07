@@ -138,7 +138,7 @@ async function main(){
   assert.deepEqual(policy['script-src'],["'self'"]);
   assert.equal(await evaluate("Array.from(document.scripts,script=>new URL(script.src).pathname.split('/').at(-1)).filter(name=>name==='plotly-strict-2.35.2.min.js').length"),1);
   const selectedRun=await evaluate("document.getElementById('run').value"),run=catalog.runs.find(r=>r.id===selectedRun);assert.ok(run);
-  await checkOverview(run);await checkLegend();await checkPlotSelection(run);await shot('crossmap-desktop');
+  await checkOverview(run);await checkLegend();await checkPlotSelection(run);await evaluate('window.scrollTo(0,0)');await new Promise(resolve=>setTimeout(resolve,300));await shot('crossmap-desktop');
   await control('reference','area');await checkOverview(run);await control('reference','delay');await checkOverview(run);
   const wanted=run.samples.at(-1);
   await control('search',wanted.id,'input');
@@ -153,8 +153,11 @@ async function main(){
   await control('search','','input');
   await control('input',wanted.id);await evaluate("document.getElementById('absolute').scrollIntoView()");await shot('crossmap-input');
   await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  const longest=run.samples.reduce((a,b)=>a.label.length>=b.label.length?a:b);
+  await control('input',longest.id);await checkSelected(run,longest.id);
   await evaluate('window.scrollTo(0,0)');await new Promise(resolve=>setTimeout(resolve,400));await ready();
-  assert.ok(await evaluate('document.documentElement.scrollWidth<=window.innerWidth'),'mobile page has no horizontal overflow');
+  const mobile=await evaluate('({width:innerWidth,content:document.documentElement.scrollWidth,title:document.getElementById("input-title").textContent,titleWidth:document.getElementById("input-title").getBoundingClientRect().width})');
+  assert.ok(mobile.content<=mobile.width,`mobile page has no horizontal overflow: ${JSON.stringify(mobile)}`);
   for(const id of ['same-aig','input-aig','absolute']){
     const bounds=await evaluate(`(()=>{const plot=document.getElementById(${JSON.stringify(id)}),legend=plot.querySelector('.legend'),outer=plot.getBoundingClientRect(),box=legend.getBoundingClientRect();return {top:box.top-outer.top,bottom:box.bottom-outer.top,gridTop:plot._fullLayout._size.t,right:box.right-outer.left,width:outer.width};})()`);
     assert.ok(bounds.top>=-2&&bounds.bottom<=bounds.gridTop+2&&bounds.right<=bounds.width+2,`${id}: ${JSON.stringify(bounds)}`);

@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const {
   kinds, key, point, usable, nearlyEqual, dominates, frontier, style, validateCatalog,
-  sameAigRows, inputAigRows, overviewSpec, absoluteSpec, resolveState, stateFromUrl, stateUrl,
+  sameAigRows, inputAigRows, overviewSpec, absoluteSpec, resolveState, stateFromUrl, stateUrl, coverageScope,
 } = require('../src/site_assets/crossmap.js');
 const sample = (id = 'one') => ({id, label: `Function ${id}`, points: kinds.map(([source, mapper, goal], i) => ({
   source, mapper, goal, area: [10, 11, 8, 12, 9, 10][i], delay_ps: [10, 9, 12, 8, 13, 10][i], cell_count: i + 1,
@@ -94,4 +94,23 @@ for (const mutate of [
 ]) {
   const invalid = structuredClone(catalog); mutate(invalid); assert.throws(() => validateCatalog(invalid));
 }
-console.log('Crossmap measurement, coverage, frontier, plot, validation and URL semantics passed');
+assert.equal(coverageScope(null), 'No mapper-isolation runs have been published yet.');
+assert.equal(coverageScope(run()), 'Measured coverage: v0.79.0 · 1 whole functions (1 expected). Only the measured runs listed below are available for mapper isolation.');
+async function checkEmptyDom(response) {
+  const elements = {
+    'coverage-scope': {textContent: 'Loading measured coverage…'},
+    results: {hidden: true}, empty: {hidden: true}, crossmap: {dataset: {rendered: 'loading'}}, error: {textContent: ''},
+  };
+  const source = require('node:fs').readFileSync(require.resolve('../src/site_assets/crossmap.js'), 'utf8');
+  require('node:vm').runInNewContext(source, {document: {getElementById: id => elements[id]}, fetch: async () => response, Intl, URL});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(elements, {
+    'coverage-scope': {textContent: 'No mapper-isolation runs have been published yet.'},
+    results: {hidden: true}, empty: {hidden: false}, crossmap: {dataset: {rendered: 'empty'}}, error: {textContent: ''},
+  });
+}
+(async () => {
+  await checkEmptyDom({status: 404, ok: false});
+  await checkEmptyDom({status: 200, ok: true, json: async () => ({schema_version: 1, runs: []})});
+  console.log('Crossmap measurement, coverage, frontier, plot, validation, URL and empty DOM semantics passed');
+})().catch(error => { console.error(error); process.exitCode = 1; });

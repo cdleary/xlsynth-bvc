@@ -87,6 +87,11 @@
   }
   const formatter = new Intl.NumberFormat(undefined, {maximumSignificantDigits: 5});
   const fmt = value => formatter.format(value);
+  function coverageScope(run) {
+    if (!run) return 'No mapper-isolation runs have been published yet.';
+    const cohortLabel = run.cohort_id === 'whole-functions-v1' ? 'whole functions' : run.cohort_id === 'mffc-v1' ? 'MFFCs' : run.cohort_id;
+    return `Measured coverage: v${run.version} · ${fmt(run.sample_count)} ${cohortLabel} (${fmt(run.expected_count)} expected). Only the measured runs listed below are available for mapper isolation.`;
+  }
   function layout(x, y, {narrow = false, logarithmic = false} = {}) {
     return {
       paper_bgcolor: 'transparent', plot_bgcolor: 'transparent', font: {color: '#a9b9c7', family: 'system-ui,sans-serif', size: 11},
@@ -138,7 +143,7 @@
     for (const field of ['run', 'sample', 'reference']) if (state[field]) result.searchParams.set(field, state[field]); else result.searchParams.delete(field);
     return result.href;
   }
-  if (typeof module !== 'undefined') module.exports = {kinds, key, point, usable, nearlyEqual, dominates, frontier, style, validateCatalog, sameAigRows, inputAigRows, overviewSpec, absoluteSpec, resolveState, stateFromUrl, stateUrl};
+  if (typeof module !== 'undefined') module.exports = {kinds, key, point, usable, nearlyEqual, dominates, frontier, style, validateCatalog, sameAigRows, inputAigRows, overviewSpec, absoluteSpec, resolveState, stateFromUrl, stateUrl, coverageScope};
   if (typeof document === 'undefined') return;
   const el = id => document.getElementById(id), set = (id, text) => { el(id).textContent = text; };
   const option = (value, text) => { const element = document.createElement('option'); element.value = value; element.textContent = text; return element; };
@@ -203,8 +208,7 @@
     el('crossmap').dataset.rendered = 'loading'; set('error', '');
     el('run').value = current.run; el('reference').value = current.reference;
     el('input').replaceChildren(...run.samples.map(sample => option(sample.id, sample.label))); el('input').value = current.sample;
-    const cohortLabel = run.cohort_id === 'whole-functions-v1' ? 'whole functions' : run.cohort_id === 'mffc-v1' ? 'MFFCs' : run.cohort_id;
-    set('coverage-scope', `Measured coverage: v${run.version} · ${fmt(run.sample_count)} ${cohortLabel} (${fmt(run.expected_count)} expected). Only the measured runs listed below are available for mapper isolation.`);
+    set('coverage-scope', coverageScope(run));
     set('coverage', `${fmt(run.sample_count)} / ${fmt(run.expected_count)} inputs · ${fmt(run.verified_points)} / ${fmt(run.sample_count * 2)} new cross-mapped endpoints verified`);
     set('constraints', `Pinned ASAP7 RVT SS standard cells; g8r v${run.version}. All six endpoints use the common library evaluator with ${fmt(run.input_transition_ps)} ps input transition and ${fmt(run.output_load_ff)} fF output load. Delay is a nominal library estimate before placement or routing.`);
     el('crossmap').dataset.sampleCount = String(run.sample_count);
@@ -229,12 +233,17 @@
     catch (error) { set('error', error.message); el('crossmap').dataset.rendered = 'error'; }
     finally { rendering = false; }
   }
+  function showEmpty() {
+    set('coverage-scope', coverageScope(null));
+    el('results').hidden = true; el('empty').hidden = false;
+    el('crossmap').dataset.rendered = 'empty';
+  }
   async function main() {
     const response = await fetch('crossmap-results.json');
-    if (response.status === 404) { el('empty').hidden = false; el('crossmap').dataset.rendered = 'empty'; return; }
+    if (response.status === 404) { showEmpty(); return; }
     if (!response.ok) throw Error(`HTTP ${response.status} loading mapper-isolation results`);
     catalog = validateCatalog(await response.json());
-    if (!catalog.runs.length) { el('empty').hidden = false; el('crossmap').dataset.rendered = 'empty'; return; }
+    if (!catalog.runs.length) { showEmpty(); return; }
     el('results').hidden = false;
     el('run').replaceChildren(...catalog.runs.map(run => option(run.id, `v${run.version} · ${run.cohort_id} · ${fmt(run.sample_count)} inputs`)));
     state = resolveState(catalog, stateFromUrl(location.href)); updateLocation('replace');
