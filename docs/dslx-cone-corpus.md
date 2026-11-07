@@ -52,7 +52,7 @@ joined row includes AIG stats, action IDs, the script digest, and runtime versio
 
 For SystemVerilog, select `g8r-abc-vs-yabc-system-verilog-aig-diff` for the builtin reader or
 `g8r-abc-vs-yabc-slang-aig-diff` for Slang, which supports nested arrays. The
-`g8r-abc-vs-yabc-slang-bounded-aig-diff` preset uses Slang with a 1,000-conflict limit per
+`g8r-abc-vs-yabc-slang-bounded-aig-diff` preset uses Slang with a 10,000-conflict limit per
 ABC SAT call on both branches. The report reads
 `joined/<recipe-preset>.jsonl` for the recipe recorded in the comparison manifest.
 

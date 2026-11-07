@@ -6,5 +6,5 @@
 proc
 opt
 techmap
-abc -g AND -script "+strash;&get -n;&fraig -x -C 1000;&put;scorr;dc2;dretime;strash;&get -n;&dch -f;&nf;&put"
+abc -g AND -script "+strash;&get -n;&fraig -x -C 10000;&put;scorr;dc2;dretime;strash;&get -n;&dch -f;&nf;&put"
 clean

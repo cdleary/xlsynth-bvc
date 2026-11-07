@@ -5101,7 +5101,7 @@ mod tests {
                 .unwrap();
         assert!(
             flow.lines()
-                .any(|line| line.starts_with("abc ") && line.contains(";&fraig -x -C 1000;"))
+                .any(|line| line.starts_with("abc ") && line.contains(";&fraig -x -C 10000;"))
         );
         assert_eq!(ordinary.yosys_script, crate::DEFAULT_YOSYS_FLOW_SCRIPT);
         assert_ne!(bounded.yosys_script_sha256, ordinary.yosys_script_sha256);

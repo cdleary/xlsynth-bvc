@@ -181,7 +181,7 @@ cargo run --bin xlsynth_bvc -- \
 
 `g8r-abc-vs-yabc-slang-bounded-aig-diff` reads generated SystemVerilog with
 pinned Slang and runs `flows/abc_bounded_fraig.ys` on both ABC branches.
-`&fraig -x -C 1000` sets a budget of 1,000 conflicts for each SAT call during
+`&fraig -x -C 10000` sets a budget of 10,000 conflicts for each SAT call during
 sweeping. Proving a candidate equivalent can take two calls, one for each
 direction. ABC skips the merge if it cannot prove equivalence. The worker's
 action timeout controls wall-clock time separately.
