@@ -439,6 +439,7 @@ pub(crate) fn run() -> Result<()> {
         corpus_shard_bytes,
         progression_run_dirs,
         techmap_run_dirs,
+        techmap_crossmap_runs,
         candidate_run_dirs,
         base_url,
         overwrite,
@@ -450,6 +451,9 @@ pub(crate) fn run() -> Result<()> {
             ("artifact database", artifacts_via_sled.as_path()),
         ];
         let has_corpus = !corpus_run_dirs.is_empty() || !corpus_evidence_dirs.is_empty();
+        if !techmap_crossmap_runs.is_empty() && techmap_run_dirs.is_empty() {
+            bail!("--techmap-crossmap-run requires its baseline --techmap-run-dir");
+        }
         if !techmap_run_dirs.is_empty() && !(snapshot_dir.is_some() && has_corpus) {
             bail!("--techmap-run-dir requires --snapshot-dir and corpus evidence or corpus runs");
         }
@@ -472,6 +476,7 @@ pub(crate) fn run() -> Result<()> {
                 corpus_evidence_dirs,
                 *corpus_shard_bytes,
                 techmap_run_dirs,
+                techmap_crossmap_runs,
             )?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
             return Ok(());

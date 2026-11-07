@@ -375,6 +375,10 @@ pub enum TopCommand {
         /// Typed ASAP7 mapping runs to include in the area/delay comparison.
         #[arg(long = "techmap-run-dir", value_name = "DIR")]
         techmap_run_dirs: Vec<PathBuf>,
+        /// Typed mapper-isolation experiment manifest (repeatable).
+        /// Requires its baseline to be included with --techmap-run-dir.
+        #[arg(long = "techmap-crossmap-run", value_name = "FILE")]
+        techmap_crossmap_runs: Vec<PathBuf>,
         /// Deprecated spelling retained for existing Git-candidate workflows.
         #[arg(long = "candidate-run-dir", value_name = "DIR")]
         #[arg(hide = true)]

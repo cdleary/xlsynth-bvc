@@ -631,8 +631,12 @@ pub(crate) fn build(
     evidence: &[PathBuf],
     target: usize,
     techmap: &[PathBuf],
+    crossmap: &[PathBuf],
 ) -> Result<BuildStaticSiteSummary> {
     reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected)?;
+    if !crossmap.is_empty() && techmap.is_empty() {
+        bail!("mapper-isolation evidence requires baseline technology-mapping runs");
+    }
     preflight_progression_run_dirs(progression)?;
     if (corpus.is_empty() && evidence.is_empty()) || target == 0 || target > 16 * 1024 * 1024 {
         bail!("dashboard requires corpus inputs and shard target in 1..=16 MiB");
@@ -642,6 +646,7 @@ pub(crate) fn build(
         .chain(corpus)
         .chain(evidence)
         .chain(techmap)
+        .chain(crossmap)
     {
         reject_site_output_overlap(&options.out_dir, run, protected)?;
     }
@@ -669,6 +674,7 @@ pub(crate) fn build(
                 &staging.out_dir.join(site_techmap::ROOT),
                 &format!("{base_url}{}/", site_techmap::ROOT),
                 techmap,
+                crossmap,
             )?;
         }
         finish(&staging.out_dir, &base_url, progression)

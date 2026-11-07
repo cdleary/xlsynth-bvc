@@ -31,6 +31,11 @@ ASAP7 RVT SS library is used for both paths. Area is reported in library units a
 these are nominal cell-level estimates without placement or routing. The small protobuf library
 summary, license, and pinned source information live in [`third_party/asap7`](../third_party/asap7/VENDORED.md).
 
+The selected [reference-flop convention](techmap-reference-conditions.md) specifies a portable
+rule for future comparisons: one reference DFF data-input capacitance at each output, and input
+slew derived from that flop driving four data-input loads. The guide records the exact ASAP7
+profile and calculation. Current runs retain the original 10 ps / 1 fF configuration.
+
 ## Evaluate a release
 
 Run the command with the deployed checkout or installed resource bundle as its working
@@ -116,3 +121,33 @@ input's native area and delay results remain distinct endpoints; the joining lin
 that intermediate designs were measured. The per-input view shows the absolute measurements for
 both native goals and both ABC mapping policies. Zero-area or zero-delay references remain
 available in the table and absolute view when a ratio is undefined.
+
+## Isolate the technology mapper
+
+The **Mapper isolation** view separates the input AIG from the technology mapper. A supplemental
+experiment maps the retained Yosys/ABC AIG with both g8r objectives and joins those results to the
+original native-g8r and ABC measurements. The retained AIG already includes ABC Boolean
+optimization; this comparison does not represent an ABC-free Yosys frontend.
+
+Pass the experiment's canonical protobuf manifest alongside its exact baseline run:
+
+```bash
+target/release/xlsynth_bvc build-static-site \
+  --snapshot-dir "$SNAPSHOT" --out-dir "$SITE" --base-url / \
+  --corpus-evidence-dir "$PREVIOUS_SITE/corpus" \
+  --techmap-run-dir "$BASELINE_TECHMAP_RUN" \
+  --techmap-crossmap-run "$CROSSMAP_MANIFEST"
+```
+
+The importer validates the run, specification, and sample digests; exact baseline measurements
+and AIG commitments; shared library and evaluator; and completed equivalence-proof commitments.
+It publishes a separate protobuf projection without local attempt or netlist paths. Site
+verification reconstructs the browser data from that evidence. The supplement preserves the
+original run and its four measured endpoints.
+
+Two interactive plots compare mappers on the same AIG and input AIGs under the same g8r objective.
+Selecting a point or searching for a function reveals all six absolute measurements and their
+measured Pareto frontier. Zero measurements remain visible in the table and absolute plot;
+logarithmic overviews explicitly account for excluded zero metrics and undefined references.
+Coverage describes the supplemental experiment only, independently of the broader release and
+corpus coverage on the main comparison page.

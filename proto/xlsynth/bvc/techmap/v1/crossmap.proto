@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// Wire-compatible execution records for controlled same-AIG mapper comparisons.
+syntax = "proto3";
+package bvc.experiment.crossmap.v1;
+import "xlsynth/bvc/techmap/v1/techmap.proto";
+message ExperimentSpec {
+  uint32 record_version = 1;
+  string experiment_id = 2;
+  bytes baseline_manifest_sha256 = 3;
+  string source_pipeline = 4;
+  string mapper = 5;
+  repeated string goals = 6;
+  string driver_image_id = 7;
+  string evaluator_image_id = 8;
+  bytes release_ready_sha256 = 9;
+  bytes merged_liberty_sha256 = 10;
+  bytes liberty_proto_sha256 = 11;
+  bytes liberty_proto_record_sha256 = 12;
+  bytes library_bundle_sha256 = 13;
+  double primary_input_transition_ps = 14;
+  double module_output_load_ff = 15;
+  uint64 expected_samples = 16;
+  string driver_crate_version = 17;
+  string cohort_id = 18;
+  bytes baseline_run_spec_sha256 = 19;
+  bytes corpus_sha256 = 20;
+  bytes schema_descriptor_sha256 = 21;
+  bytes runner_sha256 = 22;
+  string equivalence_method = 23;
+  string equivalence_image_id = 24;
+  bytes prior_diagnostic_spec_sha256 = 25;
+}
+message Metric {
+  string mapper = 1;
+  string goal = 2;
+  string source_pipeline = 3;
+  bytes input_aig_sha256 = 4;
+  double cell_area = 5;
+  double delay_ps = 6;
+  uint64 cell_count = 7;
+  bytes mapped_netlist_sha256 = 8;
+  bytes external_stats_sha256 = 9;
+  bytes external_map_metrics_sha256 = 10;
+  bytes roundtrip_aig_sha256 = 11;
+  string equivalence_status = 12;
+  bytes equivalence_report_sha256 = 13;
+  string attempt_relpath = 14;
+  string status = 15;
+  string error = 16;
+}
+message SampleResult {
+  uint32 record_version = 1;
+  string sample_id = 2;
+  bytes experiment_spec_sha256 = 3;
+  xlsynth.bvc.techmap.v1.TechmapSample baseline = 4;
+  bytes input_aig_sha256 = 5;
+  bytes input_source_record_sha256 = 6;
+  repeated Metric points = 7;
+  string status = 8;
+  string error = 9;
+  bytes record_sha256 = 10;
+}
+message ExperimentRun {
+  uint32 record_version = 1;
+  ExperimentSpec spec = 2;
+  repeated SampleResult samples = 3;
+  bool complete = 4;
+  bytes record_sha256 = 5;
+}
+
+// Public projection with private locators removed and fresh spec/sample/run digests.
+// The opaque commitment retains the identity of the original local execution record.
+message PublicCrossmapRun {
+  uint32 record_version = 1;
+  bytes source_run_sha256 = 2;
+  ExperimentRun measurements = 3;
+}

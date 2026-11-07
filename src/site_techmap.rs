@@ -15,6 +15,18 @@ fn fixed_files() -> Vec<(&'static str, &'static [u8])> {
         ("index.html", HTML),
         ("assets/techmap.js", JS),
         ("assets/techmap.css", CSS),
+        (
+            "mapper-isolation.html",
+            include_bytes!("site_assets/crossmap.html"),
+        ),
+        (
+            "assets/crossmap.js",
+            include_bytes!("site_assets/crossmap.js"),
+        ),
+        (
+            "assets/crossmap.css",
+            include_bytes!("site_assets/crossmap.css"),
+        ),
         ("assets/plotly-strict-2.35.2.min.js", PLOTLY_STRICT_JS),
         ("assets/plotly-2.35.2.LICENSE.txt", PLOTLY_LICENSE),
         (
@@ -204,7 +216,7 @@ fn project_run(run: &TechmapRun) -> PublicTechmapRun {
     }
 }
 
-fn decode_public_run(bytes: &[u8]) -> Result<PublicTechmapRun> {
+pub(super) fn decode_public_run(bytes: &[u8]) -> Result<PublicTechmapRun> {
     let public = PublicTechmapRun::decode(bytes).context("decoding public mapping evidence")?;
     if public.record_version != 1
         || public.source_run_sha256.len() != 32
@@ -629,6 +641,7 @@ fn generated_files(runs: &[PublicTechmapRun]) -> Result<BTreeMap<String, Vec<u8>
     let evidence = site_corpus::wire::TechmapSite {
         record_version: 2,
         runs: publications,
+        crossmap_runs: Vec::new(),
     }
     .encode_to_vec();
     files.insert(MANIFEST.into(), evidence.clone());
@@ -640,18 +653,52 @@ fn generated_files(runs: &[PublicTechmapRun]) -> Result<BTreeMap<String, Vec<u8>
     for (path, bytes) in fixed_files() {
         files.insert(path.into(), bytes.to_vec());
     }
+    files.extend(super::site_crossmap::generate(&[], runs)?);
     if files.values().any(|bytes| bytes.len() > 25 * 1024 * 1024) {
         bail!("technology mapping site exceeds asset budget");
     }
     Ok(files)
 }
 
-pub(super) fn build_leaf(out: &Path, base_url: &str, run_dirs: &[PathBuf]) -> Result<()> {
+fn with_crossmap(
+    mut files: BTreeMap<String, Vec<u8>>,
+    crossmap: BTreeMap<String, Vec<u8>>,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut evidence = site_corpus::wire::TechmapSite::decode(files[MANIFEST].as_slice())?;
+    for (path, bytes) in &crossmap {
+        if path.starts_with("crossmap/") && path.ends_with(".pb") {
+            if bytes.len() > SHARD_TARGET {
+                bail!("mapper-isolation evidence exceeds shard budget");
+            }
+            evidence.crossmap_runs.push(file_record(path, bytes));
+        } else if path != "crossmap-results.json" {
+            bail!("invalid mapper-isolation publication path");
+        }
+    }
+    if !evidence.crossmap_runs.is_empty() {
+        evidence.record_version = 3;
+    }
+    let evidence = evidence.encode_to_vec();
+    files.insert(MANIFEST.into(), evidence.clone());
+    files.insert("evidence.pb".into(), evidence);
+    files.extend(crossmap);
+    Ok(files)
+}
+
+pub(super) fn build_leaf(
+    out: &Path,
+    base_url: &str,
+    run_dirs: &[PathBuf],
+    crossmap_paths: &[PathBuf],
+) -> Result<()> {
     let runs = read_runs(run_dirs)?;
     if runs.is_empty() {
         bail!("technology mapping publication requires at least one run");
     }
-    let files = generated_files(&runs)?;
+    let files = with_crossmap(
+        generated_files(&runs)?,
+        super::site_crossmap::generate(crossmap_paths, &runs)?,
+    )?;
     let identity = sha256(files.get(MANIFEST).expect("generated manifest"));
     for (path, bytes) in &files {
         write_file(out, path, bytes)?;
@@ -679,7 +726,7 @@ fn load_published_runs(
 ) -> Result<Vec<PublicTechmapRun>> {
     let bytes = fs::read(out.join(MANIFEST))?;
     let site = site_corpus::wire::TechmapSite::decode(bytes.as_slice())?;
-    if site.record_version != 2
+    if ![2, 3].contains(&site.record_version)
         || site.encode_to_vec() != bytes
         || digest_hex(&manifest.source_snapshot_id, "techmap identity")? != sha256_hex(&bytes)
     {
@@ -733,7 +780,30 @@ fn load_published_runs(
 
 pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -> Result<()> {
     let runs = load_published_runs(out, manifest)?;
-    let files = generated_files(&runs)?;
+    let site = site_corpus::wire::TechmapSite::decode(fs::read(out.join(MANIFEST))?.as_slice())?;
+    let mut crossmap = BTreeMap::new();
+    for record in site.crossmap_runs {
+        let path = &record
+            .relpath
+            .as_ref()
+            .context("missing crossmap evidence path")?
+            .value;
+        normalized_relpath(path)?;
+        if !path.starts_with("crossmap/")
+            || !path.ends_with(".pb")
+            || record.bytes > SHARD_TARGET as u64
+            || record != publication_file(out, path)?
+            || crossmap
+                .insert(path.clone(), fs::read(out.join(path))?)
+                .is_some()
+        {
+            bail!("invalid mapper-isolation evidence binding");
+        }
+    }
+    let files = with_crossmap(
+        generated_files(&runs)?,
+        super::site_crossmap::regenerate_public(&crossmap, &runs)?,
+    )?;
     if actual_site_relpaths(out)? != files.keys().cloned().collect() {
         bail!("technology mapping site topology mismatch");
     }
@@ -993,7 +1063,7 @@ pub(super) mod tests {
         )
         .unwrap();
         let out = root.join(ROOT);
-        build_leaf(&out, "/tech-mapped-asap7/", &[root.join("run")]).unwrap();
+        build_leaf(&out, "/tech-mapped-asap7/", &[root.join("run")], &[]).unwrap();
         verify_static_site(&out).unwrap();
 
         let mut site = site_corpus::wire::TechmapSite::decode(
@@ -1111,7 +1181,7 @@ pub(super) mod tests {
                 dir
             })
             .collect::<Vec<_>>();
-        build_leaf(&root.join(ROOT), "/tech-mapped-asap7/", &dirs).unwrap();
+        build_leaf(&root.join(ROOT), "/tech-mapped-asap7/", &dirs, &[]).unwrap();
         root
     }
 
@@ -1282,7 +1352,7 @@ pub(super) mod tests {
         )
         .unwrap();
         let out = root.join(ROOT);
-        build_leaf(&out, "/nested/tech-mapped-asap7/", &[root.join("run")]).unwrap();
+        build_leaf(&out, "/nested/tech-mapped-asap7/", &[root.join("run")], &[]).unwrap();
         verify_static_site(&out).unwrap();
         fs::write(out.join("results.json"), b"{}").unwrap();
         // Rehash the outer publication. Reproducibility still binds the web view
@@ -1356,9 +1426,80 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn crossmap_leaf_binds_public_evidence_and_rejects_rehashed_browser_edits() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bvc-crossmap-leaf-{nonce}"));
+        fs::create_dir_all(root.join("baseline")).unwrap();
+        let (baseline, experiment) = super::super::site_crossmap::tests::fixturepair();
+        fs::write(root.join("baseline/manifest.pb"), baseline.encode_to_vec()).unwrap();
+        fs::write(root.join("experiment.pb"), experiment.encode_to_vec()).unwrap();
+        let out = root.join(ROOT);
+        build_leaf(
+            &out,
+            "/tech-mapped-asap7/",
+            &[root.join("baseline")],
+            &[root.join("experiment.pb")],
+        )
+        .unwrap();
+        verify_static_site(&out).unwrap();
+        let site = site_corpus::wire::TechmapSite::decode(
+            fs::read(out.join(MANIFEST)).unwrap().as_slice(),
+        )
+        .unwrap();
+        assert_eq!(site.record_version, 3);
+        assert_eq!(site.crossmap_runs.len(), 1);
+        let mut browser: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("crossmap-results.json")).unwrap()).unwrap();
+        assert_eq!(browser["runs"][0]["verified_points"], 2);
+        assert_eq!(
+            browser["runs"][0]["samples"][0]["points"]
+                .as_array()
+                .unwrap()
+                .len(),
+            6
+        );
+        browser["runs"][0]["samples"][0]["points"][0]["area"] = serde_json::json!(12345.0);
+        fs::write(
+            out.join("crossmap-results.json"),
+            serde_json::to_vec(&browser).unwrap(),
+        )
+        .unwrap();
+        let mut manifest = pb::StaticSiteManifest::decode(
+            fs::read(out.join(STATIC_SITE_MANIFEST_FILENAME))
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        manifest.files = actual_site_relpaths(&out)
+            .unwrap()
+            .iter()
+            .map(|path| publication_file(&out, path).unwrap())
+            .collect();
+        fs::write(
+            out.join(STATIC_SITE_MANIFEST_FILENAME),
+            manifest.encode_to_vec(),
+        )
+        .unwrap();
+        assert!(verify_static_site(&out).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn javascript_preserves_two_dimensional_tradeoffs() {
         let status = Command::new("node")
             .arg("testdata/techmap_site_test.js")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn javascript_preserves_mapper_and_aig_source_comparisons() {
+        let status = Command::new("node")
+            .arg("testdata/crossmap_site_test.js")
             .status()
             .unwrap();
         assert!(status.success());

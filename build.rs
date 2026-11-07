@@ -56,6 +56,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     techmap.compile_protos(&["proto/xlsynth/bvc/techmap/v1/techmap.proto"], &["proto"])?;
     println!("cargo:rerun-if-changed=proto/xlsynth/bvc/techmap/v1/techmap.proto");
 
+    let mut crossmap = prost_build::Config::new();
+    crossmap.protoc_executable(&protoc);
+    crossmap.extern_path(".xlsynth.bvc.techmap.v1", "crate::techmap_proto::wire");
+    crossmap.compile_protos(&["proto/xlsynth/bvc/techmap/v1/crossmap.proto"], &["proto"])?;
+    println!("cargo:rerun-if-changed=proto/xlsynth/bvc/techmap/v1/crossmap.proto");
+
     let summary_text = fs::read("third_party/asap7/summary.textproto")?;
     let mut child = Command::new(&protoc)
         .args([

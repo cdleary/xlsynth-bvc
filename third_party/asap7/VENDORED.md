@@ -50,3 +50,9 @@ The runner prepares the cached archive with the unchanged `scripts/prepare_asap7
 Convert `merged.lib` with `xlsynth-driver lib2proto --include-timing --default-output-load 1 --output library.proto merged.lib`. Evaluation uses a 10 ps primary-input transition and 1 fF module-output load. The native delay strategy is experimental and selects cells using fixed reference slew/load; `gv-stats` evaluates every mapped netlist with these same settings using the `gv-sta` timing engine.
 
 Site rendering consumes the canonical measured-result protobufs and does not read or fetch these libraries. See [the comparison guide](../../docs/tech-mapped-asap7.md) for mapping and offline-cache use.
+
+The [reference-conditions guide](../../docs/techmap-reference-conditions.md) documents a selected
+convention for future measurements, using a reference DFF's data-pin capacitance and output
+transition. Its ASAP7 example identifies a sequential library from the same pinned revision;
+that library is a source for the documented calibration only and is not added to the
+combinational mapping bundle. The runner and existing measurements retain the 10 ps / 1 fF settings.
