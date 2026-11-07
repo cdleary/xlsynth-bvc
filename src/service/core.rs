@@ -301,7 +301,6 @@ pub(crate) fn compute_ir_fn_structural_hash(
     repo_root: &Path,
     ir_input_path: &Path,
     ir_top: Option<&str>,
-    version: &str,
     runtime: &DriverRuntimeSpec,
 ) -> Result<(String, CommandTrace)> {
     if !ir_input_path.exists() {
@@ -310,11 +309,16 @@ pub(crate) fn compute_ir_fn_structural_hash(
             ir_input_path.display()
         );
     }
-    let runtime_for_hash = resolve_driver_runtime_for_aig_stats(repo_root, runtime)?;
+    let runtime_for_hash = resolve_driver_runtime_for_aig_stats(
+        repo_root,
+        runtime,
+        store.aux_driver_version.as_deref(),
+    )?;
+    let version = resolve_xlsynth_version_for_driver(repo_root, &runtime_for_hash.driver_version)?;
     ensure_driver_release_cache(
         store,
         repo_root,
-        version,
+        &version,
         &runtime_for_hash.release_platform,
         &runtime_for_hash.release_cache_input_sha256,
     )?;
@@ -406,7 +410,7 @@ pub(crate) struct LegacyG8rStatsContext {
     pub(crate) fraig: bool,
     pub(crate) version: String,
     pub(crate) runtime: DriverRuntimeSpec,
-    pub(crate) stats_relpath: Option<String>,
+    pub(crate) stats_relpath: String,
 }
 
 pub(crate) fn infer_driver_context_from_verilog_action(
@@ -441,46 +445,64 @@ pub(crate) fn infer_legacy_g8r_stats_context(
     aig_action_id: &str,
 ) -> Result<Option<LegacyG8rStatsContext>> {
     let provenance = store.load_provenance(aig_action_id)?;
+    Ok(legacy_g8r_stats_context(
+        &provenance.action,
+        &provenance.details,
+    ))
+}
+
+/// An explicitly enqueued dependency may still be waiting for a worker.
+pub(crate) fn known_legacy_g8r_stats_context(
+    store: &ArtifactStore,
+    aig_action_id: &str,
+) -> Result<Option<LegacyG8rStatsContext>> {
+    let id = crate::queue::resolve_queue_identity_alias(store, aig_action_id)?;
+    if store.action_exists(&id) {
+        return infer_legacy_g8r_stats_context(store, &id);
+    }
+    let records = crate::query::load_action_detail_records(store, &id)?;
+    if records.provenance.is_some() || (records.done.is_some() && store.action_exists(&id)) {
+        return infer_legacy_g8r_stats_context(store, &id);
+    }
+    Ok(crate::query::action_spec_from_records(&records)
+        .and_then(|action| legacy_g8r_stats_context(action, &serde_json::Value::Null)))
+}
+
+fn legacy_g8r_stats_context(
+    action: &ActionSpec,
+    details: &serde_json::Value,
+) -> Option<LegacyG8rStatsContext> {
     let ActionSpec::DriverIrToG8rAig {
         ir_action_id,
         fraig,
         version,
         runtime,
         ..
-    } = &provenance.action
+    } = action
     else {
-        return Ok(None);
+        return None;
     };
-    let legacy_cli = provenance
-        .details
+    let legacy_cli = details
         .get("driver_ir2g8r_cli_mode")
         .and_then(|v| v.as_str())
         .map(|s| s == "legacy_bin_out")
         .unwrap_or(false);
-    let legacy_runtime =
-        cmp_dotted_numeric_version(&runtime.driver_version, "0.24.0") == std::cmp::Ordering::Less;
+    let legacy_runtime = !driver_ir2g8r_cli_capabilities(&runtime.driver_version).aiger_out;
     if !legacy_cli && !legacy_runtime {
-        return Ok(None);
+        return None;
     }
-    let stats_relpath = provenance
-        .details
+    let stats_relpath = details
         .get("legacy_g8r_stats_relpath")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            if legacy_cli {
-                Some(LEGACY_G8R_STATS_RELPATH.to_string())
-            } else {
-                None
-            }
-        });
-    Ok(Some(LegacyG8rStatsContext {
+        .unwrap_or(LEGACY_G8R_STATS_RELPATH)
+        .to_string();
+    Some(LegacyG8rStatsContext {
         ir_action_id: ir_action_id.clone(),
         fraig: *fraig,
         version: version.clone(),
         runtime: runtime.clone(),
         stats_relpath,
-    }))
+    })
 }
 
 pub(crate) fn infer_verilog_driver_context(
@@ -512,6 +534,7 @@ pub(crate) fn build_aig_stat_diff_suggestion_for_stats_action(
     repo_root: &Path,
     stats_action_id: &str,
     producer_aig_action_id: &str,
+    stats_runtime: &DriverRuntimeSpec,
 ) -> Result<Option<SuggestedAction>> {
     let producer = store.load_provenance(producer_aig_action_id)?;
     match producer.action {
@@ -547,12 +570,20 @@ pub(crate) fn build_aig_stat_diff_suggestion_for_stats_action(
                 runtime: default_yosys_runtime(repo_root)?,
             };
             let yosys_aig_action_id = compute_action_id(&yosys_aig)?;
-            let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &runtime)
-                .unwrap_or(runtime.clone());
+            let yosys_stats_runtime =
+                if driver_ir2g8r_cli_capabilities(&runtime.driver_version).aiger_out {
+                    stats_runtime.clone()
+                } else {
+                    resolve_driver_runtime_for_aig_stats_or_source(
+                        repo_root,
+                        &runtime,
+                        store.aux_driver_version.as_deref(),
+                    )?
+                };
             let yosys_stats = ActionSpec::DriverAigToStats {
                 aig_action_id: yosys_aig_action_id,
                 version: version.clone(),
-                runtime: stats_runtime,
+                runtime: yosys_stats_runtime,
             };
             let yosys_stats_action_id = compute_action_id(&yosys_stats)?;
             if !action_is_materialized_or_active(store, &yosys_stats_action_id) {
@@ -591,12 +622,10 @@ pub(crate) fn build_aig_stat_diff_suggestion_for_stats_action(
                 runtime: ctx.runtime.clone(),
             };
             let g8r_aig_action_id = compute_action_id(&g8r)?;
-            let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &ctx.runtime)
-                .unwrap_or(ctx.runtime.clone());
             let g8r_stats = ActionSpec::DriverAigToStats {
                 aig_action_id: g8r_aig_action_id,
                 version: ctx.version.clone(),
-                runtime: stats_runtime,
+                runtime: raw_g8r_stats_runtime(&ctx.runtime, stats_runtime).clone(),
             };
             let g8r_stats_action_id = compute_action_id(&g8r_stats)?;
             if !action_is_materialized_or_active(store, &g8r_stats_action_id) {

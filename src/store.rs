@@ -2546,6 +2546,32 @@ impl ArtifactBackend for SledArtifactBackend {
         let encoded_file = Self::maybe_encode_action_file_value(&bytes)
             .context("encoding provenance action-file row")?;
         let provenance_file_key = Self::action_file_key(&provenance.action_id, "provenance.pb");
+
+        let materialized_dir = self.materialized_action_dir_for(store_root, &provenance.action_id);
+        let materialized_provenance = materialized_dir.join("provenance.pb");
+        let mut retain_materialized_payload = false;
+        if let Ok(entry) = fs::symlink_metadata(&materialized_provenance)
+            && entry.is_file()
+            && validate_store_path_without_links(
+                store_root,
+                &materialized_dir,
+                StorePathLeafKind::Directory,
+                "materialized action",
+            )
+            .is_ok()
+        {
+            retain_materialized_payload = existing_bytes.as_ref().is_some_and(|previous| {
+                entry.len() == previous.len() as u64
+                    && fs::read(&materialized_provenance).is_ok_and(|cached| cached == *previous)
+            });
+            // Retire the completion marker before the canonical record changes. An interrupted
+            // update then rebuilds from Sled. Keep live payloads only when the previous canonical
+            // record matches this cache and replacement validated its immutable output contract.
+            fs::remove_file(&materialized_provenance)
+                .context("retiring materialized provenance before replacement")?;
+            fs::File::open(&materialized_dir)?.sync_all()?;
+        }
+
         (&provenance_tree, &file_tree)
             .transaction(
                 |(transactional_provenance, transactional_files)|
@@ -2569,8 +2595,14 @@ impl ArtifactBackend for SledArtifactBackend {
             )
             .context("atomically replacing canonical sled provenance")?;
         db.flush().context("flushing sled artifact database")?;
-        let materialized_dir = self.materialized_action_dir_for(store_root, &provenance.action_id);
-        if materialized_dir.exists() {
+        if retain_materialized_payload {
+            ArtifactStore::write_record_atomic_at(
+                store_root,
+                "materialized-provenance",
+                &materialized_provenance,
+                &bytes,
+            )?;
+        } else if materialized_dir.exists() {
             fs::remove_dir_all(&materialized_dir).with_context(|| {
                 format!(
                     "invalidating materialized action after provenance replacement: {}",
@@ -3005,6 +3037,7 @@ struct TimedCache<T> {
 pub(crate) struct ArtifactStore {
     pub(crate) root: PathBuf,
     pub(crate) downstream_cache_dir: Option<PathBuf>,
+    pub(crate) aux_driver_version: Option<String>,
     pub(crate) pending_path_cache: crate::queue::PendingPathCache,
     artifact_backend_selection: ArtifactBackendSelection,
     artifact_backend: Box<dyn ArtifactBackend>,
@@ -3057,6 +3090,7 @@ impl ArtifactStore {
         Self {
             root,
             downstream_cache_dir: None,
+            aux_driver_version: None,
             pending_path_cache: crate::queue::PendingPathCache::default(),
             artifact_backend_selection,
             artifact_backend,
@@ -3081,6 +3115,7 @@ impl ArtifactStore {
         Self {
             root,
             downstream_cache_dir: None,
+            aux_driver_version: None,
             pending_path_cache: crate::queue::PendingPathCache::default(),
             artifact_backend_selection,
             artifact_backend,
@@ -3244,6 +3279,15 @@ impl ArtifactStore {
         destination: &Path,
         contents: &[u8],
     ) -> Result<()> {
+        Self::write_record_atomic_at(&self.root, domain, destination, contents)
+    }
+
+    fn write_record_atomic_at(
+        store_root: &Path,
+        domain: &str,
+        destination: &Path,
+        contents: &[u8],
+    ) -> Result<()> {
         if domain.is_empty()
             || !domain
                 .bytes()
@@ -3252,7 +3296,7 @@ impl ArtifactStore {
             bail!("atomic record domain must be a nonempty ASCII identifier");
         }
         validate_store_path_without_links(
-            &self.root,
+            store_root,
             destination,
             StorePathLeafKind::RegularFileOrMissing,
             "atomic record destination",
@@ -3260,11 +3304,14 @@ impl ArtifactStore {
         let parent = destination
             .parent()
             .ok_or_else(|| anyhow!("atomic record destination has no parent"))?;
-        ensure_store_directory_without_links(&self.root, parent, "atomic record parent")?;
-        let staging = self.staging_dir().join("atomic-records").join(domain);
-        ensure_store_directory_without_links(&self.root, &staging, "atomic record staging")?;
+        ensure_store_directory_without_links(store_root, parent, "atomic record parent")?;
+        let staging = store_root
+            .join(".staging")
+            .join("atomic-records")
+            .join(domain);
+        ensure_store_directory_without_links(store_root, &staging, "atomic record staging")?;
         validate_store_path_without_links(
-            &self.root,
+            store_root,
             destination,
             StorePathLeafKind::RegularFileOrMissing,
             "atomic record destination",
@@ -3295,13 +3342,13 @@ impl ArtifactStore {
             .with_context(|| format!("syncing atomic record staging file: {}", temp.display()))?;
         drop(temp_file);
         validate_store_path_without_links(
-            &self.root,
+            store_root,
             &staging,
             StorePathLeafKind::Directory,
             "atomic record staging",
         )?;
         validate_store_path_without_links(
-            &self.root,
+            store_root,
             destination,
             StorePathLeafKind::RegularFileOrMissing,
             "atomic record destination",
@@ -3309,9 +3356,9 @@ impl ArtifactStore {
         let promotion = match fs::rename(&temp, destination) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ensure_store_directory_without_links(&self.root, parent, "atomic record parent")?;
+                ensure_store_directory_without_links(store_root, parent, "atomic record parent")?;
                 validate_store_path_without_links(
-                    &self.root,
+                    store_root,
                     destination,
                     StorePathLeafKind::RegularFileOrMissing,
                     "atomic record destination",
@@ -4838,7 +4885,8 @@ mod tests {
         let materialized = store
             .materialize_action_dir(&provenance.action_id)
             .expect("materialize initial action");
-        assert!(materialized.join("provenance.pb").exists());
+        let payload = materialized.join("payload/result.txt");
+        let cached_provenance = materialized.join("provenance.pb");
 
         let mut replacement = store
             .load_provenance(&provenance.action_id)
@@ -4869,19 +4917,54 @@ mod tests {
             .expect("reload canonical provenance");
         assert_eq!(canonical.suggested_next_actions.len(), 1);
         assert_eq!(canonical.commands[0].argv[0], "discovery");
-        let rematerialized = store
-            .materialize_action_dir(&provenance.action_id)
-            .expect("rematerialize updated action");
-        let materialized_provenance = crate::proto::decode_provenance(
-            &std::fs::read(rematerialized.join("provenance.pb"))
-                .expect("read rematerialized provenance"),
-        )
-        .expect("decode rematerialized provenance");
-        assert_eq!(materialized_provenance.suggested_next_actions.len(), 1);
+        // A worker may already be using this payload path. Read it directly before any
+        // materialization call can mask eviction of the directory during replacement.
+        assert_eq!(fs::read(&payload).expect("read live payload"), b"first");
+        let expected = crate::proto::encode_provenance(&replacement).unwrap();
+        assert_eq!(fs::read(&cached_provenance).unwrap(), expected);
+
+        // If the filesystem update fails after the Sled commit, the old protobuf must no
+        // longer count as a completed materialization. The durable rows rebuild both files.
+        let staging = store
+            .staging_dir()
+            .join("atomic-records/materialized-provenance");
+        fs::remove_dir(&staging).unwrap();
+        fs::write(&staging, b"block cached metadata installation").unwrap();
+        replacement.commands[0].argv.push("--new-enumerator".into());
+        assert!(store.write_provenance(&replacement).is_err());
+        assert_eq!(fs::read(&payload).unwrap(), b"first");
+        assert!(!cached_provenance.exists());
+        store.materialize_action_dir(&provenance.action_id).unwrap();
         assert_eq!(
-            std::fs::read(rematerialized.join("payload/result.txt"))
-                .expect("read unchanged payload"),
-            b"first"
+            fs::read(&cached_provenance).unwrap(),
+            crate::proto::encode_provenance(&replacement).unwrap()
+        );
+        assert_eq!(fs::read(&payload).unwrap(), b"first");
+
+        // An unrelated stale cache with a different provenance must never have its payload
+        // blessed by installing a new discovery record over it.
+        fs::write(&cached_provenance, b"stale provenance").unwrap();
+        fs::write(&payload, b"stale payload").unwrap();
+        store.write_provenance(&replacement).unwrap();
+        store.materialize_action_dir(&provenance.action_id).unwrap();
+        assert_eq!(fs::read(&payload).unwrap(), b"first");
+
+        // A malformed cache with no completion marker must still allow the canonical commit.
+        fs::remove_dir_all(&materialized).unwrap();
+        fs::write(&materialized, b"not a directory").unwrap();
+        replacement.suggested_next_actions.clear();
+        let error = store.write_provenance(&replacement).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalidating materialized action")
+        );
+        assert!(
+            store
+                .load_provenance(&provenance.action_id)
+                .unwrap()
+                .suggested_next_actions
+                .is_empty()
         );
 
         let mut invalid = replacement;

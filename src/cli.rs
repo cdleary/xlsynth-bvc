@@ -17,6 +17,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "DIR")]
     pub(crate) downstream_cache_dir: Option<PathBuf>,
 
+    /// Pin released auxiliary tools without changing the synthesis driver.
+    #[arg(long, global = true, value_name = "VERSION")]
+    pub(crate) aux_driver_version: Option<String>,
+
     #[command(subcommand)]
     pub(crate) command: TopCommand,
 }

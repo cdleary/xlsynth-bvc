@@ -8025,11 +8025,15 @@ pub(crate) fn enqueue_processing_for_root_actions(
         let root_action_id = compute_action_id(&root_action)?;
         retry_action_with_priority(store, root_action.clone(), priority)?;
         if store.action_exists(&root_action_id) {
-            maybe_refresh_dslx_root_for_suggestion_discovery(store, repo_root, &root_action_id)?;
-            let _ = app::enqueue_suggested_actions(
+            let root = maybe_refresh_dslx_root_for_suggestion_discovery(
                 store,
                 repo_root,
-                &root_action_id,
+                store.load_provenance(&root_action_id)?,
+            )?;
+            app::enqueue_suggested_actions_from_provenance(
+                store,
+                repo_root,
+                root,
                 true,
                 DEFAULT_SUGGESTED_ENQUEUE_MAX_DEPTH,
                 priority,
@@ -8042,19 +8046,8 @@ pub(crate) fn enqueue_processing_for_root_actions(
 pub(crate) fn maybe_refresh_dslx_root_for_suggestion_discovery(
     store: &ArtifactStore,
     repo_root: &Path,
-    root_action_id: &str,
-) -> Result<()> {
-    let mut provenance = store.load_provenance(root_action_id)?;
-    if !dslx_root_provenance_needs_discovery_refresh(&provenance) {
-        ensure_dslx_root_has_suggested_actions(&provenance)?;
-        return Ok(());
-    }
-
-    eprintln!(
-        "refreshing dslx discovery suggestions for root action {}",
-        root_action_id
-    );
-
+    mut provenance: Provenance,
+) -> Result<Provenance> {
     let (dso_version, discovery_runtime) = match &provenance.action {
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
             version,
@@ -8067,9 +8060,35 @@ pub(crate) fn maybe_refresh_dslx_root_for_suggestion_discovery(
             ..
         } => (version.clone(), discovery_runtime.clone()),
         _ => {
-            return Ok(());
+            return Ok(provenance);
         }
     };
+    let pinned_enumerator = store
+        .aux_driver_version
+        .as_deref()
+        .map(|pin| {
+            let platform = discovery_runtime
+                .as_ref()
+                .map_or(crate::DEFAULT_RELEASE_PLATFORM, |r| &r.release_platform);
+            bound_driver_runtime_for_driver_version(repo_root, pin, platform)
+        })
+        .transpose()?;
+    if !dslx_root_provenance_needs_discovery_refresh(&provenance, pinned_enumerator.as_ref()) {
+        ensure_dslx_root_has_suggested_actions(&provenance)?;
+        return Ok(provenance);
+    }
+
+    // Concurrent enqueues share the materialized payload and discovery scratch directory.
+    let root_action_id = provenance.action_id.clone();
+    let _lock = QueueTransitionLock::acquire(store, &root_action_id)?;
+    provenance = store.load_provenance(&root_action_id)?;
+    if !dslx_root_provenance_needs_discovery_refresh(&provenance, pinned_enumerator.as_ref()) {
+        return Ok(provenance);
+    }
+    eprintln!(
+        "refreshing dslx discovery suggestions for root action {}",
+        root_action_id
+    );
     let payload_dir = store.resolve_artifact_ref_path(&provenance.output_artifact);
     if !payload_dir.is_dir() {
         bail!(
@@ -8081,10 +8100,11 @@ pub(crate) fn maybe_refresh_dslx_root_for_suggestion_discovery(
     let discovery = discover_dslx_fn_to_ir_suggestions(
         store,
         repo_root,
-        root_action_id,
+        &root_action_id,
         &payload_dir,
         &dso_version,
         discovery_runtime.as_ref(),
+        pinned_enumerator.as_ref(),
     )?;
     provenance.commands = discovery.commands;
     provenance.suggested_next_actions = discovery.suggested_next_actions;
@@ -8117,8 +8137,8 @@ pub(crate) fn maybe_refresh_dslx_root_for_suggestion_discovery(
         .write_provenance(&provenance)
         .context("persisting refreshed canonical DSLX discovery provenance")?;
 
-    provenance = store.load_provenance(root_action_id)?;
-    if dslx_root_provenance_needs_discovery_refresh(&provenance) {
+    provenance = store.load_provenance(&root_action_id)?;
+    if dslx_root_provenance_needs_discovery_refresh(&provenance, pinned_enumerator.as_ref()) {
         let detail = provenance
             .details
             .as_object()
@@ -8132,7 +8152,7 @@ pub(crate) fn maybe_refresh_dslx_root_for_suggestion_discovery(
         );
     }
     ensure_dslx_root_has_suggested_actions(&provenance)?;
-    Ok(())
+    Ok(provenance)
 }
 
 fn dslx_root_provenance_has_discovery_result(provenance: &Provenance) -> bool {
@@ -8142,13 +8162,24 @@ fn dslx_root_provenance_has_discovery_result(provenance: &Provenance) -> bool {
         .is_some_and(|details| details.contains_key("dslx_list_fns_discovery"))
 }
 
-pub(crate) fn dslx_root_provenance_needs_discovery_refresh(provenance: &Provenance) -> bool {
+fn dslx_root_provenance_needs_discovery_refresh(
+    provenance: &Provenance,
+    pinned_enumerator: Option<&DriverRuntimeSpec>,
+) -> bool {
     if !matches!(
         provenance.action,
         ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball { .. }
             | ActionSpec::DownloadAndExtractXlsynthSourceSubtree { .. }
     ) {
         return false;
+    }
+    if let Some(expected) = pinned_enumerator {
+        // Old roots may have suggestions without a recorded enumeration runtime.
+        let recorded = provenance
+            .details
+            .pointer("/dslx_list_fns_discovery/enumeration_runtime")
+            .and_then(|value| DriverRuntimeSpec::deserialize(value).ok());
+        return recorded.as_ref() != Some(expected);
     }
     provenance.suggested_next_actions.is_empty()
         && !dslx_root_provenance_has_discovery_result(provenance)
@@ -13548,7 +13579,10 @@ fn only(z: bits[1] id=1) -> bits[1] {
             },
             ArtifactType::DslxFileSubtree,
         );
-        assert!(dslx_root_provenance_needs_discovery_refresh(&provenance));
+        assert!(dslx_root_provenance_needs_discovery_refresh(
+            &provenance,
+            None
+        ));
         assert!(ensure_dslx_root_has_suggested_actions(&provenance).is_err());
 
         provenance.details = json!({
@@ -13557,13 +13591,140 @@ fn only(z: bits[1] id=1) -> bits[1] {
                 "suggested_actions": 0
             }
         });
-        assert!(!dslx_root_provenance_needs_discovery_refresh(&provenance));
+        assert!(!dslx_root_provenance_needs_discovery_refresh(
+            &provenance,
+            None
+        ));
         ensure_dslx_root_has_suggested_actions(&provenance)
             .expect("recorded empty discovery is a valid terminal result");
 
+        let requested = test_runtime();
+        let mut recorded = requested.clone();
+        recorded.docker_image_id = "a".repeat(64);
+        provenance.details["dslx_list_fns_discovery"]["enumeration_runtime"] = json!(recorded);
+        assert!(dslx_root_provenance_needs_discovery_refresh(
+            &provenance,
+            Some(&requested)
+        ));
+        assert!(!dslx_root_provenance_needs_discovery_refresh(
+            &provenance,
+            Some(&recorded)
+        ));
+
         provenance.details = json!({"dslx_list_fns_discovery_error": "boom"});
-        assert!(dslx_root_provenance_needs_discovery_refresh(&provenance));
+        assert!(dslx_root_provenance_needs_discovery_refresh(
+            &provenance,
+            None
+        ));
         assert!(ensure_dslx_root_has_suggested_actions(&provenance).is_err());
+    }
+
+    #[test]
+    fn reenqueue_refreshes_dslx_discovery_for_the_pinned_enumerator() -> Result<()> {
+        let (mut store, root) = make_test_store("reenqueue-dslx-discovery");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let platform = crate::DEFAULT_RELEASE_PLATFORM;
+        let source = bound_driver_runtime_for_driver_version(repo, "0.68.0", platform)?;
+        let old = bound_driver_runtime_for_driver_version(repo, "0.74.0", platform)?;
+        let pinned = bound_driver_runtime_for_driver_version(repo, "0.76.0", platform)?;
+        let dso = resolve_xlsynth_version_for_driver(repo, &source.driver_version)?;
+        let roots = canonical_root_actions_for_runtime(&dso, &source)?;
+
+        // A stdlib root with an old enumerator and a historical source root with only suggestions.
+        for (action, has_recorded_runtime) in [(&roots[0], true), (&roots[1], false)] {
+            let id = compute_action_id(action)?;
+            let stale = build_suggestion(
+                "old function",
+                ActionSpec::DriverDslxFnToIr {
+                    dslx_subtree_action_id: id.clone(),
+                    dslx_file: "old.x".into(),
+                    dslx_fn_name: "old".into(),
+                    version: dso.clone(),
+                    runtime: source.clone(),
+                },
+            )?;
+            let mut saved =
+                synthetic_provenance(&id, action.clone(), ArtifactType::DslxFileSubtree);
+            saved.suggested_next_actions.push(stale.clone());
+            if has_recorded_runtime {
+                saved.details = json!({"dslx_list_fns_discovery": {
+                    "driver_runtime": source,
+                    "enumeration_runtime": old,
+                    "enumeration_runtime_xlsynth_version": resolve_xlsynth_version_for_driver(repo, &old.driver_version)?,
+                    "concrete_functions": 1,
+                    "suggested_actions": 1
+                }});
+            }
+            let staging = store.staging_dir().join(&id);
+            let payload = staging.join("payload");
+            fs::create_dir_all(&payload)?;
+            fs::write(payload.join("README"), b"cached source")?;
+            saved.output_artifact.relpath = "payload".into();
+            saved.output_files = collect_output_files(&payload)?;
+            fs::write(
+                staging.join("provenance.pb"),
+                crate::proto::encode_provenance(&saved)?,
+            )?;
+            store.promote_staging_action_dir(&id, &staging)?;
+
+            // Pin A (or an unpinned historical replay) can reuse its populated observation.
+            store.aux_driver_version = has_recorded_runtime.then(|| old.driver_version.clone());
+            let selected = maybe_refresh_dslx_root_for_suggestion_discovery(
+                &store,
+                repo,
+                store.load_provenance(&id)?,
+            )?;
+            assert_eq!(selected.suggested_next_actions.len(), 1);
+            let live_payload = store
+                .resolve_artifact_ref_path(&selected.output_artifact)
+                .join("README");
+            store.aux_driver_version = Some(pinned.driver_version.clone());
+            let enqueue =
+                || enqueue_processing_for_root_actions(&store, repo, vec![action.clone()], 0);
+            enqueue()?;
+            let refreshed = store.load_provenance(&id)?;
+            let discovery = &refreshed.details["dslx_list_fns_discovery"];
+            assert_eq!(discovery["driver_runtime"], json!(source));
+            assert_eq!(discovery["enumeration_runtime"], json!(pinned));
+            assert!(refreshed.suggested_next_actions.is_empty());
+            assert!(!store.pending_queue_path(&stale.action_id).exists());
+            assert_eq!(
+                refreshed.output_files[0].sha256,
+                saved.output_files[0].sha256
+            );
+            assert_eq!(fs::read(live_payload)?, b"cached source");
+
+            enqueue()?;
+            assert_eq!(
+                crate::proto::encode_provenance(&store.load_provenance(&id)?)?,
+                crate::proto::encode_provenance(&refreshed)?,
+                "a successful empty result from the same enumerator must be reused"
+            );
+
+            // The explicit enqueue-suggested command must also refresh a cached empty result.
+            store.aux_driver_version = Some(old.driver_version.clone());
+            app::enqueue_suggested_actions(&store, repo, &id, false, 1, 0)?;
+            let after = store.load_provenance(&id)?;
+            assert_eq!(
+                after.details["dslx_list_fns_discovery"]["enumeration_runtime"],
+                json!(old)
+            );
+
+            // An overlapping traversal consumes the populated observation it selected, even if
+            // another enqueue has since replaced the stored root with an empty observation.
+            let summary = app::enqueue_suggested_actions_from_provenance(
+                &store,
+                repo,
+                selected,
+                true,
+                DEFAULT_SUGGESTED_ENQUEUE_MAX_DEPTH,
+                0,
+            )?;
+            assert_eq!(summary.enqueued_count, 1);
+            assert!(store.pending_queue_path(&stale.action_id).is_file());
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

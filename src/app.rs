@@ -149,9 +149,18 @@ pub(crate) fn run() -> Result<()> {
         store_dir,
         artifacts_via_sled,
         downstream_cache_dir,
+        aux_driver_version,
         command,
     } = Cli::parse();
     let repo_root = std::env::current_dir().context("getting current directory")?;
+    let aux_driver_version = aux_driver_version
+        .map(|version| -> Result<String> {
+            let version = normalize_tag_version(&version).to_string();
+            resolve_xlsynth_version_for_driver(&repo_root, &version)
+                .context("invalid --aux-driver-version")?;
+            Ok(version)
+        })
+        .transpose()?;
     if let TopCommand::DslxCorpusIngest(opts) = &command {
         println!(
             "{}",
@@ -212,6 +221,7 @@ pub(crate) fn run() -> Result<()> {
             downstream_cache_dir.as_deref(),
             driver,
             yosys,
+            aux_driver_version.as_deref(),
         )?;
         println!(
             "{}",
@@ -546,7 +556,8 @@ pub(crate) fn run() -> Result<()> {
         }
         verify_static_snapshot(snapshot_dir)
             .context("verifying static snapshot before starting web server")?;
-        let snapshot_store = ArtifactStore::new_with_snapshot(store_dir, snapshot_dir.clone());
+        let mut snapshot_store = ArtifactStore::new_with_snapshot(store_dir, snapshot_dir.clone());
+        snapshot_store.aux_driver_version = aux_driver_version;
         snapshot_store.ensure_layout()?;
         web::serve_web_ui(
             Arc::new(snapshot_store),
@@ -559,6 +570,7 @@ pub(crate) fn run() -> Result<()> {
     }
     let mut store = ArtifactStore::new_with_sled(store_dir, artifacts_via_sled.clone());
     store.downstream_cache_dir = downstream_cache_dir;
+    store.aux_driver_version = aux_driver_version;
     store.ensure_layout()?;
 
     match command {
@@ -592,7 +604,7 @@ pub(crate) fn run() -> Result<()> {
             );
         }
         TopCommand::Run { action } => {
-            let action_spec = run_action_to_spec(&repo_root, action)?;
+            let action_spec = run_action_to_spec(&store, &repo_root, action)?;
             let (action_id, artifact_ref) = execute_action(&store, action_spec)?;
             println!(
                 "{}\n{}",
@@ -601,7 +613,7 @@ pub(crate) fn run() -> Result<()> {
             );
         }
         TopCommand::Enqueue { priority, action } => {
-            let action_spec = run_action_to_spec(&repo_root, action)?;
+            let action_spec = run_action_to_spec(&store, &repo_root, action)?;
             let action_id = enqueue_action_with_priority(&store, action_spec, priority)?;
             println!("{}", action_id);
         }
@@ -1179,7 +1191,12 @@ fn prepare_action_for_rematerialization(
     Ok((projected_action_id, projected_action))
 }
 
-pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<ActionSpec> {
+pub(crate) fn run_action_to_spec(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    action: RunAction,
+) -> Result<ActionSpec> {
+    let aux_driver_version = store.aux_driver_version.as_deref();
     match action {
         RunAction::DownloadStdlib { version } => {
             let runtime = canonical_stdlib_discovery_runtime_for_version(repo_root, &version)?;
@@ -1258,13 +1275,23 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
             top_fn_name,
             version,
             driver,
-        } => Ok(ActionSpec::DriverIrAigEquiv {
-            ir_action_id,
-            aig_action_id,
-            top_fn_name,
-            version: version.clone(),
-            runtime: driver.into_runtime(repo_root, &version)?,
-        }),
+        } => {
+            let runtime = match aux_driver_version {
+                Some(aux) => bound_driver_runtime_for_driver_version(
+                    repo_root,
+                    aux,
+                    &driver.release_platform,
+                )?,
+                None => driver.into_runtime(repo_root, &version)?,
+            };
+            Ok(ActionSpec::DriverIrAigEquiv {
+                ir_action_id,
+                aig_action_id,
+                top_fn_name,
+                version,
+                runtime,
+            })
+        }
         RunAction::IrToG8rAig {
             ir_action_id,
             top_fn_name,
@@ -1374,9 +1401,16 @@ pub(crate) fn run_action_to_spec(repo_root: &Path, action: RunAction) -> Result<
             version,
             driver,
         } => {
-            let source_runtime = driver.into_runtime(repo_root, &version)?;
-            let runtime = resolve_driver_runtime_for_aig_stats(repo_root, &source_runtime)
-                .unwrap_or(source_runtime);
+            let runtime = if let Some(legacy) =
+                known_legacy_g8r_stats_context(store, &aig_action_id)?
+            {
+                legacy.runtime
+            } else if let Some(aux) = aux_driver_version {
+                bound_driver_runtime_for_driver_version(repo_root, aux, &driver.release_platform)?
+            } else {
+                let source_runtime = driver.into_runtime(repo_root, &version)?;
+                resolve_driver_runtime_for_aig_stats_or_source(repo_root, &source_runtime, None)?
+            };
             Ok(ActionSpec::DriverAigToStats {
                 aig_action_id,
                 version: version.clone(),
@@ -1838,10 +1872,31 @@ pub(crate) fn enqueue_suggested_actions(
     max_depth: u32,
     priority: i32,
 ) -> Result<EnqueueSuggestedSummary> {
+    let root = store.load_provenance(root_action_id).with_context(|| {
+        format!("cannot enqueue suggestions; root action provenance missing: {root_action_id}")
+    })?;
+    let root = if store.aux_driver_version.is_some() {
+        crate::query::maybe_refresh_dslx_root_for_suggestion_discovery(store, repo_root, root)?
+    } else {
+        root
+    };
+    enqueue_suggested_actions_from_provenance(
+        store, repo_root, root, recursive, max_depth, priority,
+    )
+}
+
+pub(crate) fn enqueue_suggested_actions_from_provenance(
+    store: &ArtifactStore,
+    repo_root: &Path,
+    root: Provenance,
+    recursive: bool,
+    max_depth: u32,
+    priority: i32,
+) -> Result<EnqueueSuggestedSummary> {
     enqueue_suggested_actions_with_policy(
         store,
         repo_root,
-        root_action_id,
+        root,
         recursive,
         max_depth,
         priority,
@@ -1852,22 +1907,19 @@ pub(crate) fn enqueue_suggested_actions(
 fn enqueue_suggested_actions_with_policy(
     store: &ArtifactStore,
     repo_root: &Path,
-    root_action_id: &str,
+    root: Provenance,
     recursive: bool,
     max_depth: u32,
     priority: i32,
     policy: SuggestedEnqueuePolicy,
 ) -> Result<EnqueueSuggestedSummary> {
-    let _root = store.load_provenance(root_action_id).with_context(|| {
-        format!(
-            "cannot enqueue suggestions; root action provenance missing: {}",
-            root_action_id
-        )
-    })?;
-
+    let root_action_id = root.action_id.clone();
+    // Another enqueue can replace the root's discovery after our caller selects it.
+    // Consume its snapshot first, then load descendants as we reach them.
+    let mut root_snapshot = Some(root);
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
-    queue.push_back((root_action_id.to_string(), 0_u32));
+    queue.push_back((root_action_id.clone(), 0_u32));
 
     let mut total_suggestions = 0_usize;
     let mut enqueued_count = 0_usize;
@@ -1885,10 +1937,13 @@ fn enqueue_suggested_actions_with_policy(
         if !visited.insert(source_action_id.clone()) {
             continue;
         }
-        let provenance = store.load_provenance(&source_action_id)?;
+        let provenance = match root_snapshot.take() {
+            Some(root) => root,
+            None => store.load_provenance(&source_action_id)?,
+        };
         for suggested in &provenance.suggested_next_actions {
             total_suggestions += 1;
-            let action = canonicalize_suggested_action(store, repo_root, &suggested.action);
+            let action = canonicalize_suggested_action(store, repo_root, &suggested.action)?;
             let suggested_priority = suggested_action_queue_priority(priority, &action);
             match classify_suggested_action_skip_reason(store, &action, &policy)? {
                 Some(SuggestedActionSkipReason::DisabledDriverIrAigEquiv) => {
@@ -1977,7 +2032,7 @@ fn enqueue_suggested_actions_with_policy(
     }
 
     Ok(EnqueueSuggestedSummary {
-        root_action_id: root_action_id.to_string(),
+        root_action_id,
         recursive,
         max_depth,
         visited_source_actions: visited.len(),
@@ -2034,7 +2089,7 @@ fn enqueue_missing_suggested_actions_with_policy(
             continue;
         }
         total_missing_entries += 1;
-        let action = canonicalize_suggested_action(store, repo_root, &entry.action);
+        let action = canonicalize_suggested_action(store, repo_root, &entry.action)?;
         match classify_suggested_action_skip_reason(store, &action, &policy)? {
             Some(SuggestedActionSkipReason::DisabledDriverIrAigEquiv) => {
                 skipped_blocked_count += 1;
@@ -2296,15 +2351,21 @@ pub(crate) fn canonicalize_suggested_action(
     store: &ArtifactStore,
     repo_root: &Path,
     action: &ActionSpec,
-) -> ActionSpec {
+) -> Result<ActionSpec> {
     let upgraded = match action {
         ActionSpec::DriverAigToStats {
             aig_action_id,
             version,
             runtime,
         } => {
-            let runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
-                .unwrap_or_else(|_| runtime.clone());
+            let runtime = match known_legacy_g8r_stats_context(store, aig_action_id)? {
+                Some(legacy) => legacy.runtime,
+                None => resolve_driver_runtime_for_aig_stats_or_source(
+                    repo_root,
+                    runtime,
+                    store.aux_driver_version.as_deref(),
+                )?,
+            };
             ActionSpec::DriverAigToStats {
                 aig_action_id: aig_action_id.clone(),
                 version: version.clone(),
@@ -2318,8 +2379,11 @@ pub(crate) fn canonicalize_suggested_action(
             version,
             runtime,
         } => {
-            let runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
-                .unwrap_or_else(|_| runtime.clone());
+            let runtime = resolve_driver_runtime_for_aig_stats_or_source(
+                repo_root,
+                runtime,
+                store.aux_driver_version.as_deref(),
+            )?;
             ActionSpec::DriverIrAigEquiv {
                 ir_action_id: ir_action_id.clone(),
                 aig_action_id: aig_action_id.clone(),
@@ -2330,7 +2394,7 @@ pub(crate) fn canonicalize_suggested_action(
         }
         _ => action.clone(),
     };
-    canonicalize_k3_cone_suggested_action(store, &upgraded).unwrap_or(upgraded)
+    Ok(canonicalize_k3_cone_suggested_action(store, &upgraded).unwrap_or(upgraded))
 }
 
 fn canonicalize_k3_cone_suggested_action(
@@ -2642,8 +2706,11 @@ pub(crate) fn backfill_stdlib_opt_ir_aig_equiv_suggestions(
         };
 
         let candidates = if ir_aig_equiv_enabled {
-            let equiv_runtime = resolve_driver_runtime_for_aig_stats(repo_root, &runtime)
-                .unwrap_or_else(|_| runtime.clone());
+            let equiv_runtime = resolve_driver_runtime_for_aig_stats_or_source(
+                repo_root,
+                &runtime,
+                store.aux_driver_version.as_deref(),
+            )?;
             if equiv_runtime != runtime {
                 ir_aig_equiv_runtime_upgraded += 1;
             }
@@ -3778,9 +3845,259 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_pin_is_available_to_enqueue_and_workers() {
+        let enqueue = Cli::try_parse_from([
+            "xlsynth_bvc",
+            "--aux-driver-version",
+            "0.74.0",
+            "enqueue-crate-version",
+            "--crate-version",
+            "0.68.0",
+        ])
+        .expect("enqueue CLI");
+        assert_eq!(enqueue.aux_driver_version.as_deref(), Some("0.74.0"));
+        let TopCommand::EnqueueCrateVersion { crate_version, .. } = enqueue.command else {
+            panic!("expected crate enqueue");
+        };
+        assert_eq!(crate_version, "0.68.0");
+        let workers = Cli::try_parse_from([
+            "xlsynth_bvc",
+            "run-workers",
+            "--aux-driver-version",
+            "0.74.0",
+            "--workers",
+            "4",
+            "--exit-when-idle",
+        ])
+        .expect("worker CLI");
+        assert_eq!(workers.aux_driver_version.as_deref(), Some("0.74.0"));
+    }
+
+    #[test]
+    fn suggested_actions_honor_auxiliary_pin_without_rewriting_queued_actions() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (mut store, root) = make_test_store("auxiliary-pin");
+        store.aux_driver_version = Some("0.74.0".into());
+        let runtime = bound_driver_runtime_for_driver_version(
+            repo_root,
+            "0.76.0",
+            crate::DEFAULT_RELEASE_PLATFORM,
+        )
+        .expect("original runtime");
+        let original = ActionSpec::DriverAigToStats {
+            aig_action_id: "a".repeat(64),
+            version: "v0.54.7".into(),
+            runtime: runtime.clone(),
+        };
+        let original_id = enqueue_action(&store, original.clone()).expect("enqueue original");
+        let original_bytes = fs::read(store.pending_queue_path(&original_id)).unwrap();
+        let replacement = canonicalize_suggested_action(&store, repo_root, &original)
+            .expect("canonicalize with auxiliary pin");
+        let ActionSpec::DriverAigToStats {
+            runtime: pinned, ..
+        } = &replacement
+        else {
+            panic!("expected statistics action");
+        };
+        assert_eq!(pinned.driver_version, "0.74.0");
+        let replacement_id = enqueue_action(&store, replacement).expect("enqueue replacement");
+        assert_ne!(replacement_id, original_id);
+        assert_eq!(
+            fs::read(store.pending_queue_path(&original_id)).unwrap(),
+            original_bytes
+        );
+
+        let equiv = ActionSpec::DriverIrAigEquiv {
+            ir_action_id: "b".repeat(64),
+            aig_action_id: "a".repeat(64),
+            top_fn_name: Some("main".into()),
+            version: "v0.54.7".into(),
+            runtime,
+        };
+        let pinned_equiv = canonicalize_suggested_action(&store, repo_root, &equiv).unwrap();
+        let ActionSpec::DriverIrAigEquiv { runtime, .. } = pinned_equiv else {
+            panic!("expected equivalence action");
+        };
+        assert_eq!(runtime.driver_version, "0.74.0");
+        store.aux_driver_version = Some("999.0.0".into());
+        assert!(canonicalize_suggested_action(&store, repo_root, &original).is_err());
+        drop(store);
+        fs::remove_dir_all(root).expect("clean up store");
+    }
+
+    #[test]
+    fn pinned_cli_helpers_do_not_prepare_an_unused_synthesis_runtime() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (mut store, root) = make_test_store("pinned-helper-cli");
+        store.aux_driver_version = Some("0.74.0".into());
+        let driver = crate::cli::DriverCli {
+            driver_version: Some("0.68.0".into()),
+            driver_git_commit: None,
+            release_platform: crate::DEFAULT_RELEASE_PLATFORM.into(),
+            dockerfile: Some(PathBuf::from("unused-synthesis.Dockerfile")),
+            docker_image: None,
+        };
+        let version = "v0.54.7";
+        let aig_action_id = "a".repeat(64);
+        let actions = [
+            RunAction::AigToStats {
+                aig_action_id: aig_action_id.clone(),
+                version: version.into(),
+                driver: driver.clone(),
+            },
+            RunAction::IrAigEquiv {
+                ir_action_id: "b".repeat(64),
+                aig_action_id,
+                top_fn_name: None,
+                version: version.into(),
+                driver,
+            },
+        ];
+        for action in actions {
+            let (runtime, source_dso) = match run_action_to_spec(&store, repo, action).unwrap() {
+                ActionSpec::DriverAigToStats {
+                    runtime, version, ..
+                }
+                | ActionSpec::DriverIrAigEquiv {
+                    runtime, version, ..
+                } => (runtime, version),
+                _ => panic!("expected a helper action"),
+            };
+            assert_eq!(runtime.driver_version, "0.74.0");
+            assert_eq!(source_dso, version);
+            assert_eq!(
+                effective_xlsynth_version_for_runtime(repo, version, &runtime),
+                resolve_xlsynth_version_for_driver(repo, "0.74.0").unwrap()
+            );
+        }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_g8r_statistics_keep_the_producer_identity_and_provenance() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (mut store, root) = make_test_store("legacy-stats-pin");
+        store.aux_driver_version = Some("0.74.0".into());
+        let source = bound_driver_runtime_for_driver_version(
+            repo,
+            "0.23.0",
+            crate::DEFAULT_RELEASE_PLATFORM,
+        )
+        .unwrap();
+        let dso = resolve_xlsynth_version_for_driver(repo, &source.driver_version).unwrap();
+        let producer = ActionSpec::DriverIrToG8rAig {
+            ir_action_id: "b".repeat(64),
+            top_fn_name: None,
+            fraig: true,
+            lowering_mode: G8rLoweringMode::Default,
+            execution_recipe_revision: driver_ir2g8r_execution_recipe_revision(
+                &source.driver_version,
+            ),
+            version: dso.clone(),
+            runtime: source.clone(),
+        };
+        let id = enqueue_action(&store, producer.clone()).unwrap();
+        let historical = ActionSpec::DriverAigToStats {
+            aig_action_id: id.clone(),
+            version: dso.clone(),
+            runtime: bound_driver_runtime_for_driver_version(
+                repo,
+                "0.74.0",
+                crate::DEFAULT_RELEASE_PLATFORM,
+            )
+            .unwrap(),
+        };
+        let expected = ActionSpec::DriverAigToStats {
+            aig_action_id: id.clone(),
+            version: dso.clone(),
+            runtime: source.clone(),
+        };
+        let direct = RunAction::AigToStats {
+            aig_action_id: id.clone(),
+            version: dso.clone(),
+            driver: crate::cli::DriverCli {
+                driver_version: None,
+                driver_git_commit: None,
+                release_platform: crate::DEFAULT_RELEASE_PLATFORM.into(),
+                dockerfile: None,
+                docker_image: None,
+            },
+        };
+        let expected_id = compute_action_id(&expected).unwrap();
+        assert_eq!(
+            compute_action_id(&run_action_to_spec(&store, repo, direct).unwrap()).unwrap(),
+            expected_id
+        );
+        write_provenance_record(
+            &store,
+            producer,
+            make_artifact(&id, ArtifactType::AigFile, "payload/result.aig"),
+            // A reused native payload can have its sidecar without the CLI-mode detail.
+            json!({}),
+            Vec::new(),
+            vec![
+                ("payload/result.aig".into(), b"native g8r".to_vec()),
+                (
+                    crate::LEGACY_G8R_STATS_RELPATH.into(),
+                    br#"{"live_nodes":7,"deepest_path":3}"#.to_vec(),
+                ),
+            ],
+        );
+        assert_eq!(
+            compute_action_id(&canonicalize_suggested_action(&store, repo, &historical).unwrap())
+                .unwrap(),
+            expected_id
+        );
+        let old_id = compute_action_id(&historical).unwrap();
+        assert!(
+            execute_action(&store, historical)
+                .unwrap_err()
+                .to_string()
+                .contains("require the producer runtime")
+        );
+        assert!(!store.action_exists(&old_id));
+        assert!(fs::read_dir(store.staging_dir()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&old_id)
+        }));
+        let (stats_id, artifact) = execute_action(&store, expected).unwrap();
+        let stats = store.load_provenance(&stats_id).unwrap();
+        assert!(stats.commands.is_empty());
+        assert_eq!(stats.details["aig_stats_mode"], "legacy_g8r_stats_sidecar");
+        assert_eq!(
+            stats.details["stats_runtime_crate_version_label"],
+            "crate:v0.23.0"
+        );
+        assert_eq!(
+            stats.details["stats_runtime_dso_version_label"],
+            version_label("dso", &dso)
+        );
+        assert_eq!(
+            stats.details["legacy_g8r_source"]["source_runtime"],
+            json!(source)
+        );
+        assert_eq!(
+            stats.details["legacy_g8r_source"]["source_xlsynth_version"],
+            dso
+        );
+        let output: serde_json::Value =
+            serde_json::from_slice(&fs::read(store.resolve_artifact_ref_path(&artifact)).unwrap())
+                .unwrap();
+        assert_eq!(output["and_nodes"].as_f64(), Some(7.0));
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn slang_cli_action_binds_the_same_revision_into_its_runtime() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (store, root) = make_test_store("slang-cli");
         let action = run_action_to_spec(
+            &store,
             repo_root,
             RunAction::ComboVerilogToYosysAbcAig {
                 verilog_action_id: "a".repeat(64),
@@ -3811,6 +4128,8 @@ mod tests {
             runtime.slang_commit.as_deref(),
             Some(crate::DEFAULT_YOSYS_SLANG_COMMIT)
         );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn test_action_id(seed: &str) -> String {
@@ -4121,8 +4440,12 @@ mod tests {
         );
 
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let stats_runtime = resolve_driver_runtime_for_aig_stats(repo_root, runtime)
-            .expect("resolve the statistics runtime used for diff suggestions");
+        let stats_runtime = resolve_driver_runtime_for_aig_stats(
+            repo_root,
+            runtime,
+            store.aux_driver_version.as_deref(),
+        )
+        .expect("resolve the statistics runtime used for diff suggestions");
         let g8r_stats_action = ActionSpec::DriverAigToStats {
             aig_action_id: compute_action_id(&ActionSpec::DriverIrToG8rAig {
                 ir_action_id: k_bool_action_id.clone(),
@@ -4210,7 +4533,7 @@ mod tests {
         let yosys_stats_action = ActionSpec::DriverAigToStats {
             aig_action_id: yosys_aig_action_id.clone(),
             version: "v0.39.0".to_string(),
-            runtime: stats_runtime,
+            runtime: stats_runtime.clone(),
         };
         let yosys_stats_action_id =
             compute_action_id(&yosys_stats_action).expect("compute yosys stats action id");
@@ -4237,6 +4560,7 @@ mod tests {
             repo_root,
             &yosys_stats_action_id,
             &yosys_aig_action_id,
+            &stats_runtime,
         )
         .expect("look up matching g8r stats for the Yosys completion");
         let diff_action = ActionSpec::AigStatDiff {
@@ -4453,7 +4777,7 @@ mod tests {
         let summary = enqueue_suggested_actions_with_policy(
             &store,
             &root,
-            &root_provenance.action_id,
+            root_provenance.clone(),
             false,
             1,
             crate::DEFAULT_QUEUE_PRIORITY,
@@ -4489,7 +4813,7 @@ mod tests {
         let second = enqueue_suggested_actions_with_policy(
             &store,
             &root,
-            &root_provenance.action_id,
+            root_provenance.clone(),
             false,
             1,
             crate::DEFAULT_QUEUE_PRIORITY,
@@ -4509,7 +4833,7 @@ mod tests {
         let refreshed = enqueue_suggested_actions_with_policy(
             &store,
             &root,
-            &root_provenance.action_id,
+            root_provenance.clone(),
             false,
             1,
             crate::DEFAULT_QUEUE_PRIORITY,
@@ -4537,7 +4861,7 @@ mod tests {
         let readmitted = enqueue_suggested_actions_with_policy(
             &store,
             &root,
-            &root_provenance.action_id,
+            root_provenance.clone(),
             false,
             1,
             crate::DEFAULT_QUEUE_PRIORITY,
@@ -4564,7 +4888,7 @@ mod tests {
         let summary = enqueue_suggested_actions_with_policy(
             &store,
             &root,
-            &current_opt.action_id,
+            current_opt.clone(),
             false,
             1,
             crate::DEFAULT_QUEUE_PRIORITY,
@@ -4601,7 +4925,7 @@ mod tests {
         let summary = enqueue_suggested_actions_with_policy(
             &store,
             &root,
-            &current_opt.action_id,
+            current_opt.clone(),
             false,
             1,
             crate::DEFAULT_QUEUE_PRIORITY,
@@ -4638,7 +4962,7 @@ mod tests {
         let first = enqueue_suggested_actions_with_policy(
             &store,
             &root,
-            &current_opt.action_id,
+            current_opt.clone(),
             false,
             1,
             crate::DEFAULT_QUEUE_PRIORITY,
@@ -4718,7 +5042,7 @@ mod tests {
         let second = enqueue_suggested_actions_with_policy(
             &store,
             &root,
-            &current_opt.action_id,
+            current_opt.clone(),
             false,
             1,
             crate::DEFAULT_QUEUE_PRIORITY,
