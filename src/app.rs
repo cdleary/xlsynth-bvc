@@ -171,8 +171,9 @@ pub(crate) fn run() -> Result<()> {
         timeout_seconds,
     } = &command
     {
-        let summary =
-            crate::techmap_corpus::run(&crate::techmap_corpus::RunTechmapCorpusOptions {
+        let summary = crate::techmap_corpus::run(
+            &repo_root,
+            &crate::techmap_corpus::RunTechmapCorpusOptions {
                 source_run_dir: source_run_dir.clone(),
                 output_dir: output_dir.clone(),
                 cohort: cohort.clone(),
@@ -189,7 +190,8 @@ pub(crate) fn run() -> Result<()> {
                 workers: *workers,
                 limit: *limit,
                 timeout_seconds: *timeout_seconds,
-            })?;
+            },
+        )?;
         println!("{}", serde_json::to_string_pretty(&summary)?);
         return Ok(());
     }

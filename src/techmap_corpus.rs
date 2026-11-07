@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::techmap_proto::wire::{SampleStatus, TechmapPoint, TechmapRun, TechmapSample};
 
+#[derive(Clone)]
 pub(crate) struct RunTechmapCorpusOptions {
     pub(crate) source_run_dir: PathBuf,
     pub(crate) output_dir: PathBuf,
@@ -288,17 +289,67 @@ fn container_path(options: &RunTechmapCorpusOptions, path: &Path) -> Result<Stri
     bail!("mapping input is outside the mounted result and cache directories")
 }
 
+fn writable_directory(resource_root: &Path, path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .context("output has no existing ancestor")?;
+    }
+    let mut resolved = fs::canonicalize(ancestor).context("resolving output ancestor")?;
+    for part in absolute.strip_prefix(ancestor)?.components() {
+        match part {
+            Component::Normal(name) => resolved.push(name),
+            Component::CurDir => {}
+            // A missing/../existing-link suffix can re-enter an unchecked symlink.
+            _ => bail!("output has an invalid suffix after a missing directory"),
+        }
+    }
+    let root = fs::canonicalize(resource_root)?;
+    if resolved.starts_with(&root) || root.starts_with(&resolved) {
+        bail!("mapping output and cache must not overlap the resource root");
+    }
+    Ok(resolved)
+}
+
+struct MappingResources {
+    archive: PathBuf,
+    preparation_script: PathBuf,
+    archive_sha256: Vec<u8>,
+    preparation_script_sha256: Vec<u8>,
+    yosys_flow_sha256: Vec<u8>,
+}
+
+impl MappingResources {
+    fn load(resource_root: &Path) -> Result<Self> {
+        let resource_root =
+            fs::canonicalize(resource_root).context("resolving the deployed resource root")?;
+        let archive = resource_root.join("third_party/asap7/asap7_rvt_ss.tar.gz");
+        let preparation_script = resource_root.join("scripts/prepare_asap7.py");
+        Ok(Self {
+            archive_sha256: file_sha(&archive)?,
+            preparation_script_sha256: file_sha(&preparation_script)?,
+            yosys_flow_sha256: file_sha(&resource_root.join(crate::DEFAULT_YOSYS_FLOW_SCRIPT))?,
+            archive,
+            preparation_script,
+        })
+    }
+}
+
 fn prepare_library(
+    resources: &MappingResources,
     options: &RunTechmapCorpusOptions,
     containers: &Containers,
     driver_id: &str,
     evaluator: bool,
 ) -> Result<(PathBuf, PathBuf, Vec<u8>, Vec<u8>)> {
-    let archive =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("third_party/asap7/asap7_rvt_ss.tar.gz");
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/prepare_asap7.py");
-    let archive_sha = file_sha(&archive)?;
-    let script_sha = file_sha(&script)?;
+    let archive_sha = resources.archive_sha256.clone();
+    let script_sha = resources.preparation_script_sha256.clone();
     let key = cache_key(&[b"prepared-liberty", &archive_sha, &script_sha]);
     let directory = options.shared_cache_dir.join("libraries").join(key);
     let _guard = lock(&directory.with_extension("lock"))?;
@@ -306,8 +357,8 @@ fn prepare_library(
     if !directory.join("merged.lib").is_file() {
         command_output(
             Command::new("python3")
-                .arg(&script)
-                .arg(&archive)
+                .arg(&resources.preparation_script)
+                .arg(&resources.archive)
                 .arg(&directory),
         )?;
     }
@@ -674,6 +725,7 @@ fn source_provenance(source: &Path, id: &str) -> Result<crate::model::Provenance
 }
 
 fn verify_source_aig(
+    resources: &MappingResources,
     source: &Path,
     manifest: &SourceManifest,
     row: &SourceSample,
@@ -718,10 +770,7 @@ fn verify_source_aig(
             && verilog_action_id == &row.combo_verilog_action_id
             && verilog_top_module_name.as_deref() == Some(&row.top_fn_name)
             && yosys_script_ref.path == crate::DEFAULT_YOSYS_FLOW_SCRIPT
-            && hex::decode(&yosys_script_ref.sha256)?
-                == file_sha(
-                    &Path::new(env!("CARGO_MANIFEST_DIR")).join(crate::DEFAULT_YOSYS_FLOW_SCRIPT),
-                )? => {}
+            && hex::decode(&yosys_script_ref.sha256)? == resources.yosys_flow_sha256 => {}
         _ => bail!("source ABC AIG has an incompatible codegen or Yosys lineage"),
     }
     if canonical_output_digest(&provenance)? != file_sha(aig)? {
@@ -882,7 +931,10 @@ pub(crate) struct TechmapCorpusSummary {
     complete: bool,
 }
 
-pub(crate) fn run(options: &RunTechmapCorpusOptions) -> Result<TechmapCorpusSummary> {
+pub(crate) fn run(
+    resource_root: &Path,
+    options: &RunTechmapCorpusOptions,
+) -> Result<TechmapCorpusSummary> {
     if options.workers == 0 || options.timeout_seconds == 0 {
         bail!("workers and timeout must be positive");
     }
@@ -897,6 +949,12 @@ pub(crate) fn run(options: &RunTechmapCorpusOptions) -> Result<TechmapCorpusSumm
     }
     let record_version = record_version_for_new_run(&options.version);
     let point_plan = required_points(&options.version, record_version)?;
+    let resources = MappingResources::load(resource_root)?;
+    let mut resolved_options = options.clone();
+    resolved_options.output_dir = writable_directory(resource_root, &options.output_dir)?;
+    resolved_options.shared_cache_dir =
+        writable_directory(resource_root, &options.shared_cache_dir)?;
+    let options = &resolved_options;
     fs::create_dir_all(&options.output_dir)?;
     fs::create_dir_all(&options.shared_cache_dir)?;
     let _run_guard = lock(&options.output_dir.join(".run.lock"))?;
@@ -958,8 +1016,9 @@ pub(crate) fn run(options: &RunTechmapCorpusOptions) -> Result<TechmapCorpusSumm
         &source.driver_runtime.release_platform,
     )?;
     let (liberty, proto, archive_sha, preparation_sha) =
-        prepare_library(&options, &containers, &driver_id, false)?;
-    let (_, evaluator_proto, _, _) = prepare_library(&options, &containers, &evaluator_id, true)?;
+        prepare_library(&resources, &options, &containers, &driver_id, false)?;
+    let (_, evaluator_proto, _, _) =
+        prepare_library(&resources, &options, &containers, &evaluator_id, true)?;
     let mut template = TechmapRun {
         record_version,
         crate_version: options.version.trim_start_matches('v').to_string(),
@@ -1074,8 +1133,14 @@ pub(crate) fn run(options: &RunTechmapCorpusOptions) -> Result<TechmapCorpusSumm
                     bail!("source IR digest differs from corpus identity");
                 }
                 let source_abc = source_dir.join("yosys_abc.aig");
-                let source_combo_digest =
-                    verify_source_aig(&options.source_run_dir, &source, row, &source_abc, &abc_id)?;
+                let source_combo_digest = verify_source_aig(
+                    &resources,
+                    &options.source_run_dir,
+                    &source,
+                    row,
+                    &source_abc,
+                    &abc_id,
+                )?;
                 if sample.status == SampleStatus::Done as i32 {
                     validate_completed_checkpoint(
                         &options.output_dir,
@@ -1208,6 +1273,93 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn resources_follow_the_deployed_bundle_and_do_not_fall_back_to_the_build_checkout() {
+        let fixture = Fixture::new();
+        let resource_root = fixture.0.join("deployed-bundle");
+        let archive = resource_root.join("third_party/asap7/asap7_rvt_ss.tar.gz");
+        let script = resource_root.join("scripts/prepare_asap7.py");
+        let flow = resource_root.join(crate::DEFAULT_YOSYS_FLOW_SCRIPT);
+        for (path, contents) in [
+            (&archive, b"deployed archive".as_slice()),
+            (&script, b"deployed preparation script".as_slice()),
+            (&flow, b"deployed Yosys flow".as_slice()),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        let resources = MappingResources::load(&resource_root).unwrap();
+        assert_eq!(resources.archive, fs::canonicalize(&archive).unwrap());
+        assert_eq!(
+            resources.preparation_script,
+            fs::canonicalize(&script).unwrap()
+        );
+        assert_eq!(resources.archive_sha256, sha(b"deployed archive"));
+        assert_eq!(
+            resources.preparation_script_sha256,
+            sha(b"deployed preparation script")
+        );
+        assert_eq!(resources.yosys_flow_sha256, sha(b"deployed Yosys flow"));
+
+        fs::remove_file(&flow).unwrap();
+        assert!(MappingResources::load(&resource_root).is_err());
+    }
+
+    #[test]
+    fn runner_rejects_resource_outputs_before_creating_any_state() {
+        let fixture = Fixture::new();
+        let root = fixture.0.join("bundle");
+        for relative in [
+            "third_party/asap7/asap7_rvt_ss.tar.gz",
+            "scripts/prepare_asap7.py",
+            crate::DEFAULT_YOSYS_FLOW_SCRIPT,
+        ] {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"fixture resource").unwrap();
+        }
+        for cache_inside in [false, true] {
+            let outside = fixture.0.join("state");
+            let inside = root.join("state");
+            let options = RunTechmapCorpusOptions {
+                source_run_dir: fixture.0.join("missing-source"),
+                output_dir: if cache_inside {
+                    outside.clone()
+                } else {
+                    inside.clone()
+                },
+                shared_cache_dir: if cache_inside {
+                    inside.clone()
+                } else {
+                    outside.clone()
+                },
+                cohort: "whole-functions-v1".into(),
+                version: "0.79.0".into(),
+                dso_version: "0.79.0".into(),
+                driver_image: String::new(),
+                abc_image: String::new(),
+                evaluator_image: String::new(),
+                evaluator_version: "0.79.0".into(),
+                evaluator_release_cache_dir: fixture.0.join("evaluator"),
+                evaluator_dso_version: "0.79.0".into(),
+                release_cache_dir: fixture.0.join("release"),
+                workers: 1,
+                limit: None,
+                timeout_seconds: 1,
+            };
+            assert!(run(&root, &options).is_err());
+            assert!(!inside.exists());
+            assert!(!outside.exists());
+        }
+        #[cfg(unix)]
+        {
+            let alias = fixture.0.join("resource-alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert!(writable_directory(&root, &alias.join("new-output")).is_err());
+            assert!(writable_directory(&root, &fixture.0).is_err());
         }
     }
 

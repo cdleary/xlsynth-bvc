@@ -33,6 +33,10 @@ license, and source information live in [`third_party/asap7`](../third_party/asa
 
 ## Evaluate a release
 
+Run the command with the deployed checkout or installed resource bundle as its working
+directory. The runner reads the ASAP7 archive, preparation script, and Yosys flow from that
+resource root. Keep output and cache directories outside the resource root.
+
 Start with a completed version-5 `run-ir-dir-corpus` export retaining its `.bvc` provenance.
 Use an immutable driver image for the release under test and the same ABC and evaluator images
 for every release in a comparison. Both release-cache directories must be verified cache leaves
