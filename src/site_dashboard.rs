@@ -147,6 +147,7 @@ struct Version {
     historical_abc_measurements: usize,
     historical_raw_measurements: usize,
     cohorts: Vec<Coverage>,
+    techmap_cohorts: Vec<Coverage>,
 }
 
 #[derive(Serialize)]
@@ -246,6 +247,7 @@ impl SeriesBuilder {
 #[derive(Serialize)]
 struct Dashboard {
     schema_version: u32,
+    techmap_url: Option<&'static str>,
     versions: Vec<Version>,
     trends: Vec<Trend>,
 }
@@ -585,11 +587,35 @@ fn projection(out: &Path) -> Result<Projection> {
         abc: abc.series,
     };
     trends.insert(0, trend);
+    for coverage in site_techmap::published_coverage(out)? {
+        let version = versions
+            .entry(coverage.version.clone())
+            .or_insert_with(|| Version {
+                crate_version: coverage.version.clone(),
+                ..Default::default()
+            });
+        version.techmap_cohorts.push(Coverage {
+            id: coverage.cohort_id.clone(),
+            label: coverage.cohort_label,
+            measured: coverage.done_count,
+            total: coverage.expected_count,
+            complete: coverage.complete,
+            url: format!(
+                "tech-mapped-asap7/?release={}&cohort={}",
+                coverage.version, coverage.cohort_id
+            ),
+        });
+    }
     let mut versions = versions.into_values().collect::<Vec<_>>();
     versions.sort_by(|a, b| cmp_dotted_numeric_version(&a.crate_version, &b.crate_version));
     Ok(Projection {
         dashboard: serde_json::to_vec(&Dashboard {
             schema_version: 3,
+            techmap_url: out
+                .join(site_techmap::ROOT)
+                .join(site_techmap::MANIFEST)
+                .is_file()
+                .then_some("tech-mapped-asap7/"),
             versions,
             trends,
         })?,
@@ -604,13 +630,19 @@ pub(crate) fn build(
     corpus: &[PathBuf],
     evidence: &[PathBuf],
     target: usize,
+    techmap: &[PathBuf],
 ) -> Result<BuildStaticSiteSummary> {
     reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected)?;
     preflight_progression_run_dirs(progression)?;
     if (corpus.is_empty() && evidence.is_empty()) || target == 0 || target > 16 * 1024 * 1024 {
         bail!("dashboard requires corpus inputs and shard target in 1..=16 MiB");
     }
-    for run in progression.iter().chain(corpus).chain(evidence) {
+    for run in progression
+        .iter()
+        .chain(corpus)
+        .chain(evidence)
+        .chain(techmap)
+    {
         reject_site_output_overlap(&options.out_dir, run, protected)?;
     }
     let base_url = normalize_base_url(&options.base_url)?;
@@ -632,6 +664,13 @@ pub(crate) fn build(
             ChildNavigation::PreviousVersions,
         )?;
         install_child_navigation(&staging.out_dir.join("corpus"), ChildNavigation::Corpus)?;
+        if !techmap.is_empty() {
+            site_techmap::build_leaf(
+                &staging.out_dir.join(site_techmap::ROOT),
+                &format!("{base_url}{}/", site_techmap::ROOT),
+                techmap,
+            )?;
+        }
         finish(&staging.out_dir, &base_url, progression)
     })
 }
@@ -672,6 +711,14 @@ fn finish(out: &Path, base_url: &str, progression: &[PathBuf]) -> Result<BuildSt
             out,
             &format!("corpus/{STATIC_SITE_MANIFEST_FILENAME}"),
         )?),
+        techmap_manifest: if out.join(site_techmap::ROOT).is_dir() {
+            Some(publication_file(
+                out,
+                &format!("{}/{STATIC_SITE_MANIFEST_FILENAME}", site_techmap::ROOT),
+            )?)
+        } else {
+            None
+        },
     };
     let bytes = dashboard.encode_to_vec();
     let snapshot_id = sha256_hex(&bytes);
@@ -812,6 +859,26 @@ pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -
             actual_site_relpaths(&root)?
                 .into_iter()
                 .map(|p| format!("{name}/{p}")),
+        );
+    }
+    if let Some(record) = &dashboard.techmap_manifest {
+        let path = format!("{}/{STATIC_SITE_MANIFEST_FILENAME}", site_techmap::ROOT);
+        if record != &publication_file(out, &path)? {
+            bail!("dashboard technology mapping child manifest mismatch");
+        }
+        let root = out.join(site_techmap::ROOT);
+        if !root.join(site_techmap::MANIFEST).is_file() {
+            bail!("invalid technology mapping child kind");
+        }
+        let verified = verify_static_site(&root)?;
+        if verified.base_url != format!("{}{}/", manifest.base_url, site_techmap::ROOT) {
+            bail!("technology mapping child base URL mismatch");
+        }
+        expected.insert(path);
+        expected.extend(
+            actual_site_relpaths(&root)?
+                .into_iter()
+                .map(|p| format!("{}/{p}", site_techmap::ROOT)),
         );
     }
     for (path, bytes) in fixed_files() {

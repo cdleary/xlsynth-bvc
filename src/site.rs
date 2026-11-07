@@ -23,6 +23,8 @@ pub(crate) mod site_corpus;
 pub(crate) mod site_dashboard;
 #[path = "site_shards.rs"]
 mod site_shards;
+#[path = "site_techmap.rs"]
+pub(crate) mod site_techmap;
 
 use crate::analysis::decode_analysis_report;
 use crate::model::{
@@ -47,11 +49,14 @@ pub(crate) const STATIC_SITE_RECORD_VERSION: u32 = 1;
 pub(crate) const STATIC_SITE_MANIFEST_FILENAME: &str = "site_manifest.v1.pb";
 const PLOTLY_ASSET_NAME: &str = "plotly-2.35.2.min.js";
 const PLOTLY_JS: &[u8] = include_bytes!("../third_party/plotly/plotly-2.35.2.min.js");
+const PLOTLY_STRICT_JS: &[u8] = include_bytes!("../third_party/plotly/plotly-strict-2.35.2.min.js");
 const PLOTLY_LICENSE_ASSET_NAME: &str = "plotly-2.35.2.LICENSE.txt";
 const PLOTLY_LICENSE: &[u8] = include_bytes!("../third_party/plotly/LICENSE");
 const PLOTLY_NOTICE_ASSET_NAME: &str = "plotly-2.35.2.min.js.LICENSE.txt";
 const PLOTLY_NOTICE: &[u8] =
     include_bytes!("../third_party/plotly/plotly-2.35.2.min.js.LICENSE.txt");
+const PLOTLY_STRICT_NOTICE: &[u8] =
+    include_bytes!("../third_party/plotly/plotly-strict-2.35.2.min.js.LICENSE.txt");
 
 const STYLE_CSS: &str = include_str!("site_assets/style.css");
 const APP_JS: &str = concat!(
@@ -5754,6 +5759,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
                 .with_context(|| format!("site text file is not UTF-8: {relpath}"))?;
             if relpath != trusted_plotly_relpath
                 && bytes.as_slice() != PLOTLY_JS
+                && bytes.as_slice() != PLOTLY_STRICT_JS
                 && text.contains("/api/")
             {
                 bail!("static site file contains forbidden /api/ request path: {relpath}");
@@ -5772,6 +5778,17 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
 
     if declared.contains_key(site_dashboard::MANIFEST) {
         site_dashboard::verify_projection(site_dir, &manifest)?;
+        return Ok(VerifyStaticSiteSummary {
+            site_dir: site_dir.display().to_string(),
+            snapshot_id,
+            base_url,
+            file_count: manifest.files.len(),
+            total_bytes,
+        });
+    }
+
+    if declared.contains_key(site_techmap::MANIFEST) {
+        site_techmap::verify_projection(site_dir, &manifest)?;
         return Ok(VerifyStaticSiteSummary {
             site_dir: site_dir.display().to_string(),
             snapshot_id,
@@ -6394,7 +6411,7 @@ pub(crate) fn smoke_static_site(
     fs::create_dir_all(&profile_dir).context("creating temporary Chrome profile")?;
     let origin = format!("http://{address}");
     let timeout = Duration::from_secs(timeout_seconds);
-    let pages = if dashboard_mode {
+    let mut pages = if dashboard_mode {
         vec![("", "g8r cost by release", progression_markers)]
     } else if corpus_mode {
         vec![("", "IR corpus synthesis results", progression_markers)]
@@ -6422,6 +6439,18 @@ pub(crate) fn smoke_static_site(
             ("dataset.html", "Dataset explorer", Vec::new()),
         ]
     };
+    if dashboard_mode
+        && site_dir
+            .join(site_techmap::ROOT)
+            .join(site_techmap::MANIFEST)
+            .is_file()
+    {
+        pages.push((
+            "tech-mapped-asap7/",
+            "Area and delay, together",
+            vec![("data-rendered=\"true\"".to_string(), 1)],
+        ));
+    }
     let result = pages
         .iter()
         .try_for_each(|(path, expected, rendered_markers)| {

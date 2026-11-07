@@ -23,6 +23,41 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Map a frozen corpus into ASAP7 and retain typed, resumable comparison results.
+    RunTechmapCorpus {
+        #[arg(long, value_name = "DIR")]
+        source_run_dir: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        output_dir: PathBuf,
+        #[arg(long)]
+        cohort: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        dso_version: String,
+        #[arg(long)]
+        driver_image: String,
+        #[arg(long)]
+        evaluator_image: String,
+        #[arg(long)]
+        evaluator_version: String,
+        #[arg(long)]
+        evaluator_dso_version: String,
+        #[arg(long, value_name = "DIR")]
+        evaluator_release_cache_dir: PathBuf,
+        #[arg(long)]
+        abc_image: String,
+        #[arg(long, value_name = "DIR")]
+        release_cache_dir: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        shared_cache_dir: PathBuf,
+        #[arg(long, default_value_t = crate::runtime::default_web_runner_workers())]
+        workers: usize,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long, default_value_t = 900)]
+        timeout_seconds: u64,
+    },
     /// Fetch verified IR archives and seed canonical IR-import roots (no synthesis).
     ImportIrArchives {
         /// A generated local site, as an alternative to --url.
@@ -337,6 +372,9 @@ pub enum TopCommand {
         /// May be repeated; all runs must match a registered cohort.
         #[arg(long = "progression-run-dir", value_name = "DIR")]
         progression_run_dirs: Vec<PathBuf>,
+        /// Typed ASAP7 mapping runs to include in the area/delay comparison.
+        #[arg(long = "techmap-run-dir", value_name = "DIR")]
+        techmap_run_dirs: Vec<PathBuf>,
         /// Deprecated spelling retained for existing Git-candidate workflows.
         #[arg(long = "candidate-run-dir", value_name = "DIR")]
         #[arg(hide = true)]

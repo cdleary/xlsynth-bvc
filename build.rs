@@ -51,6 +51,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     println!("cargo:rerun-if-changed=proto/xlsynth/bvc/ir_archive/v1/archive.proto");
 
+    let mut techmap = prost_build::Config::new();
+    techmap.protoc_executable(&protoc);
+    techmap.compile_protos(&["proto/xlsynth/bvc/techmap/v1/techmap.proto"], &["proto"])?;
+    println!("cargo:rerun-if-changed=proto/xlsynth/bvc/techmap/v1/techmap.proto");
+
+    let summary_text = fs::read("third_party/asap7/summary.textproto")?;
+    let mut child = Command::new(&protoc)
+        .args([
+            "--proto_path=proto",
+            "--encode=xlsynth.bvc.techmap.v1.Asap7LibrarySummary",
+            "proto/xlsynth/bvc/techmap/v1/techmap.proto",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or("protoc ASAP7 summary stdin unavailable")?
+        .write_all(&summary_text)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "protoc failed to compile ASAP7 summary: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    fs::write(out_dir.join("asap7-summary.pb"), output.stdout)?;
+    println!("cargo:rerun-if-changed=third_party/asap7/summary.textproto");
+
     let campaign_text = fs::read("campaigns/release-qor-v1.textproto")?;
     let mut child = Command::new(&protoc)
         .args([

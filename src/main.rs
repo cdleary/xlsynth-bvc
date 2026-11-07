@@ -12,6 +12,7 @@ use std::sync::atomic::AtomicU64;
 
 mod analysis;
 mod app;
+mod asap7_library;
 mod campaign;
 mod cli;
 mod coordinator;
@@ -35,6 +36,9 @@ mod sled_space;
 mod snapshot;
 mod store;
 mod store_validation;
+mod techmap_corpus;
+mod techmap_proto;
+mod techmap_sources;
 mod versioning;
 mod view;
 mod web;

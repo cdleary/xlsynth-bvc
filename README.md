@@ -6,6 +6,7 @@ See `DESIGN.md` for repository-wide invariants and filesystem boundaries.
 See `docs/hermetic-action-design.md` for the action execution architecture.
 See `docs/batched-persistent-runners-plan.md` for the implemented persistent Docker runner design.
 See `docs/ir-dir-corpus-runner.md` for the batch `IR directory -> recipe preset -> output bundle` runner.
+See [Tech mapped ASAP7 comparisons](docs/tech-mapped-asap7.md) for native g8r and Yosys/ABC area/delay comparisons across frozen corpora.
 See `docs/dslx-cone-corpus.md` for `dslx-corpus-ingest`, matched ABC comparison, and a static cone report.
 
 Looking for the `.ir` files for a particular xlsynth release? Start with
