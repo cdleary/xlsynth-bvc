@@ -31,6 +31,11 @@ ASAP7 RVT SS library is used for both paths. Area is reported in library units a
 these are nominal cell-level estimates without placement or routing. The small protobuf library
 summary, license, and pinned source information live in [`third_party/asap7`](../third_party/asap7/VENDORED.md).
 
+The selected [reference-flop convention](techmap-reference-conditions.md) specifies a portable
+rule for future comparisons: one reference DFF data-input capacitance at each output, and input
+slew derived from that flop driving four data-input loads. The guide records the exact ASAP7
+profile and calculation. Current runs retain the original 10 ps / 1 fF configuration.
+
 ## Evaluate a release
 
 Run the command with the deployed checkout or installed resource bundle as its working
