@@ -2649,8 +2649,7 @@ pub(crate) fn backfill_stdlib_opt_ir_aig_equiv_suggestions(
             }
 
             let mut supported = false;
-            match resolve_driver_ir_aig_equiv_supported(store, repo_root, &version, &equiv_runtime)
-            {
+            match resolve_driver_ir_aig_equiv_supported(store, repo_root, &equiv_runtime) {
                 Ok(true) => {
                     ir_aig_equiv_supported += 1;
                     supported = true;

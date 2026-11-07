@@ -233,28 +233,21 @@ def write_capabilities(
     driver_exe = shutil.which("xlsynth-driver")
     if driver_exe is not None:
         runner_family = "driver"
-        help_proc = subprocess.run(
-            [driver_exe, "--help"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-        combined_help = f"{help_proc.stdout}\n{help_proc.stderr}"
+
+        def driver_help(*args: str) -> str:
+            return subprocess.run(
+                [driver_exe, *args, "--help"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=True,
+            ).stdout
+
+        combined_help = driver_help()
         for subcommand in DRIVER_PROBED_SUBCOMMANDS:
             driver_subcommands[subcommand] = (
                 re.search(rf"^[ \t]+{re.escape(subcommand)}(?:[ \t]|$)", combined_help, re.MULTILINE)
                 is not None
             )
         for subcommand, tokens in DRIVER_PROBED_HELP_TOKENS.items():
-            help_proc = subprocess.run(
-                [driver_exe, subcommand, "--help"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-            subcommand_help = f"{help_proc.stdout}\n{help_proc.stderr}"
+            subcommand_help = driver_help(subcommand) if driver_subcommands[subcommand] else ""
             driver_help_tokens[subcommand] = {
                 token: token in subcommand_help for token in tokens
             }
@@ -477,12 +470,11 @@ def main() -> int:
             "hostname": socket.gethostname(),
         },
     )
-    write_capabilities(
-        capabilities_path,
-        args.runner_key,
-        args.runner_instance_id,
-        args.image,
-    )
+    try:
+        write_capabilities(capabilities_path, args.runner_key, args.runner_instance_id, args.image)
+    except subprocess.CalledProcessError as error:
+        # Script requests can still run. The host retries missing capability evidence.
+        print(f"driver capability probe failed: {error}", file=sys.stderr)
 
     stop_event = threading.Event()
     heartbeat_thread = threading.Thread(

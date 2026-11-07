@@ -14,6 +14,10 @@ pub(crate) use provenance::{decode_provenance, encode_provenance};
 pub(crate) use queue::*;
 pub(crate) use release_input::release_input_for_dso_version;
 
+pub(crate) mod cache {
+    include!(concat!(env!("OUT_DIR"), "/xlsynth.bvc.cache.v1.rs"));
+}
+
 #[allow(dead_code)]
 pub(crate) mod v1 {
     include!(concat!(env!("OUT_DIR"), "/xlsynth.bvc.v1.rs"));

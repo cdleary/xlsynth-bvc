@@ -7,7 +7,6 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use walkdir::WalkDir;
 
 use crate::model::*;
@@ -29,14 +28,6 @@ use crate::{
     driver_ir_aig_equiv_enabled, incremental_ir_corpus_upsert_enabled,
 };
 
-type DriverSubcommandSupportCacheKey = (String, String, String, String);
-static DRIVER_SUBCOMMAND_SUPPORT_CACHE: OnceLock<
-    Mutex<BTreeMap<DriverSubcommandSupportCacheKey, bool>>,
-> = OnceLock::new();
-type DriverSubcommandHelpTokenCacheKey = (String, String, String, String, String);
-static DRIVER_SUBCOMMAND_HELP_TOKEN_CACHE: OnceLock<
-    Mutex<BTreeMap<DriverSubcommandHelpTokenCacheKey, bool>>,
-> = OnceLock::new();
 const DRIVER_IR_EQUIV_TIMEOUT_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1641,12 +1632,7 @@ pub(crate) fn run_driver_ir_to_opt_action(
         details.insert("driver_ir_aig_equiv_supported".to_string(), json!(false));
         details.insert("driver_ir_aig_equiv_quarantined".to_string(), json!(true));
     } else {
-        match resolve_driver_ir_aig_equiv_supported(
-            store,
-            repo_root,
-            version,
-            &ir_aig_equiv_runtime,
-        ) {
+        match resolve_driver_ir_aig_equiv_supported(store, repo_root, &ir_aig_equiv_runtime) {
             Ok(true) => {
                 details.insert("driver_ir_aig_equiv_supported".to_string(), json!(true));
                 details.insert(
@@ -1919,35 +1905,19 @@ pub(crate) fn build_opt_ir_aig_equiv_suggestions(
 pub(crate) fn resolve_driver_ir_aig_equiv_supported(
     store: &ArtifactStore,
     repo_root: &Path,
-    version: &str,
     runtime: &DriverRuntimeSpec,
 ) -> Result<bool> {
-    let supports_aig2ir =
-        driver_supports_subcommand_cached(store, repo_root, version, runtime, "aig2ir")?;
-    let supports_ir_equiv =
-        driver_supports_subcommand_cached(store, repo_root, version, runtime, "ir-equiv")?;
-    Ok(supports_aig2ir && supports_ir_equiv)
+    let capabilities = load_driver_runner_capabilities(store, repo_root, runtime)?;
+    Ok(capabilities.aig2ir == Some(true) && capabilities.ir_equiv == Some(true))
 }
 
 pub(crate) fn resolve_driver_ir2gates_prepared_ir_supported(
     store: &ArtifactStore,
     repo_root: &Path,
-    version: &str,
     runtime: &DriverRuntimeSpec,
 ) -> Result<bool> {
-    let supports_ir2gates =
-        driver_supports_subcommand_cached(store, repo_root, version, runtime, "ir2gates")?;
-    if !supports_ir2gates {
-        return Ok(false);
-    }
-    driver_subcommand_help_has_token_cached(
-        store,
-        repo_root,
-        version,
-        runtime,
-        "ir2gates",
-        "--prepared-ir-out",
-    )
+    let capabilities = load_driver_runner_capabilities(store, repo_root, runtime)?;
+    Ok(capabilities.ir2gates == Some(true) && capabilities.ir2gates_prepared_ir_out == Some(true))
 }
 
 pub(crate) fn is_first_opt_action_for_output_structural_hash(
@@ -2282,87 +2252,6 @@ test -s /outputs/ir_equiv.json
     })
 }
 
-pub(crate) fn driver_supports_subcommand_cached(
-    store: &ArtifactStore,
-    repo_root: &Path,
-    version: &str,
-    runtime: &DriverRuntimeSpec,
-    subcommand: &str,
-) -> Result<bool> {
-    let key: DriverSubcommandSupportCacheKey = (
-        normalize_tag_version(version).to_string(),
-        runtime.driver_version.clone(),
-        runtime.release_platform.clone(),
-        subcommand.to_string(),
-    );
-    if let Some(cache) = DRIVER_SUBCOMMAND_SUPPORT_CACHE.get()
-        && let Ok(guard) = cache.lock()
-        && let Some(value) = guard.get(&key)
-    {
-        return Ok(*value);
-    }
-
-    let supported =
-        probe_driver_subcommand_support(store, repo_root, runtime, version, subcommand)?;
-    let cache = DRIVER_SUBCOMMAND_SUPPORT_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(key, supported);
-    }
-    Ok(supported)
-}
-
-pub(crate) fn probe_driver_subcommand_support(
-    store: &ArtifactStore,
-    repo_root: &Path,
-    runtime: &DriverRuntimeSpec,
-    _version: &str,
-    subcommand: &str,
-) -> Result<bool> {
-    driver_runner_supports_subcommand(store, repo_root, runtime, subcommand)
-}
-
-pub(crate) fn driver_subcommand_help_has_token_cached(
-    store: &ArtifactStore,
-    repo_root: &Path,
-    version: &str,
-    runtime: &DriverRuntimeSpec,
-    subcommand: &str,
-    token: &str,
-) -> Result<bool> {
-    let key: DriverSubcommandHelpTokenCacheKey = (
-        normalize_tag_version(version).to_string(),
-        runtime.driver_version.clone(),
-        runtime.release_platform.clone(),
-        subcommand.to_string(),
-        token.to_string(),
-    );
-    if let Some(cache) = DRIVER_SUBCOMMAND_HELP_TOKEN_CACHE.get()
-        && let Ok(guard) = cache.lock()
-        && let Some(value) = guard.get(&key)
-    {
-        return Ok(*value);
-    }
-
-    let supported =
-        probe_driver_subcommand_help_token(store, repo_root, runtime, version, subcommand, token)?;
-    let cache = DRIVER_SUBCOMMAND_HELP_TOKEN_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(key, supported);
-    }
-    Ok(supported)
-}
-
-pub(crate) fn probe_driver_subcommand_help_token(
-    store: &ArtifactStore,
-    repo_root: &Path,
-    runtime: &DriverRuntimeSpec,
-    _version: &str,
-    subcommand: &str,
-    token: &str,
-) -> Result<bool> {
-    driver_runner_subcommand_help_has_token(store, repo_root, runtime, subcommand, token)
-}
-
 fn effective_xlsynth_version_for_runtime(
     repo_root: &Path,
     requested_version: &str,
@@ -2403,7 +2292,7 @@ pub(crate) fn run_driver_ir_aig_equiv_action(
     let effective_version = effective_xlsynth_version_for_runtime(repo_root, version, runtime);
     let mut commands = Vec::new();
     ensure_driver_runtime_prepared(store, repo_root, &effective_version, runtime, &mut commands)?;
-    if !resolve_driver_ir_aig_equiv_supported(store, repo_root, version, runtime)? {
+    if !resolve_driver_ir_aig_equiv_supported(store, repo_root, runtime)? {
         bail!(
             "driver runtime does not support IR<->AIG equivalence flow (requires aig2ir+ir-equiv): crate:{} dso:{}",
             normalize_tag_version(&runtime.driver_version),
@@ -2688,7 +2577,7 @@ fn prepare_driver_ir_to_g8r_batch_action(
             json!("legacy_cli_unsupported"),
         );
     } else {
-        match resolve_driver_ir2gates_prepared_ir_supported(store, repo_root, version, runtime) {
+        match resolve_driver_ir2gates_prepared_ir_supported(store, repo_root, runtime) {
             Ok(supported) => {
                 capture_prepared_ir = supported;
                 details.insert(
@@ -2727,12 +2616,7 @@ fn prepare_driver_ir_to_g8r_batch_action(
         details.insert("driver_ir_aig_equiv_supported".to_string(), json!(false));
         details.insert("driver_ir_aig_equiv_quarantined".to_string(), json!(true));
     } else {
-        match resolve_driver_ir_aig_equiv_supported(
-            store,
-            repo_root,
-            version,
-            &ir_aig_equiv_runtime,
-        ) {
+        match resolve_driver_ir_aig_equiv_supported(store, repo_root, &ir_aig_equiv_runtime) {
             Ok(true) => {
                 details.insert("driver_ir_aig_equiv_supported".to_string(), json!(true));
                 details.insert(
@@ -3161,7 +3045,7 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
             json!("legacy_cli_unsupported"),
         );
     } else {
-        match resolve_driver_ir2gates_prepared_ir_supported(store, repo_root, version, runtime) {
+        match resolve_driver_ir2gates_prepared_ir_supported(store, repo_root, runtime) {
             Ok(supported) => {
                 capture_prepared_ir = supported;
                 details.insert(
@@ -3200,12 +3084,7 @@ pub(crate) fn run_driver_ir_to_g8r_aig_action(
         details.insert("driver_ir_aig_equiv_supported".to_string(), json!(false));
         details.insert("driver_ir_aig_equiv_quarantined".to_string(), json!(true));
     } else {
-        match resolve_driver_ir_aig_equiv_supported(
-            store,
-            repo_root,
-            version,
-            &ir_aig_equiv_runtime,
-        ) {
+        match resolve_driver_ir_aig_equiv_supported(store, repo_root, &ir_aig_equiv_runtime) {
             Ok(true) => {
                 details.insert("driver_ir_aig_equiv_supported".to_string(), json!(true));
                 details.insert(

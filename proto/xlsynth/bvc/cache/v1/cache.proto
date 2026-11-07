@@ -47,3 +47,14 @@ message ReuseReceipt {
   xlsynth.bvc.v1.Provenance source = 4;
   xlsynth.bvc.v1.Provenance input = 5;
 }
+
+// Boot-time probes for the immutable image and worker protocol in runner_key.
+// An absent probe is incomplete evidence. A present false is a valid result.
+message DriverRunnerCapabilities {
+  string runner_key = 1;
+  optional bool aig2ir = 2;
+  optional bool ir_equiv = 3;
+  optional bool ir2g8r = 4;
+  optional bool ir2gates = 5;
+  optional bool ir2gates_prepared_ir_out = 6;
+}
