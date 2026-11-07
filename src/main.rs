@@ -18,6 +18,7 @@ mod cli;
 mod coordinator;
 mod corpus;
 mod corpus_scheduling;
+mod crossmap_proto;
 mod downstream_cache;
 mod dslx_corpus;
 mod executor;

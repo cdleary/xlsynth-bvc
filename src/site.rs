@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 #[path = "site_corpus.rs"]
 pub(crate) mod site_corpus;
+#[path = "site_crossmap.rs"]
+mod site_crossmap;
 #[path = "site_dashboard.rs"]
 pub(crate) mod site_dashboard;
 #[path = "site_shards.rs"]

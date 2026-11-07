@@ -100,9 +100,11 @@ message DashboardSite {
 }
 
 // Version 2 binds canonical PublicTechmapRun evidence to its browser projection.
+// Version 3 additionally binds optional mapper-isolation experiment evidence.
 message TechmapSite {
   uint32 record_version = 1;
   repeated TechmapRunPublication runs = 2;
+  repeated xlsynth.bvc.v1.PublicationFile crossmap_runs = 3;
 }
 message TechmapRunPublication {
   // SHA-256 of the complete PublicTechmapRun reconstructed from its shards.
