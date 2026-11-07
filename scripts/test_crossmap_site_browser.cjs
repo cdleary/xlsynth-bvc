@@ -102,7 +102,7 @@ async function checkOverview(run){
   assert.deepEqual(sortedCoordinates(await plotted('input-aig')),sortedCoordinates(expectedInput));
   assert.equal(await evaluate("Number(document.getElementById('crossmap').dataset.sampleCount)"),run.samples.length);
   for(const id of ['same-aig','input-aig']){
-    const state=await evaluate(`(()=>{const plot=document.getElementById(${JSON.stringify(id)});return {xaxis:plot.layout.xaxis.type,yaxis:plot.layout.yaxis.type,noWebgl:plot.querySelectorAll('.no-webgl').length,points:plot.data.reduce((n,t)=>n+t.x.length,0),note:document.getElementById(${JSON.stringify(id+'-note')}).dataset,visible:document.getElementById(${JSON.stringify(id+'-note')}).getBoundingClientRect().height>0};})()`);
+    const state=await evaluate(`(()=>{const plot=document.getElementById(${JSON.stringify(id)});return {xaxis:plot.layout.xaxis.type,yaxis:plot.layout.yaxis.type,noWebgl:plot.querySelectorAll('.no-webgl').length,points:plot.data.reduce((n,t)=>n+t.x.length,0),note:Object.fromEntries(Object.entries(document.getElementById(${JSON.stringify(id+'-note')}).dataset)),visible:document.getElementById(${JSON.stringify(id+'-note')}).getBoundingClientRect().height>0};})()`);
     assert.equal(state.xaxis,'log');assert.equal(state.yaxis,'log');assert.equal(state.noWebgl,0);assert.equal(Number(state.note.plottedPoints),state.points);assert.equal(state.visible,true);
     for(const [key,value] of Object.entries(id==='same-aig'?sameCounts:inputCounts))assert.equal(Number(state.note[key]),value,`${id}: ${key}`);
   }
@@ -138,7 +138,7 @@ async function main(){
   assert.deepEqual(policy['script-src'],["'self'"]);
   assert.equal(await evaluate("Array.from(document.scripts,script=>new URL(script.src).pathname.split('/').at(-1)).filter(name=>name==='plotly-strict-2.35.2.min.js').length"),1);
   const selectedRun=await evaluate("document.getElementById('run').value"),run=catalog.runs.find(r=>r.id===selectedRun);assert.ok(run);
-  await checkOverview(run);await checkLegend();await checkPlotSelection(run);await evaluate('window.scrollTo(0,0)');await new Promise(resolve=>setTimeout(resolve,300));await shot('crossmap-desktop');
+  await checkOverview(run);await checkLegend();await checkPlotSelection(run);await send('Input.dispatchMouseEvent',{type:'mouseMoved',x:10,y:10});await evaluate("document.querySelectorAll('.notifier').forEach(node=>node.remove());window.scrollTo(0,0)");await new Promise(resolve=>setTimeout(resolve,300));await evaluate("document.querySelectorAll('.notifier,.plotly-notifier,.notifier-container').forEach(node=>node.remove())");await shot('crossmap-desktop');
   await control('reference','area');await checkOverview(run);await control('reference','delay');await checkOverview(run);
   const wanted=run.samples.at(-1);
   await control('search',wanted.id,'input');
@@ -151,18 +151,20 @@ async function main(){
   const zero=run.samples.find(sample=>sample.points.some(p=>p.area===0||p.delay_ps===0));
   if(zero){await control('input',zero.id);await checkSelected(run,zero.id);}
   await control('search','','input');
-  await control('input',wanted.id);await evaluate("document.getElementById('absolute').scrollIntoView()");await shot('crossmap-input');
+  await control('input',wanted.id);await evaluate("document.getElementById('selection').scrollIntoView()");await shot('crossmap-input');
   await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
   const longest=run.samples.reduce((a,b)=>a.label.length>=b.label.length?a:b);
   await control('input',longest.id);await checkSelected(run,longest.id);
   await evaluate('window.scrollTo(0,0)');await new Promise(resolve=>setTimeout(resolve,400));await ready();
-  const mobile=await evaluate('({width:innerWidth,content:document.documentElement.scrollWidth,title:document.getElementById("input-title").textContent,titleWidth:document.getElementById("input-title").getBoundingClientRect().width})');
+  const mobile=await evaluate('({width:innerWidth,content:document.documentElement.scrollWidth,title:document.getElementById("input-title").textContent,titleWidth:document.getElementById("input-title").getBoundingClientRect().width,titleContent:document.getElementById("input-title").scrollWidth,titleBox:document.getElementById("input-title").clientWidth})');
+  assert.equal(mobile.width,390,`mobile layout viewport keeps the device width: ${JSON.stringify(mobile)}`);
   assert.ok(mobile.content<=mobile.width,`mobile page has no horizontal overflow: ${JSON.stringify(mobile)}`);
+  assert.ok(mobile.titleContent<=mobile.titleBox+1,`mobile function title fits its panel: ${JSON.stringify(mobile)}`);
   for(const id of ['same-aig','input-aig','absolute']){
     const bounds=await evaluate(`(()=>{const plot=document.getElementById(${JSON.stringify(id)}),legend=plot.querySelector('.legend'),outer=plot.getBoundingClientRect(),box=legend.getBoundingClientRect();return {top:box.top-outer.top,bottom:box.bottom-outer.top,gridTop:plot._fullLayout._size.t,right:box.right-outer.left,width:outer.width};})()`);
     assert.ok(bounds.top>=-2&&bounds.bottom<=bounds.gridTop+2&&bounds.right<=bounds.width+2,`${id}: ${JSON.stringify(bounds)}`);
   }
-  await shot('crossmap-mobile');await evaluate("document.getElementById('absolute').scrollIntoView()");await shot('crossmap-mobile-input');
+  await shot('crossmap-mobile');await evaluate("document.getElementById('selection').scrollIntoView()");await shot('crossmap-mobile-input');
   assert.deepEqual(await evaluate('window.__bvcPolicyViolations'),[]);assert.deepEqual(errors,[]);
   console.log(`Crossmap browser integration passed (${run.samples.length} inputs)`);
 }
