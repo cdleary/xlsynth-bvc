@@ -95,6 +95,7 @@ async function checkPlots(run){
   const summaryCounts=await evaluate("document.getElementById('summary').dataset.better===undefined?null:Object.fromEntries(['better','tradeoff','equal','worse','missing'].map(key=>[key,Number(document.getElementById('summary').dataset[key])]))");
   if(summaryCounts!==null)assert.deepEqual(summaryCounts,Object.fromEntries(['better','tradeoff','equal','worse','missing'].map(key=>[key,summary[key]])));
   const expected=normalizedSpec(selected,goal);
+  assert.deepEqual(await evaluate("['xaxis','yaxis'].map(axis=>document.getElementById('normalized').layout[axis].type)"),['log','log']);
   assert.deepEqual(await evaluate("document.getElementById('normalized').data.map(trace=>[trace.x,trace.y])"),expected.data.map(trace=>[trace.x,trace.y]));
   assert.deepEqual(await evaluate("document.getElementById('normalized').data.map(t=>[t.name,t.legendgroup,t.marker.color,t.marker.symbol])"),expected.data.map(t=>[t.name,t.legendgroup,t.marker.color,t.marker.symbol]));
   assert.deepEqual(await evaluate('window.__bvcPolicyViolations'),[]);
