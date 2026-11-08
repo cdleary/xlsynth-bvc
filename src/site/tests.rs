@@ -966,9 +966,7 @@ fn progression_graph_le_is_validated_bound_and_preserved() {
         fs::read(site_dir.join(format!("data/progression-runs/{generation_id}/evidence.pb")))
             .unwrap();
     let (_, generation, runtime) = decode_progression_run_evidence(&evidence_bytes).unwrap();
-    let catalog =
-        decode_canonical_browser_catalog(&fs::read(site_dir.join("catalog.json")).unwrap())
-            .unwrap();
+    let catalog = read_browser_catalog(&site_dir).unwrap();
     let published = catalog
         .progression
         .cohorts
@@ -1044,6 +1042,16 @@ fn progression_graph_le_is_validated_bound_and_preserved() {
     fs::remove_dir_all(root).unwrap();
 }
 
+fn encode_test_browser_catalog(site_dir: &Path, catalog: &BrowserCatalog) -> Result<Vec<u8>> {
+    let mut files = browser_catalog_files(catalog)?;
+    let catalog_bytes = files.remove("catalog.json").expect("catalog projection");
+    for (relpath, bytes) in files {
+        fs::write(site_dir.join(&relpath), bytes)?;
+        refresh_site_manifest_entry(site_dir, &relpath);
+    }
+    Ok(catalog_bytes)
+}
+
 #[test]
 fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     let root = temp_root();
@@ -1051,8 +1059,8 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     verify_static_site(&site_dir).expect("verify historical candidate site");
     let catalog_path = site_dir.join("catalog.json");
     let catalog_bytes = fs::read(&catalog_path).expect("read candidate browser catalog");
-    let mut catalog =
-        decode_canonical_browser_catalog(&catalog_bytes).expect("decode candidate browser catalog");
+    let original_catalog = read_browser_catalog(&site_dir).expect("read candidate browser catalog");
+    let mut catalog = original_catalog.clone();
     assert_eq!(catalog.progression_evidence.len(), 1);
     assert_eq!(catalog.progression_evidence[0].generation_id, generation_id);
     assert_eq!(
@@ -1095,7 +1103,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     sample.g8r_product_loss = sample.g8r_product - sample.yosys_abc_product;
     fs::write(
         &catalog_path,
-        encode_browser_catalog(&catalog).expect("encode tampered catalog"),
+        encode_test_browser_catalog(&site_dir, &catalog).expect("encode tampered catalog"),
     )
     .expect("write self-consistent tampered catalog");
     refresh_site_manifest_entry(&site_dir, "catalog.json");
@@ -1165,8 +1173,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
         "unexpected error: {custom_runtime_error:#}"
     );
     fs::write(&evidence_path, &custom_runtime_bytes).expect("write custom-runtime evidence");
-    let mut custom_runtime_catalog =
-        decode_canonical_browser_catalog(&catalog_bytes).expect("decode restored browser catalog");
+    let mut custom_runtime_catalog = original_catalog.clone();
     let custom_runtime_ref = custom_runtime_catalog
         .progression_evidence
         .iter_mut()
@@ -1176,7 +1183,8 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     custom_runtime_ref.sha256 = sha256_hex(&custom_runtime_bytes);
     fs::write(
         &catalog_path,
-        encode_browser_catalog(&custom_runtime_catalog).expect("encode custom-runtime catalog"),
+        encode_test_browser_catalog(&site_dir, &custom_runtime_catalog)
+            .expect("encode custom-runtime catalog"),
     )
     .expect("write custom-runtime catalog");
     refresh_site_manifest_entry(&site_dir, "catalog.json");
@@ -1201,8 +1209,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     let mislabeled_evidence_bytes = mislabeled_evidence.encode_to_vec();
     fs::write(&evidence_path, &mislabeled_evidence_bytes)
         .expect("write mislabeled candidate evidence");
-    let mut mislabeled_catalog =
-        decode_canonical_browser_catalog(&catalog_bytes).expect("decode restored browser catalog");
+    let mut mislabeled_catalog = original_catalog.clone();
     {
         let generation = mislabeled_catalog
             .progression
@@ -1225,7 +1232,8 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     mislabeled_evidence_ref.sha256 = sha256_hex(&mislabeled_evidence_bytes);
     fs::write(
         &catalog_path,
-        encode_browser_catalog(&mislabeled_catalog).expect("encode mislabeled candidate catalog"),
+        encode_test_browser_catalog(&site_dir, &mislabeled_catalog)
+            .expect("encode mislabeled candidate catalog"),
     )
     .expect("write mislabeled candidate catalog");
     refresh_site_manifest_entry(&site_dir, "catalog.json");
@@ -1257,8 +1265,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     );
     fs::write(&evidence_path, &historical_timestamp_bytes)
         .expect("write historical timestamp evidence");
-    let mut historical_timestamp_catalog =
-        decode_canonical_browser_catalog(&catalog_bytes).expect("decode restored browser catalog");
+    let mut historical_timestamp_catalog = original_catalog.clone();
     let historical_timestamp_ref = historical_timestamp_catalog
         .progression_evidence
         .iter_mut()
@@ -1268,7 +1275,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     historical_timestamp_ref.sha256 = sha256_hex(&historical_timestamp_bytes);
     fs::write(
         &catalog_path,
-        encode_browser_catalog(&historical_timestamp_catalog)
+        encode_test_browser_catalog(&site_dir, &historical_timestamp_catalog)
             .expect("encode historical timestamp catalog"),
     )
     .expect("write historical timestamp catalog");
@@ -1289,8 +1296,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     evidence.samples[0].g8r_nodes += 1.0;
     let tampered_evidence_bytes = evidence.encode_to_vec();
     fs::write(&evidence_path, &tampered_evidence_bytes).expect("write tampered candidate evidence");
-    let mut evidence_catalog =
-        decode_canonical_browser_catalog(&catalog_bytes).expect("decode restored browser catalog");
+    let mut evidence_catalog = original_catalog.clone();
     let evidence_ref = evidence_catalog
         .progression_evidence
         .iter_mut()
@@ -1300,7 +1306,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     evidence_ref.sha256 = sha256_hex(&tampered_evidence_bytes);
     fs::write(
         &catalog_path,
-        encode_browser_catalog(&evidence_catalog).expect("encode evidence catalog"),
+        encode_test_browser_catalog(&site_dir, &evidence_catalog).expect("encode evidence catalog"),
     )
     .expect("write evidence catalog");
     refresh_site_manifest_entry(&site_dir, "catalog.json");
@@ -2063,6 +2069,7 @@ fn explicit_release_progression_generation_supersedes_snapshot_generation() {
         missing_cohort_ir_count: 0,
         extra_ir_count: 0,
         run_samples: Vec::new(),
+        run_samples_shard: None,
     };
     let mut catalog = BrowserProgressionCatalog {
         cohort_id: "test".to_string(),
@@ -2336,6 +2343,7 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
         missing_cohort_ir_count: 0,
         extra_ir_count: 0,
         run_samples,
+        run_samples_shard: None,
     };
     let observation = RepositoryHeadObservationView {
         schema_version: 2,
@@ -3402,10 +3410,7 @@ fn site_verifier_binds_release_catalog_to_versions_dataset() {
     })
     .expect("build site");
 
-    let catalog_path = site_dir.join("catalog.json");
-    let mut catalog: BrowserCatalog =
-        serde_json::from_slice(&fs::read(&catalog_path).expect("read catalog"))
-            .expect("decode catalog");
+    let mut catalog = read_browser_catalog(&site_dir).expect("read catalog");
     catalog.releases.push(CrateReleaseStatusView {
         crate_version: "0.35.0".to_string(),
         crate_release_datetime: "2026-08-28 17:52:54 PDT".to_string(),
@@ -3744,9 +3749,7 @@ fn site_verifier_binds_dataset_bytes_to_source_snapshot() {
     fs::write(&dataset_path, changed.as_bytes()).expect("rewrite dataset");
 
     let catalog_path = site_dir.join("catalog.json");
-    let mut catalog: BrowserCatalog =
-        serde_json::from_slice(&fs::read(&catalog_path).expect("read catalog"))
-            .expect("decode catalog");
+    let mut catalog = read_browser_catalog(&site_dir).expect("read catalog");
     let dataset = catalog
         .datasets
         .iter_mut()
@@ -3977,3 +3980,5 @@ fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() 
     drop(store);
     fs::remove_dir_all(root).expect("cleanup");
 }
+
+mod progression_sample_shards;
