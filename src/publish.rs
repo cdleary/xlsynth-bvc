@@ -26,7 +26,16 @@ pub(crate) const PUBLICATION_LOCK_FILENAME: &str = ".publication.lock";
 const PUBLISHED_ROOT_INDEX_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>xlsynth-bvc results</title></head>
 <body><p id="status">Loading current xlsynth-bvc results…</p><script>
-function currentSiteTarget(current,locationValue){const requested=locationValue.pathname.replace(/^\/+/, '');const reserved=requested===''||requested==='index.html'||requested==='current.json'||requested==='current.pb'||requested.startsWith('sites/')||requested.startsWith('catalogs/');const aliases={'progression':'progression.html','progression/':'progression.html','runs':'runs.html','runs/':'runs.html','dataset':'dataset.html','dataset/':'dataset.html','releases':'releases.html','releases/':'releases.html','mffc-discrepancies':'mffc-discrepancies.html','mffc-discrepancies/':'mffc-discrepancies.html'};const suffix=reserved?'':(aliases[requested]||requested);return `/${current.site_url}${suffix}${locationValue.search}${locationValue.hash}`}
+function currentSiteTarget(current,locationValue){
+let requested=locationValue.pathname.replace(/^\/+/, '');
+const previous=requested.match(/^sites\/([0-9a-f]{64})\/((?:corpus|history|tech-mapped-asap7|ir)(?:\/.*)?)$/);
+if(previous&&`sites/${previous[1]}/`!==current.site_url){
+const safe=previous[2].split('/').every(component=>{try{const part=decodeURIComponent(component);return part!=='.'&&part!=='..'&&!/[\\/]/.test(part)&&!['sites','catalogs','current.json','current.pb'].includes(part)}catch{return false}});
+if(safe)requested=previous[2];
+}
+const reserved=requested===''||requested==='index.html'||requested==='current.json'||requested==='current.pb'||requested.startsWith('sites/')||requested.startsWith('catalogs/');
+const aliases={'progression':'progression.html','progression/':'progression.html','runs':'runs.html','runs/':'runs.html','dataset':'dataset.html','dataset/':'dataset.html','releases':'releases.html','releases/':'releases.html','mffc-discrepancies':'mffc-discrepancies.html','mffc-discrepancies/':'mffc-discrepancies.html'};
+const suffix=reserved?'':(aliases[requested]||requested);return `/${current.site_url}${suffix}${locationValue.search}${locationValue.hash}`}
 fetch('/current.json',{cache:'no-store'}).then(response=>{if(!response.ok)throw new Error(`current.json ${response.status}`);return response.json()}).then(current=>{if(current.schema_version!==1||!/^sites\/[0-9a-f]{64}\/$/.test(current.site_url))throw new Error('invalid current site pointer');window.location.replace(currentSiteTarget(current,window.location))}).catch(error=>{document.getElementById('status').textContent=`Unable to load current results: ${error.message}`});
 </script></body></html>
 "#;
@@ -761,11 +770,35 @@ const cases = [
   [{pathname: '/progression.html', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/progression.html'],
   [{pathname: '/runs/abc', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/runs/abc'],
   [{pathname: '/index.html', search: '?source=root', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/?source=root'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/corpus/', search: '?release=0.77.0&stage=raw', hash: '#loss'}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/corpus/?release=0.77.0&stage=raw#loss'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/history/ir-fn-corpus-g8r-vs-yosys-abc/', search: '?crate_version=0.74.0', hash: '#plot-nodes'}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/history/ir-fn-corpus-g8r-vs-yosys-abc/?crate_version=0.74.0#plot-nodes'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/history/progression.html', search: '?cohort=mffc-v1', hash: '#chart'}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/history/progression.html?cohort=mffc-v1#chart'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/tech-mapped-asap7/mapper-isolation.html', search: '?release=0.79.0', hash: '#input'}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/tech-mapped-asap7/mapper-isolation.html?release=0.79.0#input'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/ir/00.tar.zst', search: '?download=true', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ir/00.tar.zst?download=true'],
+  [{pathname: '/sites/' + 'a'.repeat(64) + '/corpus/missing', search: '?source=missing', hash: '#chart'}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/?source=missing#chart'],
+  [{pathname: '/sites/' + 'b'.repeat(63) + '/corpus/', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
+  [{pathname: '/sites/' + 'z'.repeat(64) + '/history/', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/current.json', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/catalogs/record.pb', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/sites/' + 'c'.repeat(64) + '/corpus/', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/history/sites/' + 'c'.repeat(64) + '/corpus/', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/history/%63atalogs/record.pb', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/history/current.json', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/history/../corpus/', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/history/%2e%2e/corpus/', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/history/%2f%2fexample.test/', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/history/%5ccatalogs/', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
+  [{pathname: '/sites/' + 'b'.repeat(64) + '/history/%invalid/', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
+  [{pathname: '/catalogs/record.pb', search: '', hash: ''}, '/sites/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'],
 ];
 for (const [locationValue, expected] of cases) {
   const actual = currentSiteTarget(current, locationValue);
   if (actual !== expected) {
     throw new Error(`expected ${expected}, got ${actual}`);
+  }
+  const destination = new URL(actual, 'https://example.test');
+  if (destination.origin !== 'https://example.test') {
+    throw new Error(`redirect left the publication origin: ${destination}`);
   }
 }
 "#;

@@ -3,7 +3,7 @@
 'use strict';
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),cp=require('node:child_process'),assert=require('node:assert/strict');
 const {once}=require('node:events');
-const {trendSpec,transitionSpec,resultHref,stageInfo,change,percent,validateDetail}=require('../src/site_assets/dashboard.js');
+const {trendSpec,transitionSpec,stageInfo,change,percent,validateDetail}=require('../src/site_assets/dashboard.js');
 const url=new URL(process.argv[2]),screenshots=process.argv[3];
 const profile=fs.mkdtempSync(path.join(os.tmpdir(),'bvc-dashboard-browser-'));
 const chrome=cp.spawn(process.env.BVC_CHROME||'google-chrome',['--headless=new','--no-sandbox','--disable-gpu','--disable-dev-shm-usage','--disable-background-networking','--disable-component-update','--disable-default-apps','--disable-sync','--no-first-run','--remote-debugging-pipe',`--user-data-dir=${profile}`,'about:blank'],{stdio:['ignore','ignore','ignore','pipe','pipe']});
@@ -20,18 +20,48 @@ async function main(){
   const {targetId}=await send('Target.createTarget',{url:'about:blank'},true);session=(await send('Target.attachToTarget',{targetId,flatten:true},true)).sessionId;
   await send('Runtime.enable');await send('Page.enable');await send('Network.enable');
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1180,deviceScaleFactor:1,mobile:false});await send('Page.navigate',{url:url.href});await ready();
-  assert.equal(await evaluate("document.getElementById('latest-version').textContent"),`v${data.versions.at(-1).crate_version}`);
+  const latestAig=[...data.versions].reverse().find(version=>version.full_count>0),latestTechmap=[...data.versions].reverse().find(version=>version.techmap_cohorts?.length);
+  const aigHref=latestAig?`corpus/?release=${latestAig.crate_version}&stage=abc&reference=yosys`:null;
+  const mappedCohort=latestTechmap?.techmap_cohorts.find(cohort=>cohort.id==='full-corpus')||latestTechmap?.techmap_cohorts.find(cohort=>cohort.id==='whole-functions-v1')||latestTechmap?.techmap_cohorts[0];
   assert.equal(await evaluate("document.getElementById('stage').value"),'raw');
-  assert.equal(await evaluate("document.getElementById('latest-link').getAttribute('href')"),resultHref(data.versions.at(-1),'raw'));
+  assert.equal(await evaluate("document.getElementById('latest-link')"),null);
+  assert.equal(await evaluate("document.getElementById('latest-aig-link').hidden"),!latestAig);
+  assert.equal(await evaluate("document.getElementById('latest-techmap-link').hidden"),!latestTechmap);
+  if(latestAig){
+    assert.equal(await evaluate("document.getElementById('latest-aig-version').textContent"),`v${latestAig.crate_version}`);
+    assert.equal(await evaluate("document.getElementById('latest-aig-link').getAttribute('href')"),aigHref);
+    assert.equal(await evaluate("document.getElementById('aig-link').getAttribute('href')"),aigHref);
+  }
+  if(latestTechmap){
+    assert.equal(await evaluate("document.getElementById('latest-techmap-version').textContent"),`v${latestTechmap.crate_version}`);
+    assert.equal(await evaluate("document.getElementById('latest-techmap-link').getAttribute('href')"),mappedCohort.url);
+    assert.equal(await evaluate("document.getElementById('techmap-link').getAttribute('href')"),mappedCohort.url);
+  }
+  assert.deepEqual(await evaluate("Array.from(document.querySelectorAll('#versions thead th'),node=>node.textContent)"),['Release','IR/AIG comparisons','Release progression','Tech mapped ASAP7']);
+  for(const version of data.versions){
+    const cells=await evaluate(`(()=>{const row=Array.from(document.querySelectorAll('#version-rows tr')).find(row=>row.dataset.version===${JSON.stringify(version.crate_version)});return {releaseLink:row.firstChild.querySelector('a')!==null,cells:Object.fromEntries(Array.from(row.querySelectorAll('td[data-dimension]'),cell=>[cell.dataset.dimension,{links:Array.from(cell.querySelectorAll('a'),a=>a.getAttribute('href')),text:cell.textContent}]))};})()`);
+    assert.equal(cells.releaseLink,false);
+    const ir=version.full_count?['abc','raw'].map(stage=>`corpus/?release=${version.crate_version}&stage=${stage}&reference=yosys`):[];
+    for(const [pairs,measurements,route] of [[version.historical_abc_count||0,version.historical_abc_measurements||0,'ir-fn-g8r-abc-vs-codegen-yosys-abc'],[version.historical_raw_count||0,version.historical_raw_measurements||0,'ir-fn-corpus-g8r-vs-yosys-abc']]){if(pairs)ir.push(`history/${route}/?crate_version=${version.crate_version}`);if(measurements>2*pairs)ir.push('history/dataset.html');}
+    assert.deepEqual(cells.cells['ir-aig'].links,ir);
+    assert.deepEqual(cells.cells.progression.links,version.cohorts.map(cohort=>cohort.url));
+    assert.deepEqual(cells.cells.techmap.links,(version.techmap_cohorts||[]).map(cohort=>cohort.url));
+    if(!ir.length)assert.equal(cells.cells['ir-aig'].text,'No IR/AIG comparisons');
+    if(!version.cohorts.length)assert.equal(cells.cells.progression.text,'No release progression');
+    if(!version.techmap_cohorts?.length)assert.equal(cells.cells.techmap.text,'No ASAP7 results');
+  }
   assert.deepEqual(await evaluate("Array.from(document.querySelectorAll('#version-rows tr'),r=>r.firstChild.textContent)"),[...data.versions].reverse().map(v=>`v${v.crate_version}`));
   assert.deepEqual(await evaluate("Array.from(document.getElementById('cohort').options,o=>o.value)"),data.trends.map(t=>t.id));
   await shot('dashboard-desktop');
+  await evaluate("document.getElementById('versions').scrollIntoView()");await shot('dashboard-results-table');await evaluate('window.scrollTo(0,0)');
   const initialCohort=await evaluate("document.getElementById('cohort').value"),initialSeries=data.trends.find(t=>t.id===initialCohort).stages.raw;
   const initialJson=[...new Set(resources.filter(r=>new URL(r).pathname.endsWith('.json')).map(r=>new URL(r).pathname))];
   assert.deepEqual(initialJson,[new URL('dashboard.json',url).pathname,...(initialSeries.points.at(-1)?.transition?[new URL(initialSeries.points.at(-1).transition.details,url).pathname]:[])]);
   for(const stage of ['raw','abc']){
     await evaluate(`document.getElementById('stage').value=${JSON.stringify(stage)};document.getElementById('stage').dispatchEvent(new Event('change'))`);await ready();
     assert.equal(await evaluate("document.getElementById('trend-title').textContent"),stageInfo[stage].title);
+    if(latestAig)assert.equal(await evaluate("document.getElementById('latest-aig-link').getAttribute('href')"),aigHref);
+    if(latestTechmap)assert.equal(await evaluate("document.getElementById('latest-techmap-link').getAttribute('href')"),mappedCohort.url);
     for(const trend of data.trends){
       await evaluate(`document.getElementById('cohort').value=${JSON.stringify(trend.id)};document.getElementById('cohort').dispatchEvent(new Event('change'))`);await ready();
       const series=trend.stages[stage],selected=await evaluate("document.getElementById('release').value"),point=series.points.find(p=>p.version===selected),spec=trendSpec(series,selected),strip=transitionSpec(series,selected);
@@ -93,6 +123,16 @@ async function main(){
   const links=await evaluate("Array.from(document.querySelectorAll('a[href]'),a=>a.href)");
   assert.equal(links.some(href=>['history/','history/index.html'].some(p=>new URL(href).pathname===new URL(p,url).pathname)),false);
   for(const href of new Set(links)){const r=await fetch(href);assert.equal(r.status,200,href);await r.body.cancel()}
+  if(latestAig){
+    await send('Page.navigate',{url:await evaluate("document.getElementById('latest-aig-link').href")});
+    await waitFor("document.getElementById('corpus-site')?.dataset.rendered==='true'");
+    assert.equal(await evaluate("document.getElementById('release').value"),latestAig.crate_version);
+    assert.equal(await evaluate("document.getElementById('stage').value"),'abc');
+    assert.equal(await evaluate("document.getElementById('reference').value"),'yosys');
+    assert.deepEqual(await evaluate("['loss','product','nodes'].map(id=>[document.getElementById(id).layout.xaxis.type,document.getElementById(id).layout.yaxis.type])"),[['log','log'],['log','log'],['log','log']]);
+    await shot('dashboard-ir-aig-entry');
+    await send('Page.navigate',{url:url.href});await ready();
+  }
   // Verify every generated detail page, including nested campaign routes, has
   // exactly the same global destinations and no link back to a second overview.
   const catalogResponse=await fetch(new URL('history/catalog.json',url));assert.equal(catalogResponse.status,200);
@@ -101,7 +141,7 @@ async function main(){
   for(const page of detailPages){
     const target=new URL(page,url),response=await fetch(target);assert.equal(response.status,200);const html=await response.text();
     const parsed=await evaluate(`(()=>{const doc=new DOMParser().parseFromString(${JSON.stringify(html)},'text/html');return {nav:Array.from(doc.querySelectorAll('nav[aria-label="Primary navigation"] a'),a=>[a.textContent,a.getAttribute('href')]),back:Array.from(doc.querySelectorAll('a')).filter(a=>a.textContent.trim()==='← Results').map(a=>a.getAttribute('href'))}})()`);
-    assert.deepEqual(parsed.nav.map(([label,href])=>[label,new URL(href,target).href]),[['Results','index.html'],['Latest','index.html#latest'],['All versions','index.html#versions'],['Progression','history/progression.html']].map(([label,href])=>[label,new URL(href,url).href]));
+    assert.deepEqual(parsed.nav.map(([label,href])=>[label,new URL(href,target).href]),[['Results','index.html'],['IR/AIG plots','corpus/'],['Release progression','history/progression.html'],...(data.techmap_url?[['Tech mapped ASAP7','tech-mapped-asap7/']]:[]),['All versions','index.html#versions']].map(([label,href])=>[label,new URL(href,url).href]));
     assert.ok(parsed.back.every(href=>new URL(href,target).href===new URL('index.html',url).href));
   }
   for(const oldLanding of ['history/','history/index.html']){
@@ -111,7 +151,8 @@ async function main(){
   }
   await send('Emulation.setDeviceMetricsOverride',{width:390,height:1000,deviceScaleFactor:1,mobile:true});await evaluate('window.dispatchEvent(new Event("resize"))');
   await new Promise(r=>setTimeout(r,500));
-  assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true);await shot('dashboard-mobile');
+  assert.equal(await evaluate('innerWidth'),390);assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true);await shot('dashboard-mobile');
+  await evaluate("document.getElementById('versions').scrollIntoView()");await shot('dashboard-results-table-mobile');
   assert.ok(await evaluate("document.getElementById('release-changes').layout.xaxis.tickvals.length<=4"));
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1180,deviceScaleFactor:1,mobile:false});
   const historical=data.trends.find(t=>t.id!=='full-corpus'&&t.stages.raw.points.length>1);
