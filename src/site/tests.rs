@@ -2119,6 +2119,47 @@ fn progression_comparison_allows_release_specific_stats_drivers() {
 }
 
 #[test]
+fn release_progression_admits_only_the_versioned_canonical_driver_recipe() {
+    for (version, correct, wrong) in [
+        (
+            "0.74.0",
+            crate::DEFAULT_DOCKERFILE,
+            crate::MODERN_DRIVER_DOCKERFILE,
+        ),
+        (
+            "0.79.0",
+            crate::DEFAULT_DOCKERFILE,
+            crate::MODERN_DRIVER_DOCKERFILE,
+        ),
+        (
+            "0.80.0",
+            crate::MODERN_DRIVER_DOCKERFILE,
+            crate::DEFAULT_DOCKERFILE,
+        ),
+        (
+            "0.81.0",
+            crate::MODERN_DRIVER_DOCKERFILE,
+            crate::DEFAULT_DOCKERFILE,
+        ),
+    ] {
+        let mut runtime = candidate_driver_runtime(&"8".repeat(40), false);
+        runtime.driver_version = version.to_string();
+        runtime.docker_image = crate::runtime::default_driver_image(version);
+        runtime.dockerfile = correct.to_string();
+        validate_release_progression_driver_runtime(&runtime)
+            .expect("canonical version-specific released recipe");
+        runtime.dockerfile = wrong.to_string();
+        assert!(validate_release_progression_driver_runtime(&runtime).is_err());
+        runtime.dockerfile = correct.to_string();
+        runtime.source_revision = Some(DriverSourceRevision {
+            repository: crate::XLSYNTH_CRATE_GIT_REPOSITORY.to_string(),
+            commit: "8".repeat(40),
+        });
+        assert!(validate_release_progression_driver_runtime(&runtime).is_err());
+    }
+}
+
+#[test]
 fn progression_catalog_uses_fixed_ir_structural_hash_population() {
     fn sample(
         crate_version: &str,

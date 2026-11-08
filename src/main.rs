@@ -64,6 +64,7 @@ const ACTION_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_STORE_DIR: &str = "bvc-artifacts";
 const DEFAULT_RELEASE_PLATFORM: &str = "ubuntu2004";
 const DEFAULT_DOCKERFILE: &str = "docker/xlsynth-driver.Dockerfile";
+const MODERN_DRIVER_DOCKERFILE: &str = "docker/xlsynth-driver-modern.Dockerfile";
 const DEFAULT_GIT_DOCKERFILE: &str = "docker/xlsynth-driver-git.Dockerfile";
 const DEFAULT_DOCKER_IMAGE_PREFIX: &str = "xlsynth-bvc-driver";
 const XLSYNTH_CRATE_GIT_REPOSITORY: &str = "https://github.com/xlsynth/xlsynth-crate";
@@ -257,7 +258,7 @@ impl DriverCli {
         let default_dockerfile = if source_revision.is_some() {
             crate::DEFAULT_GIT_DOCKERFILE
         } else {
-            crate::DEFAULT_DOCKERFILE
+            crate::runtime::default_driver_dockerfile(&resolved_driver_version)
         };
         let dockerfile = self
             .dockerfile
@@ -495,6 +496,11 @@ mod tests {
             include_bytes!("../docker/xlsynth-driver.Dockerfile"),
         )
         .expect("write test runtime Dockerfile");
+        fs::write(
+            root.join(MODERN_DRIVER_DOCKERFILE),
+            include_bytes!("../docker/xlsynth-driver-modern.Dockerfile"),
+        )
+        .expect("write test modern runtime Dockerfile");
         let cache_script = root.join(VENDORED_DOWNLOAD_RELEASE_SCRIPT);
         fs::create_dir_all(cache_script.parent().expect("cache script parent"))
             .expect("create cache script parent");

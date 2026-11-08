@@ -879,6 +879,7 @@ mod tests {
         for relpath in [
             crate::VERSION_COMPAT_PATH,
             crate::DEFAULT_DOCKERFILE,
+            crate::MODERN_DRIVER_DOCKERFILE,
             crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
         ] {
             let target = root.join(relpath);
@@ -1249,6 +1250,7 @@ mod tests {
             crate::VERSION_COMPAT_PATH,
             crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
             crate::DEFAULT_DOCKERFILE,
+            crate::MODERN_DRIVER_DOCKERFILE,
             crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
         ] {
             let destination = repo_root.join(relpath);
