@@ -142,6 +142,14 @@ pub enum TopCommand {
         #[command(subcommand)]
         action: RunAction,
     },
+    /// Retry only the specified failed or canceled actions using their stored specs.
+    RetryActions {
+        #[arg(long, required = true, value_name = "ACTION_ID")]
+        action_id: Vec<String>,
+        /// Retry priority; terminal records do not retain the previous priority.
+        #[arg(long, default_value_t = crate::DEFAULT_QUEUE_PRIORITY)]
+        priority: i32,
+    },
     EnqueueCrateVersion {
         #[arg(long)]
         crate_version: String,
@@ -821,4 +829,43 @@ pub struct YosysCli {
     pub(crate) yosys_docker_image: String,
     #[arg(long, default_value = crate::DEFAULT_YOSYS_UPSTREAM_COMMIT)]
     pub(crate) yosys_upstream_commit: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_actions_cli_requires_explicit_ids_and_parses_repeated_ids() {
+        let error = Cli::try_parse_from(["xlsynth-bvc", "retry-actions"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        for priority in [None, Some("42")] {
+            let mut args = vec![
+                "xlsynth-bvc",
+                "retry-actions",
+                "--action-id",
+                first.as_str(),
+                "--action-id",
+                second.as_str(),
+            ];
+            if let Some(priority) = priority {
+                args.extend(["--priority", priority]);
+            }
+            let cli = Cli::try_parse_from(args).expect("parse explicit retries");
+            let TopCommand::RetryActions {
+                action_id,
+                priority: parsed_priority,
+            } = cli.command
+            else {
+                panic!("expected retry-actions command");
+            };
+            assert_eq!(action_id, [first.clone(), second.clone()]);
+            assert_eq!(parsed_priority, if priority.is_some() { 42 } else { 0 });
+        }
+    }
 }
