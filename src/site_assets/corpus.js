@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 'use strict';
 (() => {
+  const stats=typeof module!=='undefined'?require('./aggregation.js'):globalThis.BvcCostStats;
   const names = row => row.function_names.length ? row.function_names.join(', ') : row.top_fn_name;
   const product = row => row.g8r_nodes * row.g8r_depth;
   function metricComparison(current, previous, currentYosys, previousYosys) {
@@ -41,9 +42,10 @@
       && (options.max === null || r.ir_node_count <= options.max) && (!options.losses || r.change > 0));
   }
   function summarize(rows) {
-    return rows.reduce((s,r) => ({count:s.count+1,cost:s.cost+r.cost,reference:s.reference+r.reference_cost,
+    const totals=rows.reduce((s,r) => ({count:s.count+1,cost:s.cost+r.cost,reference:s.reference+r.reference_cost,
       better:s.better+Number(r.change<0),worse:s.worse+Number(r.change>0),unchanged:s.unchanged+Number(r.change===0)}),
       {count:0,cost:0,reference:0,better:0,worse:0,unchanged:0});
+    return {...totals,geomean:stats.summarizePairs(rows.map(r=>({before:r.reference_cost,after:r.cost})))};
   }
   const lossRows = rows => rows.filter(r => Number.isFinite(r.ir_node_count) && r.ir_node_count > 0 && Number.isFinite(r.change) && r.change > 0);
   function comparisonCsv(rows) {
@@ -101,7 +103,7 @@
   async function render() {
     const token=state.epoch;byId('error').textContent='';byId('corpus-site').dataset.rendered='loading';
     byId('scope').textContent='Loading selected release…';
-    const stage=byId('stage').value, stageLabel=stage==='raw'?'g8r (no FRAIG, pre-ABC)':'g8r+ABC';
+    const aggregation=stats.selectedAggregation(byId('aggregation').value),geomean=aggregation==='geomean',stage=byId('stage').value, stageLabel=stage==='raw'?'g8r (no FRAIG, pre-ABC)':'g8r+ABC';
     byId('reference').querySelector('option[value="release"]').textContent=`Another release’s ${stageLabel}`;
     byId('baseline').disabled=byId('reference').value!=='release';
     const version=byId('release').value, baselineVersion=byId('baseline').value, compare=byId('reference').value;
@@ -115,9 +117,10 @@
     byId('scope').textContent=`${fmt(s.count)} / ${fmt(state.catalog.sample_count)} inputs · v${version} ${stageLabel} versus ${reference}`;
     byId('coverage').textContent=`${state.catalog.generations.length} complete releases · ${fmt(state.catalog.sample_count)} identical frozen inputs each · ${stage==='raw'?'pre-ABC, no FRAIG':'post-ABC'} measurements · no partial samples`;
     const totals=metricComparison(s.cost,s.reference,rows.reduce((a,r)=>a+r.metrics.product.new_yosys,0),baseline?rows.reduce((a,r)=>a+r.metrics.product.old_yosys,0):null);
-    const cards=[['Aggregate direct change',signed(totals.percent,'%')],['Lower / higher cost',`${fmt(s.better)} / ${fmt(s.worse)}`],['Unchanged cost',fmt(s.unchanged)],['Filtered inputs',fmt(s.count)]];
-    if(baseline)cards.push(['A vs its Yosys',signed(totals.old_vs_yosys_percent,'%')],['B vs its Yosys',signed(totals.new_vs_yosys_percent,'%')],['Change relative to Yosys',signed(totals.relative_pp,' pp')]);
+    const cards=[[geomean?'Geometric-mean direct change':'Total direct change',signed(geomean?s.geomean.percent:totals.percent,'%')],['Positive pairs / filtered inputs',`${fmt(s.geomean.eligible)} / ${fmt(s.count)}`],['Lower / higher cost',`${fmt(s.better)} / ${fmt(s.worse)}`],['Unchanged cost',fmt(s.unchanged)],['Filtered inputs',fmt(s.count)]];
+    if(baseline)cards.push(['Total A vs its Yosys',signed(totals.old_vs_yosys_percent,'%')],['Total B vs its Yosys',signed(totals.new_vs_yosys_percent,'%')],['Total change relative to Yosys',signed(totals.relative_pp,' pp')]);
     byId('summary').replaceChildren(...cards.map(([label,value])=>{const card=document.createElement('div');card.className='card';const title=document.createElement('span');title.textContent=label;const number=document.createElement('strong');number.textContent=value;card.append(title,number);return card}));
+    byId('aggregation-method').textContent=`${geomean?'Geometric mean = exp(mean(log(selected cost) − log(reference cost))); each positive pair has equal weight.':'Total change uses the ratio of summed costs; larger inputs carry more weight.'} This summary describes only the selected, filtered comparison: ${fmt(s.geomean.eligible)} / ${fmt(s.count)} pairs have positive costs on both sides. It does not use the fixed positive population of the release trends. Zero costs are excluded from the geometric mean without an epsilon. Zero transitions: ${fmt(s.geomean.zero_cost.zero_to_zero)} zero → zero · ${fmt(s.geomean.zero_cost.positive_to_zero)} positive → zero · ${fmt(s.geomean.zero_cost.zero_to_positive)} zero → positive. Total cost, counts, and individual plots include zero costs where their axes permit.`;
     byId('metric-details').replaceChildren();
     ++state.selected;byId('selected').textContent='Click a point or outlier to inspect its verified source IR.';byId('ir').hidden=true;
     const body=byId('outliers');body.replaceChildren();
@@ -131,7 +134,7 @@
     await scatter('nodes',rows,r=>r.reference_nodes,r=>r.g8r_nodes,`${reference} AND nodes`,`v${version} AND nodes`,true,true);
     await scatter('delta',rows,r=>r.g8r_nodes-r.reference_nodes,r=>r.g8r_depth-r.reference_depth,'Selected − reference AND nodes','Selected − reference depth',false,false);
     if(token!==state.epoch)return;
-    const url=new URL(location.href);url.searchParams.set('release',version);url.searchParams.set('reference',compare);url.searchParams.set('baseline',baselineVersion);url.searchParams.set('stage',stage);history.replaceState(null,'',url);
+    const url=new URL(location.href);url.searchParams.set('release',version);url.searchParams.set('reference',compare);url.searchParams.set('baseline',baselineVersion);url.searchParams.set('stage',stage);url.searchParams.set('aggregation',aggregation);history.replaceState(null,'',url);
     const selected=rows.find(r=>r.sample_id===state.selectedId);
     if(selected){await selectSample(selected);if(location.hash==='#input-detail')byId('input-detail').scrollIntoView({block:'start'});}
     if(token!==state.epoch)return;
@@ -157,11 +160,12 @@
     byId('baseline').value=versions.includes(query.get('baseline'))?query.get('baseline'):versions.at(-2)||versions[0];
     byId('reference').value=query.get('reference')==='release'?'release':'yosys';
     byId('stage').value=query.get('stage')==='raw'?'raw':'abc';
+    byId('aggregation').value=stats.selectedAggregation(query.get('aggregation'));
     byId('download').addEventListener('click',()=>{
       const url=URL.createObjectURL(new Blob([comparisonCsv(state.rows)],{type:'text/csv;charset=utf-8'}));
       const link=document.createElement('a');link.href=url;link.download=`bvc-${byId('release').value}-${byId('stage').value}-vs-${byId('reference').value==='release'?byId('baseline').value:'yosys'}-${byId('kind').value}.csv`;link.click();URL.revokeObjectURL(url);
     });
-    for(const name of ['release','baseline','reference','stage','kind','search','max-ir','losses'])byId(name).addEventListener('change',requestRender);
+    for(const name of ['release','baseline','reference','stage','aggregation','kind','search','max-ir','losses'])byId(name).addEventListener('change',requestRender);
     await requestRender();
   }
   void main().catch(e=>{byId('error').textContent=e.message;byId('corpus-site').dataset.rendered='error'});

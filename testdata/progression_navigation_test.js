@@ -6,6 +6,7 @@ const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const {createHash, webcrypto} = require('node:crypto');
 const {TextDecoder} = require('node:util');
+const BvcCostStats=require(require('node:path').resolve('src/site_assets/aggregation.js'));
 const source = fs.readFileSync(0, 'utf8');
 const copy = value => JSON.parse(JSON.stringify(value));
 const hash = n => n.toString(16).padStart(64, '0');
@@ -26,7 +27,7 @@ function browser(search = '', fetchShard = () => new Promise(() => {}), options 
     document: {querySelector: () => ({content: './'}), getElementById: element},
     // Keep automatic main() pending; invoke the actual progression handler directly.
     fetch: url => url === './catalog.json' ? new Promise(() => {}) : fetchShard(url),
-    crypto: options.noCrypto ? undefined : webcrypto, TextDecoder, URL, URLSearchParams, location,
+    crypto: options.noCrypto ? undefined : webcrypto, TextDecoder, URL, URLSearchParams, location, BvcCostStats,
     history: {replaceState(_state, _title, url) { location.href = String(url); }},
     captureRender: (...args) => renders.push(args),
     captureDataset: (...args) => datasetLoads.push(args),
@@ -68,6 +69,7 @@ function legacyCatalog() {
 function selection(page) {
   const selected = {baseline: page.element('baseline-version').value, current: page.element('current-version').value};
   const query = new URL(page.location.href).searchParams;
+  assert.equal(query.get('aggregation'),page.element('aggregation').value);
   assert.equal(query.get('baseline'), selected.baseline);
   assert.equal(query.get('current'), selected.current);
   assert.equal(query.get('include_incomplete') === 'true', page.element('include-incomplete').checked);
@@ -253,6 +255,12 @@ async function shardRejections() {
   assert.deepEqual(await navigate('?cohort=whole-functions-v1&current=partial&include_incomplete=true'), {baseline: 'last', current: 'partial'});
   assert.deepEqual(await navigate('?cohort=whole-functions-v1&current=first&baseline=first'), {baseline: 'first', current: 'first'});
   assert.deepEqual(await navigate('?cohort=whole-functions-v1&current=last&baseline=first'), {baseline: 'first', current: 'last'});
+  const aggregatePage=browser('?aggregation=total');
+  await aggregatePage.context.progression(legacyCatalog());
+  assert.equal(aggregatePage.element('aggregation').value,'total');
+  aggregatePage.element('aggregation').value='geomean';
+  aggregatePage.element('aggregation').listeners.get('change')();
+  assert.equal(new URL(aggregatePage.location.href).searchParams.get('aggregation'),'geomean');
   await shardContract();
   await shardRejections();
 })().catch(error => { console.error(error); process.exitCode = 1; });
