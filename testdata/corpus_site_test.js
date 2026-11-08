@@ -4,7 +4,10 @@ const assert = require('node:assert/strict');
 const {names, pairRows, filterRows, summarize, lossRows, metricComparison, comparisonCsv} = require('../src/site_assets/corpus.js');
 const row = {sample_id:'a',source_sha256:'1',top_fn_name:'whole',source_relpath:'whole.ir',input_kinds:['whole'],function_names:['whole'],ir_node_count:4,g8r_nodes:2,g8r_depth:3,g8r_le:1.5,yosys_nodes:3,yosys_depth:3,yosys_le:2};
 const all = pairRows([row,{...row,sample_id:'b',g8r_nodes:4},{...row,sample_id:'c',g8r_nodes:3}]);
-assert.deepEqual(summarize(all), {count:3,cost:27,reference:27,better:1,worse:1,unchanged:1});
+const {geomean,...totals}=summarize(all);
+assert.deepEqual(totals, {count:3,cost:27,reference:27,better:1,worse:1,unchanged:1});
+assert.equal(geomean.eligible,3);
+assert.ok(Math.abs(geomean.ratio-Math.cbrt(8/9))<1e-12);
 assert.deepEqual(filterRows(all,{kind:'all',max:4,losses:true}).map(r=>r.sample_id),['b']);
 assert.deepEqual(filterRows(all,{kind:'all',max:3,losses:false}),[]);
 // The f32 adder is a whole function AND a deduplicated extracted MFFC.
@@ -73,3 +76,12 @@ assert.equal(metricComparison(null,10,null,10).relative_pp,null);
 assert.throws(()=>pairRows([row],[row,{...row,sample_id:'extra'}]));
 assert.throws(()=>pairRows([row,row],[row,row]));
 assert.throws(()=>pairRows([row],[{...row,source_relpath:'another.ir'}]));
+
+// Summary eligibility follows the filtered comparison, with explicit zero transitions.
+const zeroPairs=pairRows([{...row,sample_id:'zz',g8r_nodes:0,yosys_nodes:0},{...row,sample_id:'pz',g8r_nodes:0},{...row,sample_id:'zp',yosys_nodes:0},row]);
+const zeroSummary=summarize(zeroPairs).geomean;
+assert.deepEqual([zeroSummary.total,zeroSummary.eligible],[4,1]);
+assert.deepEqual(zeroSummary.zero_cost,{positive_to_positive:1,zero_to_zero:1,positive_to_zero:1,zero_to_positive:1});
+assert.ok(Math.abs(zeroSummary.ratio-2/3)<1e-12);
+const lossesSummary=summarize(filterRows(zeroPairs,{kind:'all',max:null,losses:true})).geomean;
+assert.deepEqual([lossesSummary.total,lossesSummary.eligible,lossesSummary.ratio],[1,0,null]);

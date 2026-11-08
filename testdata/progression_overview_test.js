@@ -2,6 +2,7 @@
 // Semantic contract: exact cohort pairing, weighting, classification, and plot data.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+require(require('node:path').resolve('src/site_assets/aggregation.js'));
 global.document = {querySelector: () => ({content: ''}), getElementById: () => null};
 const app = fs.readFileSync(0, 'utf8').split('async function main()')[0];
 const api = new Function(app + '\nreturn {costComparison,costOverview,costTrendSpec,costContributionSpec,costHeadline};')();
@@ -18,7 +19,7 @@ assert.equal(pair.percent, -1000 / 112);
 assert.equal(pair.rows.find(row => row.key === hash(3)).percent, null);
 assert.equal(pair.rows.find(row => row.key === hash(2)).percent, 100);
 assert.equal(pair.complete, true);
-assert.equal(api.costHeadline(pair), '8.93% lower total cost');
+assert.equal(api.costHeadline(pair,'total'), '8.93% lower total cost');
 const reference = api.costComparison(before, after, 'yosys');
 assert.deepEqual(reference.counts, {lower: 3, equal: 1, higher: 0});
 assert.equal(reference.old, 300);
@@ -33,7 +34,7 @@ const partialPair = api.costComparison(before, partial);
 assert.deepEqual([partialPair.added, partialPair.removed, partialPair.rows.length], [1, 3, 1]);
 assert.deepEqual([partialPair.old, partialPair.now], [100, 80]);
 assert.equal(partialPair.complete, false);
-const model = api.costOverview([before, after, partial, git], 'before', 'after');
+const model = api.costOverview([before, after, partial, git], 'before', 'after', 'baseline', 'total');
 assert.deepEqual(model.history.map(row => row.generation.generation_id), ['before', 'after', 'git']);
 assert.equal(model.selected.index, pair.index);
 const trend = api.costTrendSpec(model);
@@ -82,10 +83,37 @@ assert.equal(zeroTrend.traces[0].connectgaps, false);
 assert.equal(zeroTrend.layout.annotations.length, 2);
 const equal = api.costComparison(before, before);
 assert.deepEqual(equal.counts, {lower: 0, equal: 4, higher: 0});
-assert.equal(api.costHeadline(equal), 'Equal total cost');
+assert.equal(api.costHeadline(equal,'total'), 'Equal total cost');
 assert.equal(api.costComparison(before, generation('empty', [])).index, null);
 // A zero individual reference must not discard its absolute contribution to the total.
 const mixed = api.costComparison(generation('a', [sample(1, 100), sample(2, 0)]),
   generation('b', [sample(1, 80), sample(2, 10)]));
 assert.equal(mixed.index, 90);
 assert.deepEqual(mixed.counts, {lower: 1, equal: 0, higher: 1});
+
+// The default line gives each positive function equal weight across a fixed history.
+const final=generation('final',[sample(1,40),sample(2,0),sample(3,5),sample(4,2)]);
+const geometric=api.costOverview([before,after,final,partial],'before','after');
+assert.deepEqual(geometric.population,{eligible:2,total:4,generation_count:3});
+const geometricTrend=api.costTrendSpec(geometric);
+assert.ok(Math.abs(geometricTrend.traces[0].y[1]-100*Math.sqrt(.8))<1e-10);
+assert.ok(Math.abs(geometricTrend.traces[0].y[2]-100*Math.sqrt(.4))<1e-10);
+assert.equal(geometric.selected.geomean.eligible,2);
+assert.deepEqual(geometric.selected.pair_geomean.zero_cost,{positive_to_positive:3,zero_to_zero:1,positive_to_zero:0,zero_to_positive:0});
+const reverse=api.costOverview([before,after,final],'after','before');
+assert.deepEqual(reverse.population,geometric.population);
+assert.ok(Math.abs(reverse.selected.geomean.ratio*geometric.selected.geomean.ratio-1)<1e-12);
+const yosysGeometric=api.costOverview([before,after,final],'before','after','yosys');
+assert.equal(yosysGeometric.population.eligible,2);
+
+// Incomplete selections summarize their actual paired positive population;
+// they never borrow the fixed trend's denominator or erase valid pair ratios.
+const partialCurrent=api.costOverview([before,after,partial],'before','partial');
+assert.equal(partialCurrent.selected.complete,false);
+assert.equal(partialCurrent.population.eligible,3);
+assert.deepEqual([partialCurrent.selected.geomean.total,partialCurrent.selected.geomean.eligible],[1,1]);
+assert.ok(Math.abs(partialCurrent.selected.geomean.ratio-.8)<1e-12);
+const partialBaseline=api.costOverview([before,after,partial],'partial','after');
+assert.equal(partialBaseline.history.length,0);
+assert.deepEqual([partialBaseline.selected.geomean.total,partialBaseline.selected.geomean.eligible],[1,1]);
+assert.equal(partialBaseline.selected.geomean.ratio,1);
