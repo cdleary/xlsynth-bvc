@@ -658,6 +658,14 @@ pub(crate) fn run() -> Result<()> {
             let action_id = enqueue_action_with_priority(&store, action_spec, priority)?;
             println!("{}", action_id);
         }
+        TopCommand::RetryActions {
+            action_id,
+            priority,
+        } => {
+            for action_id in retry_actions_by_id_with_priority(&store, &action_id, priority)? {
+                println!("{}", action_id);
+            }
+        }
         TopCommand::EnqueueCrateVersion {
             crate_version,
             priority,

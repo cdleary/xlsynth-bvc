@@ -752,6 +752,15 @@ pub(crate) fn retry_action_with_priority(
     let action = crate::executor::canonicalize_action_identity(action);
     let action_id = crate::executor::compute_action_id(&action)?;
     let _transition_lock = QueueTransitionLock::acquire(store, &action_id)?;
+    retry_action_with_priority_locked(store, action, priority, action_id)
+}
+
+fn retry_action_with_priority_locked(
+    store: &ArtifactStore,
+    action: ActionSpec,
+    priority: i32,
+    action_id: String,
+) -> Result<String> {
     if !store.running_queue_path(&action_id).exists()
         && !store.done_queue_path(&action_id).exists()
         && !store.action_exists(&action_id)
@@ -760,6 +769,80 @@ pub(crate) fn retry_action_with_priority(
         remove_file_if_exists(&store.canceled_queue_path(&action_id))?;
     }
     enqueue_action_with_priority_locked(store, action, priority, action_id)
+}
+
+/// Retry an explicit set of terminal actions without reconstructing their identities or graph.
+/// All requested records are validated before any authoritative queue/result transition.
+/// Validation may repair diagnostic mirrors using existing store reads. I/O failures can still
+/// leave a partially retried set, because the existing retry transition is individually durable.
+pub(crate) fn retry_actions_by_id_with_priority(
+    store: &ArtifactStore,
+    action_ids: &[String],
+    priority: i32,
+) -> Result<Vec<String>> {
+    if action_ids.is_empty() {
+        bail!("retry requires at least one action id");
+    }
+    let mut actions = BTreeMap::new();
+    for action_id in action_ids {
+        if !is_action_id(action_id) {
+            bail!("retry requires a 64-character lowercase hexadecimal action id: {action_id}");
+        }
+        actions.insert(action_id.clone(), None);
+    }
+    let _migration_lock =
+        QueueTransitionLock::acquire_shared(store, QUEUE_IDENTITY_MIGRATION_LOCK_KEY)?;
+    // Failure propagation can hold a parent lock while taking descendant locks. Refuse busy
+    // actions instead of waiting with another requested action's lock already held.
+    let _locks = actions
+        .keys()
+        .map(|id| {
+            QueueTransitionLock::try_acquire(store, id)?
+                .with_context(|| format!("retry action is busy: {id}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (action_id, action) in &mut actions {
+        if store.pending_queue_path(action_id).exists()
+            || store.running_queue_path(action_id).exists()
+            || store.done_queue_path(action_id).exists()
+            || store.action_exists(action_id)
+        {
+            bail!("retry requires a failed or canceled action: {action_id}");
+        }
+        if resolve_queue_identity_alias(store, action_id)? != *action_id {
+            bail!("retry requires the canonical action id: {action_id}");
+        }
+        let failed = load_queue_failed_record(store, action_id)?;
+        let canceled = load_queue_canceled_record(store, action_id)?;
+        let (stored_id, stored_action) = match (failed, canceled) {
+            (Some(record), None) => (record.action_id, record.action),
+            (None, Some(record)) => (record.action_id, record.action),
+            (None, None) => bail!("no failed or canceled action found: {action_id}"),
+            (Some(_), Some(_)) => bail!("conflicting terminal records for action: {action_id}"),
+        };
+        let mut canonical = stored_action.clone();
+        replace_action_dependency_aliases(store, &mut canonical)?;
+        let canonical = crate::executor::canonicalize_action_identity(canonical);
+        if stored_id != *action_id
+            || crate::executor::compute_action_id(&canonical)? != *action_id
+            || crate::proto::action_spec_to_proto(&canonical)?
+                != crate::proto::action_spec_to_proto(&stored_action)?
+        {
+            bail!("stored action does not match canonical retry identity: {action_id}");
+        }
+        *action = Some(stored_action);
+    }
+    actions
+        .into_iter()
+        .map(|(id, action)| {
+            retry_action_with_priority_locked(
+                store,
+                action.expect("validated retry action"),
+                priority,
+                id,
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn enqueue_action(store: &ArtifactStore, action: ActionSpec) -> Result<String> {
@@ -4264,6 +4347,289 @@ mod tests {
             discovery_runtime: None,
             stdlib_tarball_sha256: "11".repeat(32),
         }
+    }
+
+    #[test]
+    fn retry_actions_requeues_only_explicit_failed_and_canceled_records() {
+        let (store, root) = make_test_store();
+        let failed_id = enqueue_action(&store, terminal_test_action()).unwrap();
+        let child_id = enqueue_action(
+            &store,
+            ActionSpec::DriverIrToOpt {
+                ir_action_id: failed_id.clone(),
+                top_fn_name: None,
+                version: "v0.37.0".to_owned(),
+                runtime: sample_runtime(),
+            },
+        )
+        .unwrap();
+        let grandchild_id = enqueue_action(
+            &store,
+            ActionSpec::DriverAigToStats {
+                aig_action_id: child_id.clone(),
+                version: "v0.37.0".to_owned(),
+                runtime: sample_runtime(),
+            },
+        )
+        .unwrap();
+        let omitted_id = enqueue_action(
+            &store,
+            ActionSpec::DriverIrToOpt {
+                ir_action_id: failed_id.clone(),
+                top_fn_name: None,
+                version: "v0.38.0".to_owned(),
+                runtime: sample_runtime(),
+            },
+        )
+        .unwrap();
+        let running = claim_next_pending_item(&store, "retry-test", 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.action_id(), failed_id);
+        assert_eq!(
+            fail_running_and_cancel_descendants(&store, &running, "retry-test", "test failure")
+                .unwrap(),
+            Some(3)
+        );
+        let omitted_before = fs::read(store.canceled_queue_path(&omitted_id)).unwrap();
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            failed_id.clone(),
+            crate::proto::action_spec_to_proto(
+                &load_queue_failed_record(&store, &failed_id)
+                    .unwrap()
+                    .unwrap()
+                    .action,
+            )
+            .unwrap(),
+        );
+        for id in [&child_id, &grandchild_id] {
+            expected.insert(
+                id.clone(),
+                crate::proto::action_spec_to_proto(
+                    &load_queue_canceled_record(&store, id)
+                        .unwrap()
+                        .unwrap()
+                        .action,
+                )
+                .unwrap(),
+            );
+        }
+        let completed_id = write_completed_provenance(&store, &"c".repeat(64));
+        let completed_before =
+            crate::proto::encode_provenance(&store.load_provenance(&completed_id).unwrap())
+                .unwrap();
+        let requested = [
+            failed_id.clone(),
+            child_id,
+            grandchild_id,
+            failed_id.clone(),
+        ];
+        let retried = retry_actions_by_id_with_priority(&store, &requested, 42).unwrap();
+        assert_eq!(retried, expected.keys().cloned().collect::<Vec<_>>());
+        for (id, expected_action) in expected {
+            let pending = load_queue_pending_record(&store, &id).unwrap().unwrap();
+            assert_eq!(pending.action_id, id);
+            assert_eq!(pending.priority, 42);
+            assert_eq!(
+                crate::proto::action_spec_to_proto(&pending.action).unwrap(),
+                expected_action
+            );
+            assert_eq!(
+                crate::executor::compute_action_id(&pending.action).unwrap(),
+                id
+            );
+            assert!(load_queue_failed_record(&store, &id).unwrap().is_none());
+            assert!(load_queue_canceled_record(&store, &id).unwrap().is_none());
+        }
+        assert_eq!(
+            fs::read(store.canceled_queue_path(&omitted_id)).unwrap(),
+            omitted_before
+        );
+        assert_eq!(
+            crate::proto::encode_provenance(&store.load_provenance(&completed_id).unwrap())
+                .unwrap(),
+            completed_before
+        );
+        assert!(!store.pending_queue_path(&completed_id).exists());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retry_actions_rejects_invalid_batches_without_changing_queue_or_provenance() {
+        let (store, root) = make_test_store();
+        let failed_id = enqueue_action(&store, terminal_test_action()).unwrap();
+        let running = claim_next_pending_item(&store, "retry-test", 60)
+            .unwrap()
+            .unwrap();
+        fail_running_and_cancel_descendants(&store, &running, "retry-test", "test failure")
+            .unwrap();
+        let failure_before = crate::proto::encode_queue_failed(
+            &load_queue_failed_record(&store, &failed_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let active_id = enqueue_action(
+            &store,
+            ActionSpec::ImportIrPackageFile {
+                source_sha256: "1".repeat(64),
+                top_fn_name: None,
+            },
+        )
+        .unwrap();
+        let active = claim_next_pending_item(&store, "retry-test", 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.action_id(), active_id);
+        let pending_id = enqueue_action(
+            &store,
+            ActionSpec::ImportIrPackageFile {
+                source_sha256: "2".repeat(64),
+                top_fn_name: None,
+            },
+        )
+        .unwrap();
+        let completed_id = write_completed_provenance(&store, &"c".repeat(64));
+        let completed = store.load_provenance(&completed_id).unwrap();
+        let completed_before = crate::proto::encode_provenance(&completed).unwrap();
+        write_done_record(
+            &store,
+            &active,
+            ArtifactRef {
+                action_id: active_id.clone(),
+                artifact_type: ArtifactType::IrPackageFile,
+                relpath: "payload/input.ir".to_owned(),
+            },
+            "retry-test",
+        )
+        .unwrap();
+        // Keep distinct running-only and done-only actions in the rejection matrix.
+        remove_file_if_exists(&active.path).unwrap();
+        let done_id = active_id;
+        let done_before = fs::read(store.done_queue_path(&done_id)).unwrap();
+        let active = claim_next_pending_item(&store, "retry-test", 60)
+            .unwrap()
+            .unwrap();
+        let active_id = pending_id;
+        let active_before = fs::read(&active.path).unwrap();
+        let pending_id = enqueue_action(
+            &store,
+            ActionSpec::ImportIrPackageFile {
+                source_sha256: "3".repeat(64),
+                top_fn_name: None,
+            },
+        )
+        .unwrap();
+        let pending_before = fs::read(store.pending_queue_path(&pending_id)).unwrap();
+        for rejected in [
+            "f".repeat(64),
+            "invalid".to_owned(),
+            active_id,
+            pending_id.clone(),
+            done_id.clone(),
+            completed_id.clone(),
+        ] {
+            assert!(
+                retry_actions_by_id_with_priority(&store, &[failed_id.clone(), rejected], 42)
+                    .is_err()
+            );
+            assert_eq!(
+                crate::proto::encode_queue_failed(
+                    &load_queue_failed_record(&store, &failed_id)
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                failure_before
+            );
+            assert!(!store.pending_queue_path(&failed_id).exists());
+            assert_eq!(fs::read(&active.path).unwrap(), active_before);
+            assert_eq!(
+                fs::read(store.pending_queue_path(&pending_id)).unwrap(),
+                pending_before
+            );
+            assert_eq!(
+                fs::read(store.done_queue_path(&done_id)).unwrap(),
+                done_before
+            );
+            assert_eq!(
+                crate::proto::encode_provenance(&store.load_provenance(&completed_id).unwrap())
+                    .unwrap(),
+                completed_before
+            );
+        }
+        assert!(retry_actions_by_id_with_priority(&store, &[], 0).is_err());
+        let busy = QueueTransitionLock::acquire(&store, &failed_id).unwrap();
+        assert!(
+            retry_actions_by_id_with_priority(&store, std::slice::from_ref(&failed_id), 0).is_err()
+        );
+        assert!(
+            load_queue_failed_record(&store, &failed_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!store.pending_queue_path(&failed_id).exists());
+        drop(busy);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retry_actions_rejects_mismatched_and_aliased_stored_identities() {
+        let (store, root) = make_test_store();
+        let stored_action = terminal_test_action();
+        let correct_id = crate::executor::compute_action_id(&stored_action).unwrap();
+        let mismatched_id = "1".repeat(64);
+        let old_dependency = "a".repeat(64);
+        let new_dependency = "b".repeat(64);
+        let dependent_action = ActionSpec::DriverAigToStats {
+            aig_action_id: old_dependency.clone(),
+            version: "v0.37.0".to_owned(),
+            runtime: sample_runtime(),
+        };
+        let dependent_id = crate::executor::compute_action_id(&dependent_action).unwrap();
+        for (id, action) in [
+            (mismatched_id.clone(), stored_action.clone()),
+            (correct_id.clone(), stored_action),
+            (dependent_id.clone(), dependent_action),
+        ] {
+            write_failed_action_record(
+                &store,
+                &QueueFailed {
+                    schema_version: crate::ACTION_SCHEMA_VERSION,
+                    action_id: id,
+                    enqueued_utc: Utc::now(),
+                    failed_utc: Utc::now(),
+                    failed_by: "retry-test".to_owned(),
+                    action,
+                    error: "test failure".to_owned(),
+                },
+            )
+            .unwrap();
+        }
+        write_queue_identity_alias(&store, &correct_id, &"2".repeat(64)).unwrap();
+        write_queue_identity_alias(&store, &old_dependency, &new_dependency).unwrap();
+        for id in [mismatched_id, correct_id, dependent_id] {
+            let before = crate::proto::encode_queue_failed(
+                &load_queue_failed_record(&store, &id).unwrap().unwrap(),
+            )
+            .unwrap();
+            assert!(
+                retry_actions_by_id_with_priority(&store, std::slice::from_ref(&id), 0).is_err()
+            );
+            assert_eq!(
+                crate::proto::encode_queue_failed(
+                    &load_queue_failed_record(&store, &id).unwrap().unwrap()
+                )
+                .unwrap(),
+                before
+            );
+            assert!(!store.pending_queue_path(&id).exists());
+        }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn bulk_test_actions(count: usize) -> Vec<(ActionSpec, i32)> {
