@@ -4,6 +4,7 @@
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),cp=require('node:child_process'),assert=require('node:assert/strict');
 const {once}=require('node:events');
 const {trendSpec,transitionSpec,stageInfo,change,percent,validateDetail}=require('../src/site_assets/dashboard.js');
+const {ratioPercent}=require('../src/site_assets/aggregation.js');
 const url=new URL(process.argv[2]),screenshots=process.argv[3];
 const profile=fs.mkdtempSync(path.join(os.tmpdir(),'bvc-dashboard-browser-'));
 const chrome=cp.spawn(process.env.BVC_CHROME||'google-chrome',['--headless=new','--no-sandbox','--disable-gpu','--disable-dev-shm-usage','--disable-background-networking','--disable-component-update','--disable-default-apps','--disable-sync','--no-first-run','--remote-debugging-pipe',`--user-data-dir=${profile}`,'about:blank'],{stdio:['ignore','ignore','ignore','pipe','pipe']});
@@ -23,6 +24,7 @@ async function main(){
   const latestAig=[...data.versions].reverse().find(version=>version.full_count>0),latestTechmap=[...data.versions].reverse().find(version=>version.techmap_cohorts?.length);
   const aigHref=latestAig?`corpus/?release=${latestAig.crate_version}&stage=abc&reference=yosys`:null;
   const mappedCohort=latestTechmap?.techmap_cohorts.find(cohort=>cohort.id==='full-corpus')||latestTechmap?.techmap_cohorts.find(cohort=>cohort.id==='whole-functions-v1')||latestTechmap?.techmap_cohorts[0];
+  assert.equal(await evaluate("document.getElementById('aggregation').value"),'geomean');
   assert.equal(await evaluate("document.getElementById('stage').value"),'raw');
   assert.equal(await evaluate("document.getElementById('latest-link')"),null);
   assert.equal(await evaluate("document.getElementById('latest-aig-link').hidden"),!latestAig);
@@ -57,6 +59,16 @@ async function main(){
   const initialCohort=await evaluate("document.getElementById('cohort').value"),initialSeries=data.trends.find(t=>t.id===initialCohort).stages.raw;
   const initialJson=[...new Set(resources.filter(r=>new URL(r).pathname.endsWith('.json')).map(r=>new URL(r).pathname))];
   assert.deepEqual(initialJson,[new URL('dashboard.json',url).pathname,...(initialSeries.points.at(-1)?.transition?[new URL(initialSeries.points.at(-1).transition.details,url).pathname]:[])]);
+  const initialSelected=await evaluate("document.getElementById('release').value"),initialPoint=initialSeries.points.find(point=>point.version===initialSelected);
+  assert.deepEqual(await evaluate("document.getElementById('trend').data[0].y"),trendSpec(initialSeries,initialSelected).data[0].y);
+  assert.deepEqual(await evaluate("document.getElementById('release-changes').data.map(trace=>trace.y)"),transitionSpec(initialSeries,initialSelected).data.map(trace=>trace.y));
+  assert.equal(await evaluate("document.getElementById('release-changes').data.length"),1);
+  assert.equal(await evaluate("document.getElementById('total-change-legend').hidden"),true);
+  if(initialPoint?.transition)assert.equal(await evaluate("document.getElementById('net-change').textContent"),percent(ratioPercent(initialPoint.transition.geomean_ratio)));
+  assert.equal(await evaluate("new URL(location.href).searchParams.get('aggregation')"),'geomean');
+  await evaluate("document.getElementById('aggregation').value='total';document.getElementById('aggregation').dispatchEvent(new Event('change'))");await ready();
+  assert.equal(await evaluate("document.getElementById('total-change-legend').hidden"),false);
+  assert.equal(await evaluate("new URL(location.href).searchParams.get('aggregation')"),'total');
   for(const stage of ['raw','abc']){
     await evaluate(`document.getElementById('stage').value=${JSON.stringify(stage)};document.getElementById('stage').dispatchEvent(new Event('change'))`);await ready();
     assert.equal(await evaluate("document.getElementById('trend-title').textContent"),stageInfo[stage].title);
@@ -64,7 +76,7 @@ async function main(){
     if(latestTechmap)assert.equal(await evaluate("document.getElementById('latest-techmap-link').getAttribute('href')"),mappedCohort.url);
     for(const trend of data.trends){
       await evaluate(`document.getElementById('cohort').value=${JSON.stringify(trend.id)};document.getElementById('cohort').dispatchEvent(new Event('change'))`);await ready();
-      const series=trend.stages[stage],selected=await evaluate("document.getElementById('release').value"),point=series.points.find(p=>p.version===selected),spec=trendSpec(series,selected),strip=transitionSpec(series,selected);
+      const series=trend.stages[stage],selected=await evaluate("document.getElementById('release').value"),point=series.points.find(p=>p.version===selected),spec=trendSpec(series,selected,false,'total'),strip=transitionSpec(series,selected,false,'total');
       assert.deepEqual(await evaluate("document.getElementById('trend').data[0].y"),spec.data[0].y);
       assert.deepEqual(await evaluate("document.getElementById('trend').data[0].customdata"),spec.data[0].customdata);
       assert.equal(await evaluate("document.getElementById('trend').data[0].connectgaps"),false);
@@ -116,6 +128,7 @@ async function main(){
   const documentOrigin=await evaluate('performance.timeOrigin');
   await send('Page.reload');await waitFor(`performance.timeOrigin!==${documentOrigin}`);await ready();
   assert.equal(await evaluate("document.getElementById('stage').value"),'raw');
+  assert.equal(await evaluate("document.getElementById('aggregation').value"),'total');
   // Only the summary and bounded selected-transition examples are fetched, not
   // the corpus catalog, sample metrics, fixed-cohort catalog, or source IR.
   const allowedJson=new Set([new URL('dashboard.json',url).pathname,...data.trends.flatMap(t=>Object.values(t.stages).flatMap(s=>s.points.flatMap(p=>p.transition?[new URL(p.transition.details,url).pathname]:[])))]);
@@ -166,6 +179,13 @@ async function main(){
       assert.equal(await evaluate("document.getElementById('baseline-version').value"),target.searchParams.get('baseline'));
       await waitFor("document.getElementById('progression-vectors')?.dataset.rendered==='true'");
       assert.equal(await evaluate("document.getElementById('vector-stage').value"),'raw');
+      await waitFor("document.getElementById('progression-overview')?.dataset.rendered==='true'");
+      assert.equal(await evaluate("document.getElementById('aggregation').value"),'geomean');
+      assert.equal(await evaluate("document.getElementById('progression-overview').dataset.aggregation"),'geomean');
+      await evaluate("document.getElementById('aggregation').value='total';document.getElementById('aggregation').dispatchEvent(new Event('change'))");
+      await waitFor("document.getElementById('progression-overview')?.dataset.rendered==='true'");
+      assert.equal(await evaluate("new URL(location.href).searchParams.get('aggregation')"),'total');
+      assert.equal(await evaluate("document.getElementById('progression-trend').layout.yaxis.title.text"),'Total cost index');
     }
     await shot('progression-navigation');
     await send('Page.navigate',{url:await evaluate("document.querySelector('.bvc-navigation-home').href")});await ready();

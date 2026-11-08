@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 'use strict';
 const assert=require('node:assert/strict');
-const {change,share,headline,trendSpec,transitionSpec,validateDetail,fullCorpusHref,measurementLinks,irComparisonLinks,techmapLinks,latestResults,selectedStage}=require('../src/site_assets/dashboard.js');
+const {change,share,headline,trendSpec:geomeanTrendSpec,transitionSpec:geomeanTransitionSpec,validateDetail,fullCorpusHref,measurementLinks,irComparisonLinks,techmapLinks,latestResults,selectedStage}=require('../src/site_assets/dashboard.js');
+const trendSpec=(series,selected,narrow)=>geomeanTrendSpec(series,selected,narrow,'total');
+const transitionSpec=(series,selected,narrow)=>geomeanTransitionSpec(series,selected,narrow,'total');
 assert.equal(change(100,80),-20);
 assert.equal(change(0,0),null);
 assert.equal(headline(0),'Unchanged total cost');
@@ -73,3 +75,14 @@ assert.deepEqual(retainedLinks.map(({kind,stage,count,href})=>({kind,stage,count
 ]);
 assert.deepEqual(measurementLinks(retained),retainedLinks);
 assert.deepEqual(techmapLinks(retained),[{count:3,text:'Whole functions: 3 / 187 (partial)',href:mappedCoverage.url}]);
+
+// Default plots use geometric ratios and a single unstacked adjacent-change bar.
+const geometric={points:[{version:'0.1.0',cost:1000,geomean_ratio:1},{version:'0.2.0',cost:500,geomean_ratio:1.2,transition:{baseline_version:'0.1.0',baseline_cost:1000,cost_decreases:-500,cost_increases:0,geomean_ratio:1.2}}],unavailable_versions:['0.15.0']};
+const geometricTrend=geomeanTrendSpec(geometric), geometricStrip=geomeanTransitionSpec(geometric);
+assert.deepEqual(geometricTrend.data[0].y.map(n=>n===null?null:Math.round(n)),[0,20,null]);
+assert.equal(geometricStrip.data.length,1);
+assert.equal(geometricStrip.data[0].type,'bar');
+assert.deepEqual(geometricStrip.data[0].y.map(n=>n===null?null:Math.round(n)),[null,20,null]);
+assert.deepEqual(geometricStrip.data[0].marker.color,['#80e0b1','#ff9aa9','#80e0b1']);
+assert.deepEqual(geomeanTrendSpec({...geometric,points:geometric.points.map(p=>({...p,geomean_ratio:null}))}).data[0].y,[null,null,null]);
+assert.equal(geomeanTrendSpec({...geometric,points:geometric.points.map(p=>({...p,geomean_ratio:null}))}).layout.annotations.length,1);

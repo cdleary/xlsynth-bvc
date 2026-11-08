@@ -520,6 +520,10 @@ fn project(samples: &[wire::Sample]) -> Result<(Vec<u8>, Vec<u8>)> {
 fn fixed_files() -> Vec<(&'static str, &'static [u8])> {
     vec![
         ("index.html", HTML.as_bytes()),
+        (
+            "assets/aggregation.js",
+            include_bytes!("site_assets/aggregation.js"),
+        ),
         ("assets/corpus.js", JS.as_bytes()),
         ("assets/corpus.css", CSS.as_bytes()),
         ("assets/plotly-2.35.2.min.js", PLOTLY_JS),

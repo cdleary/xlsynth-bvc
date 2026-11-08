@@ -567,8 +567,13 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
     );
     assert_eq!(data["versions"][1]["full_count"], 2);
     assert_eq!(data["trends"][0]["count"], 2);
-    assert_eq!(data["schema_version"], 3);
+    assert_eq!(data["schema_version"], 4);
     let stages = &data["trends"][0]["stages"];
+    assert_eq!(
+        stages["raw"]["geomean_population"],
+        serde_json::json!({"total": 2, "eligible": 2, "release_count": 2})
+    );
+    assert_eq!(stages["raw"]["points"][0]["geomean_ratio"], 1.0);
     assert_eq!(stages["abc"]["points"][0]["equal"], 2);
     assert_eq!(stages["raw"]["points"][0]["equal"], 2);
     assert_eq!(stages["abc"]["points"][0]["cost"], 30.0);
@@ -576,6 +581,12 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
     let transition = &stages["raw"]["points"][1]["transition"];
     assert_eq!(transition["baseline_version"], "0.74.0");
     assert_eq!(transition["equal"], 2);
+    assert_eq!(transition["geomean_ratio"], 1.0);
+    assert_eq!(
+        transition["zero_cost"],
+        serde_json::json!({"positive_to_positive": 2, "zero_to_zero": 0,
+            "positive_to_zero": 0, "zero_to_positive": 0})
+    );
     let detail_path = transition["details"].as_str().unwrap();
     let detail_bytes = fs::read(options.out_dir.join(detail_path)).unwrap();
     let detail: serde_json::Value = serde_json::from_slice(&detail_bytes).unwrap();

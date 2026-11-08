@@ -62,6 +62,8 @@ const PLOTLY_STRICT_NOTICE: &[u8] =
 
 const STYLE_CSS: &str = include_str!("site_assets/style.css");
 const APP_JS: &str = concat!(
+    include_str!("site_assets/aggregation.js"),
+    "\n",
     include_str!("site_assets/progression_overview.js"),
     "\n",
     include_str!("site_assets/app.js")
@@ -4483,10 +4485,10 @@ fn progression_body(root_site_url: &str) -> String {
 <section id="progression-overview" aria-labelledby="progression-overview-title">
 <h2 id="progression-overview-title">Did the releases improve?</h2>
 <p class="meta">Cost = AIG AND nodes × depth after ABC. Lower is better. Graph logical effort is shown separately below.</p>
-<div class="toolbar"><label>Compare cost with <select id="progression-reference" aria-label="Cost comparison reference"><option value="baseline">Selected baseline generation</option><option value="yosys">Each generation’s Yosys/ABC reference</option></select></label></div>
+<div class="toolbar"><label>Aggregation <select id="aggregation" aria-label="Cost aggregation"><option value="geomean">Geometric mean</option><option value="total">Total cost</option></select></label><label>Compare cost with <select id="progression-reference" aria-label="Cost comparison reference"><option value="baseline">Selected baseline generation</option><option value="yosys">Each generation’s Yosys/ABC reference</option></select></label></div>
 <section id="progression-summary" class="grid" aria-live="polite"></section>
 <section id="progression-chart" class="progression-chart" aria-live="polite"><p class="muted">Loading generation data…</p></section>
-<article class="progression-chart-panel contribution-panel"><h3>Which functions account for it?</h3><p id="progression-contribution-context" class="meta"></p><div class="toolbar"><label>Change units <select id="progression-change-units" aria-label="Per-function change units"><option value="absolute">Absolute cost — contribution to total</option><option value="percent">Percent — relative impact</option></select></label></div><div id="progression-contributions" class="progression-plot" aria-label="Sorted per-function cost changes"></div><p id="progression-contribution-status" class="meta"></p><div id="progression-function-detail" aria-live="polite"></div><details><summary>Exact per-function costs</summary><section id="progression-table"></section></details></article>
+<article class="progression-chart-panel contribution-panel"><h3>Contributions to total cost</h3><p id="progression-contribution-context" class="meta"></p><div class="toolbar"><label>Change units <select id="progression-change-units" aria-label="Per-function change units"><option value="absolute">Absolute cost — contribution to total</option><option value="percent">Percent — relative impact</option></select></label></div><div id="progression-contributions" class="progression-plot" aria-label="Sorted per-function cost changes"></div><p id="progression-contribution-status" class="meta"></p><div id="progression-function-detail" aria-live="polite"></div><details><summary>Exact per-function costs</summary><section id="progression-table"></section></details></article>
 </section>
 <section id="progression-vectors" aria-labelledby="vector-title" hidden>
 <div class="vector-heading"><div><p class="science-label">Function movement / graph logical effort × AIG nodes</p><h2 id="vector-title">Where did the functions move?</h2></div><p id="vector-window" class="vector-window"></p></div>
