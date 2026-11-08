@@ -7006,6 +7006,7 @@ pub(crate) fn versions_summary_input_fingerprint(
         crate::VERSION_COMPAT_PATH,
         crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
         crate::DEFAULT_DOCKERFILE,
+        crate::MODERN_DRIVER_DOCKERFILE,
         crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
     ] {
         let bytes = fs::read(repo_root.join(relpath))
@@ -9295,6 +9296,7 @@ mod tests {
             crate::VERSION_COMPAT_PATH,
             crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH,
             crate::DEFAULT_DOCKERFILE,
+            crate::MODERN_DRIVER_DOCKERFILE,
             crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
         ] {
             let source = source_root.join(relpath);
@@ -9388,6 +9390,26 @@ mod tests {
                 .is_none()
         );
         fs::write(&dockerfile_path, original_dockerfile).expect("restore Dockerfile source");
+
+        let modern_dockerfile_path = test_repo_root.join(crate::MODERN_DRIVER_DOCKERFILE);
+        let original_modern_dockerfile =
+            fs::read(&modern_dockerfile_path).expect("read modern Dockerfile source");
+        let mut modern_dockerfile = original_modern_dockerfile.clone();
+        modern_dockerfile.extend_from_slice(b"\n# modern recipe change\n");
+        fs::write(&modern_dockerfile_path, modern_dockerfile)
+            .expect("change modern Dockerfile source");
+        assert_ne!(
+            versions_summary_input_fingerprint(&store, &test_repo_root)
+                .expect("changed modern recipe fingerprint"),
+            original_input_fingerprint
+        );
+        assert!(
+            load_versions_cards_index(&store, &test_repo_root)
+                .expect("check stale modern runtime-recipe binding")
+                .is_none()
+        );
+        fs::write(&modern_dockerfile_path, original_modern_dockerfile)
+            .expect("restore modern Dockerfile source");
 
         let compat_path = test_repo_root.join(crate::VERSION_COMPAT_PATH);
         let mut compat: serde_json::Value =

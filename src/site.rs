@@ -2267,7 +2267,10 @@ fn validate_candidate_corpus_manifest_input(manifest: &CandidateCorpusManifestIn
         || candidate_run.driver_runtime.docker_image != expected_candidate_image
         || candidate_run.stats_runtime.release_platform != crate::DEFAULT_RELEASE_PLATFORM
         || candidate_run.stats_runtime.docker_image != expected_stats_image
-        || candidate_run.stats_runtime.dockerfile != crate::DEFAULT_DOCKERFILE
+        || candidate_run.stats_runtime.dockerfile
+            != crate::runtime::default_driver_dockerfile(
+                &candidate_run.stats_runtime.driver_version,
+            )
         || candidate_run.abc_runtime.docker_image != crate::DEFAULT_YOSYS_DOCKER_IMAGE
         || candidate_run.abc_runtime.dockerfile != crate::DEFAULT_YOSYS_DOCKERFILE
         || candidate_run.abc_runtime.upstream_commit.as_deref()
@@ -3315,7 +3318,7 @@ fn validate_release_progression_driver_runtime(runtime: &DriverRuntimeSpec) -> R
         || runtime.driver_version != version
         || runtime.release_platform != crate::DEFAULT_RELEASE_PLATFORM
         || runtime.docker_image != crate::runtime::default_driver_image(version)
-        || runtime.dockerfile != crate::DEFAULT_DOCKERFILE
+        || runtime.dockerfile != crate::runtime::default_driver_dockerfile(version)
     {
         bail!("release progression run does not use a canonical released driver runtime");
     }

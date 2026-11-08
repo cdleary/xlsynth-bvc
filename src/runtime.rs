@@ -19,6 +19,18 @@ pub(crate) fn default_driver_image(driver_version: &str) -> String {
     format!("{}:{}", crate::DEFAULT_DOCKER_IMAGE_PREFIX, tag)
 }
 
+// Crate 0.80 needs if-let match guards unavailable in the legacy compiler.
+// A separate recipe preserves earlier releases' runtime fingerprints.
+pub(crate) fn default_driver_dockerfile(driver_version: &str) -> &'static str {
+    let version = crate::versioning::normalize_tag_version(driver_version);
+    if crate::versioning::cmp_dotted_numeric_version(version, "0.80.0") == std::cmp::Ordering::Less
+    {
+        crate::DEFAULT_DOCKERFILE
+    } else {
+        crate::MODERN_DRIVER_DOCKERFILE
+    }
+}
+
 pub(crate) fn validate_driver_git_commit(commit: &str) -> Result<String> {
     if commit.len() != 40
         || !commit
@@ -168,6 +180,7 @@ pub(crate) fn bound_driver_runtime_for_driver_version(
 ) -> Result<DriverRuntimeSpec> {
     let xlsynth_version =
         crate::versioning::resolve_xlsynth_version_for_driver(repo_root, driver_version)?;
+    let dockerfile = default_driver_dockerfile(driver_version);
     crate::service::bind_driver_runtime_image(
         repo_root,
         DriverRuntimeSpec {
@@ -175,8 +188,8 @@ pub(crate) fn bound_driver_runtime_for_driver_version(
             source_revision: None,
             release_platform: release_platform.to_string(),
             docker_image: default_driver_image(driver_version),
-            dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
-            dockerfile_sha256: runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?,
+            dockerfile: dockerfile.to_string(),
+            dockerfile_sha256: runtime_dockerfile_sha256(repo_root, dockerfile)?,
             docker_image_id: String::new(),
             release_cache_input_sha256: crate::service::driver_release_cache_input_sha256(
                 repo_root,
@@ -255,6 +268,7 @@ pub(crate) fn default_driver_runtime_for_version(
     requested_xlsynth_version: &str,
 ) -> Result<DriverRuntimeSpec> {
     let driver_version = resolve_driver_version(repo_root, None, requested_xlsynth_version)?;
+    let dockerfile = default_driver_dockerfile(&driver_version);
     let runtime = crate::service::bind_driver_runtime_image(
         repo_root,
         DriverRuntimeSpec {
@@ -262,8 +276,8 @@ pub(crate) fn default_driver_runtime_for_version(
             source_revision: None,
             release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
             docker_image: default_driver_image(&driver_version),
-            dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
-            dockerfile_sha256: runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?,
+            dockerfile: dockerfile.to_string(),
+            dockerfile_sha256: runtime_dockerfile_sha256(repo_root, dockerfile)?,
             docker_image_id: String::new(),
             release_cache_input_sha256: crate::service::driver_release_cache_input_sha256(
                 repo_root,
@@ -300,13 +314,14 @@ pub(crate) fn explicit_driver_runtime_recipe_for_crate_version(
     requested_xlsynth_version: &str,
 ) -> Result<DriverRuntimeSpec> {
     let driver_version = crate::versioning::normalize_tag_version(crate_version).to_string();
+    let dockerfile = default_driver_dockerfile(&driver_version);
     let runtime = DriverRuntimeSpec {
         driver_version: driver_version.clone(),
         source_revision: None,
         release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
         docker_image: default_driver_image(&driver_version),
-        dockerfile: crate::DEFAULT_DOCKERFILE.to_string(),
-        dockerfile_sha256: runtime_dockerfile_sha256(repo_root, crate::DEFAULT_DOCKERFILE)?,
+        dockerfile: dockerfile.to_string(),
+        dockerfile_sha256: runtime_dockerfile_sha256(repo_root, dockerfile)?,
         docker_image_id: String::new(),
         release_cache_input_sha256: String::new(),
     };
@@ -449,7 +464,7 @@ mod tests {
         latest: &str,
     ) {
         assert_eq!(resolved.driver_version, latest);
-        assert_eq!(resolved.dockerfile, crate::DEFAULT_DOCKERFILE);
+        assert_eq!(resolved.dockerfile, default_driver_dockerfile(latest));
         assert_ne!(resolved.dockerfile_sha256, source.dockerfile_sha256);
         let resolved_dso = crate::versioning::resolve_xlsynth_version_for_driver(
             repo_root,
@@ -526,7 +541,7 @@ mod tests {
             .expect("released AIG stats runtime");
         assert_eq!(stats.driver_version, source.driver_version);
         assert!(stats.source_revision.is_none());
-        assert_eq!(stats.dockerfile, crate::DEFAULT_DOCKERFILE);
+        assert_eq!(stats.dockerfile, default_driver_dockerfile(&latest));
         assert_ne!(stats.docker_image_id, source.docker_image_id);
     }
 
@@ -547,5 +562,83 @@ mod tests {
         )
         .expect("runtime cache digest");
         assert_eq!(runtime.release_cache_input_sha256, expected_digest);
+    }
+
+    #[test]
+    fn released_driver_dockerfile_changes_at_version_080() {
+        for version in ["0.8.0", "0.74.0", "0.79.0", "v0.79.0"] {
+            assert_eq!(
+                default_driver_dockerfile(version),
+                crate::DEFAULT_DOCKERFILE
+            );
+        }
+        for version in ["0.80.0", "v0.80.0", "0.81.0", "0.100.0", "1.0.0"] {
+            assert_eq!(
+                default_driver_dockerfile(version),
+                crate::MODERN_DRIVER_DOCKERFILE
+            );
+        }
+        assert_eq!(
+            sha256_bytes(include_bytes!("../docker/xlsynth-driver.Dockerfile")),
+            "118ed791a123cd78f3dd45d33064b40c8d9d7a58ac79ddc30d25a3c13b3ef984"
+        );
+        assert_eq!(
+            include_str!("../docker/xlsynth-driver-modern.Dockerfile"),
+            include_str!("../docker/xlsynth-driver.Dockerfile").replace(
+                "ARG RUST_TOOLCHAIN=nightly-2026-02-12\n",
+                "ARG RUST_TOOLCHAIN=nightly-2026-02-20\n"
+            )
+        );
+    }
+
+    #[test]
+    fn canonical_release_constructors_and_cli_select_the_versioned_recipe() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for version in ["0.74.0", "0.79.0", "v0.80.0"] {
+            let normalized = crate::versioning::normalize_tag_version(version);
+            let dso = crate::versioning::resolve_xlsynth_version_for_driver(repo_root, normalized)
+                .expect("known DSO");
+            let explicit = explicit_driver_runtime_for_crate_version(repo_root, version, &dso)
+                .expect("explicit release runtime");
+            let bound = bound_driver_runtime_for_driver_version(
+                repo_root,
+                normalized,
+                crate::DEFAULT_RELEASE_PLATFORM,
+            )
+            .expect("canonical released runtime");
+            let cli = crate::cli::DriverCli {
+                driver_version: Some(version.to_string()),
+                driver_git_commit: None,
+                release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
+                dockerfile: None,
+                docker_image: None,
+            }
+            .into_runtime(repo_root, &dso)
+            .expect("CLI release runtime");
+            assert_eq!(explicit, bound);
+            assert_eq!(cli, bound);
+            assert_eq!(bound.dockerfile, default_driver_dockerfile(version));
+            assert_eq!(
+                bound.dockerfile_sha256,
+                runtime_dockerfile_sha256(repo_root, &bound.dockerfile)
+                    .expect("selected Dockerfile digest")
+            );
+        }
+        let latest = default_driver_runtime_for_version(repo_root, "v0.61.0")
+            .expect("latest compatible runtime");
+        assert_eq!(
+            latest.dockerfile,
+            default_driver_dockerfile(&latest.driver_version)
+        );
+        let git = crate::cli::DriverCli {
+            driver_version: None,
+            driver_git_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            release_platform: crate::DEFAULT_RELEASE_PLATFORM.to_string(),
+            dockerfile: None,
+            docker_image: None,
+        }
+        .into_runtime_with_driver_version(repo_root, "v0.61.0", Some("0.80.0"))
+        .expect("Git runtime at modern release anchor");
+        assert_eq!(git.dockerfile, crate::DEFAULT_GIT_DOCKERFILE);
     }
 }
