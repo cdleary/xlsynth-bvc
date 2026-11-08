@@ -85,7 +85,7 @@ const MFFC_PROGRESSION_IR_SHA256: &str =
     "f80befb2248a9757b7512068a4818308ecff1e77bcd78701b1a67338f979e5f8";
 const MFFC_PROGRESSION_ARTIFACT_MANIFEST_SHA256: &str =
     "cfc36afcd8b178687690a03d6c8b555e9517e7606ae8062d502452cf29e8861c";
-const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 9;
+const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 10;
 const PROGRESSION_RUN_EVIDENCE_RECORD_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_SCHEMA_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_PREFIX_HEX_CHARS: u8 = 1;
@@ -541,6 +541,26 @@ struct BrowserProgressionGeneration {
     extra_ir_count: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     run_samples: Vec<BrowserProgressionSample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_samples_shard: Option<BrowserProgressionSampleShardRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BrowserProgressionSampleShardRef {
+    url: String,
+    bytes: u64,
+    sha256: String,
+    sample_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct BrowserProgressionSampleShard {
+    schema_version: u32,
+    cohort_id: String,
+    generation_id: String,
+    samples: Vec<BrowserProgressionSample>,
 }
 
 #[derive(Debug)]
@@ -824,6 +844,123 @@ fn decode_canonical_browser_catalog(bytes: &[u8]) -> Result<BrowserCatalog> {
     }
     if encode_browser_catalog(&catalog)? != bytes {
         bail!("browser catalog is not canonically encoded");
+    }
+    Ok(catalog)
+}
+
+const MAX_PROGRESSION_SAMPLE_SHARD_BYTES: usize = 2 * 1024 * 1024;
+
+fn progression_sample_shard_url(generation_id: &str) -> Result<String> {
+    if !is_canonical_lower_hex(generation_id, 64) {
+        bail!("invalid progression sample shard generation identity");
+    }
+    Ok(format!("data/progression-samples/{generation_id}.json"))
+}
+
+fn progression_sample_shard_urls(catalog: &BrowserCatalog) -> Result<BTreeSet<String>> {
+    let mut urls = BTreeSet::new();
+    for cohort in &catalog.progression.cohorts {
+        for generation in &cohort.generations {
+            if !generation.run_samples.is_empty() || generation.run_samples_shard.is_some() {
+                let url = progression_sample_shard_url(&generation.generation_id)?;
+                if !urls.insert(url) {
+                    bail!("duplicate progression sample shard generation identity");
+                }
+            }
+        }
+    }
+    Ok(urls)
+}
+
+fn browser_catalog_files(catalog: &BrowserCatalog) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut projection = catalog.clone();
+    let mut files = BTreeMap::new();
+    for cohort in &mut projection.progression.cohorts {
+        for generation in &mut cohort.generations {
+            if generation.run_samples_shard.is_some() {
+                bail!("hydrate progression samples before projecting the browser catalog");
+            }
+            if generation.run_samples.is_empty() {
+                continue;
+            }
+            let url = progression_sample_shard_url(&generation.generation_id)?;
+            let shard = BrowserProgressionSampleShard {
+                schema_version: 1,
+                cohort_id: cohort.cohort_id.clone(),
+                generation_id: generation.generation_id.clone(),
+                samples: std::mem::take(&mut generation.run_samples),
+            };
+            let bytes = serde_json::to_vec(&shard).context("encoding progression sample shard")?;
+            if bytes.len() > MAX_PROGRESSION_SAMPLE_SHARD_BYTES {
+                bail!("progression sample shard exceeds the 2 MiB budget: {url}");
+            }
+            generation.run_samples_shard = Some(BrowserProgressionSampleShardRef {
+                url: url.clone(),
+                bytes: bytes.len() as u64,
+                sha256: sha256_hex(&bytes),
+                sample_count: shard.samples.len() as u64,
+            });
+            if files.insert(url, bytes).is_some() {
+                bail!("duplicate progression sample shard generation identity");
+            }
+        }
+    }
+    files.insert("catalog.json".into(), encode_browser_catalog(&projection)?);
+    Ok(files)
+}
+
+fn read_browser_catalog(site_dir: &Path) -> Result<BrowserCatalog> {
+    let mut catalog = decode_canonical_browser_catalog(&fs::read(site_dir.join("catalog.json"))?)?;
+    if catalog.schema_version != BROWSER_CATALOG_SCHEMA_VERSION {
+        bail!("unsupported browser catalog schema version");
+    }
+    let mut urls = BTreeSet::new();
+    for cohort in &mut catalog.progression.cohorts {
+        for generation in &mut cohort.generations {
+            if !generation.run_samples.is_empty() {
+                bail!("public browser catalog contains inline progression samples");
+            }
+            let Some(reference) = generation.run_samples_shard.take() else {
+                continue;
+            };
+            let expected_url = progression_sample_shard_url(&generation.generation_id)?;
+            if reference.url != expected_url
+                || !urls.insert(reference.url.clone())
+                || !is_canonical_lower_hex(&reference.sha256, 64)
+                || reference.bytes > MAX_PROGRESSION_SAMPLE_SHARD_BYTES as u64
+                || reference.sample_count == 0
+                || reference.sample_count != generation.observed_ir_count
+            {
+                bail!("invalid progression sample shard reference");
+            }
+            let bytes = fs::read(site_dir.join(&reference.url))
+                .with_context(|| format!("reading progression samples {}", reference.url))?;
+            if bytes.len() as u64 != reference.bytes || sha256_hex(&bytes) != reference.sha256 {
+                bail!(
+                    "progression sample shard commitment mismatch: {}",
+                    reference.url
+                );
+            }
+            let shard: BrowserProgressionSampleShard = serde_json::from_slice(&bytes)
+                .context("decoding typed progression sample shard")?;
+            if serde_json::to_vec(&shard)? != bytes
+                || shard.schema_version != 1
+                || shard.cohort_id != cohort.cohort_id
+                || shard.generation_id != generation.generation_id
+                || shard.samples.len() as u64 != reference.sample_count
+            {
+                bail!("progression sample shard identity, count, or canonical encoding mismatch");
+            }
+            let mut hashes = BTreeSet::new();
+            for sample in &shard.samples {
+                if !cohort.cohort_ir_hashes.contains(&sample.structural_hash)
+                    || !hashes.insert(&sample.structural_hash)
+                {
+                    bail!("progression sample shard contains a duplicate or non-cohort input");
+                }
+            }
+            generation.run_samples = shard.samples;
+        }
     }
     Ok(catalog)
 }
@@ -1655,6 +1792,7 @@ fn decode_progression_run_evidence(
             missing_cohort_ir_count: 0,
             extra_ir_count: 0,
             run_samples,
+            run_samples_shard: None,
         },
         runtime_identity,
     ))
@@ -1980,6 +2118,7 @@ fn build_browser_progression_catalog_for_cohort(
             missing_cohort_ir_count,
             extra_ir_count,
             run_samples: Vec::new(),
+            run_samples_shard: None,
         });
     }
     generations.sort_by(progression_generation_cmp);
@@ -3161,6 +3300,7 @@ where
             .filter(|hash| !artifacts.contains_key(*hash))
             .count() as u64,
         run_samples: samples.into_values().collect(),
+        run_samples_shard: None,
     };
     validate_candidate_progression_generation(
         &generation,
@@ -3599,6 +3739,7 @@ fn load_release_progression_generation_with_evidence(
         missing_cohort_ir_count: 0,
         extra_ir_count: 0,
         run_samples: samples.into_values().collect(),
+        run_samples_shard: None,
     };
     Ok(ProgressionRunEvidenceInput {
         cohort_id: cohort.cohort_id.to_string(),
@@ -4258,6 +4399,9 @@ fn expected_catalog_site_relpaths(
     {
         bail!("browser catalog progression evidence is not strictly sorted by generation ID");
     }
+    for url in progression_sample_shard_urls(catalog)? {
+        insert_unique_site_relpath(&mut all, url)?;
+    }
     for evidence in &catalog.progression_evidence {
         if !is_canonical_lower_hex(&evidence.generation_id, 64)
             || !is_canonical_lower_hex(&evidence.sha256, 64)
@@ -4523,7 +4667,7 @@ fn expected_fixed_site_files(
         format!("assets/{PLOTLY_NOTICE_ASSET_NAME}"),
         PLOTLY_NOTICE.to_vec(),
     );
-    files.insert("catalog.json".to_string(), encode_browser_catalog(catalog)?);
+    files.extend(browser_catalog_files(catalog)?);
     files.insert(
         "snapshot_manifest.v1.pb".to_string(),
         crate::snapshot::encode_static_snapshot_manifest(snapshot)?,
@@ -5255,11 +5399,9 @@ fn build_static_site_with_progression_runs_in_place(
         releases: versions.releases,
         repository_head_observation: versions.repository_head_observation,
     };
-    write_file(
-        &options.out_dir,
-        "catalog.json",
-        &encode_browser_catalog(&catalog)?,
-    )?;
+    for (relpath, bytes) in browser_catalog_files(&catalog)? {
+        write_file(&options.out_dir, &relpath, &bytes)?;
+    }
     write_file(
         &options.out_dir,
         "snapshot_manifest.v1.pb",
@@ -5839,9 +5981,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
             total_bytes,
         });
     }
-    let catalog_bytes =
-        fs::read(site_dir.join("catalog.json")).context("reading browser catalog")?;
-    let catalog = decode_canonical_browser_catalog(&catalog_bytes)?;
+    let catalog = read_browser_catalog(site_dir)?;
     if catalog.schema_version != BROWSER_CATALOG_SCHEMA_VERSION
         || catalog.snapshot_id != snapshot_id
         || catalog.base_url != base_url
@@ -5906,12 +6046,14 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         .iter()
         .map(|evidence| evidence.url.clone())
         .collect::<BTreeSet<_>>();
+    let progression_sample_urls = progression_sample_shard_urls(&catalog)?;
     let declared_dataset_urls = declared
         .keys()
         .filter(|relpath| {
             relpath.starts_with("data/")
                 && relpath.ends_with(".json")
                 && !progression_evidence_urls.contains(*relpath)
+                && !progression_sample_urls.contains(*relpath)
         })
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -6187,8 +6329,24 @@ fn start_plain_static_server(directory: &Path) -> Result<(Child, std::net::Socke
 
 enum SmokePageContent {
     Text(&'static str),
-    Html(&'static str),
+    Html(String),
 }
+
+impl SmokePageContent {
+    fn verify(&self, response: &str, url: &str) -> Result<()> {
+        match self {
+            Self::Text(expected) if !response.contains(expected) => {
+                bail!("static HTTP response for {url} did not contain {expected:?}");
+            }
+            Self::Html(expected) if response != expected => {
+                bail!("static HTTP response for {url} differs from its canonical HTML resource");
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+type SmokePage = (String, SmokePageContent, Vec<(String, usize)>);
 
 fn run_browser_page(
     browser: &Path,
@@ -6204,15 +6362,7 @@ fn run_browser_page(
         .with_context(|| format!("checking static smoke page status: {url}"))?
         .text()
         .with_context(|| format!("reading static smoke page: {url}"))?;
-    match expected_content {
-        SmokePageContent::Text(expected) if !response.contains(expected) => {
-            bail!("static HTTP response for {url} did not contain {expected:?}");
-        }
-        SmokePageContent::Html(expected) if response != *expected => {
-            bail!("static HTTP response for {url} differs from its canonical HTML resource");
-        }
-        _ => {}
-    }
+    expected_content.verify(&response, url)?;
     let screenshot_name = format!("{}.png", &sha256_hex(url.as_bytes())[..16]);
     let screenshot_path = profile_dir.join(screenshot_name);
     let mut command = Command::new(browser);
@@ -6227,7 +6377,7 @@ fn run_browser_page(
         "--disable-component-update",
         "--disable-default-apps",
         "--disable-sync",
-        "--window-size=1280,900",
+        "--window-size=1280,1800",
     ]);
     if !rendered_markers.is_empty() {
         command.args(["--dump-dom", "--virtual-time-budget=12000"]);
@@ -6324,6 +6474,159 @@ fn run_browser_page(
     Ok(())
 }
 
+fn legacy_progression_markers(catalog: &BrowserCatalog) -> Result<Vec<(String, usize)>> {
+    let progression_catalog = catalog
+        .progression
+        .cohorts
+        .iter()
+        .find(|cohort| cohort.cohort_id == catalog.progression.default_cohort_id)
+        .context("browser catalog has no default progression cohort")?;
+    let complete_generations = progression_catalog
+        .generations
+        .iter()
+        .filter(|generation| generation.coverage == BrowserProgressionCoverage::CohortComplete)
+        .collect::<Vec<_>>();
+    Ok(if complete_generations.len() >= 2 {
+        let current = complete_generations
+            .iter()
+            .rev()
+            .find(|generation| {
+                matches!(
+                    generation.origin,
+                    BrowserProgressionOrigin::GitRevision { .. }
+                )
+            })
+            .copied()
+            .unwrap_or_else(|| complete_generations.last().expect("nonempty generations"));
+        let baseline = current
+            .baseline_generation_id
+            .as_ref()
+            .and_then(|id| {
+                complete_generations
+                    .iter()
+                    .find(|generation| generation.generation_id == *id)
+                    .copied()
+            })
+            .unwrap_or(complete_generations[complete_generations.len() - 2]);
+        vec![
+            ("data-progression-rendered=\"true\"".to_string(), 1),
+            (
+                format!(
+                    "data-progression-baseline-version=\"{}\"",
+                    baseline.display_label
+                ),
+                1,
+            ),
+            (
+                format!(
+                    "data-progression-current-version=\"{}\"",
+                    current.display_label
+                ),
+                1,
+            ),
+        ]
+    } else {
+        Vec::new()
+    })
+}
+
+fn legacy_smoke_pages(site_dir: &Path) -> Result<Vec<SmokePage>> {
+    let catalog = read_browser_catalog(site_dir).context("reading browser smoke catalog")?;
+    let snapshot =
+        load_static_snapshot_manifest(site_dir).context("reading browser smoke source snapshot")?;
+    let progression_markers = legacy_progression_markers(&catalog)?;
+    let navigation = site_dashboard::child_navigation(site_dir)?;
+    let home_markers = if navigation.is_some() {
+        vec![("data-rendered=\"true\"".to_string(), 1)]
+    } else {
+        Vec::new()
+    };
+    let mut canonical = expected_fixed_site_files(&catalog, &snapshot)?;
+    [
+        ("", "index.html", home_markers),
+        ("runs.html", "runs.html", Vec::new()),
+        ("progression.html", "progression.html", progression_markers),
+        ("releases.html", "releases.html", Vec::new()),
+        (
+            "mffc-discrepancies.html",
+            "mffc-discrepancies.html",
+            Vec::new(),
+        ),
+        (
+            "ir-fn-corpus-g8r-vs-yosys-abc/",
+            "ir-fn-corpus-g8r-vs-yosys-abc/index.html",
+            vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
+        ),
+        (
+            "ir-fn-g8r-abc-vs-codegen-yosys-abc/",
+            "ir-fn-g8r-abc-vs-codegen-yosys-abc/index.html",
+            vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
+        ),
+        ("dataset.html", "dataset.html", Vec::new()),
+    ]
+    .into_iter()
+    .map(|(route, relpath, markers)| {
+        let canonical = canonical
+            .remove(relpath)
+            .context("missing canonical smoke page")?;
+        let canonical = site_dashboard::child_asset(navigation, relpath, &canonical)?;
+        let html = String::from_utf8(canonical).context("canonical smoke page is not UTF-8")?;
+        Ok((route.to_string(), SmokePageContent::Html(html), markers))
+    })
+    .collect()
+}
+
+fn smoke_pages(site_dir: &Path, corpus_mode: bool, dashboard_mode: bool) -> Result<Vec<SmokePage>> {
+    let rendered = vec![("data-rendered=\"true\"".to_string(), 1)];
+    let mut pages = if dashboard_mode {
+        let corpus = site_dir.join("corpus");
+        let corpus_html = site_dashboard::child_asset(
+            site_dashboard::child_navigation(&corpus)?,
+            "index.html",
+            include_bytes!("site_assets/corpus.html"),
+        )?;
+        let mut pages = vec![
+            (
+                "".to_string(),
+                SmokePageContent::Text("g8r cost by release"),
+                rendered.clone(),
+            ),
+            (
+                "corpus/".to_string(),
+                SmokePageContent::Html(String::from_utf8(corpus_html)?),
+                rendered.clone(),
+            ),
+        ];
+        pages.extend(
+            legacy_smoke_pages(&site_dir.join("history"))?
+                .into_iter()
+                .map(|(path, expected, markers)| (format!("history/{path}"), expected, markers)),
+        );
+        pages
+    } else if corpus_mode {
+        vec![(
+            "".to_string(),
+            SmokePageContent::Text("IR corpus synthesis results"),
+            rendered.clone(),
+        )]
+    } else {
+        legacy_smoke_pages(site_dir)?
+    };
+    if dashboard_mode
+        && site_dir
+            .join(site_techmap::ROOT)
+            .join(site_techmap::MANIFEST)
+            .is_file()
+    {
+        pages.push((
+            "tech-mapped-asap7/".to_string(),
+            SmokePageContent::Html(include_str!("site_assets/techmap.html").to_string()),
+            rendered,
+        ));
+    }
+    Ok(pages)
+}
+
 pub(crate) fn smoke_static_site(
     site_dir: &Path,
     explicit_browser: Option<&Path>,
@@ -6332,75 +6635,16 @@ pub(crate) fn smoke_static_site(
     if timeout_seconds == 0 {
         bail!("browser smoke timeout must be nonzero");
     }
-    let verified = verify_static_site(site_dir)?;
+    let site_dir = fs::canonicalize(site_dir).context("canonicalizing static site directory")?;
+    let verified = verify_static_site(&site_dir)?;
     let corpus_mode = site_dir.join(site_corpus::MANIFEST).is_file();
     let dashboard_mode = site_dir.join(site_dashboard::MANIFEST).is_file();
-    let progression_markers = if corpus_mode || dashboard_mode {
-        vec![("data-rendered=\"true\"".to_string(), 1)]
-    } else {
-        let catalog = decode_canonical_browser_catalog(
-            &fs::read(site_dir.join("catalog.json")).context("reading browser smoke catalog")?,
-        )?;
-        let progression_catalog = catalog
-            .progression
-            .cohorts
-            .iter()
-            .find(|cohort| cohort.cohort_id == catalog.progression.default_cohort_id)
-            .context("browser catalog has no default progression cohort")?;
-        let complete_generations = progression_catalog
-            .generations
-            .iter()
-            .filter(|generation| generation.coverage == BrowserProgressionCoverage::CohortComplete)
-            .collect::<Vec<_>>();
-        if complete_generations.len() >= 2 {
-            let current = complete_generations
-                .iter()
-                .rev()
-                .find(|generation| {
-                    matches!(
-                        generation.origin,
-                        BrowserProgressionOrigin::GitRevision { .. }
-                    )
-                })
-                .copied()
-                .unwrap_or_else(|| complete_generations.last().expect("nonempty generations"));
-            let baseline = current
-                .baseline_generation_id
-                .as_ref()
-                .and_then(|id| {
-                    complete_generations
-                        .iter()
-                        .find(|generation| generation.generation_id == *id)
-                        .copied()
-                })
-                .unwrap_or(complete_generations[complete_generations.len() - 2]);
-            vec![
-                ("data-progression-rendered=\"true\"".to_string(), 1),
-                (
-                    format!(
-                        "data-progression-baseline-version=\"{}\"",
-                        baseline.display_label
-                    ),
-                    1,
-                ),
-                (
-                    format!(
-                        "data-progression-current-version=\"{}\"",
-                        current.display_label
-                    ),
-                    1,
-                ),
-            ]
-        } else {
-            Vec::new()
-        }
-    };
+    let pages = smoke_pages(&site_dir, corpus_mode, dashboard_mode)?;
     let browser = browser_path(explicit_browser)?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let site_dir = fs::canonicalize(site_dir).context("canonicalizing static site directory")?;
     let mut temporary_server_root = None;
     let server_root = if verified.base_url == "/" {
         site_dir.clone()
@@ -6427,50 +6671,6 @@ pub(crate) fn smoke_static_site(
     fs::create_dir_all(&profile_dir).context("creating temporary Chrome profile")?;
     let origin = format!("http://{address}");
     let timeout = Duration::from_secs(timeout_seconds);
-    let pages = if dashboard_mode {
-        vec![("", "g8r cost by release", progression_markers)]
-    } else if corpus_mode {
-        vec![("", "IR corpus synthesis results", progression_markers)]
-    } else {
-        vec![
-            ("", "xlsynth-bvc results", Vec::new()),
-            ("runs.html", "Campaign runs", Vec::new()),
-            (
-                "progression.html",
-                "Fixed-IR generation progression",
-                progression_markers,
-            ),
-            ("releases.html", "Crate release processing", Vec::new()),
-            ("mffc-discrepancies.html", "MFFC discrepancies", Vec::new()),
-            (
-                "ir-fn-corpus-g8r-vs-yosys-abc/",
-                "IR corpus: g8r vs Yosys/ABC",
-                vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
-            ),
-            (
-                "ir-fn-g8r-abc-vs-codegen-yosys-abc/",
-                "IR corpus: g8r+ABC vs codegen+Yosys/ABC",
-                vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
-            ),
-            ("dataset.html", "Dataset explorer", Vec::new()),
-        ]
-    };
-    let mut pages = pages
-        .into_iter()
-        .map(|(path, expected, markers)| (path, SmokePageContent::Text(expected), markers))
-        .collect::<Vec<_>>();
-    if dashboard_mode
-        && site_dir
-            .join(site_techmap::ROOT)
-            .join(site_techmap::MANIFEST)
-            .is_file()
-    {
-        pages.push((
-            "tech-mapped-asap7/",
-            SmokePageContent::Html(include_str!("site_assets/techmap.html")),
-            vec![("data-rendered=\"true\"".to_string(), 1)],
-        ));
-    }
     let result = pages
         .iter()
         .try_for_each(|(path, expected, rendered_markers)| {
@@ -6494,10 +6694,7 @@ pub(crate) fn smoke_static_site(
         site_dir: site_dir.display().to_string(),
         base_url: verified.base_url,
         browser: browser.display().to_string(),
-        pages_checked: pages
-            .iter()
-            .map(|(path, _, _)| (*path).to_string())
-            .collect(),
+        pages_checked: pages.iter().map(|(path, _, _)| path.clone()).collect(),
     })
 }
 
