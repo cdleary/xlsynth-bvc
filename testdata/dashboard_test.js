@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 'use strict';
 const assert=require('node:assert/strict');
-const {change,share,headline,trendSpec,transitionSpec,validateDetail,resultHref,measurementLinks,selectedStage}=require('../src/site_assets/dashboard.js');
+const {change,share,headline,trendSpec,transitionSpec,validateDetail,fullCorpusHref,measurementLinks,irComparisonLinks,techmapLinks,latestResults,selectedStage}=require('../src/site_assets/dashboard.js');
 assert.equal(change(100,80),-20);
 assert.equal(change(0,0),null);
 assert.equal(headline(0),'Unchanged total cost');
@@ -48,22 +48,28 @@ assert.equal(validateDetail(detail,paired.points[1]),detail);
 assert.throws(()=>validateDetail({...detail,version:'0.3.0'},paired.points[1]));
 assert.throws(()=>validateDetail({...detail,higher:3},paired.points[1]));
 assert.throws(()=>validateDetail({...detail,largest:Array(11).fill({})},paired.points[1]));
-assert.equal(resultHref({crate_version:'0.74.0',full_count:5}),'corpus/?release=0.74.0&stage=abc');
-assert.equal(resultHref({crate_version:'0.74.0',full_count:5},'raw'),'corpus/?release=0.74.0&stage=raw&reference=release');
-assert.equal(resultHref({crate_version:'0.66.0',full_count:0,cohorts:[{url:'fixed'}]}),'fixed');
-assert.equal(resultHref({crate_version:'0.1.0',full_count:0,cohorts:[],historical_abc_count:0,historical_raw_count:2}),'history/ir-fn-corpus-g8r-vs-yosys-abc/?crate_version=0.1.0');
-assert.equal(resultHref({crate_version:'0.1.0',full_count:0,cohorts:[],historical_abc_count:0,historical_raw_count:0}),'history/dataset.html');
-const coverage={crate_version:'0.74.0',historical_abc_count:0,historical_abc_measurements:0,historical_raw_count:0,historical_raw_measurements:0};
-assert.deepEqual(measurementLinks(coverage),[]);
-const abcPair={count:2,label:'post-ABC pairs',href:'history/ir-fn-g8r-abc-vs-codegen-yosys-abc/?crate_version=0.74.0'};
-const rawPair={count:3,label:'raw g8r pairs',href:'history/ir-fn-corpus-g8r-vs-yosys-abc/?crate_version=0.74.0'};
-const abcOneSided={count:5,label:'post-ABC one-sided measurements',href:'history/dataset.html'};
-const rawOneSided={count:7,label:'raw-path one-sided measurements',href:'history/dataset.html'};
-assert.deepEqual(measurementLinks({...coverage,historical_abc_count:2,historical_abc_measurements:4,historical_raw_count:3,historical_raw_measurements:6}),[abcPair,rawPair]);
-assert.deepEqual(measurementLinks({...coverage,historical_abc_measurements:5,historical_raw_measurements:7}),[abcOneSided,rawOneSided]);
-assert.deepEqual(measurementLinks({...coverage,historical_abc_count:2,historical_abc_measurements:9,historical_raw_count:3,historical_raw_measurements:13}),[abcPair,abcOneSided,rawPair,rawOneSided]);
+// Coverage is selected independently for the two comparison dimensions.
+const full={crate_version:'0.77.0',full_count:32806,cohorts:[],techmap_cohorts:[]};
 const mappedCoverage={id:'whole-functions-v1',label:'Whole functions',measured:3,total:187,complete:false,url:'tech-mapped-asap7/?release=0.79.0&cohort=whole-functions-v1'};
-const mappedOnly={...coverage,full_count:0,cohorts:[],techmap_cohorts:[mappedCoverage]};
-assert.equal(resultHref(mappedOnly),mappedCoverage.url);
-assert.equal(measurementLinks(mappedOnly)[0].href,mappedCoverage.url);
-assert.equal(measurementLinks(mappedOnly)[0].count,3);
+const mappedOnly={crate_version:'0.79.0',full_count:0,cohorts:[],techmap_cohorts:[mappedCoverage]};
+const latest=latestResults([full,mappedOnly]);
+assert.equal(latest.aig,full);
+assert.equal(latest.techmap,mappedOnly);
+assert.deepEqual(latestResults([]),{aig:undefined,techmap:undefined});
+assert.deepEqual(irComparisonLinks(mappedOnly),[]);
+assert.deepEqual(techmapLinks(full),[]);
+const fullLinks=irComparisonLinks(full);
+assert.equal(fullLinks.length,2);
+assert.deepEqual(fullLinks.map(link=>link.count),[32806,32806]);
+assert.deepEqual(fullLinks.map(link=>{const url=new URL(link.href,'https://example.test/');return [url.pathname,url.searchParams.get('release'),url.searchParams.get('stage'),url.searchParams.get('reference')];}),[['/corpus/','0.77.0','abc','yosys'],['/corpus/','0.77.0','raw','yosys']]);
+assert.equal(fullCorpusHref(full,'abc'),fullLinks[0].href);
+const retained={crate_version:'0.74.0',full_count:0,historical_abc_count:2,historical_abc_measurements:9,historical_raw_count:3,historical_raw_measurements:13,techmap_cohorts:[mappedCoverage]};
+const retainedLinks=irComparisonLinks(retained);
+assert.deepEqual(retainedLinks.map(({kind,stage,count,href})=>({kind,stage,count,href})),[
+  {kind:'retained',stage:'abc',count:2,href:'history/ir-fn-g8r-abc-vs-codegen-yosys-abc/?crate_version=0.74.0'},
+  {kind:'unpaired',stage:'abc',count:5,href:'history/dataset.html'},
+  {kind:'retained',stage:'raw',count:3,href:'history/ir-fn-corpus-g8r-vs-yosys-abc/?crate_version=0.74.0'},
+  {kind:'unpaired',stage:'raw',count:7,href:'history/dataset.html'},
+]);
+assert.deepEqual(measurementLinks(retained),retainedLinks);
+assert.deepEqual(techmapLinks(retained),[{count:3,text:'Whole functions: 3 / 187 (partial)',href:mappedCoverage.url}]);

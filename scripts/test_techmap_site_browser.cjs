@@ -5,7 +5,6 @@
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),cp=require('node:child_process'),assert=require('node:assert/strict');
 const {once}=require('node:events');
 const {normalizedSpec,absoluteSpec,overviewSamples,counts}=require('../src/site_assets/techmap.js');
-const {resultHref}=require('../src/site_assets/dashboard.js');
 const url = new URL(process.argv[2]);
 const screenshots = process.argv[3];
 const requireWebgl=process.env.BVC_TECHMAP_REQUIRE_WEBGL==='1';
@@ -141,21 +140,32 @@ async function checkLegendLayout(){
 async function checkDashboard(){
   const rootUrl=new URL('../',url),response=await fetch(new URL('dashboard.json',rootUrl));
   if(response.status===404)return; // A standalone leaf preview has no parent.
-  assert.equal(response.status,200);const dashboard=await response.json(),latest=dashboard.versions.at(-1);
+  assert.equal(response.status,200);const dashboard=await response.json(),latest=dashboard.versions.at(-1),latestAig=[...dashboard.versions].reverse().find(v=>v.full_count>0),latestTechmap=[...dashboard.versions].reverse().find(v=>v.techmap_cohorts?.length);
   await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1100,deviceScaleFactor:1,mobile:false});
   await send('Page.navigate',{url:new URL('index.html',rootUrl).href});
   await waitFor("document.getElementById('dashboard')?.dataset.rendered==='true'");
-  assert.equal(await evaluate("document.getElementById('latest-version').textContent"),`v${latest.crate_version}`);
   const stage=await evaluate("document.getElementById('stage').value");
-  assert.equal(await evaluate("document.getElementById('latest-link').getAttribute('href')"),resultHref(latest,stage));
+  if(latestAig){
+    assert.equal(await evaluate("document.getElementById('latest-aig-version').textContent"),`v${latestAig.crate_version}`);
+    const target=new URL(await evaluate("document.getElementById('latest-aig-link').href"));
+    assert.equal(target.pathname,new URL('corpus/',rootUrl).pathname);
+    assert.equal(target.searchParams.get('release'),latestAig.crate_version);
+    assert.equal(target.searchParams.get('stage'),'abc');
+    assert.equal(target.searchParams.get('reference'),'yosys');
+  }
   assert.deepEqual(await evaluate("Array.from(document.querySelectorAll('#version-rows tr'),r=>r.firstChild.textContent)"),[...dashboard.versions].reverse().map(v=>`v${v.crate_version}`));
-  if(dashboard.techmap_url){
+  if(latestTechmap){
     assert.equal(await evaluate("document.getElementById('techmap-link').hidden"),false);
-    assert.equal(await evaluate("document.getElementById('techmap-link').getAttribute('href')"),dashboard.techmap_url);
+    assert.equal(await evaluate("document.getElementById('latest-techmap-version').textContent"),`v${latestTechmap.crate_version}`);
+    const target=new URL(await evaluate("document.getElementById('latest-techmap-link').href"));
+    assert.equal(target.pathname,new URL('tech-mapped-asap7/',rootUrl).pathname);
+    assert.equal(target.searchParams.get('release'),latestTechmap.crate_version);
+    assert.ok(latestTechmap.techmap_cohorts.some(c=>c.id===target.searchParams.get('cohort')));
+    assert.equal(await evaluate("document.getElementById('techmap-link').href"),target.href);
   }
   if(!latest.full_count&&latest.techmap_cohorts?.length){
-    assert.equal(await evaluate("document.querySelector('#version-rows tr').children[1].querySelectorAll('.badge').length"),0);
-    const urls=await evaluate("Array.from(document.querySelector('#version-rows tr').lastChild.querySelectorAll('a'),a=>a.getAttribute('href'))");
+    assert.equal(await evaluate("document.querySelector('#version-rows tr [data-dimension=\"ir-aig\"]').querySelectorAll('a[href^=\"corpus/\"]').length"),0);
+    const urls=await evaluate("Array.from(document.querySelector('#version-rows tr [data-dimension=\"techmap\"]').querySelectorAll('a'),a=>a.getAttribute('href'))");
     for(const cohort of latest.techmap_cohorts)assert.ok(urls.includes(cohort.url));
   }
   const cohort=await evaluate("document.getElementById('cohort').value"),series=dashboard.trends.find(t=>t.id===cohort).stages[stage];

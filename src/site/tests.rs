@@ -2724,6 +2724,99 @@ if (JSON.stringify(latestDso.map(sample => sample.fn_key)) !== JSON.stringify(['
 }
 
 #[test]
+fn comparison_javascript_initializes_ir_limit_and_plotted_samples() {
+    const SCRIPT: &str = r#"
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const app = fs.readFileSync(0, 'utf8');
+const prefix = app.slice(0, app.indexOf('async function main()'));
+const cases = [
+  ['', 0, 100, [0, 10, 100]],
+  ['?max_ir_nodes=', 0, 100, [0, 10, 100]],
+  ['?max_ir_nodes=+', 0, 100, [0, 10, 100]],
+  ['?max_ir_nodes=0', 0, 0, [0]],
+  ['?max_ir_nodes=10', 0, 10, [0, 10]],
+  ['?max_ir_nodes=999', 0, 100, [0, 10, 100]],
+  ['?max_ir_nodes=-1', 0, 100, [0, 10, 100]],
+  ['?max_ir_nodes=invalid', 0, 100, [0, 10, 100]],
+  ['', 1, 100, [1, 10, 100]],
+];
+(async () => {
+  for (const [query, minimum, expectedLimit, expectedInputs] of cases) {
+    const elements = new Map();
+    const element = id => {
+      if (!elements.has(id)) elements.set(id, {value: '', dataset: {}, addEventListener() {}});
+      return elements.get(id);
+    };
+    element('comparison-plots').dataset = {datasetKey: 'comparison', lhsLabel: 'g8r', rhsLabel: 'Yosys/ABC'};
+    global.document = {
+      querySelector: () => ({content: ''}),
+      getElementById: element,
+    };
+    global.location = new URL('https://example.test/history/raw/' + query);
+    global.history = {replaceState: (_state, _title, url) => { global.location = new URL(url); }};
+    const samples = [minimum, 10, 100].map(ir_node_count => ({
+      fn_key: `input-${ir_node_count}`,
+      crate_version: '0.74.0',
+      dso_version: '0.59.0',
+      ir_node_count,
+      g8r_nodes: 12,
+      g8r_levels: 3,
+      yosys_abc_nodes: 10,
+      yosys_abc_levels: 2,
+      g8r_product_loss: 16,
+    }));
+    global.fetch = async () => ({ok: true, json: async () => ({dataset: {
+      min_ir_nodes: minimum, max_ir_nodes: 100, samples,
+    }})});
+    const plots = new Map();
+    global.Plotly = {react: async (id, traces, layout) => { plots.set(id, {traces, layout}); }};
+    const api = new Function(prefix + '\nreturn {comparisonPlots};')();
+    await api.comparisonPlots({datasets: [{logical_key: 'comparison', url: 'comparison.json'}]});
+    assert.equal(Number(element('comparison-max-ir-nodes').value), expectedLimit, query);
+    assert.equal(Number(element('comparison-filtered-count').textContent), expectedInputs.length, query);
+    const nodes = plots.get('plot-nodes');
+    assert.deepEqual(nodes.traces[0].customdata.map(sample => sample.ir_node_count), expectedInputs, query);
+    assert.equal(nodes.layout.xaxis.type, 'log');
+    assert.equal(nodes.layout.yaxis.type, 'log');
+    assert.equal(Number(new URL(global.location).searchParams.get('max_ir_nodes')), expectedLimit);
+  }
+})().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"#;
+    let mut child = match Command::new("node")
+        .arg("-e")
+        .arg(SCRIPT)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping comparison initialization test: node is unavailable");
+            return;
+        }
+        Err(error) => panic!("starting node: {error}"),
+    };
+    child
+        .stdin
+        .take()
+        .expect("node stdin")
+        .write_all(APP_JS.as_bytes())
+        .expect("write embedded JavaScript");
+    let output = child.wait_with_output().expect("wait for node");
+    assert!(
+        output.status.success(),
+        "comparison initialization test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn comparison_javascript_ignores_stale_evidence_fetches() {
     const SCRIPT: &str = r#"
 const fs = require('fs');

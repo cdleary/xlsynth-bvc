@@ -16,9 +16,15 @@ pub(super) const NAV_CSS_PATH: &str = "assets/navigation.css";
 const NAV_CSS: &[u8] = include_bytes!("site_assets/navigation.css");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ChildNavigation {
+enum ChildSection {
     PreviousVersions,
     Corpus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChildNavigation {
+    section: ChildSection,
+    techmap: bool,
 }
 
 // The existing composition protobuf supplies the navigation context. Standalone
@@ -27,9 +33,9 @@ pub(crate) fn child_navigation(site_dir: &Path) -> Result<Option<ChildNavigation
     let Some(parent) = site_dir.parent() else {
         return Ok(None);
     };
-    let (name, kind) = match site_dir.file_name().and_then(|n| n.to_str()) {
-        Some("history") => ("history", ChildNavigation::PreviousVersions),
-        Some("corpus") => ("corpus", ChildNavigation::Corpus),
+    let (name, section) = match site_dir.file_name().and_then(|n| n.to_str()) {
+        Some("history") => ("history", ChildSection::PreviousVersions),
+        Some("corpus") => ("corpus", ChildSection::Corpus),
         _ => return Ok(None),
     };
     let path = parent.join(MANIFEST);
@@ -41,9 +47,10 @@ pub(crate) fn child_navigation(site_dir: &Path) -> Result<Option<ChildNavigation
     if composition.record_version != 1 || composition.encode_to_vec() != bytes {
         bail!("invalid parent dashboard navigation context");
     }
-    let file = match kind {
-        ChildNavigation::PreviousVersions => composition.history_manifest,
-        ChildNavigation::Corpus => composition.corpus_manifest,
+    let techmap = composition.techmap_manifest.is_some();
+    let file = match section {
+        ChildSection::PreviousVersions => composition.history_manifest,
+        ChildSection::Corpus => composition.corpus_manifest,
     }
     .context("missing dashboard child manifest")?;
     if file.relpath.as_ref().map(|p| p.value.as_str())
@@ -51,7 +58,7 @@ pub(crate) fn child_navigation(site_dir: &Path) -> Result<Option<ChildNavigation
     {
         bail!("unexpected dashboard child navigation path");
     }
-    Ok(Some(kind))
+    Ok(Some(ChildNavigation { section, techmap }))
 }
 
 pub(super) fn child_parent_link(page: &str, url: &str) -> Result<bool> {
@@ -61,6 +68,8 @@ pub(super) fn child_parent_link(page: &str, url: &str) -> Result<bool> {
         format!("{root}../index.html#latest"),
         format!("{root}../index.html#versions"),
         format!("{root}../history/progression.html"),
+        format!("{root}../corpus/"),
+        format!("{root}../tech-mapped-asap7/"),
     ]
     .iter()
     .any(|link| link == url))
@@ -79,11 +88,16 @@ pub(crate) fn child_asset(
     }
     let root = site_root_url(path)?;
     let home = format!("{root}../index.html");
-    if kind == ChildNavigation::PreviousVersions && path == "index.html" {
+    if kind.section == ChildSection::PreviousVersions && path == "index.html" {
         return Ok(format!(r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="bvc-site-root" content="./"><meta http-equiv="refresh" content="0;url={home}"><title>Results dashboard</title></head><body><p><a href="{home}">Open the results dashboard</a></p></body></html>"#).into_bytes());
     }
+    let techmap = if kind.techmap {
+        format!(r#"<a href="{root}../tech-mapped-asap7/">Tech mapped ASAP7</a>"#)
+    } else {
+        String::new()
+    };
     let nav = format!(
-        r#"<nav class="bvc-navigation" aria-label="Primary navigation"><a class="bvc-navigation-home" href="{home}">Results</a><a href="{home}#latest">Latest</a><a href="{home}#versions">All versions</a><a href="{root}../history/progression.html">Progression</a></nav>"#
+        r#"<nav class="bvc-navigation" aria-label="Primary navigation"><a class="bvc-navigation-home" href="{home}">Results</a><a href="{root}../corpus/">IR/AIG plots</a><a href="{root}../history/progression.html">Release progression</a>{techmap}<a href="{home}#versions">All versions</a></nav>"#
     );
     let html = std::str::from_utf8(bytes)?
         .replace(&format!(r#"href="{root}""#), &format!(r#"href="{home}""#));
@@ -666,9 +680,18 @@ pub(crate) fn build(
         site_corpus::build_in_place(&child("corpus"), corpus, evidence, target)?;
         install_child_navigation(
             &staging.out_dir.join("history"),
-            ChildNavigation::PreviousVersions,
+            ChildNavigation {
+                section: ChildSection::PreviousVersions,
+                techmap: !techmap.is_empty(),
+            },
         )?;
-        install_child_navigation(&staging.out_dir.join("corpus"), ChildNavigation::Corpus)?;
+        install_child_navigation(
+            &staging.out_dir.join("corpus"),
+            ChildNavigation {
+                section: ChildSection::Corpus,
+                techmap: !techmap.is_empty(),
+            },
+        )?;
         if !techmap.is_empty() {
             site_techmap::build_leaf(
                 &staging.out_dir.join(site_techmap::ROOT),
@@ -1037,24 +1060,50 @@ mod tests {
             original
         );
         assert_eq!(
-            child_asset(Some(ChildNavigation::Corpus), "data/metrics.json", b"{}").unwrap(),
+            child_asset(
+                Some(ChildNavigation {
+                    section: ChildSection::Corpus,
+                    techmap: false,
+                }),
+                "data/metrics.json",
+                b"{}",
+            )
+            .unwrap(),
             b"{}"
         );
         let rendered = child_asset(
-            Some(ChildNavigation::PreviousVersions),
+            Some(ChildNavigation {
+                section: ChildSection::PreviousVersions,
+                techmap: false,
+            }),
             "runs/example/index.html",
             original,
         )
         .unwrap();
         assert_eq!(
             String::from_utf8(rendered).unwrap(),
-            r#"<!doctype html><html><head><link rel="stylesheet" href="../../assets/navigation.css"></head><body><nav class="bvc-navigation" aria-label="Primary navigation"><a class="bvc-navigation-home" href="../../../index.html">Results</a><a href="../../../index.html#latest">Latest</a><a href="../../../index.html#versions">All versions</a><a href="../../../history/progression.html">Progression</a></nav><a href="../../../index.html">Results</a></body></html>"#
+            r#"<!doctype html><html><head><link rel="stylesheet" href="../../assets/navigation.css"></head><body><nav class="bvc-navigation" aria-label="Primary navigation"><a class="bvc-navigation-home" href="../../../index.html">Results</a><a href="../../../corpus/">IR/AIG plots</a><a href="../../../history/progression.html">Release progression</a><a href="../../../index.html#versions">All versions</a></nav><a href="../../../index.html">Results</a></body></html>"#
+        );
+        let rendered = child_asset(
+            Some(ChildNavigation {
+                section: ChildSection::Corpus,
+                techmap: true,
+            }),
+            "index.html",
+            original,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(rendered).unwrap(),
+            r#"<!doctype html><html><head><link rel="stylesheet" href="./assets/navigation.css"></head><body><nav class="bvc-navigation" aria-label="Primary navigation"><a class="bvc-navigation-home" href="./../index.html">Results</a><a href="./../corpus/">IR/AIG plots</a><a href="./../history/progression.html">Release progression</a><a href="./../tech-mapped-asap7/">Tech mapped ASAP7</a><a href="./../index.html#versions">All versions</a></nav><a href="../../">Results</a></body></html>"#
         );
         assert!(
             child_parent_link("runs/example/index.html", "../../../index.html#versions").unwrap()
         );
         assert!(!child_parent_link("runs/example/index.html", "../../../../index.html").unwrap());
         assert!(!child_parent_link("index.html", "https://example.invalid/").unwrap());
+        assert!(child_parent_link("index.html", "./../corpus/").unwrap());
+        assert!(child_parent_link("index.html", "./../tech-mapped-asap7/").unwrap());
     }
     #[test]
     fn dashboard_browser_semantics() {
