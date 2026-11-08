@@ -318,7 +318,7 @@ fn projection(out: &Path) -> Result<Projection> {
     // Both child projections have already been verified against their protobuf
     // evidence. They are read only to create the final dashboard web projection.
     let history = out.join("history");
-    let catalog = decode_canonical_browser_catalog(&fs::read(history.join("catalog.json"))?)?;
+    let catalog = read_browser_catalog(&history)?;
     let mut versions: BTreeMap<String, Version> = BTreeMap::new();
     for (key, raw) in [
         (

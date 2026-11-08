@@ -85,7 +85,7 @@ const MFFC_PROGRESSION_IR_SHA256: &str =
     "f80befb2248a9757b7512068a4818308ecff1e77bcd78701b1a67338f979e5f8";
 const MFFC_PROGRESSION_ARTIFACT_MANIFEST_SHA256: &str =
     "cfc36afcd8b178687690a03d6c8b555e9517e7606ae8062d502452cf29e8861c";
-const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 9;
+const BROWSER_CATALOG_SCHEMA_VERSION: u32 = 10;
 const PROGRESSION_RUN_EVIDENCE_RECORD_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_SCHEMA_VERSION: u32 = 1;
 const STATIC_COMPARISON_SHARD_PREFIX_HEX_CHARS: u8 = 1;
@@ -541,6 +541,26 @@ struct BrowserProgressionGeneration {
     extra_ir_count: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     run_samples: Vec<BrowserProgressionSample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_samples_shard: Option<BrowserProgressionSampleShardRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BrowserProgressionSampleShardRef {
+    url: String,
+    bytes: u64,
+    sha256: String,
+    sample_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct BrowserProgressionSampleShard {
+    schema_version: u32,
+    cohort_id: String,
+    generation_id: String,
+    samples: Vec<BrowserProgressionSample>,
 }
 
 #[derive(Debug)]
@@ -824,6 +844,123 @@ fn decode_canonical_browser_catalog(bytes: &[u8]) -> Result<BrowserCatalog> {
     }
     if encode_browser_catalog(&catalog)? != bytes {
         bail!("browser catalog is not canonically encoded");
+    }
+    Ok(catalog)
+}
+
+const MAX_PROGRESSION_SAMPLE_SHARD_BYTES: usize = 2 * 1024 * 1024;
+
+fn progression_sample_shard_url(generation_id: &str) -> Result<String> {
+    if !is_canonical_lower_hex(generation_id, 64) {
+        bail!("invalid progression sample shard generation identity");
+    }
+    Ok(format!("data/progression-samples/{generation_id}.json"))
+}
+
+fn progression_sample_shard_urls(catalog: &BrowserCatalog) -> Result<BTreeSet<String>> {
+    let mut urls = BTreeSet::new();
+    for cohort in &catalog.progression.cohorts {
+        for generation in &cohort.generations {
+            if !generation.run_samples.is_empty() || generation.run_samples_shard.is_some() {
+                let url = progression_sample_shard_url(&generation.generation_id)?;
+                if !urls.insert(url) {
+                    bail!("duplicate progression sample shard generation identity");
+                }
+            }
+        }
+    }
+    Ok(urls)
+}
+
+fn browser_catalog_files(catalog: &BrowserCatalog) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut projection = catalog.clone();
+    let mut files = BTreeMap::new();
+    for cohort in &mut projection.progression.cohorts {
+        for generation in &mut cohort.generations {
+            if generation.run_samples_shard.is_some() {
+                bail!("hydrate progression samples before projecting the browser catalog");
+            }
+            if generation.run_samples.is_empty() {
+                continue;
+            }
+            let url = progression_sample_shard_url(&generation.generation_id)?;
+            let shard = BrowserProgressionSampleShard {
+                schema_version: 1,
+                cohort_id: cohort.cohort_id.clone(),
+                generation_id: generation.generation_id.clone(),
+                samples: std::mem::take(&mut generation.run_samples),
+            };
+            let bytes = serde_json::to_vec(&shard).context("encoding progression sample shard")?;
+            if bytes.len() > MAX_PROGRESSION_SAMPLE_SHARD_BYTES {
+                bail!("progression sample shard exceeds the 2 MiB budget: {url}");
+            }
+            generation.run_samples_shard = Some(BrowserProgressionSampleShardRef {
+                url: url.clone(),
+                bytes: bytes.len() as u64,
+                sha256: sha256_hex(&bytes),
+                sample_count: shard.samples.len() as u64,
+            });
+            if files.insert(url, bytes).is_some() {
+                bail!("duplicate progression sample shard generation identity");
+            }
+        }
+    }
+    files.insert("catalog.json".into(), encode_browser_catalog(&projection)?);
+    Ok(files)
+}
+
+fn read_browser_catalog(site_dir: &Path) -> Result<BrowserCatalog> {
+    let mut catalog = decode_canonical_browser_catalog(&fs::read(site_dir.join("catalog.json"))?)?;
+    if catalog.schema_version != BROWSER_CATALOG_SCHEMA_VERSION {
+        bail!("unsupported browser catalog schema version");
+    }
+    let mut urls = BTreeSet::new();
+    for cohort in &mut catalog.progression.cohorts {
+        for generation in &mut cohort.generations {
+            if !generation.run_samples.is_empty() {
+                bail!("public browser catalog contains inline progression samples");
+            }
+            let Some(reference) = generation.run_samples_shard.take() else {
+                continue;
+            };
+            let expected_url = progression_sample_shard_url(&generation.generation_id)?;
+            if reference.url != expected_url
+                || !urls.insert(reference.url.clone())
+                || !is_canonical_lower_hex(&reference.sha256, 64)
+                || reference.bytes > MAX_PROGRESSION_SAMPLE_SHARD_BYTES as u64
+                || reference.sample_count == 0
+                || reference.sample_count != generation.observed_ir_count
+            {
+                bail!("invalid progression sample shard reference");
+            }
+            let bytes = fs::read(site_dir.join(&reference.url))
+                .with_context(|| format!("reading progression samples {}", reference.url))?;
+            if bytes.len() as u64 != reference.bytes || sha256_hex(&bytes) != reference.sha256 {
+                bail!(
+                    "progression sample shard commitment mismatch: {}",
+                    reference.url
+                );
+            }
+            let shard: BrowserProgressionSampleShard = serde_json::from_slice(&bytes)
+                .context("decoding typed progression sample shard")?;
+            if serde_json::to_vec(&shard)? != bytes
+                || shard.schema_version != 1
+                || shard.cohort_id != cohort.cohort_id
+                || shard.generation_id != generation.generation_id
+                || shard.samples.len() as u64 != reference.sample_count
+            {
+                bail!("progression sample shard identity, count, or canonical encoding mismatch");
+            }
+            let mut hashes = BTreeSet::new();
+            for sample in &shard.samples {
+                if !cohort.cohort_ir_hashes.contains(&sample.structural_hash)
+                    || !hashes.insert(&sample.structural_hash)
+                {
+                    bail!("progression sample shard contains a duplicate or non-cohort input");
+                }
+            }
+            generation.run_samples = shard.samples;
+        }
     }
     Ok(catalog)
 }
@@ -1655,6 +1792,7 @@ fn decode_progression_run_evidence(
             missing_cohort_ir_count: 0,
             extra_ir_count: 0,
             run_samples,
+            run_samples_shard: None,
         },
         runtime_identity,
     ))
@@ -1980,6 +2118,7 @@ fn build_browser_progression_catalog_for_cohort(
             missing_cohort_ir_count,
             extra_ir_count,
             run_samples: Vec::new(),
+            run_samples_shard: None,
         });
     }
     generations.sort_by(progression_generation_cmp);
@@ -3161,6 +3300,7 @@ where
             .filter(|hash| !artifacts.contains_key(*hash))
             .count() as u64,
         run_samples: samples.into_values().collect(),
+        run_samples_shard: None,
     };
     validate_candidate_progression_generation(
         &generation,
@@ -3599,6 +3739,7 @@ fn load_release_progression_generation_with_evidence(
         missing_cohort_ir_count: 0,
         extra_ir_count: 0,
         run_samples: samples.into_values().collect(),
+        run_samples_shard: None,
     };
     Ok(ProgressionRunEvidenceInput {
         cohort_id: cohort.cohort_id.to_string(),
@@ -4258,6 +4399,9 @@ fn expected_catalog_site_relpaths(
     {
         bail!("browser catalog progression evidence is not strictly sorted by generation ID");
     }
+    for url in progression_sample_shard_urls(catalog)? {
+        insert_unique_site_relpath(&mut all, url)?;
+    }
     for evidence in &catalog.progression_evidence {
         if !is_canonical_lower_hex(&evidence.generation_id, 64)
             || !is_canonical_lower_hex(&evidence.sha256, 64)
@@ -4523,7 +4667,7 @@ fn expected_fixed_site_files(
         format!("assets/{PLOTLY_NOTICE_ASSET_NAME}"),
         PLOTLY_NOTICE.to_vec(),
     );
-    files.insert("catalog.json".to_string(), encode_browser_catalog(catalog)?);
+    files.extend(browser_catalog_files(catalog)?);
     files.insert(
         "snapshot_manifest.v1.pb".to_string(),
         crate::snapshot::encode_static_snapshot_manifest(snapshot)?,
@@ -5255,11 +5399,9 @@ fn build_static_site_with_progression_runs_in_place(
         releases: versions.releases,
         repository_head_observation: versions.repository_head_observation,
     };
-    write_file(
-        &options.out_dir,
-        "catalog.json",
-        &encode_browser_catalog(&catalog)?,
-    )?;
+    for (relpath, bytes) in browser_catalog_files(&catalog)? {
+        write_file(&options.out_dir, &relpath, &bytes)?;
+    }
     write_file(
         &options.out_dir,
         "snapshot_manifest.v1.pb",
@@ -5839,9 +5981,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
             total_bytes,
         });
     }
-    let catalog_bytes =
-        fs::read(site_dir.join("catalog.json")).context("reading browser catalog")?;
-    let catalog = decode_canonical_browser_catalog(&catalog_bytes)?;
+    let catalog = read_browser_catalog(site_dir)?;
     if catalog.schema_version != BROWSER_CATALOG_SCHEMA_VERSION
         || catalog.snapshot_id != snapshot_id
         || catalog.base_url != base_url
@@ -5906,12 +6046,14 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
         .iter()
         .map(|evidence| evidence.url.clone())
         .collect::<BTreeSet<_>>();
+    let progression_sample_urls = progression_sample_shard_urls(&catalog)?;
     let declared_dataset_urls = declared
         .keys()
         .filter(|relpath| {
             relpath.starts_with("data/")
                 && relpath.ends_with(".json")
                 && !progression_evidence_urls.contains(*relpath)
+                && !progression_sample_urls.contains(*relpath)
         })
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -6338,9 +6480,7 @@ pub(crate) fn smoke_static_site(
     let progression_markers = if corpus_mode || dashboard_mode {
         vec![("data-rendered=\"true\"".to_string(), 1)]
     } else {
-        let catalog = decode_canonical_browser_catalog(
-            &fs::read(site_dir.join("catalog.json")).context("reading browser smoke catalog")?,
-        )?;
+        let catalog = read_browser_catalog(site_dir).context("reading browser smoke catalog")?;
         let progression_catalog = catalog
             .progression
             .cohorts
