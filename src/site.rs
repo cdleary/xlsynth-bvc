@@ -6329,8 +6329,24 @@ fn start_plain_static_server(directory: &Path) -> Result<(Child, std::net::Socke
 
 enum SmokePageContent {
     Text(&'static str),
-    Html(&'static str),
+    Html(String),
 }
+
+impl SmokePageContent {
+    fn verify(&self, response: &str, url: &str) -> Result<()> {
+        match self {
+            Self::Text(expected) if !response.contains(expected) => {
+                bail!("static HTTP response for {url} did not contain {expected:?}");
+            }
+            Self::Html(expected) if response != expected => {
+                bail!("static HTTP response for {url} differs from its canonical HTML resource");
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+type SmokePage = (String, SmokePageContent, Vec<(String, usize)>);
 
 fn run_browser_page(
     browser: &Path,
@@ -6346,15 +6362,7 @@ fn run_browser_page(
         .with_context(|| format!("checking static smoke page status: {url}"))?
         .text()
         .with_context(|| format!("reading static smoke page: {url}"))?;
-    match expected_content {
-        SmokePageContent::Text(expected) if !response.contains(expected) => {
-            bail!("static HTTP response for {url} did not contain {expected:?}");
-        }
-        SmokePageContent::Html(expected) if response != *expected => {
-            bail!("static HTTP response for {url} differs from its canonical HTML resource");
-        }
-        _ => {}
-    }
+    expected_content.verify(&response, url)?;
     let screenshot_name = format!("{}.png", &sha256_hex(url.as_bytes())[..16]);
     let screenshot_path = profile_dir.join(screenshot_name);
     let mut command = Command::new(browser);
@@ -6369,7 +6377,7 @@ fn run_browser_page(
         "--disable-component-update",
         "--disable-default-apps",
         "--disable-sync",
-        "--window-size=1280,900",
+        "--window-size=1280,1800",
     ]);
     if !rendered_markers.is_empty() {
         command.args(["--dump-dom", "--virtual-time-budget=12000"]);
@@ -6466,6 +6474,159 @@ fn run_browser_page(
     Ok(())
 }
 
+fn legacy_progression_markers(catalog: &BrowserCatalog) -> Result<Vec<(String, usize)>> {
+    let progression_catalog = catalog
+        .progression
+        .cohorts
+        .iter()
+        .find(|cohort| cohort.cohort_id == catalog.progression.default_cohort_id)
+        .context("browser catalog has no default progression cohort")?;
+    let complete_generations = progression_catalog
+        .generations
+        .iter()
+        .filter(|generation| generation.coverage == BrowserProgressionCoverage::CohortComplete)
+        .collect::<Vec<_>>();
+    Ok(if complete_generations.len() >= 2 {
+        let current = complete_generations
+            .iter()
+            .rev()
+            .find(|generation| {
+                matches!(
+                    generation.origin,
+                    BrowserProgressionOrigin::GitRevision { .. }
+                )
+            })
+            .copied()
+            .unwrap_or_else(|| complete_generations.last().expect("nonempty generations"));
+        let baseline = current
+            .baseline_generation_id
+            .as_ref()
+            .and_then(|id| {
+                complete_generations
+                    .iter()
+                    .find(|generation| generation.generation_id == *id)
+                    .copied()
+            })
+            .unwrap_or(complete_generations[complete_generations.len() - 2]);
+        vec![
+            ("data-progression-rendered=\"true\"".to_string(), 1),
+            (
+                format!(
+                    "data-progression-baseline-version=\"{}\"",
+                    baseline.display_label
+                ),
+                1,
+            ),
+            (
+                format!(
+                    "data-progression-current-version=\"{}\"",
+                    current.display_label
+                ),
+                1,
+            ),
+        ]
+    } else {
+        Vec::new()
+    })
+}
+
+fn legacy_smoke_pages(site_dir: &Path) -> Result<Vec<SmokePage>> {
+    let catalog = read_browser_catalog(site_dir).context("reading browser smoke catalog")?;
+    let snapshot =
+        load_static_snapshot_manifest(site_dir).context("reading browser smoke source snapshot")?;
+    let progression_markers = legacy_progression_markers(&catalog)?;
+    let navigation = site_dashboard::child_navigation(site_dir)?;
+    let home_markers = if navigation.is_some() {
+        vec![("data-rendered=\"true\"".to_string(), 1)]
+    } else {
+        Vec::new()
+    };
+    let mut canonical = expected_fixed_site_files(&catalog, &snapshot)?;
+    [
+        ("", "index.html", home_markers),
+        ("runs.html", "runs.html", Vec::new()),
+        ("progression.html", "progression.html", progression_markers),
+        ("releases.html", "releases.html", Vec::new()),
+        (
+            "mffc-discrepancies.html",
+            "mffc-discrepancies.html",
+            Vec::new(),
+        ),
+        (
+            "ir-fn-corpus-g8r-vs-yosys-abc/",
+            "ir-fn-corpus-g8r-vs-yosys-abc/index.html",
+            vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
+        ),
+        (
+            "ir-fn-g8r-abc-vs-codegen-yosys-abc/",
+            "ir-fn-g8r-abc-vs-codegen-yosys-abc/index.html",
+            vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
+        ),
+        ("dataset.html", "dataset.html", Vec::new()),
+    ]
+    .into_iter()
+    .map(|(route, relpath, markers)| {
+        let canonical = canonical
+            .remove(relpath)
+            .context("missing canonical smoke page")?;
+        let canonical = site_dashboard::child_asset(navigation, relpath, &canonical)?;
+        let html = String::from_utf8(canonical).context("canonical smoke page is not UTF-8")?;
+        Ok((route.to_string(), SmokePageContent::Html(html), markers))
+    })
+    .collect()
+}
+
+fn smoke_pages(site_dir: &Path, corpus_mode: bool, dashboard_mode: bool) -> Result<Vec<SmokePage>> {
+    let rendered = vec![("data-rendered=\"true\"".to_string(), 1)];
+    let mut pages = if dashboard_mode {
+        let corpus = site_dir.join("corpus");
+        let corpus_html = site_dashboard::child_asset(
+            site_dashboard::child_navigation(&corpus)?,
+            "index.html",
+            include_bytes!("site_assets/corpus.html"),
+        )?;
+        let mut pages = vec![
+            (
+                "".to_string(),
+                SmokePageContent::Text("g8r cost by release"),
+                rendered.clone(),
+            ),
+            (
+                "corpus/".to_string(),
+                SmokePageContent::Html(String::from_utf8(corpus_html)?),
+                rendered.clone(),
+            ),
+        ];
+        pages.extend(
+            legacy_smoke_pages(&site_dir.join("history"))?
+                .into_iter()
+                .map(|(path, expected, markers)| (format!("history/{path}"), expected, markers)),
+        );
+        pages
+    } else if corpus_mode {
+        vec![(
+            "".to_string(),
+            SmokePageContent::Text("IR corpus synthesis results"),
+            rendered.clone(),
+        )]
+    } else {
+        legacy_smoke_pages(site_dir)?
+    };
+    if dashboard_mode
+        && site_dir
+            .join(site_techmap::ROOT)
+            .join(site_techmap::MANIFEST)
+            .is_file()
+    {
+        pages.push((
+            "tech-mapped-asap7/".to_string(),
+            SmokePageContent::Html(include_str!("site_assets/techmap.html").to_string()),
+            rendered,
+        ));
+    }
+    Ok(pages)
+}
+
 pub(crate) fn smoke_static_site(
     site_dir: &Path,
     explicit_browser: Option<&Path>,
@@ -6474,73 +6635,16 @@ pub(crate) fn smoke_static_site(
     if timeout_seconds == 0 {
         bail!("browser smoke timeout must be nonzero");
     }
-    let verified = verify_static_site(site_dir)?;
+    let site_dir = fs::canonicalize(site_dir).context("canonicalizing static site directory")?;
+    let verified = verify_static_site(&site_dir)?;
     let corpus_mode = site_dir.join(site_corpus::MANIFEST).is_file();
     let dashboard_mode = site_dir.join(site_dashboard::MANIFEST).is_file();
-    let progression_markers = if corpus_mode || dashboard_mode {
-        vec![("data-rendered=\"true\"".to_string(), 1)]
-    } else {
-        let catalog = read_browser_catalog(site_dir).context("reading browser smoke catalog")?;
-        let progression_catalog = catalog
-            .progression
-            .cohorts
-            .iter()
-            .find(|cohort| cohort.cohort_id == catalog.progression.default_cohort_id)
-            .context("browser catalog has no default progression cohort")?;
-        let complete_generations = progression_catalog
-            .generations
-            .iter()
-            .filter(|generation| generation.coverage == BrowserProgressionCoverage::CohortComplete)
-            .collect::<Vec<_>>();
-        if complete_generations.len() >= 2 {
-            let current = complete_generations
-                .iter()
-                .rev()
-                .find(|generation| {
-                    matches!(
-                        generation.origin,
-                        BrowserProgressionOrigin::GitRevision { .. }
-                    )
-                })
-                .copied()
-                .unwrap_or_else(|| complete_generations.last().expect("nonempty generations"));
-            let baseline = current
-                .baseline_generation_id
-                .as_ref()
-                .and_then(|id| {
-                    complete_generations
-                        .iter()
-                        .find(|generation| generation.generation_id == *id)
-                        .copied()
-                })
-                .unwrap_or(complete_generations[complete_generations.len() - 2]);
-            vec![
-                ("data-progression-rendered=\"true\"".to_string(), 1),
-                (
-                    format!(
-                        "data-progression-baseline-version=\"{}\"",
-                        baseline.display_label
-                    ),
-                    1,
-                ),
-                (
-                    format!(
-                        "data-progression-current-version=\"{}\"",
-                        current.display_label
-                    ),
-                    1,
-                ),
-            ]
-        } else {
-            Vec::new()
-        }
-    };
+    let pages = smoke_pages(&site_dir, corpus_mode, dashboard_mode)?;
     let browser = browser_path(explicit_browser)?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let site_dir = fs::canonicalize(site_dir).context("canonicalizing static site directory")?;
     let mut temporary_server_root = None;
     let server_root = if verified.base_url == "/" {
         site_dir.clone()
@@ -6567,50 +6671,6 @@ pub(crate) fn smoke_static_site(
     fs::create_dir_all(&profile_dir).context("creating temporary Chrome profile")?;
     let origin = format!("http://{address}");
     let timeout = Duration::from_secs(timeout_seconds);
-    let pages = if dashboard_mode {
-        vec![("", "g8r cost by release", progression_markers)]
-    } else if corpus_mode {
-        vec![("", "IR corpus synthesis results", progression_markers)]
-    } else {
-        vec![
-            ("", "xlsynth-bvc results", Vec::new()),
-            ("runs.html", "Campaign runs", Vec::new()),
-            (
-                "progression.html",
-                "Fixed-IR generation progression",
-                progression_markers,
-            ),
-            ("releases.html", "Crate release processing", Vec::new()),
-            ("mffc-discrepancies.html", "MFFC discrepancies", Vec::new()),
-            (
-                "ir-fn-corpus-g8r-vs-yosys-abc/",
-                "IR corpus: g8r vs Yosys/ABC",
-                vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
-            ),
-            (
-                "ir-fn-g8r-abc-vs-codegen-yosys-abc/",
-                "IR corpus: g8r+ABC vs codegen+Yosys/ABC",
-                vec![("class=\"plotly-host js-plotly-plot\"".to_string(), 4)],
-            ),
-            ("dataset.html", "Dataset explorer", Vec::new()),
-        ]
-    };
-    let mut pages = pages
-        .into_iter()
-        .map(|(path, expected, markers)| (path, SmokePageContent::Text(expected), markers))
-        .collect::<Vec<_>>();
-    if dashboard_mode
-        && site_dir
-            .join(site_techmap::ROOT)
-            .join(site_techmap::MANIFEST)
-            .is_file()
-    {
-        pages.push((
-            "tech-mapped-asap7/",
-            SmokePageContent::Html(include_str!("site_assets/techmap.html")),
-            vec![("data-rendered=\"true\"".to_string(), 1)],
-        ));
-    }
     let result = pages
         .iter()
         .try_for_each(|(path, expected, rendered_markers)| {
@@ -6634,10 +6694,7 @@ pub(crate) fn smoke_static_site(
         site_dir: site_dir.display().to_string(),
         base_url: verified.base_url,
         browser: browser.display().to_string(),
-        pages_checked: pages
-            .iter()
-            .map(|(path, _, _)| (*path).to_string())
-            .collect(),
+        pages_checked: pages.iter().map(|(path, _, _)| path.clone()).collect(),
     })
 }
 
