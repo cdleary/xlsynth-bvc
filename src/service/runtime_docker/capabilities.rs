@@ -3,6 +3,81 @@
 use super::*;
 use crate::proto::cache::DriverRunnerCapabilities;
 
+pub(super) const PROBE_SCRIPT: &str = r#"
+python3 - <<'PY'
+import os
+import runpy
+from pathlib import Path
+probe = runpy.run_path("/probe/worker.py")["write_capabilities"]
+probe(Path("/outputs/capabilities.json"), os.environ["CAPABILITY_RUNNER_KEY"],
+      os.environ["CAPABILITY_INSTANCE_ID"], os.environ["CAPABILITY_IMAGE"])
+PY
+"#;
+
+pub(super) fn probe(
+    repo_root: &Path,
+    image: &str,
+    mounts: &[DockerMount],
+    env: &BTreeMap<String, String>,
+    script: &str,
+) -> Result<()> {
+    let mut command = Command::new("docker");
+    command.args([
+        "run",
+        "--rm",
+        "--pull",
+        "never",
+        "--network",
+        "none",
+        "--entrypoint",
+        "timeout",
+    ]);
+    for mount in mounts {
+        command.arg("--volume").arg(format!(
+            "{}:{}{}",
+            mount.host_path.display(),
+            mount.container_path,
+            if mount.read_only { ":ro" } else { "" },
+        ));
+    }
+    for (name, value) in env {
+        command.arg("--env").arg(format!("{name}={value}"));
+    }
+    let output = command
+        .args([image, "--kill-after=5s", "30s", "bash", "-c", script])
+        .current_dir(repo_root)
+        .output()
+        .context("running bound driver capability probe")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "bound driver capability probe failed (exit={:?}): {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    Ok(())
+}
+
+pub(super) fn bound_cache_key(
+    image: &str,
+    runtime_fingerprint: &str,
+    dso_version: &str,
+    worker_script: &[u8],
+) -> String {
+    format!(
+        "capabilities-{}",
+        super::runtime_fingerprint(
+            "driver-capability-probe-v1",
+            &[
+                image,
+                runtime_fingerprint,
+                dso_version,
+                &hex::encode(Sha256::digest(worker_script)),
+                &hex::encode(Sha256::digest(PROBE_SCRIPT)),
+            ],
+        )
+    )
+}
+
 #[derive(serde::Deserialize)]
 struct WorkerReport {
     schema_version: u32,
@@ -30,8 +105,8 @@ fn validate(record: &DriverRunnerCapabilities, runner_key: &str) -> Result<()> {
     Ok(())
 }
 
-// The worker publishes its JSON report before its first heartbeat. Import it
-// only at startup, under the slot lock, for the instance the host just started.
+// Import only the completed bound probe's report, under its cache lock. The
+// request environment and immutable image bind the help calls to that runtime.
 pub(super) fn publish(
     paths: &PersistentRunnerPaths,
     runner_key: &str,
@@ -92,7 +167,7 @@ pub(super) fn load_or_probe(
         if let Some(guard) = PersistentRunnerSlotGuard::try_acquire(paths)? {
             break guard;
         }
-        // Startup can publish the cache and continue into a long request.
+        // Another bound probe may publish the cache while holding its reservation.
         thread::sleep(Duration::from_millis(100));
     };
     // A concurrent startup may have published between the read and the lock.
@@ -118,6 +193,55 @@ mod tests {
             "driver_subcommands": {"aig2ir": true, "ir-equiv": false, "ir2g8r": true, "ir2gates": true},
             "driver_help_tokens": {"ir2gates": {"--prepared-ir-out": false}},
         })
+    }
+
+    #[test]
+    fn bound_keys_change_with_the_image_runtime_dso_and_parser() {
+        let key = bound_cache_key("image", "runtime", "dso", b"parser");
+        assert_eq!(key, bound_cache_key("image", "runtime", "dso", b"parser"));
+        for changed in [
+            bound_cache_key("other-image", "runtime", "dso", b"parser"),
+            bound_cache_key("image", "other-runtime", "dso", b"parser"),
+            bound_cache_key("image", "runtime", "other-dso", b"parser"),
+            bound_cache_key("image", "runtime", "dso", b"other-parser"),
+        ] {
+            assert_ne!(key, changed);
+        }
+    }
+
+    #[test]
+    fn concurrent_cold_queries_publish_once_and_failed_probes_can_retry() -> Result<()> {
+        let root = make_temp_store_root("bound-capability-concurrent");
+        let paths = PersistentRunnerPaths::new(&root, "slot");
+        paths.ensure_layout()?;
+        assert!(load_or_probe(&paths, "slot", || bail!("failed help")).is_err());
+        assert!(!paths.root.join("capabilities.pb").exists());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let ready = std::sync::Barrier::new(8);
+        thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        ready.wait();
+                        load_or_probe(&paths, "slot", || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            fs::write(&paths.capabilities_path, serde_json::to_vec(&report())?)?;
+                            publish(&paths, "slot", "image", "instance")
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                let record = handle.join().expect("capability query thread")?;
+                assert_eq!(record.aig2ir, Some(true));
+                assert_eq!(record.ir_equiv, Some(false));
+                assert_eq!(record.ir2gates_prepared_ir_out, Some(false));
+            }
+            Ok::<_, anyhow::Error>(())
+        })?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

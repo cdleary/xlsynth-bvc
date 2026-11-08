@@ -2032,19 +2032,49 @@ pub(crate) fn load_driver_runner_capabilities(
         .root
         .canonicalize()
         .context("resolving the runner store root")?;
-    let base_runner_key = persistent_runner_key(&image, &store_root);
-    let pool_size = persistent_runner_pool_size(PersistentRunnerFamily::Driver);
-    let runner_key = persistent_runner_slot_key(&base_runner_key, pool_size, 0);
-    let container_name = persistent_runner_container_name(&image, &runner_key);
+    let version = resolve_xlsynth_version_for_driver(repo_root, &runtime.driver_version)?;
+    let runner_key = capabilities::bound_cache_key(
+        &image,
+        &driver_runtime_fingerprint(runtime)?,
+        &version,
+        worker_script::EMBEDDED,
+    );
     let runner_paths = PersistentRunnerPaths::new(&store_root, &runner_key);
+    // This reservation belongs to the bound capability cache, never an execution
+    // slot. An isolated probe also works when all execution slots are reserved.
     capabilities::load_or_probe(&runner_paths, &runner_key, || {
-        let instance_id = start_persistent_runner_locked(
+        ensure_driver_release_cache(
+            store,
             repo_root,
-            &store_root,
+            &version,
+            &runtime.release_platform,
+            &runtime.release_cache_input_sha256,
+        )?;
+        let instance_id = new_persistent_runner_instance_id(&runner_key);
+        let env = BTreeMap::from([
+            ("XLSYNTH_VERSION".to_string(), version.clone()),
+            (
+                "XLSYNTH_PLATFORM".to_string(),
+                runtime.release_platform.clone(),
+            ),
+            ("CAPABILITY_RUNNER_KEY".to_string(), runner_key.clone()),
+            ("CAPABILITY_INSTANCE_ID".to_string(), instance_id.clone()),
+            ("CAPABILITY_IMAGE".to_string(), image.clone()),
+        ]);
+        let mounts = [
+            DockerMount::read_write(&runner_paths.root, "/outputs")?,
+            driver_cache_mount(store, runtime)?,
+            DockerMount::read_only(
+                &worker_script::materialize(&store_root, worker_script::EMBEDDED)?,
+                "/probe/worker.py",
+            )?,
+        ];
+        capabilities::probe(
+            repo_root,
             &image,
-            &runner_key,
-            &container_name,
-            &runner_paths,
+            &mounts,
+            &env,
+            &driver_script(capabilities::PROBE_SCRIPT),
         )?;
         capabilities::publish(&runner_paths, &runner_key, &image, &instance_id)
     })
@@ -2598,7 +2628,7 @@ fn select_persistent_runner(
                 _ => {
                     // An unreserved busy runner is orphaned work from an interrupted
                     // host. Retire it before accepting another request in this slot.
-                    let instance_id = start_persistent_runner_locked(
+                    start_persistent_runner_locked(
                         repo_root,
                         store_root,
                         image,
@@ -2606,14 +2636,6 @@ fn select_persistent_runner(
                         &container_name,
                         &paths,
                     )?;
-                    if slot == 0
-                        && matches!(family, PersistentRunnerFamily::Driver)
-                        && let Err(error) =
-                            capabilities::publish(&paths, &runner_key, image, &instance_id)
-                    {
-                        // Script execution can proceed. A capability lookup retries the probe.
-                        log::warn!("could not cache driver capabilities: {error:#}");
-                    }
                     docker_container_id(&container_name)?
                         .context("new persistent runner disappeared during selection")?
                 }
@@ -4168,6 +4190,104 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
     }
 
     #[test]
+    #[ignore = "requires Docker and XLSYNTH_BVC_TEST_CAPABILITY_CORPUS naming a completed corpus output"]
+    fn bound_capability_probes_use_pinned_caches_once_while_execution_is_reserved() -> Result<()> {
+        let _guard = docker_integration_test_lock()
+            .lock()
+            .map_err(|_| anyhow!("docker integration test lock poisoned"))?;
+        let _pool = ScopedEnvVar::set(PERSISTENT_RUNNER_DRIVER_POOL_SIZE_ENV, "1");
+        let repo_root = std::env::current_dir()?;
+        let corpus = PathBuf::from(
+            std::env::var_os("XLSYNTH_BVC_TEST_CAPABILITY_CORPUS")
+                .context("set XLSYNTH_BVC_TEST_CAPABILITY_CORPUS to a completed corpus output")?,
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(corpus.join("manifest.json"))?)?;
+        let source_store = PathBuf::from(
+            manifest["workspace_store_dir"]
+                .as_str()
+                .context("corpus manifest store path")?,
+        );
+        let store = ArtifactStore::new(make_temp_store_root("pinned-bound-capabilities"));
+        store.ensure_layout()?;
+        let mut cleanup = DockerCleanup::new(Vec::new());
+        for field in ["driver_runtime", "stats_runtime"] {
+            let runtime: DriverRuntimeSpec = serde_json::from_value(manifest[field].clone())?;
+            let cache = store.driver_release_cache_dir(&runtime.release_cache_input_sha256)?;
+            let source = source_store
+                .join(crate::DRIVER_RELEASE_CACHE_DIR)
+                .join("by-input-sha256")
+                .join(&runtime.release_cache_input_sha256);
+            // Keep all probe writes in this test's store; the completed workspace is input only.
+            for entry in WalkDir::new(&source) {
+                let entry = entry?;
+                let destination = cache.join(entry.path().strip_prefix(&source)?);
+                if entry.file_type().is_dir() {
+                    fs::create_dir_all(destination)?;
+                } else {
+                    fs::copy(entry.path(), destination)?;
+                }
+            }
+            let image = docker_image_content_ref(&runtime.docker_image_id)?;
+            let execution_key = persistent_runner_key(&image, &store.root);
+            let container = persistent_runner_container_name(&image, &execution_key);
+            cleanup.add_container(container.clone());
+            // Hold the sole execution slot throughout the cold query. The probe
+            // must use its explicit cache/parser mounts in a separate container.
+            let reserved = select_persistent_runner(
+                &repo_root,
+                &store.root,
+                &image,
+                PersistentRunnerFamily::Driver,
+            )?
+            .context("reserve the execution slot")?;
+            let before_container = docker_container_id(&container)?.context("reserved runner")?;
+            let record = load_driver_runner_capabilities(&store, &repo_root, &runtime)?;
+            assert_eq!(
+                record,
+                crate::proto::cache::DriverRunnerCapabilities {
+                    runner_key: record.runner_key.clone(),
+                    aig2ir: Some(true),
+                    ir_equiv: Some(true),
+                    ir2g8r: Some(true),
+                    ir2gates: Some(true),
+                    ir2gates_prepared_ir_out: Some(true),
+                }
+            );
+            let paths = PersistentRunnerPaths::new(&store.root, &record.runner_key);
+            assert_eq!(
+                crate::proto::cache::DriverRunnerCapabilities::decode(
+                    fs::read(paths.root.join("capabilities.pb"))?.as_slice()
+                )?,
+                record
+            );
+            let first_report = fs::read(&paths.capabilities_path)?;
+            for _ in 0..3 {
+                assert_eq!(
+                    load_driver_runner_capabilities(&store, &repo_root, &runtime)?,
+                    record
+                );
+                assert_eq!(fs::read(&paths.capabilities_path)?, first_report);
+                assert_eq!(
+                    docker_container_id(&container)?,
+                    Some(before_container.clone())
+                );
+            }
+            validate_driver_release_cache(
+                &cache,
+                &resolve_xlsynth_version_for_driver(&repo_root, &runtime.driver_version)?,
+                &runtime.release_platform,
+                &runtime.release_cache_input_sha256,
+            )?;
+            eprintln!("pinned {} capabilities: {record:?}", runtime.driver_version);
+            drop(reserved);
+        }
+        drop(cleanup);
+        fs::remove_dir_all(store.root)?;
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires docker"]
     fn persistent_runners_retire_without_host_activity_and_restart() -> Result<()> {
         let _guard = docker_integration_test_lock()
@@ -4198,6 +4318,10 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
         ensure_driver_image(&repo_root, &runtime)?;
         runtime.docker_image_id = inspect_image_id(&image_ref)?.context("test driver image")?;
         let image = docker_image_content_ref(&runtime.docker_image_id)?;
+        let version = resolve_xlsynth_version_for_driver(&repo_root, &runtime.driver_version)?;
+        seed_fake_driver_release_cache(&store, &version, &runtime.release_platform)?;
+        let capabilities = load_driver_runner_capabilities(&store, &repo_root, &runtime)?;
+        assert_eq!(capabilities.aig2ir, Some(true));
         let expiring_key = persistent_runner_key(&image, &store.root);
         {
             let _disabled = ScopedEnvVar::set(PERSISTENT_RUNNER_IDLE_TTL_SECS_ENV, "0");
@@ -4309,7 +4433,15 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
             });
             assert!(running?.into_iter().all(|running| running));
             let capabilities = capabilities.context("capability query waited for busy slot")??;
-            assert_eq!(capabilities.runner_key, first_key);
+            assert_eq!(
+                capabilities.runner_key,
+                capabilities::bound_cache_key(
+                    &image,
+                    &driver_runtime_fingerprint(&runtime)?,
+                    &version,
+                    worker_script::EMBEDDED,
+                )
+            );
             assert_eq!(capabilities.aig2ir, Some(true));
             for name in &names {
                 wait_removed(name)?;
@@ -4339,6 +4471,7 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
 
             // A missing container must be restartable even after a damaged heartbeat.
             let paths = PersistentRunnerPaths::new(&store.root, &first_key);
+            remove_file_if_exists(&paths.heartbeat_path)?;
             fs::write(&paths.heartbeat_path, b"{")?;
 
             // A job longer than the idle timeout still completes and its
