@@ -3982,3 +3982,4 @@ fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() 
 }
 
 mod progression_sample_shards;
+mod smoke_pages;
