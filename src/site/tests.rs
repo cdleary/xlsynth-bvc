@@ -202,6 +202,14 @@ fn candidate_baseline_is_bound_to_checked_latest_release_observation() {
         candidate_run.stats_runtime.driver_version = observation.latest_crate_version.clone();
         candidate_run.stats_runtime.docker_image =
             crate::runtime::default_driver_image(&observation.latest_crate_version);
+        candidate_run.stats_runtime.dockerfile =
+            crate::runtime::default_driver_dockerfile(&observation.latest_crate_version)
+                .to_string();
+        candidate_run.stats_runtime.dockerfile_sha256 = crate::runtime::runtime_dockerfile_sha256(
+            &test_repo_root(),
+            &candidate_run.stats_runtime.dockerfile,
+        )
+        .expect("released stats Dockerfile digest");
         candidate_run.candidate_run_id =
             candidate_run_identity_sha256(candidate_run).expect("candidate run identity");
     }
