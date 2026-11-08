@@ -138,19 +138,21 @@ if [ -n "${BVC_PREPARED_XLSYNTH_TOOLS:-}" ]; then
   export XLSYNTH_TOOLS="${BVC_PREPARED_XLSYNTH_TOOLS}"
 else
 cache_dir="/cache-input"
+release_dir="/tmp/xlsynth-release"
 if [ ! -d "${cache_dir}" ]; then
   echo "missing cached xlsynth release at ${cache_dir}" >&2
   exit 1
 fi
-rm -rf /tmp/xlsynth-release
-mkdir -p /tmp/xlsynth-release
-cp -a "${cache_dir}/." /tmp/xlsynth-release/
+rm -rf "${release_dir}"
+mkdir -p "${release_dir}"
+# Payloads stay on the read-only cache mount; directories remain request-local for aliases.
+cp -as "${cache_dir}/." "${release_dir}/"
 for ext in so dylib; do
-  if [ -f "/tmp/xlsynth-release/libxls-${XLSYNTH_PLATFORM}.${ext}" ]; then
-    ln -sf "/tmp/xlsynth-release/libxls-${XLSYNTH_PLATFORM}.${ext}" "/tmp/xlsynth-release/libxls-${XLSYNTH_VERSION}-${XLSYNTH_PLATFORM}.${ext}"
+  if [ -f "${release_dir}/libxls-${XLSYNTH_PLATFORM}.${ext}" ]; then
+    ln -sf "${release_dir}/libxls-${XLSYNTH_PLATFORM}.${ext}" "${release_dir}/libxls-${XLSYNTH_VERSION}-${XLSYNTH_PLATFORM}.${ext}"
   fi
 done
-export XLSYNTH_TOOLS=/tmp/xlsynth-release
+export XLSYNTH_TOOLS="${release_dir}"
 fi
 export LD_LIBRARY_PATH="${XLSYNTH_TOOLS}:${LD_LIBRARY_PATH:-}"
 "#;
@@ -339,6 +341,123 @@ mod tests {
     use std::fs::File;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tar::Builder;
+
+    #[test]
+    fn driver_release_setup_links_read_only_payloads_and_recreates_local_aliases() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "xlsynth-bvc-release-view-{}-{nanos}",
+            std::process::id()
+        ));
+        let view = root.join("request release");
+        let script = format!(
+            "set -euo pipefail\n{}\nprintf '%s\\0%s\\0' \"$XLSYNTH_TOOLS\" \"$LD_LIBRARY_PATH\"\n",
+            DRIVER_TOOLS_SETUP_FROM_CACHE_SNIPPET
+                .replace("cache_dir=\"/cache-input\"", "cache_dir=\"$TEST_CACHE\"")
+                .replace(
+                    "release_dir=\"/tmp/xlsynth-release\"",
+                    "release_dir=\"$TEST_RELEASE\""
+                )
+        );
+        for versioned_only in [false, true] {
+            let cache = root.join(if versioned_only {
+                "versioned cache"
+            } else {
+                "unversioned cache"
+            });
+            let mut payloads = BTreeMap::from([
+                ("opt_main".to_string(), b"tool payload".to_vec()),
+                (
+                    "protos/xls/ir/op.proto".to_string(),
+                    b"proto payload".to_vec(),
+                ),
+                (
+                    "xls/dslx/stdlib/std.x".to_string(),
+                    b"stdlib payload".to_vec(),
+                ),
+            ]);
+            for ext in ["so", "dylib"] {
+                let library = if versioned_only {
+                    format!("libxls-v0.61.0-test-platform.{ext}")
+                } else {
+                    format!("libxls-test-platform.{ext}")
+                };
+                payloads.insert(library, format!("{ext} library payload").into_bytes());
+            }
+            for (relpath, bytes) in &payloads {
+                let path = cache.join(relpath);
+                fs::create_dir_all(path.parent().expect("payload parent")).unwrap();
+                fs::write(&path, bytes).unwrap();
+                let mut permissions = fs::metadata(&path).unwrap().permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(path, permissions).unwrap();
+            }
+            for _request in 0..2 {
+                let output = std::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(&script)
+                    .env("TEST_CACHE", &cache)
+                    .env("TEST_RELEASE", &view)
+                    .env("XLSYNTH_PLATFORM", "test-platform")
+                    .env("XLSYNTH_VERSION", "v0.61.0")
+                    .env("LD_LIBRARY_PATH", "/existing/library/path")
+                    .output()
+                    .expect("running real release setup shell");
+                assert!(
+                    output.status.success(),
+                    "release setup failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    output.stdout,
+                    format!(
+                        "{}\0{}:/existing/library/path\0",
+                        view.display(),
+                        view.display()
+                    )
+                    .into_bytes()
+                );
+                assert!(!view.join("stale-request-file").exists());
+                assert!(
+                    !fs::symlink_metadata(view.join("protos"))
+                        .unwrap()
+                        .is_symlink()
+                );
+                for (relpath, bytes) in &payloads {
+                    let source = cache.join(relpath);
+                    assert!(fs::symlink_metadata(&source).unwrap().is_file());
+                    assert_eq!(fs::read(&source).unwrap(), *bytes);
+                    assert_eq!(fs::read_link(view.join(relpath)).unwrap(), source);
+                    assert_eq!(fs::read(view.join(relpath)).unwrap(), *bytes);
+                }
+                for ext in ["so", "dylib"] {
+                    let alias = format!("libxls-v0.61.0-test-platform.{ext}");
+                    let source = if versioned_only {
+                        cache.join(&alias)
+                    } else {
+                        assert!(!cache.join(&alias).exists());
+                        view.join(format!("libxls-test-platform.{ext}"))
+                    };
+                    assert_eq!(fs::read_link(view.join(&alias)).unwrap(), source);
+                    assert_eq!(
+                        fs::read(view.join(&alias)).unwrap(),
+                        format!("{ext} library payload").into_bytes()
+                    );
+                }
+                fs::write(view.join("stale-request-file"), b"request-local payload").unwrap();
+                fs::write(
+                    view.join("protos/request-local-file"),
+                    b"request-local payload",
+                )
+                .unwrap();
+                assert!(!cache.join("protos/request-local-file").exists());
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn make_test_store() -> (ArtifactStore, PathBuf) {
         let nanos = SystemTime::now()
