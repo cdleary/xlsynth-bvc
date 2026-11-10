@@ -1661,7 +1661,7 @@ pub(crate) fn ensure_yosys_image(
         let content_ref = docker_image_content_ref(&runtime.docker_image_id)?;
         validate_pinned_image(&content_ref, &fingerprint, || {
             require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
-            if !image_has_python3(&content_ref)? {
+            if !inspected_image_has_python3(&content_ref)? {
                 bail!("pinned Yosys image `{content_ref}` lacks python3");
             }
             Ok(())
@@ -1762,11 +1762,17 @@ fn bind_driver_runtime_image_uncached(
     repo_root: &Path,
     runtime: &DriverRuntimeSpec,
 ) -> Result<String> {
-    ensure_driver_image(repo_root, runtime)?;
+    checked_runtime_dockerfile(repo_root, &runtime.dockerfile, &runtime.dockerfile_sha256)?;
     let fingerprint = driver_runtime_fingerprint(runtime)?;
     let build_ref = fingerprint_qualified_image_ref(&runtime.docker_image, "driver", &fingerprint)?;
-    let image_id = inspect_image_id(&build_ref)?
-        .with_context(|| format!("driver image `{build_ref}` disappeared after preparation"))?;
+    // Resolve the mutable tag once, then validate and execute that content ID.
+    let image_id = if let Some(image_id) = inspect_image_id(&build_ref)? {
+        image_id
+    } else {
+        ensure_driver_image(repo_root, runtime)?;
+        inspect_image_id(&build_ref)?
+            .with_context(|| format!("driver image `{build_ref}` disappeared after preparation"))?
+    };
     let content_ref = docker_image_content_ref(&image_id)?;
     require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
     require_driver_source_labels(&content_ref, runtime)?;
@@ -1812,21 +1818,27 @@ fn bind_yosys_runtime_image_uncached(
     repo_root: &Path,
     runtime: &YosysRuntimeSpec,
 ) -> Result<String> {
-    ensure_yosys_image(repo_root, runtime)?;
+    checked_runtime_dockerfile(repo_root, &runtime.dockerfile, &runtime.dockerfile_sha256)?;
     let fingerprint = yosys_runtime_fingerprint(runtime)?;
     let build_ref = fingerprint_qualified_image_ref(&runtime.docker_image, "yosys", &fingerprint)?;
-    let image_id = inspect_image_id(&build_ref)?
-        .with_context(|| format!("Yosys image `{build_ref}` disappeared after preparation"))?;
+    // Resolve the mutable tag once, then validate and execute that content ID.
+    let image_id = if let Some(image_id) = inspect_image_id(&build_ref)? {
+        image_id
+    } else {
+        ensure_yosys_image(repo_root, runtime)?;
+        inspect_image_id(&build_ref)?
+            .with_context(|| format!("Yosys image `{build_ref}` disappeared after preparation"))?
+    };
     let content_ref = docker_image_content_ref(&image_id)?;
     require_image_runtime_fingerprint(&content_ref, &fingerprint)?;
-    if !image_has_python3(&content_ref)? {
+    if !inspected_image_has_python3(&content_ref)? {
         bail!("prepared Yosys image `{content_ref}` lacks python3");
     }
     Ok(image_id)
 }
 
 /// Process-local capability cache, not evidence about image existence or runtime identity.
-/// Resolve references on every call so retagging and image removal are still observed.
+/// Mutable references must resolve before looking up the immutable image's capability.
 /// Each immutable image has its own probe lock; unrelated images need not wait on it.
 #[derive(Default)]
 struct PythonImageProbeCache {
@@ -1844,11 +1856,19 @@ impl PythonImageProbeCache {
             return Ok(false);
         };
         let content_ref = docker_image_content_ref(&image_id)?;
+        self.has_python3_at_id(&content_ref, probe)
+    }
+
+    fn has_python3_at_id(
+        &self,
+        content_ref: &str,
+        probe: impl FnOnce(&str) -> Result<bool>,
+    ) -> Result<bool> {
         let validated = self
             .images
             .lock()
             .map_err(|_| anyhow!("Python image probe cache lock poisoned"))?
-            .entry(content_ref.clone())
+            .entry(content_ref.to_string())
             .or_default()
             .clone();
         let mut validated = validated
@@ -1859,17 +1879,26 @@ impl PythonImageProbeCache {
         }
         // Probe the resolved ID, never the possibly retagged input. Only success
         // is reusable: transient Docker failures and negative probes must retry.
-        let available = probe(&content_ref)?;
+        let available = probe(content_ref)?;
         *validated = available;
         Ok(available)
     }
 }
 
-fn image_has_python3(image: &str) -> Result<bool> {
+fn python_image_probe_cache() -> &'static PythonImageProbeCache {
     static CACHE: OnceLock<PythonImageProbeCache> = OnceLock::new();
-    CACHE
-        .get_or_init(PythonImageProbeCache::default)
-        .has_python3(image, inspect_image_id, probe_image_has_python3)
+    CACHE.get_or_init(PythonImageProbeCache::default)
+}
+
+fn image_has_python3(image: &str) -> Result<bool> {
+    python_image_probe_cache().has_python3(image, inspect_image_id, probe_image_has_python3)
+}
+
+/// The caller has just inspected this content ID, so presence is already known.
+/// Only the intrinsic capability is cached; mutable references still resolve.
+fn inspected_image_has_python3(content_ref: &str) -> Result<bool> {
+    let content_ref = docker_image_content_ref(content_ref)?;
+    python_image_probe_cache().has_python3_at_id(&content_ref, probe_image_has_python3)
 }
 
 fn probe_image_has_python3(image: &str) -> Result<bool> {
@@ -2066,13 +2095,29 @@ struct SelectedPersistentRunner {
     runner_instance_id: String,
     container_name: String,
     container_id: String,
+    container_cache_key: String,
+    container_checked_at: Instant,
     paths: PersistentRunnerPaths,
     _slot_guard: PersistentRunnerSlotGuard,
+}
+
+impl SelectedPersistentRunner {
+    fn remember_inspection(&self, checked_at: Instant) {
+        persistent_runner_identity_cache().remember(
+            &self.container_cache_key,
+            PersistentRunnerIdentity {
+                runner_instance_id: self.runner_instance_id.clone(),
+                container_id: self.container_id.clone(),
+                checked_at,
+            },
+        );
+    }
 }
 
 struct PersistentRunnerFailureRetirement {
     container_name: String,
     container_id: String,
+    container_cache_key: String,
     armed: bool,
 }
 
@@ -2081,11 +2126,13 @@ impl PersistentRunnerFailureRetirement {
         Self {
             container_name: runner.container_name.clone(),
             container_id: runner.container_id.clone(),
+            container_cache_key: runner.container_cache_key.clone(),
             armed: true,
         }
     }
 
     fn retire_now(&mut self) -> String {
+        persistent_runner_identity_cache().forget(&self.container_cache_key);
         match cleanup_persistent_runner_container_if_id(&self.container_name, &self.container_id) {
             Ok(true) => {
                 self.armed = false;
@@ -2106,6 +2153,9 @@ impl PersistentRunnerFailureRetirement {
 
 impl Drop for PersistentRunnerFailureRetirement {
     fn drop(&mut self) {
+        if self.armed {
+            persistent_runner_identity_cache().forget(&self.container_cache_key);
+        }
         if self.armed
             && let Err(error) =
                 cleanup_persistent_runner_container_if_id(&self.container_name, &self.container_id)
@@ -2548,6 +2598,61 @@ fn count_json_files(path: &Path) -> Result<usize> {
     Ok(count)
 }
 
+/// The Docker name-to-ID mapping observed at the last inspection.
+#[derive(Clone)]
+struct PersistentRunnerIdentity {
+    runner_instance_id: String,
+    container_id: String,
+    checked_at: Instant,
+}
+
+impl PersistentRunnerIdentity {
+    fn is_fresh(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.checked_at) < DOCKER_INSPECTION_INTERVAL
+    }
+}
+
+#[derive(Default)]
+struct PersistentRunnerIdentityCache {
+    entries: Mutex<BTreeMap<String, PersistentRunnerIdentity>>,
+}
+
+impl PersistentRunnerIdentityCache {
+    fn get(
+        &self,
+        key: &str,
+        runner_instance_id: &str,
+        now: Instant,
+    ) -> Option<PersistentRunnerIdentity> {
+        let entries = self.entries.lock().ok()?;
+        entries
+            .get(key)
+            .filter(|identity| {
+                identity.runner_instance_id == runner_instance_id && identity.is_fresh(now)
+            })
+            .cloned()
+    }
+
+    fn remember(&self, key: &str, identity: PersistentRunnerIdentity) {
+        if let Ok(mut entries) = self.entries.lock() {
+            // Workers may retire independently, with no host cleanup to evict them.
+            entries.retain(|_, entry| entry.is_fresh(identity.checked_at));
+            entries.insert(key.to_string(), identity);
+        }
+    }
+
+    fn forget(&self, key: &str) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(key);
+        }
+    }
+}
+
+fn persistent_runner_identity_cache() -> &'static PersistentRunnerIdentityCache {
+    static CACHE: OnceLock<PersistentRunnerIdentityCache> = OnceLock::new();
+    CACHE.get_or_init(PersistentRunnerIdentityCache::default)
+}
+
 #[derive(Debug)]
 struct DockerContainerState {
     running: bool,
@@ -2587,7 +2692,7 @@ fn inspect_container_state(container_name: &str) -> Result<Option<DockerContaine
     }))
 }
 
-fn check_persistent_runner_container(runner: &SelectedPersistentRunner) -> Result<()> {
+fn check_persistent_runner_container(runner: &SelectedPersistentRunner) -> Result<Instant> {
     let state = inspect_container_state(&runner.container_name)?
         .filter(|s| s.running)
         .with_context(|| {
@@ -2602,7 +2707,9 @@ fn check_persistent_runner_container(runner: &SelectedPersistentRunner) -> Resul
             runner.container_name
         );
     }
-    Ok(())
+    let checked_at = Instant::now();
+    runner.remember_inspection(checked_at);
+    Ok(checked_at)
 }
 
 fn persistent_runner_depth(paths: &PersistentRunnerPaths) -> Result<usize> {
@@ -2631,23 +2738,34 @@ fn read_persistent_runner_heartbeat(
         })
 }
 
-fn persistent_runner_is_idle(paths: &PersistentRunnerPaths) -> Result<bool> {
+fn idle_persistent_runner_instance(paths: &PersistentRunnerPaths) -> Result<Option<String>> {
     if persistent_runner_depth(paths)? != 0 {
-        return Ok(false);
+        return Ok(None);
     }
-    let Some(heartbeat) = read_persistent_runner_heartbeat(paths)? else {
-        return Ok(false);
-    };
-    Ok(heartbeat.state == "idle"
-        && heartbeat.current_request_id.is_none()
-        && heartbeat.idle_since_unix_seconds.is_some())
+    Ok(read_persistent_runner_heartbeat(paths)?
+        .filter(|heartbeat| {
+            heartbeat.state == "idle"
+                && heartbeat.current_request_id.is_none()
+                && heartbeat.idle_since_unix_seconds.is_some()
+                && !heartbeat.runner_instance_id.is_empty()
+        })
+        .map(|heartbeat| heartbeat.runner_instance_id))
 }
 
 fn cleanup_persistent_runner_container(container_name: &str) -> Result<()> {
+    persistent_runner_identity_cache().forget(&format!(
+        "{}/{}",
+        runtime_engine_identity(),
+        container_name
+    ));
+    remove_persistent_runner_container(container_name)
+}
+
+fn remove_persistent_runner_container(reference: &str) -> Result<()> {
     let output = Command::new("docker")
-        .args(["rm", "-f", container_name])
+        .args(["rm", "-f", reference])
         .output()
-        .with_context(|| format!("removing persistent runner container: {container_name}"))?;
+        .with_context(|| format!("removing persistent runner container: {reference}"))?;
     if output.status.success()
         || String::from_utf8_lossy(&output.stderr).contains("No such container")
     {
@@ -2660,7 +2778,7 @@ fn cleanup_persistent_runner_container(container_name: &str) -> Result<()> {
     {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            if docker_container_id(container_name)?.is_none() {
+            if docker_container_id(reference)?.is_none() {
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(100));
@@ -2668,7 +2786,7 @@ fn cleanup_persistent_runner_container(container_name: &str) -> Result<()> {
     }
     bail!(
         "failed removing persistent runner container {}: {}",
-        container_name,
+        reference,
         first_line(&String::from_utf8_lossy(&output.stderr))
     );
 }
@@ -2683,7 +2801,8 @@ fn cleanup_persistent_runner_container_if_id(
     if current_container_id != expected_container_id {
         return Ok(false);
     }
-    cleanup_persistent_runner_container(expected_container_id)?;
+    // The name can be reassigned between inspect and rm.
+    remove_persistent_runner_container(expected_container_id)?;
     Ok(true)
 }
 
@@ -2833,23 +2952,47 @@ fn select_persistent_runner(
             let Some(slot_guard) = PersistentRunnerSlotGuard::try_acquire(&paths)? else {
                 continue;
             };
-            let idle = persistent_runner_is_idle(&paths);
+            let container_name = persistent_runner_container_name(image, &runner_key);
+            let idle_instance = match idle_persistent_runner_instance(&paths) {
+                Ok(instance) => instance,
+                Err(error) => {
+                    // A dead or replaced worker can leave an unreadable heartbeat.
+                    // Startup clears its stale files while holding the slot lock.
+                    if inspect_container_state(&container_name)?
+                        .is_some_and(|state| state.running && state.image == image)
+                    {
+                        return Err(error);
+                    }
+                    None
+                }
+            };
             // Uncreated slots have no idle heartbeat and need no Docker probe
             // during the reuse pass. Retirement also holds the slot lock.
-            if reuse_only && matches!(idle, Ok(false)) {
+            if reuse_only && idle_instance.is_none() {
                 continue;
             }
-            let container_name = persistent_runner_container_name(image, &runner_key);
-            let state = inspect_container_state(&container_name)?
-                .filter(|state| state.running && state.image == image);
-            // Stale request files matter only for a running candidate. Startup
-            // clears them when the old container has gone away.
-            let container_id = match state {
-                Some(state) if idle? => state.id,
-                _ if reuse_only => continue,
-                _ => {
-                    // An unreserved busy runner is orphaned work from an interrupted
-                    // host. Retire it before accepting another request in this slot.
+            let container_cache_key = format!("{}/{}", runtime_engine_identity(), container_name);
+            let cached = idle_instance.as_ref().and_then(|instance| {
+                persistent_runner_identity_cache().get(
+                    &container_cache_key,
+                    instance,
+                    Instant::now(),
+                )
+            });
+            let cache_hit = cached.is_some();
+            let (container_id, container_checked_at, reused) = if let Some(identity) = cached {
+                (identity.container_id, identity.checked_at, true)
+            } else {
+                let reusable = inspect_container_state(&container_name)?.filter(|state| {
+                    state.running && state.image == image && idle_instance.is_some()
+                });
+                let (container_id, reused) = if let Some(state) = reusable {
+                    (state.id, true)
+                } else {
+                    if reuse_only {
+                        continue;
+                    }
+                    // Retire an interrupted host's work before reusing its slot.
                     let instance_id = start_persistent_runner_locked(
                         repo_root,
                         store_root,
@@ -2863,26 +3006,43 @@ fn select_persistent_runner(
                         && let Err(error) =
                             capabilities::publish(&paths, &runner_key, image, &instance_id)
                     {
-                        // Script execution can proceed. A capability lookup retries the probe.
                         log::warn!("could not cache driver capabilities: {error:#}");
                     }
-                    docker_container_id(&container_name)?
-                        .context("new persistent runner disappeared during selection")?
-                }
+                    let state = inspect_container_state(&container_name)?
+                        .filter(|state| state.running && state.image == image)
+                        .context(
+                            "new persistent runner disappeared or changed image during selection",
+                        )?;
+                    (state.id, false)
+                };
+                (container_id, Instant::now(), reused)
             };
             let heartbeat = read_persistent_runner_heartbeat(&paths)?
                 .context("selected persistent runner is missing its heartbeat")?;
             if heartbeat.runner_instance_id.is_empty() {
                 bail!("selected persistent runner is missing its instance identity");
             }
-            return Ok(Some(SelectedPersistentRunner {
+            if reused && Some(&heartbeat.runner_instance_id) != idle_instance.as_ref() {
+                persistent_runner_identity_cache().forget(&container_cache_key);
+                continue;
+            }
+            log::debug!(target: "bvc_timing",
+                "runner_identity_reuse container={} hit={} checked_age_us={}",
+                container_name, cache_hit, container_checked_at.elapsed().as_micros());
+            let runner = SelectedPersistentRunner {
                 runner_key,
                 runner_instance_id: heartbeat.runner_instance_id,
                 container_id,
                 container_name,
+                container_cache_key,
+                container_checked_at,
                 paths,
                 _slot_guard: slot_guard,
-            }));
+            };
+            if !cache_hit {
+                runner.remember_inspection(container_checked_at);
+            }
+            return Ok(Some(runner));
         }
     }
     Ok(None)
@@ -3058,9 +3218,7 @@ fn execute_persistent_runner_script_with_timeout_and_family(
     };
     let published_at = Instant::now();
     let mut failure_retirement = PersistentRunnerFailureRetirement::new(&runner);
-    // Selection checked the container identity under the slot reservation.
-    // Heartbeat, result identity, and deadlines are still checked every poll.
-    let mut last_container_check = Instant::now();
+    let mut last_container_check = runner.container_checked_at;
 
     let deadline = Instant::now()
         + Duration::from_secs(timeout_secs + PERSISTENT_RUNNER_REQUEST_TIMEOUT_GRACE_SECS);
@@ -3069,8 +3227,7 @@ fn execute_persistent_runner_script_with_timeout_and_family(
     let result = loop {
         match poll_persistent_runner_result(&result_path, || {
             if last_container_check.elapsed() >= DOCKER_INSPECTION_INTERVAL {
-                check_persistent_runner_container(&runner)?;
-                last_container_check = Instant::now();
+                last_container_check = check_persistent_runner_container(&runner)?;
             }
             if read_persistent_runner_heartbeat(&runner.paths)?
                 .is_some_and(|heartbeat| heartbeat.runner_instance_id != runner.runner_instance_id)
@@ -3183,8 +3340,7 @@ fn execute_persistent_runner_script_with_timeout_and_family(
             break;
         }
         if last_container_check.elapsed() >= DOCKER_INSPECTION_INTERVAL {
-            check_persistent_runner_container(&runner)?;
-            last_container_check = Instant::now();
+            last_container_check = check_persistent_runner_container(&runner)?;
         }
         if Instant::now() >= idle_deadline {
             bail!(
@@ -3552,6 +3708,115 @@ mod tests {
     }
 
     #[test]
+    fn runner_identity_reuse_expires_and_rejects_a_new_incarnation() {
+        let cache = PersistentRunnerIdentityCache::default();
+        let start = Instant::now();
+        let identity = PersistentRunnerIdentity {
+            runner_instance_id: "first-instance".into(),
+            container_id: "first-container".into(),
+            checked_at: start,
+        };
+        cache.remember("engine/runner", identity.clone());
+        cache.remember("engine/retired-runner", identity.clone());
+        let deadline = start + DOCKER_INSPECTION_INTERVAL;
+        let hit = cache
+            .get(
+                "engine/runner",
+                "first-instance",
+                deadline - Duration::from_nanos(1),
+            )
+            .unwrap();
+        assert_eq!(hit.container_id, "first-container");
+        assert_eq!(hit.checked_at, start);
+        assert!(
+            cache
+                .get("other-engine/runner", "first-instance", start)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get("engine/runner", "replacement-instance", start)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get("engine/runner", "first-instance", deadline)
+                .is_none()
+        );
+        cache.remember(
+            "engine/runner",
+            PersistentRunnerIdentity {
+                checked_at: deadline,
+                ..identity
+            },
+        );
+        assert!(
+            !cache
+                .entries
+                .lock()
+                .unwrap()
+                .contains_key("engine/retired-runner")
+        );
+        assert_eq!(
+            cache
+                .get("engine/runner", "first-instance", deadline)
+                .unwrap()
+                .checked_at,
+            deadline
+        );
+        cache.forget("engine/runner");
+        assert!(
+            cache
+                .get("engine/runner", "first-instance", deadline)
+                .is_none()
+        );
+        cache.remember(
+            "engine/runner",
+            PersistentRunnerIdentity {
+                runner_instance_id: "replacement-instance".into(),
+                container_id: "replacement-container".into(),
+                checked_at: deadline,
+            },
+        );
+        assert!(
+            cache
+                .get("engine/runner", "first-instance", deadline)
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .get("engine/runner", "replacement-instance", deadline)
+                .unwrap()
+                .container_id,
+            "replacement-container"
+        );
+    }
+
+    #[test]
+    fn inspected_python_capability_reuses_success_without_resolving_again() -> Result<()> {
+        let cache = PythonImageProbeCache::default();
+        let content_ref = docker_image_content_ref(&"a".repeat(64))?;
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..3 {
+            assert!(cache.has_python3_at_id(&content_ref, |image| {
+                assert_eq!(image, content_ref);
+                calls.set(calls.get() + 1);
+                Ok(true)
+            })?);
+        }
+        assert_eq!(calls.get(), 1);
+        // A mutable reference must still resolve even when this ID was probed.
+        assert!(!cache.has_python3("mutable:tag", |_| Ok(None), |_| panic!("missing image"))?);
+        assert!(
+            !cache.has_python3_at_id(&docker_image_content_ref(&"b".repeat(64))?, |_| Ok(false))?
+        );
+        assert!(
+            cache.has_python3_at_id(&docker_image_content_ref(&"b".repeat(64))?, |_| Ok(true))?
+        );
+        Ok(())
+    }
+
+    #[test]
     fn python_probe_cache_shares_success_across_aliases() -> Result<()> {
         let cache = PythonImageProbeCache::default();
         let image_id = "a".repeat(64);
@@ -3762,7 +4027,21 @@ mod tests {
                 serde_json::to_vec(&heartbeat).expect("heartbeat JSON"),
             )
             .expect("refresh heartbeat");
-            assert!(persistent_runner_is_idle(&paths).expect("idle state"));
+            assert_eq!(
+                idle_persistent_runner_instance(&paths).unwrap().as_deref(),
+                Some("instance-1")
+            );
+        }
+
+        for field in ["runner_instance_id", "idle_since_unix_seconds"] {
+            let mut incomplete = heartbeat.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            fs::write(
+                &paths.heartbeat_path,
+                serde_json::to_vec(&incomplete).unwrap(),
+            )
+            .unwrap();
+            assert!(idle_persistent_runner_instance(&paths).unwrap().is_none());
         }
 
         let retired = json!({
@@ -3772,7 +4051,13 @@ mod tests {
             "idle_since_unix_seconds": null,
         });
         fs::write(&paths.heartbeat_path, serde_json::to_vec(&retired).unwrap()).unwrap();
-        assert!(!persistent_runner_is_idle(&paths).expect("retired state"));
+        assert!(idle_persistent_runner_instance(&paths).unwrap().is_none());
+
+        // A queued request makes an unreserved slot ineligible even if the
+        // interrupted worker left an unreadable heartbeat.
+        fs::write(paths.processing_dir.join("orphan.json"), b"{}").unwrap();
+        fs::write(&paths.heartbeat_path, b"{").unwrap();
+        assert!(idle_persistent_runner_instance(&paths).unwrap().is_none());
 
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -4868,7 +5153,7 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
                 wait_removed(name)?;
             }
             assert_eq!(fs::read_to_string(output.join("result.txt"))?, "completed");
-            assert!(!persistent_runner_is_idle(&paths)?);
+            assert!(idle_persistent_runner_instance(&paths)?.is_none());
         }
         drop(cleanup);
         fs::remove_dir_all(&store_root)?;
@@ -5310,15 +5595,34 @@ top fn {top}(x: bits[1] id=1) -> bits[1] {{\n\
             container_a_id_after_timeout
         );
 
+        let reserve = || {
+            select_persistent_runner(
+                &repo_root,
+                &store.root,
+                &image_a,
+                PersistentRunnerFamily::Driver,
+            )?
+            .context("available test slot")
+        };
+        let inspected_at = reserve()?.container_checked_at;
+        execute_persistent_runner_script_with_timeout(
+            &image_a,
+            &[DockerMount::read_only(&timeout_output, "/inputs")?],
+            &BTreeMap::new(),
+            "true",
+            "inspection-deadline",
+            30,
+        )?;
+        let selected = reserve()?;
+        assert!(
+            selected.container_checked_at == inspected_at
+                || selected.container_checked_at.duration_since(inspected_at)
+                    >= DOCKER_INSPECTION_INTERVAL,
+            "request completion renewed an unexpired Docker inspection"
+        );
+
         // A live reservation must detect removal and same-name replacement;
         // its failure cleanup must leave the replacement container intact.
-        let selected = select_persistent_runner(
-            &repo_root,
-            &store.root,
-            &image_a,
-            PersistentRunnerFamily::Driver,
-        )?
-        .context("available replacement-test slot")?;
         check_persistent_runner_container(&selected)?;
         cleanup_persistent_runner_container(&selected.container_name)?;
         assert!(check_persistent_runner_container(&selected).is_err());
