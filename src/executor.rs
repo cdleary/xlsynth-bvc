@@ -22,7 +22,7 @@ use crate::store::ArtifactStore;
 use crate::versioning::*;
 use crate::{
     ACTION_SCHEMA_VERSION, DEFAULT_YOSYS_FLOW_SCRIPT, DELAY_INFO_OUTPUT_FORMAT_TEXTPROTO_V1,
-    DSLX_PATH_LIST_SEPARATOR, INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY, LEGACY_G8R_STATS_RELPATH,
+    INPUT_IR_FN_STRUCTURAL_HASH_DETAILS_KEY, LEGACY_G8R_STATS_RELPATH,
     OUTPUT_IR_OP_COUNT_DETAILS_KEY, XLSYNTH_SOURCE_ARCHIVE_URL_PREFIX,
     default_k_bool_cone_max_ir_ops_for_k, default_mffc_min_internal_non_literal,
     driver_ir_aig_equiv_enabled, incremental_ir_corpus_upsert_enabled,
@@ -902,12 +902,26 @@ pub(crate) fn run_download_source_subtree_action(
     })
 }
 
-pub(crate) fn determine_dslx_import_context(subtree_root: &Path) -> DslxImportContext {
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DslxImportConsumer {
+    DriverListFns,
+    ToolchainIrConverter,
+}
+
+pub(crate) fn determine_dslx_import_context(
+    subtree_root: &Path,
+    consumer: DslxImportConsumer,
+) -> DslxImportContext {
+    // The in-process driver CLI and external XLS converter parse different path lists.
+    let path_list_separator = match consumer {
+        DslxImportConsumer::DriverListFns => ";",
+        DslxImportConsumer::ToolchainIrConverter => ":",
+    };
     let subtree_stdlib = subtree_root.join("xls/dslx/stdlib");
     if subtree_stdlib.is_dir() {
         return DslxImportContext {
             dslx_path: ["/inputs/subtree", "/inputs/subtree/xls/dslx/stdlib"]
-                .join(DSLX_PATH_LIST_SEPARATOR),
+                .join(path_list_separator),
             dslx_stdlib_path: "/inputs/subtree/xls/dslx/stdlib".to_string(),
             stdlib_source: "subtree".to_string(),
         };
@@ -918,7 +932,7 @@ pub(crate) fn determine_dslx_import_context(subtree_root: &Path) -> DslxImportCo
             "/tmp/xlsynth-release",
             "/tmp/xlsynth-release/xls/dslx/stdlib",
         ]
-        .join(DSLX_PATH_LIST_SEPARATOR),
+        .join(path_list_separator),
         dslx_stdlib_path: "/tmp/xlsynth-release/xls/dslx/stdlib".to_string(),
         stdlib_source: "toolchain_release".to_string(),
     }
@@ -933,7 +947,8 @@ pub(crate) fn discover_dslx_fn_to_ir_suggestions(
     discovery_runtime: Option<&DriverRuntimeSpec>,
 ) -> Result<DslxFnDiscovery> {
     let dslx_files = collect_dslx_files(subtree_root)?;
-    let import_context = determine_dslx_import_context(subtree_root);
+    let import_context =
+        determine_dslx_import_context(subtree_root, DslxImportConsumer::DriverListFns);
     let source_runtime = discovery_runtime
         .cloned()
         .unwrap_or(default_driver_runtime_for_version(repo_root, version)?);
@@ -1419,7 +1434,8 @@ pub(crate) fn run_driver_dslx_fn_to_ir_action(
 
     let mut commands = Vec::new();
     ensure_driver_runtime_prepared(store, repo_root, version, runtime, &mut commands)?;
-    let import_context = determine_dslx_import_context(&subtree_root);
+    let import_context =
+        determine_dslx_import_context(&subtree_root, DslxImportConsumer::ToolchainIrConverter);
 
     let script = driver_script(
         r#"

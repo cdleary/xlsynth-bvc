@@ -47,8 +47,9 @@ mod web;
 use crate::cli::{DriverCli, YosysCli};
 #[cfg(test)]
 use crate::executor::{
-    compute_action_id, determine_dslx_import_context, extract_tar_gz_subtree_safely,
-    parse_discovered_dslx_functions, parse_dslx_list_fns_failed_files,
+    DslxImportConsumer, compute_action_id, determine_dslx_import_context,
+    extract_tar_gz_subtree_safely, parse_discovered_dslx_functions,
+    parse_dslx_list_fns_failed_files,
 };
 #[cfg(test)]
 use crate::model::*;
@@ -82,7 +83,6 @@ const DEFAULT_WEB_RUNNER_MAX_WORKERS: usize = 8;
 const DEFAULT_STRUCTURAL_INDEX_MAX_THREADS: usize = 16;
 const DEFAULT_SUGGESTED_ENQUEUE_MAX_DEPTH: u32 = 32;
 const DEFAULT_STDLIB_FN_TIMELINE_ROUTE: &str = "/dslx-fns/float32.x:add";
-const DSLX_PATH_LIST_SEPARATOR: &str = ":";
 const IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION: u32 = 2;
 const WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE: &str = "ir-fn-corpus-structural.v2";
 const WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY: &str =
@@ -580,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn determine_dslx_import_context_switches_on_subtree_stdlib_presence() {
+    fn determine_dslx_import_context_provides_consumer_search_paths_for_each_stdlib_source() {
         let temp_root = std::env::temp_dir().join(format!(
             "xlsynth-bvc-test-import-context-{}-{}",
             std::process::id(),
@@ -591,38 +591,44 @@ mod tests {
         ));
         fs::create_dir_all(&temp_root).expect("create temp root");
 
-        let without_stdlib = determine_dslx_import_context(&temp_root);
-        assert_eq!(without_stdlib.stdlib_source, "toolchain_release");
-        assert_eq!(
-            without_stdlib.dslx_stdlib_path,
-            "/tmp/xlsynth-release/xls/dslx/stdlib"
-        );
-        assert_eq!(
-            without_stdlib.dslx_path,
-            [
-                "/inputs/subtree",
-                "/tmp/xlsynth-release",
-                "/tmp/xlsynth-release/xls/dslx/stdlib",
-            ]
-            .join(DSLX_PATH_LIST_SEPARATOR)
-        );
-        assert!(without_stdlib.dslx_path.contains(DSLX_PATH_LIST_SEPARATOR));
-        assert!(!without_stdlib.dslx_path.contains(';'));
+        for (consumer, separator) in [
+            (DslxImportConsumer::DriverListFns, ';'),
+            (DslxImportConsumer::ToolchainIrConverter, ':'),
+        ] {
+            let without_stdlib = determine_dslx_import_context(&temp_root, consumer);
+            assert_eq!(without_stdlib.stdlib_source, "toolchain_release");
+            assert_eq!(
+                without_stdlib.dslx_stdlib_path,
+                "/tmp/xlsynth-release/xls/dslx/stdlib"
+            );
+            assert_eq!(
+                without_stdlib
+                    .dslx_path
+                    .split(separator)
+                    .collect::<Vec<_>>(),
+                [
+                    "/inputs/subtree",
+                    "/tmp/xlsynth-release",
+                    "/tmp/xlsynth-release/xls/dslx/stdlib",
+                ],
+                "{consumer:?} search paths without a subtree stdlib"
+            );
 
-        let stdlib_dir = temp_root.join("xls/dslx/stdlib");
-        fs::create_dir_all(&stdlib_dir).expect("create subtree stdlib");
-        let with_stdlib = determine_dslx_import_context(&temp_root);
-        assert_eq!(with_stdlib.stdlib_source, "subtree");
-        assert_eq!(
-            with_stdlib.dslx_stdlib_path,
-            "/inputs/subtree/xls/dslx/stdlib"
-        );
-        assert_eq!(
-            with_stdlib.dslx_path,
-            ["/inputs/subtree", "/inputs/subtree/xls/dslx/stdlib"].join(DSLX_PATH_LIST_SEPARATOR)
-        );
-        assert!(with_stdlib.dslx_path.contains(DSLX_PATH_LIST_SEPARATOR));
-        assert!(!with_stdlib.dslx_path.contains(';'));
+            let stdlib_dir = temp_root.join("xls/dslx/stdlib");
+            fs::create_dir_all(&stdlib_dir).expect("create subtree stdlib");
+            let with_stdlib = determine_dslx_import_context(&temp_root, consumer);
+            assert_eq!(with_stdlib.stdlib_source, "subtree");
+            assert_eq!(
+                with_stdlib.dslx_stdlib_path,
+                "/inputs/subtree/xls/dslx/stdlib"
+            );
+            assert_eq!(
+                with_stdlib.dslx_path.split(separator).collect::<Vec<_>>(),
+                ["/inputs/subtree", "/inputs/subtree/xls/dslx/stdlib"],
+                "{consumer:?} search paths with a subtree stdlib"
+            );
+            fs::remove_dir_all(&stdlib_dir).expect("remove subtree stdlib");
+        }
 
         fs::remove_dir_all(&temp_root).expect("cleanup temp root");
     }
