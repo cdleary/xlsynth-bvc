@@ -2094,39 +2094,22 @@ pub(crate) fn run_driver_ir_to_delay_info_action(
         }
     }
 
-    let script = if ir_top.is_some() {
-        driver_script(
-            r#"
-/tmp/xlsynth-release/delay_info_main --delay_model "${DELAY_MODEL}" --top "${IR_TOP}" --proto_out /tmp/delay_info.pb /inputs/input.ir > /tmp/delay_info_stdout.txt
-decode_proto_root=/tmp/xlsynth-release/protos
-if grep -Eq '^edition = "[0-9]+";' "${decode_proto_root}/xls/ir/op.proto"; then
-  decode_proto_root=/tmp/xls-protos-decode
-  rm -rf "${decode_proto_root}"
-  mkdir -p "${decode_proto_root}/xls/ir" "${decode_proto_root}/xls/estimators/delay_model"
-  sed -E 's/^edition = "[0-9]+";/syntax = "proto3";/' /tmp/xlsynth-release/protos/xls/ir/op.proto > "${decode_proto_root}/xls/ir/op.proto"
-  cp /tmp/xlsynth-release/protos/xls/estimators/delay_model/delay_info.proto "${decode_proto_root}/xls/estimators/delay_model/delay_info.proto"
-fi
-protoc -I "${decode_proto_root}" --decode=xls.DelayInfoProto "${decode_proto_root}/xls/estimators/delay_model/delay_info.proto" < /tmp/delay_info.pb > /outputs/delay_info.textproto
-test -s /outputs/delay_info.textproto
-"#,
-        )
+    let top_arg = if ir_top.is_some() {
+        " --top \"${IR_TOP}\""
     } else {
-        driver_script(
-            r#"
-/tmp/xlsynth-release/delay_info_main --delay_model "${DELAY_MODEL}" --proto_out /tmp/delay_info.pb /inputs/input.ir > /tmp/delay_info_stdout.txt
-decode_proto_root=/tmp/xlsynth-release/protos
-if grep -Eq '^edition = "[0-9]+";' "${decode_proto_root}/xls/ir/op.proto"; then
-  decode_proto_root=/tmp/xls-protos-decode
-  rm -rf "${decode_proto_root}"
-  mkdir -p "${decode_proto_root}/xls/ir" "${decode_proto_root}/xls/estimators/delay_model"
-  sed -E 's/^edition = "[0-9]+";/syntax = "proto3";/' /tmp/xlsynth-release/protos/xls/ir/op.proto > "${decode_proto_root}/xls/ir/op.proto"
-  cp /tmp/xlsynth-release/protos/xls/estimators/delay_model/delay_info.proto "${decode_proto_root}/xls/estimators/delay_model/delay_info.proto"
-fi
-protoc -I "${decode_proto_root}" --decode=xls.DelayInfoProto "${decode_proto_root}/xls/estimators/delay_model/delay_info.proto" < /tmp/delay_info.pb > /outputs/delay_info.textproto
+        ""
+    };
+    let script = driver_script(&format!(
+        r#"
+/tmp/xlsynth-release/delay_info_main --delay_model "${{DELAY_MODEL}}"{top_arg} --proto_out /tmp/delay_info.pb /inputs/input.ir > /tmp/delay_info_stdout.txt
+python3 - /tmp/xlsynth-release/protos /tmp/xls-protos-decode <<'PYTHON'
+{prepare_decode_protos}
+PYTHON
+protoc -I /tmp/xls-protos-decode --decode=xls.DelayInfoProto /tmp/xls-protos-decode/xls/estimators/delay_model/delay_info.proto < /tmp/delay_info.pb > /outputs/delay_info.textproto
 test -s /outputs/delay_info.textproto
 "#,
-        )
-    };
+        prepare_decode_protos = include_str!("../scripts/prepare_delay_info_decode_protos.py"),
+    ));
 
     let mut env = BTreeMap::new();
     env.insert("XLSYNTH_VERSION".to_string(), version.to_string());

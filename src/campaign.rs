@@ -905,15 +905,21 @@ fn stdlib_dataset_has_root_lineage(
     version: &str,
     root_action_id: &str,
 ) -> Result<bool> {
+    // The paired dataset also includes module samples without a stdlib root.
+    // Require a nonempty declared stdlib population and validate every claim.
     let matching = dataset
         .samples
         .iter()
         .filter(|sample| canonical_version_matches(&sample.crate_version, version))
+        .filter(|sample| sample.stdlib_root_action_id.is_some())
         .collect::<Vec<_>>();
     if matching.is_empty() {
         return Ok(false);
     }
     for sample in matching {
+        if sample.stdlib_root_action_id.as_deref() != Some(root_action_id) {
+            return Ok(false);
+        }
         for action_id in [
             &sample.ir_action_id,
             &sample.g8r_stats_action_id,
@@ -1998,6 +2004,231 @@ mod tests {
             !action_descends_from_root("leaf", "other-root", |id| { Ok(actions.get(id).cloned()) })
                 .expect("unrelated lineage")
         );
+    }
+
+    fn write_stdlib_lineage_sample(
+        store: &ArtifactStore,
+        root_action_id: &str,
+        dslx_file: &str,
+        stdlib_root_action_id: Option<String>,
+    ) -> StdlibG8rVsYosysSample {
+        let runtime = crate::model::DriverRuntimeSpec {
+            driver_version: "0.40.0".to_string(),
+            source_revision: None,
+            release_platform: "test-platform".to_string(),
+            docker_image: "test-driver:0.40.0".to_string(),
+            dockerfile: "docker/test.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
+        };
+        let source_ir_action_id = write_test_provenance(
+            store,
+            ActionSpec::DriverDslxFnToIr {
+                dslx_subtree_action_id: root_action_id.to_string(),
+                dslx_file: dslx_file.to_string(),
+                dslx_fn_name: "sample".to_string(),
+                version: "v0.40.0".to_string(),
+                runtime: runtime.clone(),
+            },
+            Vec::new(),
+        );
+        let ir_action_id = write_test_provenance(
+            store,
+            ActionSpec::DriverIrToOpt {
+                ir_action_id: source_ir_action_id,
+                top_fn_name: None,
+                version: "v0.40.0".to_string(),
+                runtime: runtime.clone(),
+            },
+            Vec::new(),
+        );
+        let g8r_aig_action_id = write_test_provenance(
+            store,
+            ActionSpec::DriverIrToG8rAig {
+                ir_action_id: ir_action_id.clone(),
+                top_fn_name: None,
+                fraig: false,
+                lowering_mode: crate::model::G8rLoweringMode::Default,
+                execution_recipe_revision: 1,
+                version: "v0.40.0".to_string(),
+                runtime: runtime.clone(),
+            },
+            Vec::new(),
+        );
+        let g8r_stats_action_id = write_test_provenance(
+            store,
+            ActionSpec::DriverAigToStats {
+                aig_action_id: g8r_aig_action_id,
+                version: "v0.40.0".to_string(),
+                runtime: runtime.clone(),
+            },
+            Vec::new(),
+        );
+        let verilog_action_id = write_test_provenance(
+            store,
+            ActionSpec::IrFnToCombinationalVerilog {
+                ir_action_id: ir_action_id.clone(),
+                top_fn_name: None,
+                use_system_verilog: false,
+                version: "v0.40.0".to_string(),
+                runtime: runtime.clone(),
+            },
+            Vec::new(),
+        );
+        let yosys_aig_action_id = write_test_provenance(
+            store,
+            ActionSpec::ComboVerilogToYosysAbcAig {
+                verilog_action_id,
+                verilog_top_module_name: None,
+                frontend: crate::model::YosysVerilogFrontend::Builtin,
+                yosys_script_ref: crate::model::ScriptRef {
+                    path: "scripts/test.ys".to_string(),
+                    sha256: "1".repeat(64),
+                },
+                runtime: crate::model::YosysRuntimeSpec {
+                    docker_image: "test-yosys:latest".to_string(),
+                    dockerfile: "docker/test-yosys.Dockerfile".to_string(),
+                    dockerfile_sha256: "2".repeat(64),
+                    docker_image_id: "3".repeat(64),
+                    upstream_commit: Some("7".repeat(40)),
+                    slang_commit: None,
+                },
+            },
+            Vec::new(),
+        );
+        let yosys_abc_stats_action_id = write_test_provenance(
+            store,
+            ActionSpec::DriverAigToStats {
+                aig_action_id: yosys_aig_action_id,
+                version: "v0.40.0".to_string(),
+                runtime,
+            },
+            Vec::new(),
+        );
+        StdlibG8rVsYosysSample {
+            fn_key: format!("{dslx_file}::sample"),
+            crate_version: "0.40.0".to_string(),
+            dso_version: "0.39.0".to_string(),
+            stdlib_root_action_id,
+            ir_action_id,
+            ir_top: None,
+            structural_hash: None,
+            ir_node_count: 1,
+            g8r_nodes: 1.0,
+            g8r_levels: 1.0,
+            yosys_abc_nodes: 1.0,
+            yosys_abc_levels: 1.0,
+            g8r_product: 1.0,
+            yosys_abc_product: 1.0,
+            g8r_product_loss: 0.0,
+            g8r_stats_action_id,
+            yosys_abc_stats_action_id,
+        }
+    }
+
+    #[test]
+    fn stdlib_dataset_lineage_validates_declared_samples_in_a_mixed_dataset() {
+        let root = temp_path("stdlib-dataset-lineage");
+        let store = ArtifactStore::new(root.clone());
+        store.ensure_layout().expect("layout");
+        let stdlib_root_action_id = write_test_provenance(
+            &store,
+            ActionSpec::DownloadAndExtractXlsynthReleaseStdlibTarball {
+                version: "v0.39.0".to_string(),
+                discovery_runtime: None,
+                stdlib_tarball_sha256: "4".repeat(64),
+            },
+            Vec::new(),
+        );
+        let module_root_action_id = write_test_provenance(
+            &store,
+            ActionSpec::DownloadAndExtractXlsynthSourceSubtree {
+                version: "v0.39.0".to_string(),
+                subtree: "xls/modules".to_string(),
+                discovery_runtime: None,
+                source_commit: "5".repeat(40),
+            },
+            Vec::new(),
+        );
+        let stdlib_sample = write_stdlib_lineage_sample(
+            &store,
+            &stdlib_root_action_id,
+            "xls/dslx/stdlib/sample.x",
+            Some(stdlib_root_action_id.clone()),
+        );
+        let module_sample = write_stdlib_lineage_sample(
+            &store,
+            &module_root_action_id,
+            "xls/modules/sample.x",
+            None,
+        );
+        let mut dataset = StdlibG8rVsYosysDataset {
+            fraig: false,
+            samples: vec![stdlib_sample.clone(), module_sample.clone()],
+            min_ir_nodes: 1,
+            max_ir_nodes: 1,
+            g8r_only_count: 0,
+            yosys_only_count: 0,
+            available_crate_versions: vec!["0.40.0".to_string()],
+        };
+        let has_lineage = |dataset: &StdlibG8rVsYosysDataset| {
+            stdlib_dataset_has_root_lineage(&store, dataset, "v0.40.0", &stdlib_root_action_id)
+                .expect("dataset lineage")
+        };
+        assert!(
+            has_lineage(&dataset),
+            "module samples may coexist with stdlib"
+        );
+
+        dataset.samples = vec![module_sample.clone()];
+        assert!(
+            !has_lineage(&dataset),
+            "modules cannot satisfy stdlib output"
+        );
+        let mut undeclared = stdlib_sample.clone();
+        undeclared.stdlib_root_action_id = None;
+        dataset.samples = vec![undeclared];
+        assert!(!has_lineage(&dataset), "stdlib lineage must be declared");
+        dataset.samples.clear();
+        assert!(
+            !has_lineage(&dataset),
+            "an advertised version is insufficient"
+        );
+
+        for claimed_root in [module_root_action_id, String::new()] {
+            let mut wrong_claim = stdlib_sample.clone();
+            wrong_claim.stdlib_root_action_id = Some(claimed_root);
+            dataset.samples = vec![stdlib_sample.clone(), wrong_claim];
+            assert!(!has_lineage(&dataset), "every declared root must match");
+        }
+        for action_index in 0..3 {
+            let mut mismatched = stdlib_sample.clone();
+            match action_index {
+                0 => mismatched.ir_action_id = module_sample.ir_action_id.clone(),
+                1 => mismatched.g8r_stats_action_id = module_sample.g8r_stats_action_id.clone(),
+                2 => {
+                    mismatched.yosys_abc_stats_action_id =
+                        module_sample.yosys_abc_stats_action_id.clone()
+                }
+                _ => unreachable!(),
+            }
+            dataset.samples = vec![stdlib_sample.clone(), mismatched];
+            assert!(
+                !has_lineage(&dataset),
+                "declared stdlib action {action_index} must descend from its root"
+            );
+        }
+        let mut unresolved = stdlib_sample;
+        unresolved.g8r_stats_action_id = "6".repeat(64);
+        dataset.samples = vec![unresolved];
+        assert!(
+            !has_lineage(&dataset),
+            "unknown declared provenance must fail"
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
