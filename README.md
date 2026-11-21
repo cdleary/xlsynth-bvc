@@ -284,8 +284,9 @@ run-directory options; overlapping generations are rejected.
 
 When release collection used separate canonical stores, `import-store --source-store-dir DIR
 --source-artifacts-via-sled PATH` imports completed actions and terminal campaign records into
-the selected destination store. Stop its workers first. Identity and payload conflicts fail;
-derived web indices are rebuilt by the subsequent fresh snapshot command.
+the selected destination store. Stop its workers first. Identity and payload conflicts fail.
+Run `populate-ir-fn-corpus-structural` and `check-ir-fn-corpus-structural-freshness` against the
+combined store, then build a fresh snapshot to regenerate the other derived web indices.
 
 The enqueue workflow is intentionally explicit:
 
