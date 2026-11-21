@@ -79,6 +79,13 @@ pub enum TopCommand {
         #[arg(long, value_name = "DIR")]
         out_dir: PathBuf,
     },
+    /// Import completed canonical actions and terminal campaign records from an idle store.
+    ImportStore {
+        #[arg(long, value_name = "DIR")]
+        source_store_dir: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        source_artifacts_via_sled: PathBuf,
+    },
     /// Seed a downstream cache from completed canonical actions in this store.
     SeedDownstreamCache {
         #[arg(long, value_name = "DIR")]
@@ -380,9 +387,15 @@ pub enum TopCommand {
         /// May be repeated; all runs must match a registered cohort.
         #[arg(long = "progression-run-dir", value_name = "DIR")]
         progression_run_dirs: Vec<PathBuf>,
+        /// Reuse verified fixed-cohort protobuf evidence from an earlier history/ site.
+        #[arg(long = "progression-evidence-dir", value_name = "DIR")]
+        progression_evidence_dirs: Vec<PathBuf>,
         /// Typed ASAP7 mapping runs to include in the area/delay comparison.
         #[arg(long = "techmap-run-dir", value_name = "DIR")]
         techmap_run_dirs: Vec<PathBuf>,
+        /// Reuse verified mapping and mapper-isolation protobuf evidence from an earlier site.
+        #[arg(long = "techmap-evidence-dir", value_name = "DIR")]
+        techmap_evidence_dirs: Vec<PathBuf>,
         /// Typed mapper-isolation experiment manifest (repeatable).
         /// Requires its baseline to be included with --techmap-run-dir.
         #[arg(long = "techmap-crossmap-run", value_name = "FILE")]

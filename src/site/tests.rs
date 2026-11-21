@@ -896,9 +896,58 @@ fn build_historical_candidate_site_fixture_with_graph_le(
         },
         &[],
         &[run_dir],
+        &[],
     )
     .expect("build historical candidate site");
     (site_dir, generation_id)
+}
+
+#[test]
+fn published_progression_evidence_reuses_canonical_bytes_and_rejects_duplicates() {
+    let root = temp_root();
+    let (source, generation_id) = build_historical_candidate_site_fixture(&root);
+    let source_catalog = read_browser_catalog(&source).unwrap();
+    let relative = format!("data/progression-runs/{generation_id}/evidence.pb");
+    let canonical_bytes = fs::read(source.join(&relative)).unwrap();
+    let options = BuildStaticSiteOptions {
+        snapshot_dir: root.join("snapshot"),
+        out_dir: root.join("reused"),
+        base_url: "/".into(),
+        overwrite: false,
+    };
+    build_static_site_with_progression_runs(&options, &[], &[], std::slice::from_ref(&source))
+        .unwrap();
+    let reused_catalog = read_browser_catalog(&options.out_dir).unwrap();
+    assert_eq!(reused_catalog.progression, source_catalog.progression);
+    assert_eq!(
+        reused_catalog.progression_evidence,
+        source_catalog.progression_evidence
+    );
+    assert_eq!(
+        fs::read(options.out_dir.join(&relative)).unwrap(),
+        canonical_bytes
+    );
+    verify_static_site(&options.out_dir).unwrap();
+
+    let mut duplicates = options.clone();
+    duplicates.out_dir = root.join("duplicate-inputs");
+    assert!(
+        build_static_site_with_progression_runs(
+            &duplicates,
+            &[],
+            &[],
+            &[source.clone(), source.clone()]
+        )
+        .is_err()
+    );
+    assert!(!duplicates.out_dir.exists());
+
+    fs::write(source.join(&relative), b"tampered evidence").unwrap();
+    let mut tampered = options;
+    tampered.out_dir = root.join("tampered-source");
+    assert!(build_static_site_with_progression_runs(&tampered, &[], &[], &[source]).is_err());
+    assert!(!tampered.out_dir.exists());
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -3660,6 +3709,7 @@ fn site_overwrite_preserves_existing_site_on_late_candidate_failure() {
         },
         &[],
         &[candidate_dir],
+        &[],
     )
     .expect_err("candidate without the comparison dataset must fail after staging starts");
     assert!(

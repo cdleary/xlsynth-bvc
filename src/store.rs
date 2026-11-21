@@ -217,6 +217,8 @@ trait ArtifactBackend: std::fmt::Debug + Send + Sync {
     fn artifacts_dir(&self, store_root: &Path) -> PathBuf;
     fn action_dir(&self, store_root: &Path, action_id: &str) -> PathBuf;
     fn materialize_action_dir(&self, store_root: &Path, action_id: &str) -> Result<PathBuf>;
+    /// Read canonical action-file bytes without consulting the disposable materialized cache.
+    fn read_action_files(&self, action_id: &str) -> Result<Vec<(String, Vec<u8>)>>;
     fn promote_staging_action_dir(
         &self,
         store_root: &Path,
@@ -2213,6 +2215,36 @@ impl ArtifactBackend for SledArtifactBackend {
         self.materialize_action_from_db(store_root, action_id)
     }
 
+    fn read_action_files(&self, action_id: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let db = self.open_db()?;
+        let provenance_tree = db.open_tree(Self::TREE_PROVENANCE_BY_ACTION)?;
+        let provenance_bytes = provenance_tree
+            .get(action_id.as_bytes())?
+            .context("canonical action is missing provenance")?;
+        Self::decode_keyed_provenance(action_id.as_bytes(), &provenance_bytes)?;
+        let file_tree = db.open_tree(Self::TREE_ACTION_FILE_BYTES)?;
+        let mut files = Vec::new();
+        for row in file_tree.scan_prefix(Self::action_files_prefix(action_id)) {
+            let (key, value) = row.context("reading canonical action-file row")?;
+            let relpath = Self::relpath_from_action_file_key(action_id, &key)?;
+            if Self::normalize_relpath(Path::new(&relpath))? != relpath || relpath.is_empty() {
+                bail!("canonical action-file path is not normalized");
+            }
+            let bytes = Self::decode_action_file_value(&value)?;
+            if relpath == "provenance.pb" {
+                // Discovery metadata can be updated independently of immutable payload rows.
+                files.push((relpath, provenance_bytes.to_vec()));
+            } else {
+                files.push((relpath, bytes));
+            }
+        }
+        if !files.iter().any(|(path, _)| path == "provenance.pb") {
+            files.push(("provenance.pb".into(), provenance_bytes.to_vec()));
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        Ok(files)
+    }
+
     fn promote_staging_action_dir(
         &self,
         store_root: &Path,
@@ -2803,6 +2835,10 @@ impl ArtifactBackend for SnapshotArtifactBackend {
             "materialize_action_dir is unavailable in snapshot read-only backend (action_id={})",
             action_id
         )
+    }
+
+    fn read_action_files(&self, _action_id: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        bail!("canonical action files are unavailable in a publication snapshot");
     }
 
     fn promote_staging_action_dir(
@@ -3424,6 +3460,10 @@ impl ArtifactStore {
     pub(crate) fn materialize_action_dir(&self, action_id: &str) -> Result<PathBuf> {
         self.artifact_backend
             .materialize_action_dir(&self.root, action_id)
+    }
+
+    pub(crate) fn read_action_files(&self, action_id: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        self.artifact_backend.read_action_files(action_id)
     }
 
     pub(crate) fn promote_staging_action_dir(

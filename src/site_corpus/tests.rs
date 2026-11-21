@@ -534,9 +534,11 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
             &options,
             &[],
             &[root.0.join("candidate")],
+            &[],
             &[run.clone(), newer.clone()],
             &[],
             100_000,
+            &[],
             &[],
             &[],
         )
@@ -547,9 +549,11 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
         &options,
         &[],
         &[],
+        &[],
         &[run, newer],
         &[],
         100_000,
+        &[],
         &[],
         &[],
     )
@@ -603,8 +607,10 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
         &[],
         &[],
         &[],
+        &[],
         &[options.out_dir.join("corpus")],
         100_000,
+        &[],
         &[],
         &[],
     )
@@ -624,9 +630,11 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
         &[],
         &[],
         &[],
+        &[],
         &[options.out_dir.join("corpus")],
         100_000,
         &[mapper_run],
+        &[],
         &[],
     )
     .unwrap();

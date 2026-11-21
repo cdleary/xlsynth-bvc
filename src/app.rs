@@ -339,6 +339,18 @@ pub(crate) fn run() -> Result<()> {
             bail!("--artifacts-via-sled is required for commands that access the build store")
         }
     };
+    if let TopCommand::ImportStore {
+        source_store_dir,
+        source_artifacts_via_sled,
+    } = &command
+    {
+        crate::store_import::preflight_paths(
+            &store_dir,
+            &artifacts_via_sled,
+            source_store_dir,
+            source_artifacts_via_sled,
+        )?;
+    }
     if let TopCommand::AnalyzeSledSpace { top, sample } = &command {
         let summary = analyze_sled_space(&artifacts_via_sled, *top, *sample)?;
         println!(
@@ -438,7 +450,9 @@ pub(crate) fn run() -> Result<()> {
         corpus_evidence_dirs,
         corpus_shard_bytes,
         progression_run_dirs,
+        progression_evidence_dirs,
         techmap_run_dirs,
+        techmap_evidence_dirs,
         techmap_crossmap_runs,
         candidate_run_dirs,
         base_url,
@@ -451,11 +465,14 @@ pub(crate) fn run() -> Result<()> {
             ("artifact database", artifacts_via_sled.as_path()),
         ];
         let has_corpus = !corpus_run_dirs.is_empty() || !corpus_evidence_dirs.is_empty();
-        if !techmap_crossmap_runs.is_empty() && techmap_run_dirs.is_empty() {
-            bail!("--techmap-crossmap-run requires its baseline --techmap-run-dir");
+        let has_techmap = !techmap_run_dirs.is_empty() || !techmap_evidence_dirs.is_empty();
+        if !techmap_crossmap_runs.is_empty() && !has_techmap {
+            bail!("--techmap-crossmap-run requires its baseline mapping run or evidence");
         }
-        if !techmap_run_dirs.is_empty() && !(snapshot_dir.is_some() && has_corpus) {
-            bail!("--techmap-run-dir requires --snapshot-dir and corpus evidence or corpus runs");
+        if has_techmap && !(snapshot_dir.is_some() && has_corpus) {
+            bail!(
+                "technology-mapping inputs require --snapshot-dir and corpus evidence or corpus runs"
+            );
         }
         if snapshot_dir.is_some() && has_corpus {
             let progression = progression_run_dirs
@@ -472,18 +489,23 @@ pub(crate) fn run() -> Result<()> {
                 },
                 &protected_roots,
                 &progression,
+                progression_evidence_dirs,
                 corpus_run_dirs,
                 corpus_evidence_dirs,
                 *corpus_shard_bytes,
                 techmap_run_dirs,
+                techmap_evidence_dirs,
                 techmap_crossmap_runs,
             )?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
             return Ok(());
         }
         if has_corpus {
-            if !progression_run_dirs.is_empty() || !candidate_run_dirs.is_empty() {
-                bail!("--progression-run-dir requires --snapshot-dir");
+            if !progression_run_dirs.is_empty()
+                || !candidate_run_dirs.is_empty()
+                || !progression_evidence_dirs.is_empty()
+            {
+                bail!("progression inputs require --snapshot-dir");
             }
             let summary = crate::site::site_corpus::build(
                 &BuildStaticSiteOptions {
@@ -518,6 +540,7 @@ pub(crate) fn run() -> Result<()> {
                 ("artifact database", artifacts_via_sled.as_path()),
             ],
             &progression_run_dirs,
+            progression_evidence_dirs,
         )?;
         println!(
             "{}",
@@ -615,6 +638,18 @@ pub(crate) fn run() -> Result<()> {
     store.ensure_layout()?;
 
     match command {
+        TopCommand::ImportStore {
+            source_store_dir,
+            source_artifacts_via_sled,
+        } => {
+            if !source_store_dir.is_dir() || !source_artifacts_via_sled.is_dir() {
+                bail!("source store and artifact database must already exist");
+            }
+            let source = ArtifactStore::new_with_sled(source_store_dir, source_artifacts_via_sled);
+            source.ensure_layout()?;
+            let summary = crate::store_import::import_store(&store, &source)?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
         TopCommand::ImportIrArchives {
             site_dir,
             url,

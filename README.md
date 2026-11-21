@@ -275,6 +275,18 @@ and still verifies the complete result. Use a separate output directory. See
 [evidence reuse](docs/complete-corpus-site.md#reuse-completed-release-evidence) for the frozen-input
 contract and standalone-site usage.
 
+Retain published fixed-cohort generations with
+`--progression-evidence-dir ../previous-site/history` and mapped measurements with
+`--techmap-evidence-dir ../previous-site/tech-mapped-asap7`. These inputs use verified protobuf
+evidence, including mapper-isolation results and archived fixed-cohort IR, so the original
+evaluation workspaces are unnecessary. Supply only new generations through the corresponding
+run-directory options; overlapping generations are rejected.
+
+When release collection used separate canonical stores, `import-store --source-store-dir DIR
+--source-artifacts-via-sled PATH` imports completed actions and terminal campaign records into
+the selected destination store. Stop its workers first. Identity and payload conflicts fail;
+derived web indices are rebuilt by the subsequent fresh snapshot command.
+
 The enqueue workflow is intentionally explicit:
 
 1. The first `run-ir-dir-corpus` invocation seeds `OUTPUT_DIR/.bvc/`, imports local IR roots,

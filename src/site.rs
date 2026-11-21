@@ -727,6 +727,76 @@ struct ProgressionRunEvidenceInput {
     git_identity: Option<ProgressionGitIdentity>,
     sample_sources_by_g8r_stats_action: BTreeMap<String, ProgressionSampleSourceEvidence>,
 }
+/// Canonical publication bytes remain the durable boundary when reusing a site.
+struct PublishedProgressionEvidence {
+    cohort_id: String,
+    generation: BrowserProgressionGeneration,
+    runtime_identity: ProgressionRuntimeIdentity,
+    bytes: Vec<u8>,
+}
+
+impl PublishedProgressionEvidence {
+    fn from_native(input: ProgressionRunEvidenceInput) -> Result<Self> {
+        let bytes = encode_progression_run_evidence(&input)?;
+        Ok(Self {
+            cohort_id: input.cohort_id,
+            generation: input.generation,
+            runtime_identity: input.runtime_identity,
+            bytes,
+        })
+    }
+}
+
+fn read_published_progression_evidence(
+    dirs: &[PathBuf],
+) -> Result<Vec<PublishedProgressionEvidence>> {
+    let mut evidence = Vec::new();
+    for dir in dirs {
+        let previous_count = evidence.len();
+        verify_static_site(dir)
+            .with_context(|| format!("verifying progression evidence site {}", dir.display()))?;
+        let manifest = pb::StaticSiteManifest::decode(
+            fs::read(dir.join(STATIC_SITE_MANIFEST_FILENAME))?.as_slice(),
+        )?;
+        for record in manifest.files {
+            let path = &record
+                .relpath
+                .context("missing progression evidence path")?
+                .value;
+            if !path.starts_with("data/progression-runs/") || !path.ends_with("/evidence.pb") {
+                continue;
+            }
+            normalized_relpath(path)?;
+            let bytes = fs::read(dir.join(path))?;
+            if bytes.len() as u64 != record.bytes
+                || sha256_hex(&bytes) != digest_hex(&record.sha256, "progression evidence digest")?
+            {
+                bail!("reused progression evidence differs from its source manifest");
+            }
+            let (cohort_id, generation, runtime_identity) =
+                decode_progression_run_evidence(&bytes)?;
+            if path
+                != &format!(
+                    "data/progression-runs/{}/evidence.pb",
+                    generation.generation_id
+                )
+            {
+                bail!("reused progression evidence has a noncanonical path");
+            }
+            evidence.push(PublishedProgressionEvidence {
+                cohort_id,
+                generation,
+                runtime_identity,
+                bytes,
+            });
+        }
+        if evidence.len() == previous_count {
+            bail!("progression evidence site contains no fixed-corpus run evidence");
+        }
+    }
+    Ok(evidence)
+}
+
 #[derive(Debug, Serialize)]
 struct ProgressionStatsMetricProjection {
     and_nodes: f64,
@@ -3949,9 +4019,10 @@ fn build_browser_progression_catalog_and_progression_evidence_from_site(
     releases: &[CrateReleaseStatusView],
     repository_observation: Option<&RepositoryHeadObservationView>,
     progression_run_dirs: &[PathBuf],
-) -> Result<(BrowserProgressionIndex, Vec<ProgressionRunEvidenceInput>)> {
+    progression_evidence_dirs: &[PathBuf],
+) -> Result<(BrowserProgressionIndex, Vec<PublishedProgressionEvidence>)> {
     let Some(dataset) = load_progression_comparison_dataset_from_site(site_dir, datasets)? else {
-        if !progression_run_dirs.is_empty() {
+        if !progression_run_dirs.is_empty() || !progression_evidence_dirs.is_empty() {
             bail!("cannot add progression runs without the fixed-IR comparison dataset");
         }
         return Ok((empty_browser_progression_index()?, Vec::new()));
@@ -3972,16 +4043,23 @@ fn build_browser_progression_catalog_and_progression_evidence_from_site(
             release_dirs.push(run_dir);
         }
     }
-    let mut evidence = Vec::with_capacity(progression_run_dirs.len());
+    let mut evidence = read_published_progression_evidence(progression_evidence_dirs)?;
     let mut release_generations = BTreeMap::<String, Vec<BrowserProgressionGeneration>>::new();
     for run_dir in release_dirs {
         let input = load_release_progression_generation_with_evidence(run_dir, &dataset, releases)
             .with_context(|| format!("loading release progression run {}", run_dir.display()))?;
-        release_generations
-            .entry(input.cohort_id.clone())
-            .or_default()
-            .push(input.generation.clone());
-        evidence.push(input);
+        evidence.push(PublishedProgressionEvidence::from_native(input)?);
+    }
+    for input in &evidence {
+        if matches!(
+            input.generation.origin,
+            BrowserProgressionOrigin::CrateRelease
+        ) {
+            release_generations
+                .entry(input.cohort_id.clone())
+                .or_default()
+                .push(input.generation.clone());
+        }
     }
     let mut catalogs = base_catalogs
         .into_iter()
@@ -4002,6 +4080,17 @@ fn build_browser_progression_catalog_and_progression_evidence_from_site(
         bail!("release generations remain outside the registered progression cohorts");
     }
     let mut candidate_generations = BTreeMap::<String, Vec<BrowserProgressionGeneration>>::new();
+    for input in &evidence {
+        if matches!(
+            input.generation.origin,
+            BrowserProgressionOrigin::GitRevision { .. }
+        ) {
+            candidate_generations
+                .entry(input.cohort_id.clone())
+                .or_default()
+                .push(input.generation.clone());
+        }
+    }
     for run_dir in candidate_dirs {
         let manifest = read_candidate_corpus_manifest(run_dir)?;
         let cohort = progression_cohort_for_candidate(
@@ -4025,7 +4114,7 @@ fn build_browser_progression_catalog_and_progression_evidence_from_site(
             .entry(input.cohort_id.clone())
             .or_default()
             .push(input.generation.clone());
-        evidence.push(input);
+        evidence.push(PublishedProgressionEvidence::from_native(input)?);
     }
     catalogs = catalogs
         .into_iter()
@@ -4074,6 +4163,7 @@ fn build_browser_progression_catalog_from_site(
         releases,
         repository_observation,
         progression_run_dirs,
+        &[],
     )
     .map(|(catalog, _)| catalog)
 }
@@ -4927,7 +5017,7 @@ pub(crate) fn build_static_site_with_protected_roots(
     options: &BuildStaticSiteOptions,
     protected_roots: &[(&str, &Path)],
 ) -> Result<BuildStaticSiteSummary> {
-    build_static_site_with_progression_runs(options, protected_roots, &[])
+    build_static_site_with_progression_runs(options, protected_roots, &[], &[])
 }
 
 fn unique_site_sibling_path(out_dir: &Path, role: &str) -> Result<PathBuf> {
@@ -5098,10 +5188,11 @@ pub(crate) fn build_static_site_with_progression_runs(
     options: &BuildStaticSiteOptions,
     protected_roots: &[(&str, &Path)],
     progression_run_dirs: &[PathBuf],
+    progression_evidence_dirs: &[PathBuf],
 ) -> Result<BuildStaticSiteSummary> {
     preflight_progression_run_dirs(progression_run_dirs)?;
     reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected_roots)?;
-    for progression_run_dir in progression_run_dirs {
+    for progression_run_dir in progression_run_dirs.iter().chain(progression_evidence_dirs) {
         reject_site_output_overlap(&options.out_dir, progression_run_dir, &[]).with_context(
             || {
                 format!(
@@ -5116,6 +5207,7 @@ pub(crate) fn build_static_site_with_progression_runs(
             staging_options,
             protected_roots,
             progression_run_dirs,
+            progression_evidence_dirs,
         )
     })
 }
@@ -5266,13 +5358,14 @@ fn build_static_site_with_progression_runs_in_place(
     options: &BuildStaticSiteOptions,
     protected_roots: &[(&str, &Path)],
     progression_run_dirs: &[PathBuf],
+    progression_evidence_dirs: &[PathBuf],
 ) -> Result<BuildStaticSiteSummary> {
     verify_static_snapshot(&options.snapshot_dir).context("verifying source snapshot")?;
     let snapshot = load_static_snapshot_manifest(&options.snapshot_dir)?;
     let base_url = normalize_base_url(&options.base_url)?;
     let root_site_url = site_root_url("index.html")?;
     reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected_roots)?;
-    for progression_run_dir in progression_run_dirs {
+    for progression_run_dir in progression_run_dirs.iter().chain(progression_evidence_dirs) {
         reject_site_output_overlap(&options.out_dir, progression_run_dir, &[]).with_context(
             || {
                 format!(
@@ -5373,13 +5466,14 @@ fn build_static_site_with_progression_runs_in_place(
             &versions.releases,
             versions.repository_head_observation.as_ref(),
             progression_run_dirs,
+            progression_evidence_dirs,
         )?;
     let mut progression_evidence = Vec::with_capacity(progression_evidence_inputs.len());
     for evidence in progression_evidence_inputs {
         let cohort_id = evidence.cohort_id.clone();
         let generation_id = evidence.generation.generation_id.clone();
         let url = format!("data/progression-runs/{generation_id}/evidence.pb");
-        let bytes = encode_progression_run_evidence(&evidence)?;
+        let bytes = evidence.bytes;
         write_file(&options.out_dir, &url, &bytes)?;
         progression_evidence.push(BrowserProgressionEvidenceRef {
             cohort_id,

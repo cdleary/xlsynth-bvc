@@ -36,6 +36,7 @@ mod site;
 mod sled_space;
 mod snapshot;
 mod store;
+mod store_import;
 mod store_validation;
 mod techmap_corpus;
 mod techmap_proto;

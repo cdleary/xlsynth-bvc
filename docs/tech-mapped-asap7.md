@@ -112,6 +112,10 @@ netlist paths and recomputes sample record digests. It retains an opaque SHA-256
 original execution manifest, while the publication binds the complete public projection. Local
 execution evidence and scientific browser measurements are unchanged.
 
+For later builds, `--techmap-evidence-dir PREVIOUS_SITE/tech-mapped-asap7` reuses the previous
+publication's verified protobuf measurements and mapper-isolation experiments. Add only new
+release/cohort runs with `--techmap-run-dir`; duplicate measurements or experiments are rejected.
+
 The comparison embeds Plotly's pinned strict bundle so full-corpus WebGL plots work under the
 page's content security policy. Browsers without WebGL show a deterministic overview of up to
 2,000 inputs; summaries, search, and the paginated table retain the complete selected population.

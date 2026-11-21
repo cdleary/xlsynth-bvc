@@ -725,14 +725,17 @@ pub(crate) fn build(
     options: &BuildStaticSiteOptions,
     protected: &[(&str, &Path)],
     progression: &[PathBuf],
+    progression_evidence: &[PathBuf],
     corpus: &[PathBuf],
     evidence: &[PathBuf],
     target: usize,
     techmap: &[PathBuf],
+    techmap_evidence: &[PathBuf],
     crossmap: &[PathBuf],
 ) -> Result<BuildStaticSiteSummary> {
     reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected)?;
-    if !crossmap.is_empty() && techmap.is_empty() {
+    let has_techmap = !techmap.is_empty() || !techmap_evidence.is_empty();
+    if !crossmap.is_empty() && !has_techmap {
         bail!("mapper-isolation evidence requires baseline technology-mapping runs");
     }
     preflight_progression_run_dirs(progression)?;
@@ -741,12 +744,20 @@ pub(crate) fn build(
     }
     for run in progression
         .iter()
+        .chain(progression_evidence)
         .chain(corpus)
         .chain(evidence)
         .chain(techmap)
+        .chain(techmap_evidence)
         .chain(crossmap)
     {
         reject_site_output_overlap(&options.out_dir, run, protected)?;
+    }
+    for history in progression_evidence {
+        let source = history
+            .parent()
+            .context("progression evidence has no archive parent")?;
+        reject_site_output_overlap(&options.out_dir, source, protected)?;
     }
     let base_url = normalize_base_url(&options.base_url)?;
     build_static_site_atomically(options, |staging| {
@@ -760,36 +771,49 @@ pub(crate) fn build(
             &child("history"),
             protected,
             progression,
+            progression_evidence,
         )?;
         site_corpus::build_in_place(&child("corpus"), corpus, evidence, target)?;
         install_child_navigation(
             &staging.out_dir.join("history"),
             ChildNavigation {
                 section: ChildSection::PreviousVersions,
-                techmap: !techmap.is_empty(),
+                techmap: has_techmap,
             },
         )?;
         install_child_navigation(
             &staging.out_dir.join("corpus"),
             ChildNavigation {
                 section: ChildSection::Corpus,
-                techmap: !techmap.is_empty(),
+                techmap: has_techmap,
             },
         )?;
-        if !techmap.is_empty() {
+        if has_techmap {
             site_techmap::build_leaf(
                 &staging.out_dir.join(site_techmap::ROOT),
                 &format!("{base_url}{}/", site_techmap::ROOT),
                 techmap,
+                techmap_evidence,
                 crossmap,
             )?;
         }
-        finish(&staging.out_dir, &base_url, progression)
+        finish(
+            &staging.out_dir,
+            &base_url,
+            progression,
+            progression_evidence,
+        )
     })
 }
 
-fn finish(out: &Path, base_url: &str, progression: &[PathBuf]) -> Result<BuildStaticSiteSummary> {
+fn finish(
+    out: &Path,
+    base_url: &str,
+    progression: &[PathBuf],
+    progression_evidence: &[PathBuf],
+) -> Result<BuildStaticSiteSummary> {
     let mut archives = archive_roots(out)?;
+    let mut missing = Vec::new();
     for root in progression_archive_roots(&out.join("history"))? {
         let sample_id = crate::corpus::sample_id_for_relpath(&root.source_relpath);
         let mut found = false;
@@ -807,11 +831,35 @@ fn finish(out: &Path, base_url: &str, progression: &[PathBuf]) -> Result<BuildSt
             }
         }
         if !found {
-            bail!(
-                "progression archive input is missing: {}",
-                root.source_relpath
-            );
+            missing.push(root);
         }
+    }
+    for history in progression_evidence {
+        if missing.is_empty() {
+            break;
+        }
+        let source = history
+            .parent()
+            .context("progression evidence has no archive parent")?;
+        let index = crate::ir_archive::wire::IrArchiveIndex::decode(
+            fs::read(source.join(crate::ir_archive::INDEX))?.as_slice(),
+        )?;
+        let mut selected = Vec::new();
+        missing.retain(|root| {
+            if index.roots.iter().any(|candidate| candidate == root) {
+                selected.push(root.clone());
+                false
+            } else {
+                true
+            }
+        });
+        archives.extend_selected_from_site(source, &selected)?;
+    }
+    if let Some(root) = missing.first() {
+        bail!(
+            "progression archive input is missing: {}",
+            root.source_relpath
+        );
     }
     archives.write(out)?;
     let dashboard = wire::DashboardSite {

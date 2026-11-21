@@ -689,15 +689,43 @@ pub(super) fn build_leaf(
     out: &Path,
     base_url: &str,
     run_dirs: &[PathBuf],
+    evidence_dirs: &[PathBuf],
     crossmap_paths: &[PathBuf],
 ) -> Result<()> {
-    let runs = read_runs(run_dirs)?;
+    let mut runs = read_runs(run_dirs)?;
+    let mut crossmap = BTreeMap::new();
+    for dir in evidence_dirs {
+        verify_static_site(dir).with_context(|| {
+            format!(
+                "verifying technology-mapping evidence site {}",
+                dir.display()
+            )
+        })?;
+        let manifest = pb::StaticSiteManifest::decode(
+            fs::read(dir.join(STATIC_SITE_MANIFEST_FILENAME))?.as_slice(),
+        )?;
+        runs.extend(load_published_runs(dir, &manifest)?);
+        for (path, bytes) in load_published_crossmap_evidence(dir)? {
+            if crossmap.insert(path, bytes).is_some() {
+                bail!("duplicate mapper-isolation publication evidence");
+            }
+        }
+    }
+    validate_public_run_set(&mut runs)?;
     if runs.is_empty() {
         bail!("technology mapping publication requires at least one run");
     }
+    for (path, bytes) in super::site_crossmap::generate(crossmap_paths, &runs)? {
+        if path.starts_with("crossmap/")
+            && path.ends_with(".pb")
+            && crossmap.insert(path, bytes).is_some()
+        {
+            bail!("duplicate mapper-isolation publication evidence");
+        }
+    }
     let files = with_crossmap(
         generated_files(&runs)?,
-        super::site_crossmap::generate(crossmap_paths, &runs)?,
+        super::site_crossmap::regenerate_public(&crossmap, &runs)?,
     )?;
     let identity = sha256(files.get(MANIFEST).expect("generated manifest"));
     for (path, bytes) in &files {
@@ -778,8 +806,7 @@ fn load_published_runs(
     Ok(runs)
 }
 
-pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -> Result<()> {
-    let runs = load_published_runs(out, manifest)?;
+fn load_published_crossmap_evidence(out: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
     let site = site_corpus::wire::TechmapSite::decode(fs::read(out.join(MANIFEST))?.as_slice())?;
     let mut crossmap = BTreeMap::new();
     for record in site.crossmap_runs {
@@ -800,6 +827,12 @@ pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -
             bail!("invalid mapper-isolation evidence binding");
         }
     }
+    Ok(crossmap)
+}
+
+pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -> Result<()> {
+    let runs = load_published_runs(out, manifest)?;
+    let crossmap = load_published_crossmap_evidence(out)?;
     let files = with_crossmap(
         generated_files(&runs)?,
         super::site_crossmap::regenerate_public(&crossmap, &runs)?,
@@ -1063,7 +1096,7 @@ pub(super) mod tests {
         )
         .unwrap();
         let out = root.join(ROOT);
-        build_leaf(&out, "/tech-mapped-asap7/", &[root.join("run")], &[]).unwrap();
+        build_leaf(&out, "/tech-mapped-asap7/", &[root.join("run")], &[], &[]).unwrap();
         verify_static_site(&out).unwrap();
 
         let mut site = site_corpus::wire::TechmapSite::decode(
@@ -1181,7 +1214,7 @@ pub(super) mod tests {
                 dir
             })
             .collect::<Vec<_>>();
-        build_leaf(&root.join(ROOT), "/tech-mapped-asap7/", &dirs, &[]).unwrap();
+        build_leaf(&root.join(ROOT), "/tech-mapped-asap7/", &dirs, &[], &[]).unwrap();
         root
     }
 
@@ -1352,7 +1385,14 @@ pub(super) mod tests {
         )
         .unwrap();
         let out = root.join(ROOT);
-        build_leaf(&out, "/nested/tech-mapped-asap7/", &[root.join("run")], &[]).unwrap();
+        build_leaf(
+            &out,
+            "/nested/tech-mapped-asap7/",
+            &[root.join("run")],
+            &[],
+            &[],
+        )
+        .unwrap();
         verify_static_site(&out).unwrap();
         fs::write(out.join("results.json"), b"{}").unwrap();
         // Rehash the outer publication. Reproducibility still binds the web view
@@ -1426,6 +1466,92 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn published_mapping_evidence_combines_with_new_runs_and_rejects_duplicates() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bvc-techmap-reuse-{nonce}"));
+        let old = root.join("old-run");
+        let new = root.join("new-run");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(old.join("manifest.pb"), fixture("0.76.0").encode_to_vec()).unwrap();
+        fs::write(new.join("manifest.pb"), fixture("0.77.0").encode_to_vec()).unwrap();
+        let source = root.join("source");
+        build_leaf(
+            &source,
+            "/tech-mapped-asap7/",
+            std::slice::from_ref(&old),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let retained = load_published_runs(
+            &source,
+            &pb::StaticSiteManifest::decode(
+                fs::read(source.join(STATIC_SITE_MANIFEST_FILENAME))
+                    .unwrap()
+                    .as_slice(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let out = root.join("combined");
+        build_leaf(
+            &out,
+            "/tech-mapped-asap7/",
+            &[new],
+            std::slice::from_ref(&source),
+            &[],
+        )
+        .unwrap();
+        verify_static_site(&out).unwrap();
+        let manifest = pb::StaticSiteManifest::decode(
+            fs::read(out.join(STATIC_SITE_MANIFEST_FILENAME))
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let combined = load_published_runs(&out, &manifest).unwrap();
+        assert_eq!(combined.len(), 2);
+        assert_eq!(combined[0], retained[0]);
+        assert_eq!(
+            combined[1].measurements.as_ref().unwrap().crate_version,
+            "0.77.0"
+        );
+        assert!(
+            build_leaf(
+                &root.join("duplicates"),
+                "/tech-mapped-asap7/",
+                &[old],
+                std::slice::from_ref(&source),
+                &[]
+            )
+            .is_err()
+        );
+        assert!(!root.join("duplicates").exists());
+        let site = site_corpus::wire::TechmapSite::decode(
+            fs::read(source.join(MANIFEST)).unwrap().as_slice(),
+        )
+        .unwrap();
+        let path = &site.runs[0].shards[0].relpath.as_ref().unwrap().value;
+        fs::write(source.join(path), b"tampered evidence").unwrap();
+        assert!(
+            build_leaf(
+                &root.join("tampered"),
+                "/tech-mapped-asap7/",
+                &[],
+                &[source],
+                &[]
+            )
+            .is_err()
+        );
+        assert!(!root.join("tampered").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn crossmap_leaf_binds_public_evidence_and_rejects_rehashed_browser_edits() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1441,6 +1567,7 @@ pub(super) mod tests {
             &out,
             "/tech-mapped-asap7/",
             &[root.join("baseline")],
+            &[],
             &[root.join("experiment.pb")],
         )
         .unwrap();
@@ -1451,6 +1578,22 @@ pub(super) mod tests {
         .unwrap();
         assert_eq!(site.record_version, 3);
         assert_eq!(site.crossmap_runs.len(), 1);
+        let reused = root.join("reused");
+        build_leaf(
+            &reused,
+            "/tech-mapped-asap7/",
+            &[],
+            std::slice::from_ref(&out),
+            &[],
+        )
+        .unwrap();
+        verify_static_site(&reused).unwrap();
+        for path in actual_site_relpaths(&out).unwrap() {
+            assert_eq!(
+                fs::read(reused.join(&path)).unwrap(),
+                fs::read(out.join(&path)).unwrap()
+            );
+        }
         let mut browser: serde_json::Value =
             serde_json::from_slice(&fs::read(out.join("crossmap-results.json")).unwrap()).unwrap();
         assert_eq!(browser["runs"][0]["verified_points"], 2);
