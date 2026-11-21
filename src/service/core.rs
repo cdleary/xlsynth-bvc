@@ -296,12 +296,24 @@ pub(crate) fn make_temp_work_dir(prefix: &str) -> Result<PathBuf> {
     bail!("unable to create temporary work directory for prefix {prefix}")
 }
 
+/// The structural hasher is a helper toolchain; its driver and native library
+/// must come from the same pinned release. The input's producing DSO remains
+/// recorded by the structural-index member, independently of this toolchain.
+fn structural_hash_toolchain(
+    repo_root: &Path,
+    source_runtime: &DriverRuntimeSpec,
+) -> Result<(DriverRuntimeSpec, String)> {
+    let runtime = resolve_driver_runtime_for_aig_stats(repo_root, source_runtime)?;
+    let dso_version = resolve_xlsynth_version_for_driver(repo_root, &runtime.driver_version)?;
+    Ok((runtime, dso_version))
+}
+
 pub(crate) fn compute_ir_fn_structural_hash(
     store: &ArtifactStore,
     repo_root: &Path,
     ir_input_path: &Path,
     ir_top: Option<&str>,
-    version: &str,
+    _source_dso_version: &str,
     runtime: &DriverRuntimeSpec,
 ) -> Result<(String, CommandTrace)> {
     if !ir_input_path.exists() {
@@ -310,11 +322,11 @@ pub(crate) fn compute_ir_fn_structural_hash(
             ir_input_path.display()
         );
     }
-    let runtime_for_hash = resolve_driver_runtime_for_aig_stats(repo_root, runtime)?;
+    let (runtime_for_hash, helper_dso_version) = structural_hash_toolchain(repo_root, runtime)?;
     ensure_driver_release_cache(
         store,
         repo_root,
-        version,
+        &helper_dso_version,
         &runtime_for_hash.release_platform,
         &runtime_for_hash.release_cache_input_sha256,
     )?;
@@ -345,7 +357,7 @@ test -s /scratch/structural_hash.json
         };
 
         let mut env = BTreeMap::new();
-        env.insert("XLSYNTH_VERSION".to_string(), version.to_string());
+        env.insert("XLSYNTH_VERSION".to_string(), helper_dso_version.clone());
         env.insert(
             "XLSYNTH_PLATFORM".to_string(),
             runtime_for_hash.release_platform.to_string(),
@@ -1028,6 +1040,41 @@ pub(crate) fn summarize_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structural_hash_toolchain_keeps_selected_driver_and_library_content_bound() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let latest = latest_known_driver_version(repo).unwrap();
+        let expected_helper =
+            bound_driver_runtime_for_driver_version(repo, &latest, crate::DEFAULT_RELEASE_PLATFORM)
+                .unwrap();
+        let expected_dso = resolve_xlsynth_version_for_driver(repo, &latest).unwrap();
+        for source_crate in ["0.80.0", "0.81.0", latest.as_str()] {
+            let source = bound_driver_runtime_for_driver_version(
+                repo,
+                source_crate,
+                crate::DEFAULT_RELEASE_PLATFORM,
+            )
+            .unwrap();
+            let retained_source = source.clone();
+            let (helper, dso) = structural_hash_toolchain(repo, &source).unwrap();
+            assert_eq!(helper, expected_helper);
+            assert_eq!(dso, expected_dso);
+            assert_eq!(source, retained_source);
+            assert_eq!(
+                helper.release_cache_input_sha256,
+                driver_release_cache_input_sha256(repo, &dso, &helper.release_platform).unwrap()
+            );
+            if source_crate == "0.80.0" {
+                let source_dso = resolve_xlsynth_version_for_driver(repo, source_crate).unwrap();
+                assert_ne!(source_dso, dso);
+                assert_ne!(
+                    source.release_cache_input_sha256,
+                    helper.release_cache_input_sha256
+                );
+            }
+        }
+    }
 
     #[test]
     fn custom_worker_label_retains_live_process_fencing_prefix() {

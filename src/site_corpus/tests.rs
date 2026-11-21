@@ -534,9 +534,11 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
             &options,
             &[],
             &[root.0.join("candidate")],
+            &[],
             &[run.clone(), newer.clone()],
             &[],
             100_000,
+            &[],
             &[],
             &[],
         )
@@ -547,9 +549,11 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
         &options,
         &[],
         &[],
+        &[],
         &[run, newer],
         &[],
         100_000,
+        &[],
         &[],
         &[],
     )
@@ -567,8 +571,13 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
     );
     assert_eq!(data["versions"][1]["full_count"], 2);
     assert_eq!(data["trends"][0]["count"], 2);
-    assert_eq!(data["schema_version"], 3);
+    assert_eq!(data["schema_version"], 4);
     let stages = &data["trends"][0]["stages"];
+    assert_eq!(
+        stages["raw"]["geomean_population"],
+        serde_json::json!({"total": 2, "eligible": 2, "release_count": 2})
+    );
+    assert_eq!(stages["raw"]["points"][0]["geomean_ratio"], 1.0);
     assert_eq!(stages["abc"]["points"][0]["equal"], 2);
     assert_eq!(stages["raw"]["points"][0]["equal"], 2);
     assert_eq!(stages["abc"]["points"][0]["cost"], 30.0);
@@ -576,6 +585,12 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
     let transition = &stages["raw"]["points"][1]["transition"];
     assert_eq!(transition["baseline_version"], "0.74.0");
     assert_eq!(transition["equal"], 2);
+    assert_eq!(transition["geomean_ratio"], 1.0);
+    assert_eq!(
+        transition["zero_cost"],
+        serde_json::json!({"positive_to_positive": 2, "zero_to_zero": 0,
+            "positive_to_zero": 0, "zero_to_positive": 0})
+    );
     let detail_path = transition["details"].as_str().unwrap();
     let detail_bytes = fs::read(options.out_dir.join(detail_path)).unwrap();
     let detail: serde_json::Value = serde_json::from_slice(&detail_bytes).unwrap();
@@ -592,8 +607,10 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
         &[],
         &[],
         &[],
+        &[],
         &[options.out_dir.join("corpus")],
         100_000,
+        &[],
         &[],
         &[],
     )
@@ -608,14 +625,18 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
     .unwrap();
     let mut mapped_options = options.clone();
     mapped_options.out_dir = root.0.join("mapped-dashboard");
+    // A composed IR/AIG and technology-mapped site can be built entirely from
+    // native completed runs. Retained publication evidence is optional.
     super::super::site_dashboard::build(
         &mapped_options,
         &[],
         &[],
         &[],
-        &[options.out_dir.join("corpus")],
+        &[root.0.join("0.74.0"), root.0.join("0.75.0")],
+        &[],
         100_000,
         &[mapper_run],
+        &[],
         &[],
     )
     .unwrap();
@@ -891,7 +912,7 @@ fn evidence_reuse_rejects_duplicate_releases_mixed_populations_and_overlap() {
 }
 
 #[test]
-fn evidence_reuse_preserves_aliases_or_refreshes_them_from_an_explicit_snapshot() {
+fn evidence_reuse_preserves_frozen_aliases_across_partial_snapshots_and_new_releases() {
     let root = Fixture::new();
     let run = fixture_run(&root.0, "0.74.0", 1);
     let mut options = root.options();
@@ -933,19 +954,32 @@ fn evidence_reuse_preserves_aliases_or_refreshes_them_from_an_explicit_snapshot(
         samples
     );
 
-    // The supplied snapshot lacks this function. Its verified index must replace
-    // the old alias binding rather than silently retaining stale classifications.
+    // A partial current snapshot cannot erase verified frozen-input aliases.
+    // A new release of the same exact input inherits the original PB binding.
     let historical = Fixture::new();
     super::super::tests::build_historical_candidate_site_fixture(&historical.0);
     options.snapshot_dir = historical.0.join("snapshot");
     options.out_dir = root.0.join("refreshed");
-    build(&options, &[], &[], std::slice::from_ref(&source), 100_000).unwrap();
-    samples[0].provenance = None;
+    let newer = fixture_run(&root.0, "0.75.0", 1);
+    let (_, expected_new) = ingest(&newer).unwrap();
+    build(
+        &options,
+        &[],
+        &[newer],
+        std::slice::from_ref(&source),
+        100_000,
+    )
+    .unwrap();
     let refreshed = evidence::Source::open(&options.out_dir).unwrap();
+    assert_eq!(refreshed.site.generations.len(), 2);
     assert_eq!(
         refreshed.samples(&refreshed.site.generations[0]).unwrap(),
         samples
     );
+    let new_samples = refreshed.samples(&refreshed.site.generations[1]).unwrap();
+    let mut expected_new = expected_new;
+    expected_new[0].provenance = samples[0].provenance.clone();
+    assert_eq!(new_samples, expected_new);
 
     // A new snapshot cannot launder an invalid old binding before validation.
     samples[0].provenance = Some(wire::InputProvenance::default());

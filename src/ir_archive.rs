@@ -200,6 +200,51 @@ impl Builder {
         Ok(())
     }
 
+    /// Reuse only roots independently selected by retained publication evidence.
+    pub(crate) fn extend_selected_from_site(
+        &mut self,
+        site: &Path,
+        roots: &[wire::IrArchiveRoot],
+    ) -> Result<()> {
+        let (index, blobs, _) = read_bundle(&Source::Local(site.to_path_buf()))?;
+        let available = index
+            .roots
+            .iter()
+            .map(|root| (root_key(root), root))
+            .collect::<BTreeMap<_, _>>();
+        let mut selected = BTreeSet::new();
+        // Check every requested identity and destination conflict before adding
+        // anything, so a rejected selection leaves the builder unchanged.
+        for root in roots {
+            validate_root(root)?;
+            let key = root_key(root);
+            if !selected.insert(key.clone()) {
+                bail!("duplicate selected IR archive root");
+            }
+            let source_root = available
+                .get(&key)
+                .context("selected IR archive root is missing from the source site")?;
+            if **source_root != *root {
+                bail!("selected IR archive root identity differs from the source site");
+            }
+            let ir = blobs
+                .get(&root.source_sha256)
+                .context("selected IR archive root has no verified blob")?;
+            if self.roots.get(&key).is_some_and(|prior| prior != root)
+                || self
+                    .blobs
+                    .get(&root.source_sha256)
+                    .is_some_and(|prior| prior != ir)
+            {
+                bail!("selected IR archive root conflicts with the destination");
+            }
+        }
+        for root in roots {
+            self.add(root.clone(), &blobs[&root.source_sha256])?;
+        }
+        Ok(())
+    }
+
     /// Additional bytes may come from the download itself only after their
     /// complete root identities are independently bound by progression evidence.
     pub(crate) fn verify_including(

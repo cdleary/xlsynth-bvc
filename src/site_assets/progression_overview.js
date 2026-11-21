@@ -27,20 +27,28 @@ function costComparison(baseline, current, mode = 'baseline') {
   const counts = Object.fromEntries(costKinds.map(kind => [kind.key, rows.filter(row => row.kind === kind.key).length]));
   const added = [...after.keys()].filter(key => !before.has(key)).length;
   const removed = [...before.keys()].filter(key => !after.has(key)).length;
-  return {rows, counts, old, now, delta: now - old, index: rows.length ? costRatio(now, old) : null,
+  const geomean = BvcCostStats.summarizePairs(rows.map(row => ({before:row.old,after:row.now})));
+  return {rows, counts, old, now, geomean, delta: now - old, index: rows.length ? costRatio(now, old) : null,
     percent: rows.length && old !== 0 ? 100 * (now - old) / old : null, added, removed,
     complete: current.coverage === 'cohort_complete' &&
       (mode === 'yosys' || baseline.coverage === 'cohort_complete') && added === 0 && removed === 0};
 }
-function costOverview(generations, baselineId, currentId, mode = 'baseline') {
+function costOverview(generations, baselineId, currentId, mode = 'baseline', aggregation = 'geomean') {
   const baseline = generations.find(g => g.generation_id === baselineId);
   const current = generations.find(g => g.generation_id === currentId);
   if (!baseline || !current) throw Error('Selected fixed-IR generation is unavailable.');
   const selected = costComparison(baseline, current, mode);
   const history = generations.filter(g => g.coverage === 'cohort_complete').map(g =>
     ({generation: g, ...costComparison(baseline, g, mode)})).filter(row => row.complete);
+  const keys = BvcCostStats.fixedPositiveKeys(history.flatMap(row => [new Map(row.rows.map(sample => [sample.key,sample.old])),new Map(row.rows.map(sample => [sample.key,sample.now]))]));
+  const fixed = new Set(keys);
+  for (const row of [...history,selected]) {
+    row.pair_geomean = row.geomean;
+    row.geomean = row.complete ? BvcCostStats.summarizePairs(row.rows.filter(sample => fixed.has(sample.key)).map(sample => ({before:sample.old,after:sample.now}))) : row.pair_geomean;
+  }
+  const population = {eligible:keys.length,total:history[0]?.rows.length || 0,generation_count:history.length};
   const referenceLabel = mode === 'yosys' ? 'matched codegen+Yosys/ABC' : `${generationLabel(baseline)} g8r+ABC`;
-  return {baseline, current, mode, selected, history, referenceLabel};
+  return {baseline, current, mode, selected, history, referenceLabel, population, aggregation:BvcCostStats.selectedAggregation(aggregation)};
 }
 function costPlotLayout(xTitle, yTitle) {
   return {paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
@@ -50,10 +58,10 @@ function costPlotLayout(xTitle, yTitle) {
     yaxis: {title: {text: yTitle}, gridcolor: '#30363d', zerolinecolor: '#8795a8', automargin: true}};
 }
 function costTrendSpec(model) {
-  const rows = model.history, x = rows.map((_, i) => i), values = rows.map(row => row.index);
+  const rows = model.history, geomean=model.aggregation==='geomean', index=row=>geomean?(row.geomean.ratio===null?null:100*row.geomean.ratio):row.index, x = rows.map((_, i) => i), values = rows.map(index);
   const finite = values.filter(Number.isFinite), lo = Math.min(100, ...finite), hi = Math.max(100, ...finite);
   const pad = Math.max((hi - lo) * .15, .01);
-  const layout = costPlotLayout('Generations in order · equally spaced', 'Total cost index');
+  const layout = costPlotLayout('Generations in order · equally spaced', geomean?'Geomean cost index':'Total cost index');
   const labelStep = Math.max(1, Math.ceil(rows.length / 6));
   const ticks = x.filter(i => i % labelStep === 0 || i === rows.length - 1);
   layout.xaxis = {...layout.xaxis, range: [-.3, Math.max(.3, rows.length - .7)],
@@ -64,13 +72,13 @@ function costTrendSpec(model) {
   layout.annotations = [{xref: 'paper', yref: 'paper', x: 0, y: 1.1, xanchor: 'left', showarrow: false,
     text: model.mode === 'yosys' ? '100 = each generation’s Yosys/ABC' : `100 = ${esc(generationLabel(model.baseline))}`}];
   if (!finite.length) layout.annotations.push({xref: 'paper', yref: 'paper', x: .5, y: .5,
-    showarrow: false, text: rows.length ? 'Index undefined: reference total is zero' : 'No complete, matched generations'});
+    showarrow: false, text: rows.length ? (geomean?'No inputs have positive cost in every plotted generation':'Index undefined: reference total is zero') : 'No complete, matched generations'});
   const trace = {type: 'scatter', mode: 'lines+markers', x, y: values, connectgaps: false,
     line: {color: '#d2a8ff', width: 2.5},
     marker: {color: '#d2a8ff', size: rows.map(row => row.generation.generation_id === model.current.generation_id ? 12 : 7),
       symbol: rows.map(row => generationIsGit(row.generation) ? 'diamond-open' : 'circle')},
     customdata: rows.map(row => row.generation.generation_id),
-    text: rows.map(row => `${esc(generationLabel(row.generation))}<br>${esc(row.generation.event_time_utc || 'Date unavailable')} · DSO v${esc(row.generation.dso_version)}<br>Index: ${product(row.index)}<br>g8r+ABC cost: ${product(row.now)}<br>Reference cost: ${product(row.old)}<br>${row.rows.length} paired functions`),
+    text: rows.map(row => `${esc(generationLabel(row.generation))}<br>${esc(row.generation.event_time_utc || 'Date unavailable')} · DSO v${esc(row.generation.dso_version)}<br>Index: ${product(index(row))}<br>${geomean?`${row.geomean.eligible} fixed positive functions<br>`:''}Total g8r+ABC cost: ${product(row.now)}<br>Reference cost: ${product(row.old)}<br>${row.rows.length} paired functions`),
     hovertemplate: '%{text}<extra></extra>'};
   return {traces: [trace], layout};
 }
@@ -97,8 +105,12 @@ function costContributionSpec(comparison, units = 'absolute') {
   });
   return {traces, layout, omitted: comparison.rows.length - rows.length};
 }
-function costHeadline(comparison) {
+function costHeadline(comparison, aggregation='geomean') {
   if (!comparison.rows.length) return 'No paired functions';
+  if (aggregation==='geomean') {
+    const value=comparison.geomean.percent;
+    return value===null?'No eligible positive inputs':value===0?'Equal geometric-mean cost':`${product(Math.abs(value))}% ${value<0?'lower':'higher'} geometric-mean cost`;
+  }
   if (comparison.percent === null) return 'Zero reference cost';
   if (comparison.delta === 0) return 'Equal total cost';
   return `${product(Math.abs(comparison.percent))}% ${comparison.delta < 0 ? 'lower' : 'higher'} total cost`;
@@ -113,23 +125,23 @@ function costBreadthRows(model) {
 function renderGenerationPair(generations, baselineId, currentId) {
   const root = byId('progression-overview');
   if (!root) return;
-  const mode = byId('progression-reference').value;
-  const model = costOverview(generations, baselineId, currentId, mode), s = model.selected;
+  const mode = byId('progression-reference').value, aggregation=BvcCostStats.selectedAggregation(byId('aggregation').value), geomean=aggregation==='geomean';
+  const model = costOverview(generations, baselineId, currentId, mode, aggregation), s = model.selected;
   const currentLabel = generationLabel(model.current), context = `${currentLabel} g8r+ABC vs ${model.referenceLabel}`;
-  root.dataset.costReference = mode;
+  root.dataset.costReference = mode;root.dataset.aggregation=aggregation;
   root.dataset.rendered = 'loading';
   const previousTrend = byId('progression-trend');
   if (previousTrend && typeof Plotly !== 'undefined') Plotly.purge(previousTrend);
   const warning = !s.complete ? `<p class="coverage-warning">Incomplete fixed-IR warning: this selected comparison uses only ${s.rows.length} paired functions (${s.added} current-only, ${s.removed} reference-only). It is not a full-cohort result. Incomplete generations are never plotted in the historical charts.</p>` : '';
-  byId('progression-summary').innerHTML = warning + `<article class="card"><div class="muted">${esc(context)}</div><div class="stat-value cost-text-${costKind(s.delta)}">${costHeadline(s)}</div><div class="meta">${product(s.old)} → ${product(s.now)} nodes × depth. ${s.percent === null ? 'A percentage is undefined when the reference total is zero.' : 'Ratio of summed costs; larger functions carry more weight.'}</div></article><article class="card"><div class="muted">How widespread is it?</div><div class="cost-summary-counts">${costKinds.map(kind => `<span class="cost-text-${kind.key}"><strong>${s.counts[kind.key]}</strong> ${kind.label.toLowerCase()}</span>`).join('')}</div><div class="meta">${s.rows.length} paired functions, each counted once. Equal cost need not mean equal nodes and depth.</div></article>`;
-  byId('progression-chart').innerHTML = `<div class="progression-chart-grid"><article class="progression-chart-panel"><h3>How much did total cost change?</h3><p class="meta">Lower index is better · reference = 100</p><div id="progression-trend" class="progression-plot" aria-label="Indexed total cost by generation"></div></article><article class="progression-chart-panel"><h3>How many functions improved?</h3><p class="meta">Product cost vs ${esc(model.referenceLabel)}</p><div class="cost-legend">${costKinds.map(kind => `<span class="cost-text-${kind.key}">● ${kind.label}</span>`).join('')}</div><div class="cost-breadth">${costBreadthRows(model) || '<p class="muted">No complete, matched generations.</p>'}</div><p class="meta cost-chart-help">Counts: lower / equal / higher. Click a row or trend point to inspect that generation.</p></article></div><p class="meta cost-chart-help">Same canonical structural-hash cohort in every historical point. ${mode === 'yosys' ? 'Each point uses its own matched Yosys/ABC reference; changes in this gap can come from either implementation. This is not a direct release-to-release change.' : `Each point compares g8r+ABC directly with ${esc(generationLabel(model.baseline))}; no Yosys/ABC subtraction. DSO and runtime details remain in the coverage inventory.`} The indexed line uses a zoomed vertical range around the observed values; 100 marks parity.</p>`;
+  byId('progression-summary').innerHTML = warning + `<article class="card"><div class="muted">${esc(context)}</div><div class="stat-value cost-text-${costKind(geomean?s.geomean.percent:s.delta)}">${costHeadline(s,aggregation)}</div><div class="meta">${geomean?`${s.complete?`${model.population.eligible} / ${model.population.total} inputs positive in all ${model.population.generation_count} complete plotted generations`:`${s.geomean.eligible} / ${s.rows.length} positive pairs in this selected incomplete comparison; this pair uses its own positive population and is excluded from the historical trend`}. Each eligible input has equal weight. Total cost: ${percentage(s.percent)}; ${product(s.old)} → ${product(s.now)} nodes × depth.`:`${product(s.old)} → ${product(s.now)} nodes × depth. ${s.percent === null ? 'A percentage is undefined when the reference total is zero.' : 'Ratio of summed costs; larger functions carry more weight.'}`}<br>Zero costs in selected pair: ${s.pair_geomean.zero_cost.zero_to_zero} zero → zero · ${s.pair_geomean.zero_cost.positive_to_zero} positive → zero · ${s.pair_geomean.zero_cost.zero_to_positive} zero → positive; ${s.pair_geomean.zero_cost.positive_to_positive} positive → positive.</div></article><article class="card"><div class="muted">How widespread is it?</div><div class="cost-summary-counts">${costKinds.map(kind => `<span class="cost-text-${kind.key}"><strong>${s.counts[kind.key]}</strong> ${kind.label.toLowerCase()}</span>`).join('')}</div><div class="meta">${s.rows.length} paired functions, each counted once. Equal cost need not mean equal nodes and depth.</div></article>`;
+  byId('progression-chart').innerHTML = `<div class="progression-chart-grid"><article class="progression-chart-panel"><h3>How much did ${geomean?'geometric-mean':'total'} cost change?</h3><p class="meta">Lower index is better · reference = 100</p><div id="progression-trend" class="progression-plot" aria-label="Indexed ${geomean?'geometric-mean':'total'} cost by generation"></div></article><article class="progression-chart-panel"><h3>How many functions improved?</h3><p class="meta">Product cost vs ${esc(model.referenceLabel)}</p><div class="cost-legend">${costKinds.map(kind => `<span class="cost-text-${kind.key}">● ${kind.label}</span>`).join('')}</div><div class="cost-breadth">${costBreadthRows(model) || '<p class="muted">No complete, matched generations.</p>'}</div><p class="meta cost-chart-help">Counts: lower / equal / higher. Click a row or trend point to inspect that generation.</p></article></div><p class="meta cost-chart-help">Same canonical structural-hash cohort in every historical point. ${geomean?`The geometric mean uses the same ${model.population.eligible} / ${model.population.total} inputs with positive current and reference costs across all ${model.population.generation_count} complete plotted generations; no epsilon is added. Zero-cost pairs remain in counts, total costs, and exact tables.`:'Total cost includes every paired input and weights larger functions more heavily.'} ${mode === 'yosys' ? 'Each point uses its own matched Yosys/ABC reference; changes in this gap can come from either implementation. This is not a direct release-to-release change.' : `Each point compares g8r+ABC directly with ${esc(generationLabel(model.baseline))}; no Yosys/ABC subtraction. DSO and runtime details remain in the coverage inventory.`} The indexed line uses a zoomed vertical range around the observed values; 100 marks parity.</p>`;
   const selectGeneration = id => {
     const select = byId('current-version'); select.value = id; select.dispatchEvent(new Event('change'));
   };
   root.querySelectorAll('[data-cost-generation]').forEach(button => button.onclick = () => selectGeneration(button.dataset.costGeneration));
   const breadth = root.querySelector('.cost-breadth'), selectedBar = breadth.querySelector('[aria-pressed="true"]');
   if (selectedBar) breadth.scrollTop = Math.max(0, selectedBar.getBoundingClientRect().bottom - breadth.getBoundingClientRect().bottom + 8);
-  byId('progression-contribution-context').textContent = context;
+  byId('progression-contribution-context').textContent = `Total cost contributions · ${context}`;
   byId('progression-function-detail').innerHTML = '';
   const exactRows = [...s.rows].sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta) || a.key.localeCompare(b.key));
   byId('progression-table').innerHTML = `<div class="table-wrap"><table><caption>${esc(context)} · all ${s.rows.length} paired functions, ordered by absolute change</caption><thead><tr><th>Function</th><th>${esc(model.referenceLabel)}</th><th>${esc(currentLabel)} g8r+ABC</th><th>Cost change</th><th>Percent change</th></tr></thead><tbody>${exactRows.map(row => `<tr><td><button type="button" class="sample-link" data-cost-function="${row.key}">${esc(row.label)}</button></td><td>${product(row.old)}</td><td>${product(row.now)}</td><td class="cost-text-${row.kind}">${product(row.delta)}</td><td>${percentage(row.percent)}</td></tr>`).join('')}</tbody></table></div>`;

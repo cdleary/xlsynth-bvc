@@ -36,6 +36,7 @@ mod site;
 mod sled_space;
 mod snapshot;
 mod store;
+mod store_import;
 mod store_validation;
 mod techmap_corpus;
 mod techmap_proto;
@@ -47,8 +48,9 @@ mod web;
 use crate::cli::{DriverCli, YosysCli};
 #[cfg(test)]
 use crate::executor::{
-    compute_action_id, determine_dslx_import_context, extract_tar_gz_subtree_safely,
-    parse_discovered_dslx_functions, parse_dslx_list_fns_failed_files,
+    DslxImportConsumer, compute_action_id, determine_dslx_import_context,
+    extract_tar_gz_subtree_safely, parse_discovered_dslx_functions,
+    parse_dslx_list_fns_failed_files,
 };
 #[cfg(test)]
 use crate::model::*;
@@ -64,6 +66,7 @@ const ACTION_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_STORE_DIR: &str = "bvc-artifacts";
 const DEFAULT_RELEASE_PLATFORM: &str = "ubuntu2004";
 const DEFAULT_DOCKERFILE: &str = "docker/xlsynth-driver.Dockerfile";
+const MODERN_DRIVER_DOCKERFILE: &str = "docker/xlsynth-driver-modern.Dockerfile";
 const DEFAULT_GIT_DOCKERFILE: &str = "docker/xlsynth-driver-git.Dockerfile";
 const DEFAULT_DOCKER_IMAGE_PREFIX: &str = "xlsynth-bvc-driver";
 const XLSYNTH_CRATE_GIT_REPOSITORY: &str = "https://github.com/xlsynth/xlsynth-crate";
@@ -81,7 +84,6 @@ const DEFAULT_WEB_RUNNER_MAX_WORKERS: usize = 8;
 const DEFAULT_STRUCTURAL_INDEX_MAX_THREADS: usize = 16;
 const DEFAULT_SUGGESTED_ENQUEUE_MAX_DEPTH: u32 = 32;
 const DEFAULT_STDLIB_FN_TIMELINE_ROUTE: &str = "/dslx-fns/float32.x:add";
-const DSLX_PATH_LIST_SEPARATOR: &str = ":";
 const IR_FN_CORPUS_STRUCTURAL_INDEX_SCHEMA_VERSION: u32 = 2;
 const WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_NAMESPACE: &str = "ir-fn-corpus-structural.v2";
 const WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY: &str =
@@ -138,19 +140,21 @@ if [ -n "${BVC_PREPARED_XLSYNTH_TOOLS:-}" ]; then
   export XLSYNTH_TOOLS="${BVC_PREPARED_XLSYNTH_TOOLS}"
 else
 cache_dir="/cache-input"
+release_dir="/tmp/xlsynth-release"
 if [ ! -d "${cache_dir}" ]; then
   echo "missing cached xlsynth release at ${cache_dir}" >&2
   exit 1
 fi
-rm -rf /tmp/xlsynth-release
-mkdir -p /tmp/xlsynth-release
-cp -a "${cache_dir}/." /tmp/xlsynth-release/
+rm -rf "${release_dir}"
+mkdir -p "${release_dir}"
+# Payloads stay on the read-only cache mount; directories remain request-local for aliases.
+cp -as "${cache_dir}/." "${release_dir}/"
 for ext in so dylib; do
-  if [ -f "/tmp/xlsynth-release/libxls-${XLSYNTH_PLATFORM}.${ext}" ]; then
-    ln -sf "/tmp/xlsynth-release/libxls-${XLSYNTH_PLATFORM}.${ext}" "/tmp/xlsynth-release/libxls-${XLSYNTH_VERSION}-${XLSYNTH_PLATFORM}.${ext}"
+  if [ -f "${release_dir}/libxls-${XLSYNTH_PLATFORM}.${ext}" ]; then
+    ln -sf "${release_dir}/libxls-${XLSYNTH_PLATFORM}.${ext}" "${release_dir}/libxls-${XLSYNTH_VERSION}-${XLSYNTH_PLATFORM}.${ext}"
   fi
 done
-export XLSYNTH_TOOLS=/tmp/xlsynth-release
+export XLSYNTH_TOOLS="${release_dir}"
 fi
 export LD_LIBRARY_PATH="${XLSYNTH_TOOLS}:${LD_LIBRARY_PATH:-}"
 "#;
@@ -259,7 +263,7 @@ impl DriverCli {
         let default_dockerfile = if source_revision.is_some() {
             crate::DEFAULT_GIT_DOCKERFILE
         } else {
-            crate::DEFAULT_DOCKERFILE
+            crate::runtime::default_driver_dockerfile(&resolved_driver_version)
         };
         let dockerfile = self
             .dockerfile
@@ -340,6 +344,123 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tar::Builder;
 
+    #[test]
+    fn driver_release_setup_links_read_only_payloads_and_recreates_local_aliases() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "xlsynth-bvc-release-view-{}-{nanos}",
+            std::process::id()
+        ));
+        let view = root.join("request release");
+        let script = format!(
+            "set -euo pipefail\n{}\nprintf '%s\\0%s\\0' \"$XLSYNTH_TOOLS\" \"$LD_LIBRARY_PATH\"\n",
+            DRIVER_TOOLS_SETUP_FROM_CACHE_SNIPPET
+                .replace("cache_dir=\"/cache-input\"", "cache_dir=\"$TEST_CACHE\"")
+                .replace(
+                    "release_dir=\"/tmp/xlsynth-release\"",
+                    "release_dir=\"$TEST_RELEASE\""
+                )
+        );
+        for versioned_only in [false, true] {
+            let cache = root.join(if versioned_only {
+                "versioned cache"
+            } else {
+                "unversioned cache"
+            });
+            let mut payloads = BTreeMap::from([
+                ("opt_main".to_string(), b"tool payload".to_vec()),
+                (
+                    "protos/xls/ir/op.proto".to_string(),
+                    b"proto payload".to_vec(),
+                ),
+                (
+                    "xls/dslx/stdlib/std.x".to_string(),
+                    b"stdlib payload".to_vec(),
+                ),
+            ]);
+            for ext in ["so", "dylib"] {
+                let library = if versioned_only {
+                    format!("libxls-v0.61.0-test-platform.{ext}")
+                } else {
+                    format!("libxls-test-platform.{ext}")
+                };
+                payloads.insert(library, format!("{ext} library payload").into_bytes());
+            }
+            for (relpath, bytes) in &payloads {
+                let path = cache.join(relpath);
+                fs::create_dir_all(path.parent().expect("payload parent")).unwrap();
+                fs::write(&path, bytes).unwrap();
+                let mut permissions = fs::metadata(&path).unwrap().permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(path, permissions).unwrap();
+            }
+            for _request in 0..2 {
+                let output = std::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(&script)
+                    .env("TEST_CACHE", &cache)
+                    .env("TEST_RELEASE", &view)
+                    .env("XLSYNTH_PLATFORM", "test-platform")
+                    .env("XLSYNTH_VERSION", "v0.61.0")
+                    .env("LD_LIBRARY_PATH", "/existing/library/path")
+                    .output()
+                    .expect("running real release setup shell");
+                assert!(
+                    output.status.success(),
+                    "release setup failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    output.stdout,
+                    format!(
+                        "{}\0{}:/existing/library/path\0",
+                        view.display(),
+                        view.display()
+                    )
+                    .into_bytes()
+                );
+                assert!(!view.join("stale-request-file").exists());
+                assert!(
+                    !fs::symlink_metadata(view.join("protos"))
+                        .unwrap()
+                        .is_symlink()
+                );
+                for (relpath, bytes) in &payloads {
+                    let source = cache.join(relpath);
+                    assert!(fs::symlink_metadata(&source).unwrap().is_file());
+                    assert_eq!(fs::read(&source).unwrap(), *bytes);
+                    assert_eq!(fs::read_link(view.join(relpath)).unwrap(), source);
+                    assert_eq!(fs::read(view.join(relpath)).unwrap(), *bytes);
+                }
+                for ext in ["so", "dylib"] {
+                    let alias = format!("libxls-v0.61.0-test-platform.{ext}");
+                    let source = if versioned_only {
+                        cache.join(&alias)
+                    } else {
+                        assert!(!cache.join(&alias).exists());
+                        view.join(format!("libxls-test-platform.{ext}"))
+                    };
+                    assert_eq!(fs::read_link(view.join(&alias)).unwrap(), source);
+                    assert_eq!(
+                        fs::read(view.join(&alias)).unwrap(),
+                        format!("{ext} library payload").into_bytes()
+                    );
+                }
+                fs::write(view.join("stale-request-file"), b"request-local payload").unwrap();
+                fs::write(
+                    view.join("protos/request-local-file"),
+                    b"request-local payload",
+                )
+                .unwrap();
+                assert!(!cache.join("protos/request-local-file").exists());
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn make_test_store() -> (ArtifactStore, PathBuf) {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -380,6 +501,11 @@ mod tests {
             include_bytes!("../docker/xlsynth-driver.Dockerfile"),
         )
         .expect("write test runtime Dockerfile");
+        fs::write(
+            root.join(MODERN_DRIVER_DOCKERFILE),
+            include_bytes!("../docker/xlsynth-driver-modern.Dockerfile"),
+        )
+        .expect("write test modern runtime Dockerfile");
         let cache_script = root.join(VENDORED_DOWNLOAD_RELEASE_SCRIPT);
         fs::create_dir_all(cache_script.parent().expect("cache script parent"))
             .expect("create cache script parent");
@@ -455,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn determine_dslx_import_context_switches_on_subtree_stdlib_presence() {
+    fn determine_dslx_import_context_provides_consumer_search_paths_for_each_stdlib_source() {
         let temp_root = std::env::temp_dir().join(format!(
             "xlsynth-bvc-test-import-context-{}-{}",
             std::process::id(),
@@ -466,38 +592,44 @@ mod tests {
         ));
         fs::create_dir_all(&temp_root).expect("create temp root");
 
-        let without_stdlib = determine_dslx_import_context(&temp_root);
-        assert_eq!(without_stdlib.stdlib_source, "toolchain_release");
-        assert_eq!(
-            without_stdlib.dslx_stdlib_path,
-            "/tmp/xlsynth-release/xls/dslx/stdlib"
-        );
-        assert_eq!(
-            without_stdlib.dslx_path,
-            [
-                "/inputs/subtree",
-                "/tmp/xlsynth-release",
-                "/tmp/xlsynth-release/xls/dslx/stdlib",
-            ]
-            .join(DSLX_PATH_LIST_SEPARATOR)
-        );
-        assert!(without_stdlib.dslx_path.contains(DSLX_PATH_LIST_SEPARATOR));
-        assert!(!without_stdlib.dslx_path.contains(';'));
+        for (consumer, separator) in [
+            (DslxImportConsumer::DriverListFns, ';'),
+            (DslxImportConsumer::ToolchainIrConverter, ':'),
+        ] {
+            let without_stdlib = determine_dslx_import_context(&temp_root, consumer);
+            assert_eq!(without_stdlib.stdlib_source, "toolchain_release");
+            assert_eq!(
+                without_stdlib.dslx_stdlib_path,
+                "/tmp/xlsynth-release/xls/dslx/stdlib"
+            );
+            assert_eq!(
+                without_stdlib
+                    .dslx_path
+                    .split(separator)
+                    .collect::<Vec<_>>(),
+                [
+                    "/inputs/subtree",
+                    "/tmp/xlsynth-release",
+                    "/tmp/xlsynth-release/xls/dslx/stdlib",
+                ],
+                "{consumer:?} search paths without a subtree stdlib"
+            );
 
-        let stdlib_dir = temp_root.join("xls/dslx/stdlib");
-        fs::create_dir_all(&stdlib_dir).expect("create subtree stdlib");
-        let with_stdlib = determine_dslx_import_context(&temp_root);
-        assert_eq!(with_stdlib.stdlib_source, "subtree");
-        assert_eq!(
-            with_stdlib.dslx_stdlib_path,
-            "/inputs/subtree/xls/dslx/stdlib"
-        );
-        assert_eq!(
-            with_stdlib.dslx_path,
-            ["/inputs/subtree", "/inputs/subtree/xls/dslx/stdlib"].join(DSLX_PATH_LIST_SEPARATOR)
-        );
-        assert!(with_stdlib.dslx_path.contains(DSLX_PATH_LIST_SEPARATOR));
-        assert!(!with_stdlib.dslx_path.contains(';'));
+            let stdlib_dir = temp_root.join("xls/dslx/stdlib");
+            fs::create_dir_all(&stdlib_dir).expect("create subtree stdlib");
+            let with_stdlib = determine_dslx_import_context(&temp_root, consumer);
+            assert_eq!(with_stdlib.stdlib_source, "subtree");
+            assert_eq!(
+                with_stdlib.dslx_stdlib_path,
+                "/inputs/subtree/xls/dslx/stdlib"
+            );
+            assert_eq!(
+                with_stdlib.dslx_path.split(separator).collect::<Vec<_>>(),
+                ["/inputs/subtree", "/inputs/subtree/xls/dslx/stdlib"],
+                "{consumer:?} search paths with a subtree stdlib"
+            );
+            fs::remove_dir_all(&stdlib_dir).expect("remove subtree stdlib");
+        }
 
         fs::remove_dir_all(&temp_root).expect("cleanup temp root");
     }

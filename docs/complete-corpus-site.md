@@ -42,6 +42,32 @@ Repeat the same flag when finalizing or resuming. An existing workspace rejects 
 resolved statistics runtime. Git candidates retain their captured baseline estimator and do
 not accept this override.
 
+### Rebuild inputs and retained results
+
+The website is disposable output. To recompute measurements, retain the exact frozen IR bytes,
+selected top functions, cohort manifests, and pinned release/runtime/recipe definitions. Run the
+evaluations into fresh canonical stores, finalize their operational exports, and build from those
+completed run directories. The registered manifests bind the input bytes; hashes alone cannot
+reconstruct missing IR. Portable [protobuf-indexed IR archives](ir-archives.md) preserve those
+bytes without requiring the original DSLX-to-IR generation pipeline.
+
+To render existing measurements again, retain the completed canonical stores and run records.
+Use `import-store` to combine idle release stores when building the historical snapshot,
+then supply that snapshot and the completed corpus, progression, and technology-mapping runs.
+Neither route requires a previous website. Keep these inputs separately from deployment output;
+publishing a site is not a replacement for retaining evaluation data.
+
+Reconstruct the structural index explicitly before building the snapshot, as shown below.
+`populate-ir-fn-corpus-structural --recompute-missing-hashes` uses canonical IR and recorded hash
+hints, invoking the pinned helper when a hash is missing. These calculations can take time; they
+belong to the computation stage. Snapshot construction rebuilds the other web indices and
+checks structural-index closure, but does not perform this hash computation itself.
+
+The optional evidence inputs below avoid rereading completed stores for measurements already
+present in a typed publication bundle. They do not reconstruct the original execution store,
+recover missing stdlib history, or prove that a measurement has been recomputed. Do not use
+browser JSON or a separate historical website to fill a gap in canonical evaluation coverage.
+
 ### Faster repeated evaluation
 
 `run-ir-dir-corpus --prepare-threads 4` imports inputs and enqueues independent
@@ -91,8 +117,8 @@ and does not change the artifact-store descriptor fingerprint.
 
 ## Reuse completed release evidence
 
-After the first build, reuse its typed publication evidence instead of reopening every completed
-evaluation store. Add only newly finalized releases as raw run inputs:
+As an optional rendering shortcut, reuse typed publication evidence instead of reopening every
+completed evaluation store. Add newly finalized releases as raw run inputs:
 
 ```bash
 cargo run --release --bin xlsynth_bvc -- build-static-site \
@@ -115,29 +141,40 @@ catalog JSON, and metric/IR JSON are neither read nor copied: current templates 
 are regenerated, with the requested shard size and base URL. The completed output still receives
 the full semantic, comparability, hosting-budget, and integrity verification before installation.
 
-The source evidence is sufficient even after the original evaluation store has been archived.
-Conversely, changes to that store do **not** update an existing publication artifact: explicitly
+The source evidence is sufficient to rerender these retained measurements without opening the
+original evaluation store. It is a summary, not a backup of that store. Changes to the store do
+**not** update an existing publication artifact: explicitly
 rebuild that release from `--corpus-run-dir` to include reevaluated results. There is no mtime-based
 cache hit or implicit preference between duplicate releases. Keep evidence inputs and output
 directories disjoint, and retain the source until the new build succeeds. This avoids millions of
 small provenance/export reads, but does not skip validation of the resulting website.
 
-Without a snapshot, existing function aliases and their provenance bindings are retained. With
-`--snapshot-dir`, those bindings are validated and then refreshed from the supplied snapshot,
-just as for run-directory inputs. Measurement evidence remains frozen in either case.
+Existing function aliases and their source-snapshot provenance bindings are retained. Verified
+metadata may be reused for another release only when the exact input bytes and selected top
+function match. With `--snapshot-dir`, the supplied snapshot enriches inputs that have no retained
+metadata. Measurement evidence remains frozen in either case.
 
 ## All-versions dashboard
 
-Supply a historical snapshot **and** the completed full-corpus runs in the same command to build
-the project dashboard. Include the registered fixed-cohort runs for the historical progression:
+Rebuild the historical snapshot from the canonical store, then supply it **and** the completed
+full-corpus runs to build the project dashboard. Include the registered fixed-cohort runs for
+the historical progression and technology-mapping runs for the ASAP7 view:
 
 ```bash
+cargo run --release --bin xlsynth_bvc -- populate-ir-fn-corpus-structural \
+  --recompute-missing-hashes
+
+cargo run --release --bin xlsynth_bvc -- build-static-snapshot \
+  --out-dir ../bvc-snapshots/current
+
 cargo run --release --bin xlsynth_bvc -- build-static-site \
-  --snapshot-dir snapshots/current \
+  --snapshot-dir ../bvc-snapshots/current \
   --progression-run-dir runs/fixed-cohort-older \
   --progression-run-dir runs/fixed-cohort-newer \
   --corpus-run-dir runs/full-corpus-older \
   --corpus-run-dir runs/full-corpus-newer \
+  --techmap-run-dir runs/asap7-older \
+  --techmap-run-dir runs/asap7-newer \
   --out-dir ../bvc-site
 ```
 

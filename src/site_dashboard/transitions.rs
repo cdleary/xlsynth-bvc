@@ -16,6 +16,17 @@ impl Metrics {
     pub fn cost(&self) -> f64 {
         self.nodes * self.depth
     }
+
+    pub fn validate(&self) -> Result<()> {
+        if [self.nodes, self.depth, self.cost()]
+            .into_iter()
+            .chain(self.graph_le)
+            .any(|v| !v.is_finite() || v < 0.)
+        {
+            bail!("dashboard transition metrics must be finite and nonnegative");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +40,8 @@ pub(super) struct Input {
 pub(super) struct Transition {
     pub baseline_version: String,
     pub baseline_cost: f64,
+    pub geomean_ratio: Option<f64>,
+    pub zero_cost: ZeroCost,
     pub cost_decreases: f64,
     pub cost_increases: f64,
     pub lower: usize,
@@ -36,6 +49,14 @@ pub(super) struct Transition {
     pub higher: usize,
     pub url: String,
     pub details: String,
+}
+
+#[derive(Default, Debug, PartialEq, Eq, Serialize)]
+pub(super) struct ZeroCost {
+    pub positive_to_positive: usize,
+    pub zero_to_zero: usize,
+    pub positive_to_zero: usize,
+    pub zero_to_positive: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -114,21 +135,14 @@ pub(super) fn compare(
         bail!("dashboard transition populations differ");
     }
     for input in before.values().chain(after.values()) {
-        if [
-            input.metrics.nodes,
-            input.metrics.depth,
-            input.metrics.cost(),
-        ]
-        .into_iter()
-        .any(|v| !v.is_finite() || v < 0.)
-        {
-            bail!("dashboard transition metrics must be finite and nonnegative");
-        }
+        input.metrics.validate()?;
     }
     let baseline_cost: f64 = before.values().map(|s| s.metrics.cost()).sum();
     let mut transition = Transition {
         baseline_version: baseline_version.into(),
         baseline_cost,
+        geomean_ratio: None,
+        zero_cost: ZeroCost::default(),
         cost_decreases: 0.,
         cost_increases: 0.,
         lower: 0,
@@ -142,6 +156,12 @@ pub(super) fn compare(
         let old = &before[key];
         if old.ir_nodes != now.ir_nodes {
             bail!("dashboard transition IR sizes differ");
+        }
+        match (old.metrics.cost() > 0., now.metrics.cost() > 0.) {
+            (true, true) => transition.zero_cost.positive_to_positive += 1,
+            (false, false) => transition.zero_cost.zero_to_zero += 1,
+            (true, false) => transition.zero_cost.positive_to_zero += 1,
+            (false, true) => transition.zero_cost.zero_to_positive += 1,
         }
         let delta = now.metrics.cost() - old.metrics.cost();
         if delta < 0. {

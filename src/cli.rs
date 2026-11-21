@@ -79,6 +79,13 @@ pub enum TopCommand {
         #[arg(long, value_name = "DIR")]
         out_dir: PathBuf,
     },
+    /// Import completed canonical actions and terminal campaign records from an idle store.
+    ImportStore {
+        #[arg(long, value_name = "DIR")]
+        source_store_dir: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        source_artifacts_via_sled: PathBuf,
+    },
     /// Seed a downstream cache from completed canonical actions in this store.
     SeedDownstreamCache {
         #[arg(long, value_name = "DIR")]
@@ -141,6 +148,14 @@ pub enum TopCommand {
         priority: i32,
         #[command(subcommand)]
         action: RunAction,
+    },
+    /// Retry only the specified failed or canceled actions using their stored specs.
+    RetryActions {
+        #[arg(long, required = true, value_name = "ACTION_ID")]
+        action_id: Vec<String>,
+        /// Retry priority; terminal records do not retain the previous priority.
+        #[arg(long, default_value_t = crate::DEFAULT_QUEUE_PRIORITY)]
+        priority: i32,
     },
     EnqueueCrateVersion {
         #[arg(long)]
@@ -372,9 +387,15 @@ pub enum TopCommand {
         /// May be repeated; all runs must match a registered cohort.
         #[arg(long = "progression-run-dir", value_name = "DIR")]
         progression_run_dirs: Vec<PathBuf>,
+        /// Reuse verified fixed-cohort protobuf evidence from an earlier history/ site.
+        #[arg(long = "progression-evidence-dir", value_name = "DIR")]
+        progression_evidence_dirs: Vec<PathBuf>,
         /// Typed ASAP7 mapping runs to include in the area/delay comparison.
         #[arg(long = "techmap-run-dir", value_name = "DIR")]
         techmap_run_dirs: Vec<PathBuf>,
+        /// Reuse verified mapping and mapper-isolation protobuf evidence from an earlier site.
+        #[arg(long = "techmap-evidence-dir", value_name = "DIR")]
+        techmap_evidence_dirs: Vec<PathBuf>,
         /// Typed mapper-isolation experiment manifest (repeatable).
         /// Requires its baseline to be included with --techmap-run-dir.
         #[arg(long = "techmap-crossmap-run", value_name = "FILE")]
@@ -821,4 +842,43 @@ pub struct YosysCli {
     pub(crate) yosys_docker_image: String,
     #[arg(long, default_value = crate::DEFAULT_YOSYS_UPSTREAM_COMMIT)]
     pub(crate) yosys_upstream_commit: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_actions_cli_requires_explicit_ids_and_parses_repeated_ids() {
+        let error = Cli::try_parse_from(["xlsynth-bvc", "retry-actions"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        for priority in [None, Some("42")] {
+            let mut args = vec![
+                "xlsynth-bvc",
+                "retry-actions",
+                "--action-id",
+                first.as_str(),
+                "--action-id",
+                second.as_str(),
+            ];
+            if let Some(priority) = priority {
+                args.extend(["--priority", priority]);
+            }
+            let cli = Cli::try_parse_from(args).expect("parse explicit retries");
+            let TopCommand::RetryActions {
+                action_id,
+                priority: parsed_priority,
+            } = cli.command
+            else {
+                panic!("expected retry-actions command");
+            };
+            assert_eq!(action_id, [first.clone(), second.clone()]);
+            assert_eq!(parsed_priority, if priority.is_some() { 42 } else { 0 });
+        }
+    }
 }

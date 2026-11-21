@@ -1823,6 +1823,357 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_pipeline_recovers_populated_corpus_without_web_indices() {
+        use crate::model::{
+            ActionSpec, ArtifactRef, ArtifactType, DriverRuntimeSpec, G8rLoweringMode, OutputFile,
+            Provenance, ScriptRef, YosysVerilogFrontend,
+        };
+
+        fn persist_result(
+            store: &ArtifactStore,
+            action: ActionSpec,
+            dependencies: Vec<ArtifactRef>,
+            artifact_type: ArtifactType,
+            relpath: &str,
+            contents: &str,
+            details: serde_json::Value,
+        ) -> ArtifactRef {
+            let action_id = crate::executor::compute_action_id(&action).expect("action id");
+            let staging_dir = store.staging_dir().join(format!("{action_id}-fixture"));
+            let output_path = staging_dir.join(relpath);
+            fs::create_dir_all(output_path.parent().expect("artifact parent"))
+                .expect("create fixture artifact parent");
+            fs::write(&output_path, contents).expect("write fixture artifact");
+            let output_artifact = ArtifactRef {
+                action_id: action_id.clone(),
+                artifact_type,
+                relpath: relpath.to_string(),
+            };
+            let provenance = Provenance {
+                schema_version: crate::ACTION_SCHEMA_VERSION,
+                action_id: action_id.clone(),
+                created_utc: DateTime::from_timestamp(1_700_000_000, 0).expect("fixture timestamp"),
+                action,
+                dependencies,
+                output_artifact: output_artifact.clone(),
+                output_files: vec![OutputFile {
+                    path: relpath.to_string(),
+                    bytes: contents.len() as u64,
+                    sha256: sha256_hex(contents.as_bytes()),
+                }],
+                commands: Vec::new(),
+                details,
+                suggested_next_actions: Vec::new(),
+            };
+            fs::write(
+                staging_dir.join("provenance.pb"),
+                crate::proto::encode_provenance(&provenance).expect("encode fixture result"),
+            )
+            .expect("write canonical fixture result");
+            store
+                .promote_staging_action_dir(&action_id, &staging_dir)
+                .expect("persist canonical fixture result");
+            output_artifact
+        }
+
+        let root = make_temp_dir("default-rebuild-cacheless-corpus");
+        let store = ArtifactStore::new(root.join("store"));
+        store.ensure_layout().expect("ensure layout");
+        let repo_root = test_repo_root();
+        let runtime = DriverRuntimeSpec {
+            driver_version: "0.31.0".to_string(),
+            source_revision: None,
+            release_platform: "x64-linux".to_string(),
+            docker_image: "fixture-driver:0.31.0".to_string(),
+            dockerfile: "docker/xlsynth-driver.Dockerfile".to_string(),
+            dockerfile_sha256: "d".repeat(64),
+            docker_image_id: "e".repeat(64),
+            release_cache_input_sha256: "f".repeat(64),
+        };
+        let ir_function =
+            "top fn main(x: bits[1] id=1) -> bits[1] {\n  ret result: bits[1] = not(x, id=2)\n}";
+        let ir_package = format!("package fixture\n\n{ir_function}\n");
+        let structural_hash = "c".repeat(64);
+        let input = persist_result(
+            &store,
+            ActionSpec::ImportIrPackageFile {
+                source_sha256: sha256_hex(ir_package.as_bytes()),
+                top_fn_name: Some("main".to_string()),
+            },
+            Vec::new(),
+            ArtifactType::IrPackageFile,
+            "payload/input.ir",
+            &ir_package,
+            serde_json::json!({}),
+        );
+        let opt = persist_result(
+            &store,
+            ActionSpec::DriverIrToOpt {
+                ir_action_id: input.action_id.clone(),
+                top_fn_name: Some("main".to_string()),
+                version: "0.35.0".to_string(),
+                runtime: runtime.clone(),
+            },
+            vec![input],
+            ArtifactType::IrPackageFile,
+            "payload/opt.ir",
+            &ir_package,
+            serde_json::json!({"ir_top": "main"}),
+        );
+        crate::service::populate_ir_fn_corpus_structural_index(
+            &store,
+            &repo_root,
+            &root.join("structural-output"),
+            false,
+            1,
+        )
+        .expect("compute structural projection from canonical results before hash hints");
+        build_static_snapshot(
+            &store,
+            &repo_root,
+            &BuildStaticSnapshotOptions {
+                out_dir: root.join("snapshot-before-hash-hints"),
+                overwrite: false,
+                skip_rebuild_web_indices: false,
+            },
+        )
+        .expect("initialize structural projection before downstream hash hints exist");
+        let before_hints: crate::model::IrFnCorpusStructuralManifest = serde_json::from_slice(
+            &store
+                .load_web_index_bytes(WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY)
+                .expect("load structural manifest before hints")
+                .expect("structural manifest exists before hints"),
+        )
+        .expect("decode structural manifest before hints");
+        assert_eq!(before_hints.indexed_actions, 0);
+        assert_eq!(before_hints.skipped_missing_hash_hint_count, 1);
+        assert!(before_hints.groups.is_empty());
+
+        let g8r = persist_result(
+            &store,
+            ActionSpec::DriverIrToG8rAig {
+                ir_action_id: opt.action_id.clone(),
+                top_fn_name: Some("main".to_string()),
+                fraig: false,
+                lowering_mode: G8rLoweringMode::Default,
+                execution_recipe_revision: 0,
+                version: "0.35.0".to_string(),
+                runtime: runtime.clone(),
+            },
+            vec![opt.clone()],
+            ArtifactType::AigFile,
+            "payload/g8r.aig",
+            "fixture AIG",
+            serde_json::json!({
+                "input_ir_fn_structural_hash": structural_hash,
+                "ir_top": "main",
+            }),
+        );
+        let g8r_stats = persist_result(
+            &store,
+            ActionSpec::DriverAigToStats {
+                aig_action_id: g8r.action_id.clone(),
+                version: "0.35.0".to_string(),
+                runtime: runtime.clone(),
+            },
+            vec![g8r],
+            ArtifactType::AigStatsFile,
+            "payload/stats.json",
+            r#"{"and_nodes":10,"depth":3}"#,
+            serde_json::json!({}),
+        );
+        let verilog = persist_result(
+            &store,
+            ActionSpec::IrFnToCombinationalVerilog {
+                ir_action_id: opt.action_id.clone(),
+                top_fn_name: Some("main".to_string()),
+                use_system_verilog: false,
+                version: "0.35.0".to_string(),
+                runtime: runtime.clone(),
+            },
+            vec![opt.clone()],
+            ArtifactType::VerilogFile,
+            "payload/module.v",
+            "module main(input x, output result); assign result = ~x; endmodule\n",
+            serde_json::json!({
+                "input_ir_fn_structural_hash": structural_hash,
+                "ir_top": "main",
+            }),
+        );
+        let yosys = persist_result(
+            &store,
+            ActionSpec::ComboVerilogToYosysAbcAig {
+                verilog_action_id: verilog.action_id.clone(),
+                verilog_top_module_name: Some("main".to_string()),
+                frontend: YosysVerilogFrontend::Builtin,
+                yosys_script_ref: ScriptRef {
+                    path: crate::DEFAULT_YOSYS_FLOW_SCRIPT.to_string(),
+                    sha256: "0".repeat(64),
+                },
+                runtime: crate::runtime::test_yosys_runtime(),
+            },
+            vec![verilog],
+            ArtifactType::AigFile,
+            "payload/yosys.aig",
+            "fixture AIG",
+            serde_json::json!({}),
+        );
+        let yosys_stats = persist_result(
+            &store,
+            ActionSpec::DriverAigToStats {
+                aig_action_id: yosys.action_id.clone(),
+                version: "0.35.0".to_string(),
+                runtime,
+            },
+            vec![yosys],
+            ArtifactType::AigStatsFile,
+            "payload/stats.json",
+            r#"{"and_nodes":8,"depth":2}"#,
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            store.list_provenances().expect("canonical results").len(),
+            7
+        );
+        let after_hints = crate::service::check_ir_fn_corpus_structural_freshness(&store)
+            .expect("check source-action fingerprint after downstream hints");
+        assert_eq!(
+            before_hints.source_action_set_sha256.as_deref(),
+            Some(after_hints.current_source_action_set_sha256.as_str()),
+        );
+        assert!(
+            after_hints.up_to_date,
+            "source-action freshness alone does not detect downstream hash hints"
+        );
+
+        let first_dir = root.join("populated-snapshot");
+        let options = BuildStaticSnapshotOptions {
+            out_dir: first_dir.clone(),
+            overwrite: false,
+            skip_rebuild_web_indices: false,
+        };
+        crate::service::populate_ir_fn_corpus_structural_index(
+            &store,
+            &repo_root,
+            &root.join("structural-output"),
+            false,
+            1,
+        )
+        .expect("recompute structural projection from newly completed downstream hash hints");
+        let first = build_static_snapshot(&store, &repo_root, &options)
+            .expect("build snapshot from explicitly recomputed structural projection");
+        verify_static_snapshot(&first_dir).expect("verify populated snapshot");
+        let structural: crate::model::IrFnCorpusStructuralManifest = serde_json::from_slice(
+            &fs::read(
+                snapshot_web_index_path(&first_dir, WEB_IR_FN_CORPUS_STRUCTURAL_INDEX_MANIFEST_KEY)
+                    .expect("structural manifest path"),
+            )
+            .expect("read structural manifest"),
+        )
+        .expect("decode structural manifest");
+        assert_eq!(structural.indexed_actions, 1);
+        assert_eq!(structural.groups.len(), 1);
+        assert_eq!(structural.groups[0].structural_hash, structural_hash);
+        assert_eq!(structural.groups[0].member_count, 1);
+
+        let ir_manifest: crate::query::IrFnCorpusIrIndexManifest = serde_json::from_slice(
+            &fs::read(
+                snapshot_web_index_path(&first_dir, WEB_IR_FN_CORPUS_IR_INDEX_FILENAME)
+                    .expect("IR manifest path"),
+            )
+            .expect("read IR manifest"),
+        )
+        .expect("decode IR manifest");
+        assert_eq!(ir_manifest.entry_count, 1);
+        let populated_shards = ir_manifest
+            .shards
+            .iter()
+            .filter(|shard| shard.entry_count > 0)
+            .collect::<Vec<_>>();
+        assert_eq!(populated_shards.len(), 1);
+        let shard: crate::query::IrFnCorpusIrShardFile = serde_json::from_slice(
+            &fs::read(
+                snapshot_web_index_path(&first_dir, &populated_shards[0].index_key)
+                    .expect("IR shard path"),
+            )
+            .expect("read IR shard"),
+        )
+        .expect("decode IR shard");
+        assert_eq!(shard.entries.len(), 1);
+        let pair = &shard.entries[0];
+        assert_eq!(pair.g8r_stats_action_id, g8r_stats.action_id);
+        assert_eq!(pair.yosys_abc_stats_action_id, yosys_stats.action_id);
+        assert_eq!(pair.structural_hash, structural_hash);
+        for side in [&pair.g8r, &pair.yosys_abc] {
+            assert_eq!(side.ir_action_id, opt.action_id);
+            assert_eq!(side.ir_top, "main");
+            assert_eq!(side.ir_text, ir_function);
+        }
+
+        assert!(
+            store
+                .delete_web_index_keys_with_prefix("")
+                .expect("delete every web index")
+                > 0
+        );
+        assert!(
+            store
+                .list_web_index_entries_with_prefix("")
+                .expect("list empty web indices")
+                .is_empty()
+        );
+        crate::service::populate_ir_fn_corpus_structural_index(
+            &store,
+            &repo_root,
+            &root.join("structural-output"),
+            false,
+            1,
+        )
+        .expect(
+            "regenerate structural projection from canonical results without prior web indices",
+        );
+        let rebuilt_dir = root.join("cacheless-snapshot");
+        let rebuilt = build_static_snapshot(
+            &store,
+            &repo_root,
+            &BuildStaticSnapshotOptions {
+                out_dir: rebuilt_dir.clone(),
+                ..options
+            },
+        )
+        .expect("regenerate snapshot after deleting every web index");
+        verify_static_snapshot(&rebuilt_dir).expect("verify cacheless snapshot");
+        assert_eq!(first.snapshot_id, rebuilt.snapshot_id);
+        let manifest = load_static_snapshot_manifest(&first_dir).expect("first manifest");
+        for entry in manifest.dataset_files {
+            assert_eq!(
+                fs::read(first_dir.join(&entry.relpath)).expect("read first dataset"),
+                fs::read(rebuilt_dir.join(&entry.relpath)).expect("read regenerated dataset"),
+                "regenerated dataset differs: {}",
+                entry.index_key,
+            );
+        }
+        assert_eq!(
+            fs::read(first_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME)).expect("first manifest"),
+            fs::read(rebuilt_dir.join(STATIC_SNAPSHOT_MANIFEST_FILENAME))
+                .expect("regenerated manifest"),
+        );
+        let site_dir = root.join("regenerated-site");
+        let site = crate::site::build_static_site(&crate::site::BuildStaticSiteOptions {
+            snapshot_dir: rebuilt_dir,
+            out_dir: site_dir.clone(),
+            base_url: "/".to_string(),
+            overwrite: false,
+        })
+        .expect("render site from regenerated snapshot without prior evidence directories");
+        let verified_site = crate::site::verify_static_site(&site_dir)
+            .expect("verify site rendered from canonical results");
+        assert_eq!(site.snapshot_id, rebuilt.snapshot_id);
+        assert_eq!(verified_site.snapshot_id, rebuilt.snapshot_id);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn default_snapshot_rebuild_is_content_idempotent() {
         let root = make_temp_dir("default-rebuild-idempotent");
         let store = ArtifactStore::new(root.join("store"));

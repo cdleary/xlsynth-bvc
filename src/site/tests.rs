@@ -202,6 +202,14 @@ fn candidate_baseline_is_bound_to_checked_latest_release_observation() {
         candidate_run.stats_runtime.driver_version = observation.latest_crate_version.clone();
         candidate_run.stats_runtime.docker_image =
             crate::runtime::default_driver_image(&observation.latest_crate_version);
+        candidate_run.stats_runtime.dockerfile =
+            crate::runtime::default_driver_dockerfile(&observation.latest_crate_version)
+                .to_string();
+        candidate_run.stats_runtime.dockerfile_sha256 = crate::runtime::runtime_dockerfile_sha256(
+            &test_repo_root(),
+            &candidate_run.stats_runtime.dockerfile,
+        )
+        .expect("released stats Dockerfile digest");
         candidate_run.candidate_run_id =
             candidate_run_identity_sha256(candidate_run).expect("candidate run identity");
     }
@@ -481,6 +489,54 @@ pub(super) fn build_historical_candidate_site_fixture(root: &Path) -> (PathBuf, 
 fn build_historical_candidate_site_fixture_with_graph_le(
     root: &Path,
     graph_le: bool,
+) -> (PathBuf, String) {
+    build_candidate_site_fixture_with_observation(root, graph_le, None)
+}
+
+fn fixture_repository_observation(
+    root: &Path,
+    mut observation: RepositoryHeadObservationView,
+) -> PathBuf {
+    let repo = root.join("repository");
+    for relative in [
+        crate::DEFAULT_DOCKERFILE,
+        crate::MODERN_DRIVER_DOCKERFILE,
+        crate::DEFAULT_GIT_DOCKERFILE,
+        crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
+    ] {
+        let destination = repo.join(relative);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::copy(test_repo_root().join(relative), destination).unwrap();
+    }
+    #[derive(Serialize, Deserialize)]
+    struct CompatEntry {
+        xlsynth_release_version: String,
+        crate_release_datetime: String,
+    }
+    let mut compat: BTreeMap<String, CompatEntry> = serde_json::from_slice(
+        &fs::read(test_repo_root().join(crate::VERSION_COMPAT_PATH)).unwrap(),
+    )
+    .unwrap();
+    compat.retain(|version, _| {
+        !cmp_dotted_numeric_version(version, &observation.latest_crate_version).is_gt()
+    });
+    let bytes = serde_json::to_vec(&compat).unwrap();
+    observation.version_compat_sha256 = sha256_hex(&bytes);
+    let path = repo.join(crate::VERSION_COMPAT_PATH);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+    fs::write(
+        repo.join(crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH),
+        serde_json::to_vec(&observation).unwrap(),
+    )
+    .unwrap();
+    repo
+}
+
+fn build_candidate_site_fixture_with_observation(
+    root: &Path,
+    graph_le: bool,
+    observation: Option<RepositoryHeadObservationView>,
 ) -> (PathBuf, String) {
     let baseline_version = "0.66.0";
     let dso_version = "v0.54.7";
@@ -864,11 +920,14 @@ fn build_historical_candidate_site_fixture_with_graph_le(
             .expect("write paired IR shard");
     }
     let snapshot_dir = root.join("snapshot");
-    rebuild_versions_cards_index(&store, &test_repo_root())
+    let repo = observation
+        .map(|observation| fixture_repository_observation(root, observation))
+        .unwrap_or_else(test_repo_root);
+    rebuild_versions_cards_index(&store, &repo)
         .expect("rebuild versions dataset after source artifacts");
     build_static_snapshot(
         &store,
-        &test_repo_root(),
+        &repo,
         &BuildStaticSnapshotOptions {
             out_dir: snapshot_dir.clone(),
             overwrite: false,
@@ -888,9 +947,301 @@ fn build_historical_candidate_site_fixture_with_graph_le(
         },
         &[],
         &[run_dir],
+        &[],
     )
     .expect("build historical candidate site");
     (site_dir, generation_id)
+}
+
+#[test]
+fn retained_git_evidence_survives_advancing_head_and_latest_release() {
+    let root = temp_root();
+    let mut captured_observation =
+        load_xlsynth_crate_repository_head_observation(&test_repo_root())
+            .unwrap()
+            .unwrap();
+    captured_observation.head_commit = "8".repeat(40);
+    captured_observation.head_committed_at_utc = "2026-08-31T12:00:00Z".into();
+    captured_observation.observed_at_utc = "2026-09-01T12:00:00Z".into();
+    captured_observation.latest_crate_version = "0.66.0".into();
+    captured_observation.latest_release_tag = "v0.66.0".into();
+    captured_observation.latest_release_commit = "7".repeat(40);
+    captured_observation.latest_release_committed_at_utc = "2026-08-30T12:00:00Z".into();
+    captured_observation.comparison_status = "ahead".into();
+    captured_observation.commits_ahead = 1;
+    captured_observation.commits_behind = 0;
+    let (source, generation_id) = build_candidate_site_fixture_with_observation(
+        &root,
+        false,
+        Some(captured_observation.clone()),
+    );
+    verify_static_site(&source).unwrap();
+    let catalog = read_browser_catalog(&source).unwrap();
+    let captured = catalog
+        .progression
+        .cohorts
+        .iter()
+        .flat_map(|cohort| &cohort.generations)
+        .find(|generation| generation.generation_id == generation_id)
+        .unwrap()
+        .clone();
+    let BrowserProgressionOrigin::GitRevision {
+        requested_ref,
+        baseline_release_commit,
+        ..
+    } = &captured.origin
+    else {
+        panic!("Git fixture")
+    };
+    assert_eq!(requested_ref.as_deref(), Some("main"));
+    assert_eq!(
+        baseline_release_commit.as_deref(),
+        Some("7777777777777777777777777777777777777777")
+    );
+    let relative = format!("data/progression-runs/{generation_id}/evidence.pb");
+    let evidence_bytes = fs::read(source.join(&relative)).unwrap();
+    site_evidence::retain_protobuf_files(&source);
+
+    let store = ArtifactStore::new(root.join("store"));
+    for (name, head_advances, release_advances) in [
+        ("head", true, false),
+        ("latest", false, true),
+        ("both", true, true),
+    ] {
+        let mut observation = captured_observation.clone();
+        observation.observed_at_utc = "2026-09-03T12:00:00Z".into();
+        if head_advances {
+            observation.head_commit = "9".repeat(40);
+            observation.head_committed_at_utc = "2026-09-02T12:00:00Z".into();
+        }
+        if release_advances {
+            observation.latest_crate_version = "0.68.0".into();
+            observation.latest_release_tag = "v0.68.0".into();
+            observation.latest_release_commit = "6".repeat(40);
+        }
+        let repo = fixture_repository_observation(&root, observation);
+        rebuild_versions_cards_index(&store, &repo).unwrap();
+        let snapshot = root.join(format!("snapshot-{name}"));
+        build_static_snapshot(
+            &store,
+            &repo,
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .unwrap();
+        let out = root.join(format!("reused-{name}"));
+        build_static_site_with_progression_runs(
+            &BuildStaticSiteOptions {
+                snapshot_dir: snapshot,
+                out_dir: out.clone(),
+                base_url: "/".into(),
+                overwrite: false,
+            },
+            &[],
+            &[],
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        verify_static_site(&out).unwrap();
+        assert_eq!(fs::read(out.join(&relative)).unwrap(), evidence_bytes);
+        let current = read_browser_catalog(&out).unwrap();
+        let generation = current
+            .progression
+            .cohorts
+            .iter()
+            .flat_map(|cohort| &cohort.generations)
+            .find(|generation| generation.generation_id == generation_id)
+            .unwrap();
+        let mut expected = captured.clone();
+        let BrowserProgressionOrigin::GitRevision {
+            requested_ref,
+            baseline_release_commit,
+            ..
+        } = &mut expected.origin
+        else {
+            unreachable!()
+        };
+        if head_advances {
+            *requested_ref = None;
+            expected.display_label = "git@88888888".into();
+        }
+        if release_advances {
+            *baseline_release_commit = None;
+        }
+        assert_eq!(generation, &expected);
+        // The retained scientific record still carries both original collection-time annotations.
+        let (_, retained, _) =
+            decode_progression_run_evidence(&fs::read(out.join(&relative)).unwrap()).unwrap();
+        assert_eq!(retained, captured);
+    }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn frozen_progression_metadata_is_independent_of_current_stdlib_measurements() {
+    let root = temp_root();
+    let (source, generation_id) = build_historical_candidate_site_fixture(&root);
+    let bytes = fs::read(source.join(format!("data/progression-runs/{generation_id}/evidence.pb")))
+        .unwrap();
+    let (cohort_id, generation, _) = decode_progression_run_evidence(&bytes).unwrap();
+    let empty = StdlibG8rVsYosysDataset {
+        fraig: false,
+        samples: Vec::new(),
+        min_ir_nodes: 0,
+        max_ir_nodes: 0,
+        g8r_only_count: 0,
+        yosys_only_count: 0,
+        available_crate_versions: Vec::new(),
+    };
+    let mut lookup = ProgressionMetadataLookup::from_dataset(&empty).unwrap();
+    let sample = &generation.run_samples[0];
+    assert!(lookup.get(&cohort_id, &sample.structural_hash).is_err());
+    lookup.record_generation(&cohort_id, &generation).unwrap();
+    assert_eq!(
+        lookup.get(&cohort_id, &sample.structural_hash).unwrap(),
+        &ProgressionSampleMetadata {
+            fn_key: sample.fn_key.clone(),
+            ir_node_count: sample.ir_node_count,
+            source_sha256: sample.source_sha256.clone(),
+        }
+    );
+    let mut inconsistent = generation.clone();
+    inconsistent.run_samples[0].ir_node_count += 1;
+    assert!(lookup.record_generation(&cohort_id, &inconsistent).is_err());
+    let mut wrong_bytes = generation.clone();
+    wrong_bytes.run_samples[0].source_sha256 = "0".repeat(64);
+    assert!(
+        ProgressionMetadataLookup::default()
+            .record_generation(&cohort_id, &wrong_bytes)
+            .is_err()
+    );
+
+    // A complete release remains independently checkable when that release's
+    // historical stdlib sample rows are absent from the current snapshot.
+    let catalog = read_browser_catalog(&source).unwrap();
+    let mut release = generation.clone();
+    release.origin = BrowserProgressionOrigin::CrateRelease;
+    release.crate_version = Some("0.66.0".into());
+    release.generation_id = progression_generation_id(&cohort_id, "0.66.0", &release.dso_version);
+    release.display_label = "v0.66.0".into();
+    release.baseline_generation_id = None;
+    release.event_time_utc =
+        Some(release_event_time_utc(&catalog.releases, "0.66.0", &release.dso_version).unwrap());
+    let mut lookup = ProgressionMetadataLookup::from_dataset(&empty).unwrap();
+    lookup.record_generation(&cohort_id, &generation).unwrap();
+    let cohort =
+        empty_browser_progression_catalog_for(progression_cohort(&cohort_id).unwrap()).unwrap();
+    validate_release_progression_generation(&release, &cohort, &lookup, &catalog.releases).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn published_progression_evidence_reuses_canonical_bytes_and_rejects_duplicates() {
+    let root = temp_root();
+    let (source, generation_id) = build_historical_candidate_site_fixture(&root);
+    let source_catalog = read_browser_catalog(&source).unwrap();
+    let relative = format!("data/progression-runs/{generation_id}/evidence.pb");
+    let canonical_bytes = fs::read(source.join(&relative)).unwrap();
+    // Retention consumes protobuf evidence, regardless of the historical web renderer.
+    let mut old_catalog = source_catalog.clone();
+    old_catalog.schema_version = 9;
+    fs::write(
+        source.join("catalog.json"),
+        encode_browser_catalog(&old_catalog).unwrap(),
+    )
+    .unwrap();
+    fs::write(source.join("index.html"), b"previous HTML renderer").unwrap();
+    refresh_site_manifest_entry(&source, "catalog.json");
+    refresh_site_manifest_entry(&source, "index.html");
+    assert!(verify_static_site(&source).is_err());
+    let options = BuildStaticSiteOptions {
+        snapshot_dir: root.join("snapshot"),
+        out_dir: root.join("reused"),
+        base_url: "/".into(),
+        overwrite: false,
+    };
+    build_static_site_with_progression_runs(&options, &[], &[], std::slice::from_ref(&source))
+        .unwrap();
+    let reused_catalog = read_browser_catalog(&options.out_dir).unwrap();
+    assert_eq!(reused_catalog.progression, source_catalog.progression);
+    assert_eq!(
+        reused_catalog.progression_evidence,
+        source_catalog.progression_evidence
+    );
+    assert_eq!(
+        fs::read(options.out_dir.join(&relative)).unwrap(),
+        canonical_bytes
+    );
+    verify_static_site(&options.out_dir).unwrap();
+
+    // Web projections may be discarded completely once their protobuf evidence is retained.
+    site_evidence::retain_protobuf_files(&source);
+    let mut protobuf_only = options.clone();
+    protobuf_only.out_dir = root.join("protobuf-only");
+    build_static_site_with_progression_runs(
+        &protobuf_only,
+        &[],
+        &[],
+        std::slice::from_ref(&source),
+    )
+    .unwrap();
+    verify_static_site(&protobuf_only.out_dir).unwrap();
+    assert_eq!(
+        read_browser_catalog(&protobuf_only.out_dir)
+            .unwrap()
+            .progression,
+        source_catalog.progression
+    );
+
+    let mut duplicates = options.clone();
+    duplicates.out_dir = root.join("duplicate-inputs");
+    assert!(
+        build_static_site_with_progression_runs(
+            &duplicates,
+            &[],
+            &[],
+            &[source.clone(), source.clone()]
+        )
+        .is_err()
+    );
+    assert!(!duplicates.out_dir.exists());
+
+    fs::write(source.join(&relative), b"tampered evidence").unwrap();
+    let mut tampered = options;
+    tampered.out_dir = root.join("tampered-source");
+    assert!(
+        build_static_site_with_progression_runs(&tampered, &[], &[], std::slice::from_ref(&source))
+            .is_err()
+    );
+    assert!(!tampered.out_dir.exists());
+    // Rehashing a malformed canonical message cannot bypass its semantic validators.
+    let mut invalid =
+        pb::FixedCorpusProgressionRunEvidence::decode(canonical_bytes.as_slice()).unwrap();
+    invalid.samples[0].g8r_nodes = -1.0;
+    fs::write(source.join(&relative), invalid.encode_to_vec()).unwrap();
+    refresh_site_manifest_entry(&source, &relative);
+    assert!(read_published_progression_evidence(std::slice::from_ref(&source)).is_err());
+
+    fs::write(source.join(&relative), canonical_bytes).unwrap();
+    refresh_site_manifest_entry(&source, &relative);
+    let wrong_path = "data/progression-runs/wrong-generation/evidence.pb";
+    fs::create_dir_all(source.join(wrong_path).parent().unwrap()).unwrap();
+    fs::rename(source.join(&relative), source.join(wrong_path)).unwrap();
+    let manifest_path = source.join(STATIC_SITE_MANIFEST_FILENAME);
+    let mut manifest =
+        pb::StaticSiteManifest::decode(fs::read(&manifest_path).unwrap().as_slice()).unwrap();
+    *manifest
+        .files
+        .iter_mut()
+        .find(|record| record.logical_key == relative)
+        .unwrap() = publication_file(&source, wrong_path).unwrap();
+    fs::write(manifest_path, manifest.encode_to_vec()).unwrap();
+    assert!(read_published_progression_evidence(&[source]).is_err());
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -958,9 +1309,7 @@ fn progression_graph_le_is_validated_bound_and_preserved() {
         fs::read(site_dir.join(format!("data/progression-runs/{generation_id}/evidence.pb")))
             .unwrap();
     let (_, generation, runtime) = decode_progression_run_evidence(&evidence_bytes).unwrap();
-    let catalog =
-        decode_canonical_browser_catalog(&fs::read(site_dir.join("catalog.json")).unwrap())
-            .unwrap();
+    let catalog = read_browser_catalog(&site_dir).unwrap();
     let published = catalog
         .progression
         .cohorts
@@ -1036,6 +1385,16 @@ fn progression_graph_le_is_validated_bound_and_preserved() {
     fs::remove_dir_all(root).unwrap();
 }
 
+fn encode_test_browser_catalog(site_dir: &Path, catalog: &BrowserCatalog) -> Result<Vec<u8>> {
+    let mut files = browser_catalog_files(catalog)?;
+    let catalog_bytes = files.remove("catalog.json").expect("catalog projection");
+    for (relpath, bytes) in files {
+        fs::write(site_dir.join(&relpath), bytes)?;
+        refresh_site_manifest_entry(site_dir, &relpath);
+    }
+    Ok(catalog_bytes)
+}
+
 #[test]
 fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     let root = temp_root();
@@ -1043,8 +1402,8 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     verify_static_site(&site_dir).expect("verify historical candidate site");
     let catalog_path = site_dir.join("catalog.json");
     let catalog_bytes = fs::read(&catalog_path).expect("read candidate browser catalog");
-    let mut catalog =
-        decode_canonical_browser_catalog(&catalog_bytes).expect("decode candidate browser catalog");
+    let original_catalog = read_browser_catalog(&site_dir).expect("read candidate browser catalog");
+    let mut catalog = original_catalog.clone();
     assert_eq!(catalog.progression_evidence.len(), 1);
     assert_eq!(catalog.progression_evidence[0].generation_id, generation_id);
     assert_eq!(
@@ -1087,7 +1446,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     sample.g8r_product_loss = sample.g8r_product - sample.yosys_abc_product;
     fs::write(
         &catalog_path,
-        encode_browser_catalog(&catalog).expect("encode tampered catalog"),
+        encode_test_browser_catalog(&site_dir, &catalog).expect("encode tampered catalog"),
     )
     .expect("write self-consistent tampered catalog");
     refresh_site_manifest_entry(&site_dir, "catalog.json");
@@ -1157,8 +1516,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
         "unexpected error: {custom_runtime_error:#}"
     );
     fs::write(&evidence_path, &custom_runtime_bytes).expect("write custom-runtime evidence");
-    let mut custom_runtime_catalog =
-        decode_canonical_browser_catalog(&catalog_bytes).expect("decode restored browser catalog");
+    let mut custom_runtime_catalog = original_catalog.clone();
     let custom_runtime_ref = custom_runtime_catalog
         .progression_evidence
         .iter_mut()
@@ -1168,7 +1526,8 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     custom_runtime_ref.sha256 = sha256_hex(&custom_runtime_bytes);
     fs::write(
         &catalog_path,
-        encode_browser_catalog(&custom_runtime_catalog).expect("encode custom-runtime catalog"),
+        encode_test_browser_catalog(&site_dir, &custom_runtime_catalog)
+            .expect("encode custom-runtime catalog"),
     )
     .expect("write custom-runtime catalog");
     refresh_site_manifest_entry(&site_dir, "catalog.json");
@@ -1193,8 +1552,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     let mislabeled_evidence_bytes = mislabeled_evidence.encode_to_vec();
     fs::write(&evidence_path, &mislabeled_evidence_bytes)
         .expect("write mislabeled candidate evidence");
-    let mut mislabeled_catalog =
-        decode_canonical_browser_catalog(&catalog_bytes).expect("decode restored browser catalog");
+    let mut mislabeled_catalog = original_catalog.clone();
     {
         let generation = mislabeled_catalog
             .progression
@@ -1217,7 +1575,8 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     mislabeled_evidence_ref.sha256 = sha256_hex(&mislabeled_evidence_bytes);
     fs::write(
         &catalog_path,
-        encode_browser_catalog(&mislabeled_catalog).expect("encode mislabeled candidate catalog"),
+        encode_test_browser_catalog(&site_dir, &mislabeled_catalog)
+            .expect("encode mislabeled candidate catalog"),
     )
     .expect("write mislabeled candidate catalog");
     refresh_site_manifest_entry(&site_dir, "catalog.json");
@@ -1249,8 +1608,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     );
     fs::write(&evidence_path, &historical_timestamp_bytes)
         .expect("write historical timestamp evidence");
-    let mut historical_timestamp_catalog =
-        decode_canonical_browser_catalog(&catalog_bytes).expect("decode restored browser catalog");
+    let mut historical_timestamp_catalog = original_catalog.clone();
     let historical_timestamp_ref = historical_timestamp_catalog
         .progression_evidence
         .iter_mut()
@@ -1260,7 +1618,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     historical_timestamp_ref.sha256 = sha256_hex(&historical_timestamp_bytes);
     fs::write(
         &catalog_path,
-        encode_browser_catalog(&historical_timestamp_catalog)
+        encode_test_browser_catalog(&site_dir, &historical_timestamp_catalog)
             .expect("encode historical timestamp catalog"),
     )
     .expect("write historical timestamp catalog");
@@ -1281,8 +1639,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     evidence.samples[0].g8r_nodes += 1.0;
     let tampered_evidence_bytes = evidence.encode_to_vec();
     fs::write(&evidence_path, &tampered_evidence_bytes).expect("write tampered candidate evidence");
-    let mut evidence_catalog =
-        decode_canonical_browser_catalog(&catalog_bytes).expect("decode restored browser catalog");
+    let mut evidence_catalog = original_catalog.clone();
     let evidence_ref = evidence_catalog
         .progression_evidence
         .iter_mut()
@@ -1292,7 +1649,7 @@ fn site_verifier_reconstructs_historical_candidate_from_published_evidence() {
     evidence_ref.sha256 = sha256_hex(&tampered_evidence_bytes);
     fs::write(
         &catalog_path,
-        encode_browser_catalog(&evidence_catalog).expect("encode evidence catalog"),
+        encode_test_browser_catalog(&site_dir, &evidence_catalog).expect("encode evidence catalog"),
     )
     .expect("write evidence catalog");
     refresh_site_manifest_entry(&site_dir, "catalog.json");
@@ -1466,7 +1823,7 @@ fn empty_versions_index_bytes() -> Vec<u8> {
     bytes
 }
 
-fn refresh_site_manifest_entry(site_dir: &Path, relpath: &str) {
+pub(super) fn refresh_site_manifest_entry(site_dir: &Path, relpath: &str) {
     let manifest_path = site_dir.join(STATIC_SITE_MANIFEST_FILENAME);
     let mut manifest = pb::StaticSiteManifest::decode(
         fs::read(&manifest_path)
@@ -2055,6 +2412,7 @@ fn explicit_release_progression_generation_supersedes_snapshot_generation() {
         missing_cohort_ir_count: 0,
         extra_ir_count: 0,
         run_samples: Vec::new(),
+        run_samples_shard: None,
     };
     let mut catalog = BrowserProgressionCatalog {
         cohort_id: "test".to_string(),
@@ -2116,6 +2474,47 @@ fn progression_comparison_allows_release_specific_stats_drivers() {
     let error = record_progression_comparison_runtime(&mut identities, "test-cohort", &second)
         .expect_err("a different ABC toolchain must remain incomparable");
     assert!(format!("{error:#}").contains("common Yosys/ABC runtime and script"));
+}
+
+#[test]
+fn release_progression_admits_only_the_versioned_canonical_driver_recipe() {
+    for (version, correct, wrong) in [
+        (
+            "0.74.0",
+            crate::DEFAULT_DOCKERFILE,
+            crate::MODERN_DRIVER_DOCKERFILE,
+        ),
+        (
+            "0.79.0",
+            crate::DEFAULT_DOCKERFILE,
+            crate::MODERN_DRIVER_DOCKERFILE,
+        ),
+        (
+            "0.80.0",
+            crate::MODERN_DRIVER_DOCKERFILE,
+            crate::DEFAULT_DOCKERFILE,
+        ),
+        (
+            "0.81.0",
+            crate::MODERN_DRIVER_DOCKERFILE,
+            crate::DEFAULT_DOCKERFILE,
+        ),
+    ] {
+        let mut runtime = candidate_driver_runtime(&"8".repeat(40), false);
+        runtime.driver_version = version.to_string();
+        runtime.docker_image = crate::runtime::default_driver_image(version);
+        runtime.dockerfile = correct.to_string();
+        validate_release_progression_driver_runtime(&runtime)
+            .expect("canonical version-specific released recipe");
+        runtime.dockerfile = wrong.to_string();
+        assert!(validate_release_progression_driver_runtime(&runtime).is_err());
+        runtime.dockerfile = correct.to_string();
+        runtime.source_revision = Some(DriverSourceRevision {
+            repository: crate::XLSYNTH_CRATE_GIT_REPOSITORY.to_string(),
+            commit: "8".repeat(40),
+        });
+        assert!(validate_release_progression_driver_runtime(&runtime).is_err());
+    }
 }
 
 #[test]
@@ -2287,6 +2686,7 @@ fn progression_catalog_uses_fixed_ir_structural_hash_population() {
         missing_cohort_ir_count: 0,
         extra_ir_count: 0,
         run_samples,
+        run_samples_shard: None,
     };
     let observation = RepositoryHeadObservationView {
         schema_version: 2,
@@ -2718,6 +3118,99 @@ if (JSON.stringify(latestDso.map(sample => sample.fn_key)) !== JSON.stringify(['
     assert!(
         output.status.success(),
         "embedded JavaScript test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn comparison_javascript_initializes_ir_limit_and_plotted_samples() {
+    const SCRIPT: &str = r#"
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const app = fs.readFileSync(0, 'utf8');
+const prefix = app.slice(0, app.indexOf('async function main()'));
+const cases = [
+  ['', 0, 100, [0, 10, 100]],
+  ['?max_ir_nodes=', 0, 100, [0, 10, 100]],
+  ['?max_ir_nodes=+', 0, 100, [0, 10, 100]],
+  ['?max_ir_nodes=0', 0, 0, [0]],
+  ['?max_ir_nodes=10', 0, 10, [0, 10]],
+  ['?max_ir_nodes=999', 0, 100, [0, 10, 100]],
+  ['?max_ir_nodes=-1', 0, 100, [0, 10, 100]],
+  ['?max_ir_nodes=invalid', 0, 100, [0, 10, 100]],
+  ['', 1, 100, [1, 10, 100]],
+];
+(async () => {
+  for (const [query, minimum, expectedLimit, expectedInputs] of cases) {
+    const elements = new Map();
+    const element = id => {
+      if (!elements.has(id)) elements.set(id, {value: '', dataset: {}, addEventListener() {}});
+      return elements.get(id);
+    };
+    element('comparison-plots').dataset = {datasetKey: 'comparison', lhsLabel: 'g8r', rhsLabel: 'Yosys/ABC'};
+    global.document = {
+      querySelector: () => ({content: ''}),
+      getElementById: element,
+    };
+    global.location = new URL('https://example.test/history/raw/' + query);
+    global.history = {replaceState: (_state, _title, url) => { global.location = new URL(url); }};
+    const samples = [minimum, 10, 100].map(ir_node_count => ({
+      fn_key: `input-${ir_node_count}`,
+      crate_version: '0.74.0',
+      dso_version: '0.59.0',
+      ir_node_count,
+      g8r_nodes: 12,
+      g8r_levels: 3,
+      yosys_abc_nodes: 10,
+      yosys_abc_levels: 2,
+      g8r_product_loss: 16,
+    }));
+    global.fetch = async () => ({ok: true, json: async () => ({dataset: {
+      min_ir_nodes: minimum, max_ir_nodes: 100, samples,
+    }})});
+    const plots = new Map();
+    global.Plotly = {react: async (id, traces, layout) => { plots.set(id, {traces, layout}); }};
+    const api = new Function(prefix + '\nreturn {comparisonPlots};')();
+    await api.comparisonPlots({datasets: [{logical_key: 'comparison', url: 'comparison.json'}]});
+    assert.equal(Number(element('comparison-max-ir-nodes').value), expectedLimit, query);
+    assert.equal(Number(element('comparison-filtered-count').textContent), expectedInputs.length, query);
+    const nodes = plots.get('plot-nodes');
+    assert.deepEqual(nodes.traces[0].customdata.map(sample => sample.ir_node_count), expectedInputs, query);
+    assert.equal(nodes.layout.xaxis.type, 'log');
+    assert.equal(nodes.layout.yaxis.type, 'log');
+    assert.equal(Number(new URL(global.location).searchParams.get('max_ir_nodes')), expectedLimit);
+  }
+})().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
+"#;
+    let mut child = match Command::new("node")
+        .arg("-e")
+        .arg(SCRIPT)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping comparison initialization test: node is unavailable");
+            return;
+        }
+        Err(error) => panic!("starting node: {error}"),
+    };
+    child
+        .stdin
+        .take()
+        .expect("node stdin")
+        .write_all(APP_JS.as_bytes())
+        .expect("write embedded JavaScript");
+    let output = child.wait_with_output().expect("wait for node");
+    assert!(
+        output.status.success(),
+        "comparison initialization test failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -3260,10 +3753,7 @@ fn site_verifier_binds_release_catalog_to_versions_dataset() {
     })
     .expect("build site");
 
-    let catalog_path = site_dir.join("catalog.json");
-    let mut catalog: BrowserCatalog =
-        serde_json::from_slice(&fs::read(&catalog_path).expect("read catalog"))
-            .expect("decode catalog");
+    let mut catalog = read_browser_catalog(&site_dir).expect("read catalog");
     catalog.releases.push(CrateReleaseStatusView {
         crate_version: "0.35.0".to_string(),
         crate_release_datetime: "2026-08-28 17:52:54 PDT".to_string(),
@@ -3513,6 +4003,7 @@ fn site_overwrite_preserves_existing_site_on_late_candidate_failure() {
         },
         &[],
         &[candidate_dir],
+        &[],
     )
     .expect_err("candidate without the comparison dataset must fail after staging starts");
     assert!(
@@ -3602,9 +4093,7 @@ fn site_verifier_binds_dataset_bytes_to_source_snapshot() {
     fs::write(&dataset_path, changed.as_bytes()).expect("rewrite dataset");
 
     let catalog_path = site_dir.join("catalog.json");
-    let mut catalog: BrowserCatalog =
-        serde_json::from_slice(&fs::read(&catalog_path).expect("read catalog"))
-            .expect("decode catalog");
+    let mut catalog = read_browser_catalog(&site_dir).expect("read catalog");
     let dataset = catalog
         .datasets
         .iter_mut()
@@ -3835,3 +4324,6 @@ fn empty_stdlib_evidence_is_degraded_and_rendered_as_verified_static_run_page() 
     drop(store);
     fs::remove_dir_all(root).expect("cleanup");
 }
+
+mod progression_sample_shards;
+mod smoke_pages;

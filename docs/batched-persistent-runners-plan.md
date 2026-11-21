@@ -177,9 +177,11 @@ If runner sharing across stores becomes important later, the key can be widened 
 
 ## Capabilities
 
-The worker reports its boot-time probes in `capabilities.json`. The host validates the startup
-report and atomically publishes `capabilities.pb` for the driver slot used by capability queries.
-An absent, incomplete, or mismatched cache triggers a fresh probe under the slot reservation.
+The host runs an isolated probe with the pinned driver image, its exact read-only release cache,
+and the same library setup used by action requests. It validates the resulting `capabilities.json`
+and atomically publishes the typed `capabilities.pb` cache. The cache key binds the image, runtime,
+DSO, and parser. An absent, incomplete, or mismatched cache triggers a fresh probe under a separate
+cache reservation, without reserving or restarting an execution slot.
 
 Current driver capability metadata includes:
 

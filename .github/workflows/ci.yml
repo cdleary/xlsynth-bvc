@@ -44,6 +44,12 @@ jobs:
       - name: Test persistent runner lifecycle
         run: python3 scripts/persistent_runner_worker_test.py
 
+      - name: Test delay-info schema compatibility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          python3 scripts/prepare_delay_info_decode_protos_test.py
+
       - name: Typecheck
         run: cargo check --all-targets
 

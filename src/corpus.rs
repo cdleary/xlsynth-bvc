@@ -609,7 +609,8 @@ fn build_candidate_run_preflight(
             || stats_runtime.source_revision.is_some()
             || stats_runtime.release_platform != crate::DEFAULT_RELEASE_PLATFORM
             || stats_runtime.docker_image != expected_stats_image
-            || stats_runtime.dockerfile != crate::DEFAULT_DOCKERFILE
+            || stats_runtime.dockerfile
+                != crate::runtime::default_driver_dockerfile(&stats_runtime.driver_version)
             || yosys_runtime.docker_image != crate::DEFAULT_YOSYS_DOCKER_IMAGE
             || yosys_runtime.dockerfile != crate::DEFAULT_YOSYS_DOCKERFILE
             || yosys_runtime.upstream_commit.as_deref()
@@ -4569,6 +4570,12 @@ mod tests {
         stats_runtime.driver_version = observation.latest_crate_version.clone();
         stats_runtime.docker_image =
             crate::runtime::default_driver_image(&observation.latest_crate_version);
+        stats_runtime.dockerfile =
+            crate::runtime::default_driver_dockerfile(&observation.latest_crate_version)
+                .to_string();
+        stats_runtime.dockerfile_sha256 =
+            crate::runtime::runtime_dockerfile_sha256(repo_root, &stats_runtime.dockerfile)
+                .expect("released stats Dockerfile digest");
         let yosys_runtime = sample_yosys_runtime();
         let yosys_script_ref = sample_yosys_script_ref();
         let plan = build_action_plan(

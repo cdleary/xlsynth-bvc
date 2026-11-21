@@ -12,13 +12,20 @@ pub(super) const MANIFEST: &str = "dashboard.pb";
 const HTML: &str = include_str!("site_assets/dashboard.html");
 const JS: &str = include_str!("site_assets/dashboard.js");
 const CSS: &str = include_str!("site_assets/dashboard.css");
+const AGGREGATION_JS: &[u8] = include_bytes!("site_assets/aggregation.js");
 pub(super) const NAV_CSS_PATH: &str = "assets/navigation.css";
 const NAV_CSS: &[u8] = include_bytes!("site_assets/navigation.css");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ChildNavigation {
+enum ChildSection {
     PreviousVersions,
     Corpus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChildNavigation {
+    section: ChildSection,
+    techmap: bool,
 }
 
 // The existing composition protobuf supplies the navigation context. Standalone
@@ -27,9 +34,9 @@ pub(crate) fn child_navigation(site_dir: &Path) -> Result<Option<ChildNavigation
     let Some(parent) = site_dir.parent() else {
         return Ok(None);
     };
-    let (name, kind) = match site_dir.file_name().and_then(|n| n.to_str()) {
-        Some("history") => ("history", ChildNavigation::PreviousVersions),
-        Some("corpus") => ("corpus", ChildNavigation::Corpus),
+    let (name, section) = match site_dir.file_name().and_then(|n| n.to_str()) {
+        Some("history") => ("history", ChildSection::PreviousVersions),
+        Some("corpus") => ("corpus", ChildSection::Corpus),
         _ => return Ok(None),
     };
     let path = parent.join(MANIFEST);
@@ -41,9 +48,10 @@ pub(crate) fn child_navigation(site_dir: &Path) -> Result<Option<ChildNavigation
     if composition.record_version != 1 || composition.encode_to_vec() != bytes {
         bail!("invalid parent dashboard navigation context");
     }
-    let file = match kind {
-        ChildNavigation::PreviousVersions => composition.history_manifest,
-        ChildNavigation::Corpus => composition.corpus_manifest,
+    let techmap = composition.techmap_manifest.is_some();
+    let file = match section {
+        ChildSection::PreviousVersions => composition.history_manifest,
+        ChildSection::Corpus => composition.corpus_manifest,
     }
     .context("missing dashboard child manifest")?;
     if file.relpath.as_ref().map(|p| p.value.as_str())
@@ -51,7 +59,7 @@ pub(crate) fn child_navigation(site_dir: &Path) -> Result<Option<ChildNavigation
     {
         bail!("unexpected dashboard child navigation path");
     }
-    Ok(Some(kind))
+    Ok(Some(ChildNavigation { section, techmap }))
 }
 
 pub(super) fn child_parent_link(page: &str, url: &str) -> Result<bool> {
@@ -61,6 +69,8 @@ pub(super) fn child_parent_link(page: &str, url: &str) -> Result<bool> {
         format!("{root}../index.html#latest"),
         format!("{root}../index.html#versions"),
         format!("{root}../history/progression.html"),
+        format!("{root}../corpus/"),
+        format!("{root}../tech-mapped-asap7/"),
     ]
     .iter()
     .any(|link| link == url))
@@ -79,11 +89,16 @@ pub(crate) fn child_asset(
     }
     let root = site_root_url(path)?;
     let home = format!("{root}../index.html");
-    if kind == ChildNavigation::PreviousVersions && path == "index.html" {
+    if kind.section == ChildSection::PreviousVersions && path == "index.html" {
         return Ok(format!(r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="bvc-site-root" content="./"><meta http-equiv="refresh" content="0;url={home}"><title>Results dashboard</title></head><body><p><a href="{home}">Open the results dashboard</a></p></body></html>"#).into_bytes());
     }
+    let techmap = if kind.techmap {
+        format!(r#"<a href="{root}../tech-mapped-asap7/">Tech mapped ASAP7</a>"#)
+    } else {
+        String::new()
+    };
     let nav = format!(
-        r#"<nav class="bvc-navigation" aria-label="Primary navigation"><a class="bvc-navigation-home" href="{home}">Results</a><a href="{home}#latest">Latest</a><a href="{home}#versions">All versions</a><a href="{root}../history/progression.html">Progression</a></nav>"#
+        r#"<nav class="bvc-navigation" aria-label="Primary navigation"><a class="bvc-navigation-home" href="{home}">Results</a><a href="{root}../corpus/">IR/AIG plots</a><a href="{root}../history/progression.html">Release progression</a>{techmap}<a href="{home}#versions">All versions</a></nav>"#
     );
     let html = std::str::from_utf8(bytes)?
         .replace(&format!(r#"href="{root}""#), &format!(r#"href="{home}""#));
@@ -130,11 +145,12 @@ fn install_child_navigation(root: &Path, kind: ChildNavigation) -> Result<()> {
     )
 }
 
-fn fixed_files() -> [(&'static str, &'static [u8]); 3] {
+fn fixed_files() -> [(&'static str, &'static [u8]); 4] {
     [
         ("index.html", HTML.as_bytes()),
         ("assets/dashboard.js", JS.as_bytes()),
         ("assets/dashboard.css", CSS.as_bytes()),
+        ("assets/aggregation.js", AGGREGATION_JS),
     ]
 }
 
@@ -165,6 +181,7 @@ struct Point {
     version: String,
     url: String,
     cost: f64,
+    geomean_ratio: Option<f64>,
     lower: usize,
     equal: usize,
     higher: usize,
@@ -183,6 +200,14 @@ struct Trend {
 struct Series {
     points: Vec<Point>,
     unavailable_versions: Vec<String>,
+    geomean_population: GeomeanPopulation,
+}
+
+#[derive(Default, Debug, PartialEq, Eq, Serialize)]
+struct GeomeanPopulation {
+    total: usize,
+    eligible: usize,
+    release_count: usize,
 }
 
 #[derive(Default, Serialize)]
@@ -196,6 +221,10 @@ struct SeriesBuilder {
     series: Series,
     baseline: Option<(String, BTreeMap<String, f64>)>,
     previous: Option<(String, String, BTreeMap<String, transitions::Input>)>,
+    // All vectors follow the same validated, sorted input-key order. Retaining
+    // costs alone keeps the all-release population independent of labels.
+    costs: Vec<Vec<f64>>,
+    positive_intersection: Vec<bool>,
     details: BTreeMap<String, Vec<u8>>,
 }
 
@@ -215,6 +244,9 @@ impl SeriesBuilder {
         };
         if inputs.len() != count {
             bail!("complete dashboard stage has missing samples");
+        }
+        for input in inputs.values() {
+            input.metrics.validate()?;
         }
         let costs = inputs
             .iter()
@@ -238,10 +270,74 @@ impl SeriesBuilder {
             self.details.insert(path, serde_json::to_vec(&detail)?);
             point.transition = Some(transition);
         }
+        let ordered_costs = costs.into_values().collect::<Vec<_>>();
+        if self.costs.is_empty() {
+            self.positive_intersection = ordered_costs.iter().map(|v| *v > 0.).collect();
+        } else {
+            for (eligible, cost) in self.positive_intersection.iter_mut().zip(&ordered_costs) {
+                *eligible &= *cost > 0.;
+            }
+        }
+        self.costs.push(ordered_costs);
         self.series.points.push(point);
         self.previous = Some((version.into(), generation.into(), inputs));
         Ok(())
     }
+
+    fn finish(mut self) -> Result<(Series, BTreeMap<String, Vec<u8>>)> {
+        self.series.geomean_population = GeomeanPopulation {
+            total: self.positive_intersection.len(),
+            eligible: self.positive_intersection.iter().filter(|v| **v).count(),
+            release_count: self.costs.len(),
+        };
+        if let Some(baseline) = self.costs.first() {
+            for (index, point) in self.series.points.iter_mut().enumerate() {
+                point.geomean_ratio =
+                    geomean_ratio(baseline, &self.costs[index], &self.positive_intersection)?;
+                if let Some(transition) = &mut point.transition {
+                    transition.geomean_ratio = geomean_ratio(
+                        &self.costs[index - 1],
+                        &self.costs[index],
+                        &self.positive_intersection,
+                    )?;
+                }
+            }
+        }
+        Ok((self.series, self.details))
+    }
+}
+
+fn geomean_ratio(reference: &[f64], current: &[f64], eligible: &[bool]) -> Result<Option<f64>> {
+    if reference.len() != current.len() || current.len() != eligible.len() {
+        bail!("dashboard geometric-mean populations differ");
+    }
+    if reference
+        .iter()
+        .chain(current)
+        .any(|v| !v.is_finite() || *v < 0.)
+    {
+        bail!("dashboard geometric-mean costs must be finite and nonnegative");
+    }
+    let mut log_ratio = 0.;
+    let mut count = 0;
+    for ((reference, current), eligible) in reference.iter().zip(current).zip(eligible) {
+        if !eligible {
+            continue;
+        }
+        if *reference <= 0. || *current <= 0. {
+            bail!("dashboard geometric-mean eligible costs must be positive");
+        }
+        log_ratio += current.ln() - reference.ln();
+        count += 1;
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+    let ratio = (log_ratio / count as f64).exp();
+    if !ratio.is_finite() || ratio <= 0. {
+        bail!("dashboard geometric-mean ratio must be finite and positive");
+    }
+    Ok(Some(ratio))
 }
 
 #[derive(Serialize)]
@@ -272,11 +368,15 @@ fn point(
         version: version.into(),
         url,
         cost: now.values().sum(),
+        geomean_ratio: None,
         lower: 0,
         equal: 0,
         higher: 0,
         transition: None,
     };
+    if !result.cost.is_finite() {
+        bail!("dashboard cost total must be finite");
+    }
     for (key, value) in now {
         match value.total_cmp(&baseline[key]) {
             std::cmp::Ordering::Less => result.lower += 1,
@@ -304,7 +404,7 @@ fn projection(out: &Path) -> Result<Projection> {
     // Both child projections have already been verified against their protobuf
     // evidence. They are read only to create the final dashboard web projection.
     let history = out.join("history");
-    let catalog = decode_canonical_browser_catalog(&fs::read(history.join("catalog.json"))?)?;
+    let catalog = read_browser_catalog(&history)?;
     let mut versions: BTreeMap<String, Version> = BTreeMap::new();
     for (key, raw) in [
         (
@@ -486,12 +586,11 @@ fn projection(out: &Path) -> Result<Projection> {
                 &format!("data/transitions/{}/abc", cohort.cohort_id),
             )?;
         }
-        details.extend(raw.details);
-        details.extend(abc.details);
-        trend.stages = Stages {
-            raw: raw.series,
-            abc: abc.series,
-        };
+        let (raw, raw_details) = raw.finish()?;
+        let (abc, abc_details) = abc.finish()?;
+        details.extend(raw_details);
+        details.extend(abc_details);
+        trend.stages = Stages { raw, abc };
         if !trend.stages.abc.points.is_empty() {
             trends.push(trend);
         }
@@ -580,12 +679,11 @@ fn projection(out: &Path) -> Result<Projection> {
             }, &format!("data/transitions/full-corpus/{stage}"))?;
         }
     }
-    details.extend(raw.details);
-    details.extend(abc.details);
-    trend.stages = Stages {
-        raw: raw.series,
-        abc: abc.series,
-    };
+    let (raw, raw_details) = raw.finish()?;
+    let (abc, abc_details) = abc.finish()?;
+    details.extend(raw_details);
+    details.extend(abc_details);
+    trend.stages = Stages { raw, abc };
     trends.insert(0, trend);
     for coverage in site_techmap::published_coverage(out)? {
         let version = versions
@@ -610,7 +708,7 @@ fn projection(out: &Path) -> Result<Projection> {
     versions.sort_by(|a, b| cmp_dotted_numeric_version(&a.crate_version, &b.crate_version));
     Ok(Projection {
         dashboard: serde_json::to_vec(&Dashboard {
-            schema_version: 3,
+            schema_version: 4,
             techmap_url: out
                 .join(site_techmap::ROOT)
                 .join(site_techmap::MANIFEST)
@@ -627,14 +725,17 @@ pub(crate) fn build(
     options: &BuildStaticSiteOptions,
     protected: &[(&str, &Path)],
     progression: &[PathBuf],
+    progression_evidence: &[PathBuf],
     corpus: &[PathBuf],
     evidence: &[PathBuf],
     target: usize,
     techmap: &[PathBuf],
+    techmap_evidence: &[PathBuf],
     crossmap: &[PathBuf],
 ) -> Result<BuildStaticSiteSummary> {
     reject_site_output_overlap(&options.out_dir, &options.snapshot_dir, protected)?;
-    if !crossmap.is_empty() && techmap.is_empty() {
+    let has_techmap = !techmap.is_empty() || !techmap_evidence.is_empty();
+    if !crossmap.is_empty() && !has_techmap {
         bail!("mapper-isolation evidence requires baseline technology-mapping runs");
     }
     preflight_progression_run_dirs(progression)?;
@@ -643,12 +744,20 @@ pub(crate) fn build(
     }
     for run in progression
         .iter()
+        .chain(progression_evidence)
         .chain(corpus)
         .chain(evidence)
         .chain(techmap)
+        .chain(techmap_evidence)
         .chain(crossmap)
     {
         reject_site_output_overlap(&options.out_dir, run, protected)?;
+    }
+    for history in progression_evidence {
+        let source = history
+            .parent()
+            .context("progression evidence has no archive parent")?;
+        reject_site_output_overlap(&options.out_dir, source, protected)?;
     }
     let base_url = normalize_base_url(&options.base_url)?;
     build_static_site_atomically(options, |staging| {
@@ -662,27 +771,49 @@ pub(crate) fn build(
             &child("history"),
             protected,
             progression,
+            progression_evidence,
         )?;
         site_corpus::build_in_place(&child("corpus"), corpus, evidence, target)?;
         install_child_navigation(
             &staging.out_dir.join("history"),
-            ChildNavigation::PreviousVersions,
+            ChildNavigation {
+                section: ChildSection::PreviousVersions,
+                techmap: has_techmap,
+            },
         )?;
-        install_child_navigation(&staging.out_dir.join("corpus"), ChildNavigation::Corpus)?;
-        if !techmap.is_empty() {
+        install_child_navigation(
+            &staging.out_dir.join("corpus"),
+            ChildNavigation {
+                section: ChildSection::Corpus,
+                techmap: has_techmap,
+            },
+        )?;
+        if has_techmap {
             site_techmap::build_leaf(
                 &staging.out_dir.join(site_techmap::ROOT),
                 &format!("{base_url}{}/", site_techmap::ROOT),
                 techmap,
+                techmap_evidence,
                 crossmap,
             )?;
         }
-        finish(&staging.out_dir, &base_url, progression)
+        finish(
+            &staging.out_dir,
+            &base_url,
+            progression,
+            progression_evidence,
+        )
     })
 }
 
-fn finish(out: &Path, base_url: &str, progression: &[PathBuf]) -> Result<BuildStaticSiteSummary> {
+fn finish(
+    out: &Path,
+    base_url: &str,
+    progression: &[PathBuf],
+    progression_evidence: &[PathBuf],
+) -> Result<BuildStaticSiteSummary> {
     let mut archives = archive_roots(out)?;
+    let mut missing = Vec::new();
     for root in progression_archive_roots(&out.join("history"))? {
         let sample_id = crate::corpus::sample_id_for_relpath(&root.source_relpath);
         let mut found = false;
@@ -700,11 +831,35 @@ fn finish(out: &Path, base_url: &str, progression: &[PathBuf]) -> Result<BuildSt
             }
         }
         if !found {
-            bail!(
-                "progression archive input is missing: {}",
-                root.source_relpath
-            );
+            missing.push(root);
         }
+    }
+    for history in progression_evidence {
+        if missing.is_empty() {
+            break;
+        }
+        let source = history
+            .parent()
+            .context("progression evidence has no archive parent")?;
+        let index = crate::ir_archive::wire::IrArchiveIndex::decode(
+            fs::read(source.join(crate::ir_archive::INDEX))?.as_slice(),
+        )?;
+        let mut selected = Vec::new();
+        missing.retain(|root| {
+            if index.roots.iter().any(|candidate| candidate == root) {
+                selected.push(root.clone());
+                false
+            } else {
+                true
+            }
+        });
+        archives.extend_selected_from_site(source, &selected)?;
+    }
+    if let Some(root) = missing.first() {
+        bail!(
+            "progression archive input is missing: {}",
+            root.source_relpath
+        );
     }
     archives.write(out)?;
     let dashboard = wire::DashboardSite {
@@ -915,6 +1070,239 @@ pub(super) fn verify_projection(out: &Path, manifest: &pb::StaticSiteManifest) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inputs(costs: &[f64]) -> BTreeMap<String, transitions::Input> {
+        costs
+            .iter()
+            .enumerate()
+            .map(|(index, cost)| {
+                (
+                    index.to_string(),
+                    transitions::Input {
+                        label: "sample".into(),
+                        ir_nodes: 1,
+                        metrics: transitions::Metrics {
+                            nodes: *cost,
+                            depth: 1.,
+                            graph_le: None,
+                        },
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn add_costs(builder: &mut SeriesBuilder, version: &str, costs: &[f64]) {
+        builder
+            .add(
+                version,
+                version,
+                costs.len(),
+                Some(inputs(costs)),
+                str::to_string,
+                "data/test",
+            )
+            .unwrap();
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 1e-12 * expected.abs().max(1.),
+            "{actual} differs from {expected}"
+        );
+    }
+
+    #[test]
+    fn geomean_equal_input_weight_can_differ_from_total_cost_weight() {
+        let mut builder = SeriesBuilder::default();
+        add_costs(&mut builder, "a", &[1000., 1., 1., 1.]);
+        add_costs(&mut builder, "b", &[2000., 0.5, 0.5, 0.5]);
+        let (series, _) = builder.finish().unwrap();
+        assert_eq!(
+            series.geomean_population,
+            GeomeanPopulation {
+                total: 4,
+                eligible: 4,
+                release_count: 2,
+            }
+        );
+        assert!(series.points[1].cost / series.points[0].cost > 1.);
+        assert_close(series.points[0].geomean_ratio.unwrap(), 1.);
+        assert_close(series.points[1].geomean_ratio.unwrap(), 0.25_f64.powf(0.25));
+        assert_close(
+            series.points[1]
+                .transition
+                .as_ref()
+                .unwrap()
+                .geomean_ratio
+                .unwrap(),
+            0.25_f64.powf(0.25),
+        );
+    }
+
+    #[test]
+    fn geomean_preserves_uniform_scaling_reciprocity_and_chaining() {
+        let reference = [1e-100, 1., 1e100];
+        let scaled = [4e-100, 4., 4e100];
+        let eligible = [true; 3];
+        assert_close(
+            geomean_ratio(&reference, &scaled, &eligible)
+                .unwrap()
+                .unwrap(),
+            4.,
+        );
+        assert_close(
+            geomean_ratio(&scaled, &reference, &eligible)
+                .unwrap()
+                .unwrap(),
+            0.25,
+        );
+        // The per-input quotient would overflow, while the log differences
+        // retain the well-defined population result.
+        assert_close(
+            geomean_ratio(&[1e-200, 1e200], &[1e200, 1e-200], &[true; 2])
+                .unwrap()
+                .unwrap(),
+            1.,
+        );
+        let mut builder = SeriesBuilder::default();
+        add_costs(&mut builder, "a", &[1., 8., 3.]);
+        add_costs(&mut builder, "b", &[2., 4., 6.]);
+        add_costs(&mut builder, "c", &[8., 2., 3.]);
+        let (series, _) = builder.finish().unwrap();
+        let first = series.points[1].geomean_ratio.unwrap();
+        let last = series.points[2].geomean_ratio.unwrap();
+        let first_step = series.points[1]
+            .transition
+            .as_ref()
+            .unwrap()
+            .geomean_ratio
+            .unwrap();
+        let last_step = series.points[2]
+            .transition
+            .as_ref()
+            .unwrap()
+            .geomean_ratio
+            .unwrap();
+        assert_close(first, first_step);
+        assert_close(last / first, last_step);
+        assert_close(first_step * last_step, last);
+    }
+
+    #[test]
+    fn geomean_uses_all_complete_releases_for_one_positive_population() {
+        let mut builder = SeriesBuilder::default();
+        add_costs(&mut builder, "a", &[1., 1., 0., 2., 0.]);
+        builder
+            .add("missing", "missing", 5, None, str::to_string, "data/test")
+            .unwrap();
+        add_costs(&mut builder, "b", &[2., 0., 3., 2., 0.]);
+        add_costs(&mut builder, "c", &[8., 2., 3., 0., 0.]);
+        let (series, _) = builder.finish().unwrap();
+        assert_eq!(series.unavailable_versions, ["missing"]);
+        assert_eq!(
+            series.geomean_population,
+            GeomeanPopulation {
+                total: 5,
+                eligible: 1,
+                release_count: 3,
+            }
+        );
+        for (point, ratio) in series.points.iter().zip([1., 2., 8.]) {
+            assert_close(point.geomean_ratio.unwrap(), ratio);
+        }
+        for (point, ratio) in series.points[1..].iter().zip([2., 4.]) {
+            let transition = point.transition.as_ref().unwrap();
+            assert_close(transition.geomean_ratio.unwrap(), ratio);
+            assert_eq!(
+                transition.zero_cost,
+                transitions::ZeroCost {
+                    positive_to_positive: 2,
+                    zero_to_zero: 1,
+                    positive_to_zero: 1,
+                    zero_to_positive: 1,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn geomean_has_no_ratio_for_an_empty_positive_population() {
+        let mut builder = SeriesBuilder::default();
+        add_costs(&mut builder, "a", &[0., 1.]);
+        add_costs(&mut builder, "b", &[1., 0.]);
+        let (series, _) = builder.finish().unwrap();
+        assert_eq!(
+            series.geomean_population,
+            GeomeanPopulation {
+                total: 2,
+                eligible: 0,
+                release_count: 2,
+            }
+        );
+        assert!(
+            series
+                .points
+                .iter()
+                .all(|point| point.geomean_ratio.is_none())
+        );
+        assert_eq!(
+            series.points[1].transition.as_ref().unwrap().geomean_ratio,
+            None
+        );
+        let (empty, _) = SeriesBuilder::default().finish().unwrap();
+        assert_eq!(empty.geomean_population, GeomeanPopulation::default());
+        assert!(empty.points.is_empty());
+    }
+
+    #[test]
+    fn geomean_rejects_invalid_metrics_or_population() {
+        for (reference, current, eligible) in [
+            (vec![1.], vec![1., 2.], vec![true]),
+            (vec![1.], vec![1.], vec![]),
+            (vec![1.], vec![f64::NAN], vec![true]),
+            (vec![f64::INFINITY], vec![1.], vec![true]),
+            (vec![-1.], vec![1.], vec![false]),
+            (vec![0.], vec![1.], vec![true]),
+            (vec![1e-300], vec![1e300], vec![true]),
+        ] {
+            assert!(geomean_ratio(&reference, &current, &eligible).is_err());
+        }
+        for (nodes, depth, graph_le) in [
+            (-1., -1., None),
+            (f64::INFINITY, 1., None),
+            (f64::MAX, 2., None),
+            (1., 1., Some(f64::NAN)),
+            (1., 1., Some(-1.)),
+        ] {
+            let mut builder = SeriesBuilder::default();
+            let mut invalid = inputs(&[1.]);
+            invalid.get_mut("0").unwrap().metrics = transitions::Metrics {
+                nodes,
+                depth,
+                graph_le,
+            };
+            assert!(
+                builder
+                    .add("a", "a", 1, Some(invalid), str::to_string, "data/test")
+                    .is_err()
+            );
+        }
+        let mut builder = SeriesBuilder::default();
+        assert!(
+            builder
+                .add(
+                    "a",
+                    "a",
+                    2,
+                    Some(inputs(&[f64::MAX, f64::MAX])),
+                    str::to_string,
+                    "data/test"
+                )
+                .is_err()
+        );
+    }
+
     #[test]
     fn stage_series_preserves_its_population_and_skips_missing_releases() {
         let mut raw = SeriesBuilder::default();
@@ -1037,24 +1425,62 @@ mod tests {
             original
         );
         assert_eq!(
-            child_asset(Some(ChildNavigation::Corpus), "data/metrics.json", b"{}").unwrap(),
+            child_asset(
+                Some(ChildNavigation {
+                    section: ChildSection::Corpus,
+                    techmap: false,
+                }),
+                "data/metrics.json",
+                b"{}",
+            )
+            .unwrap(),
             b"{}"
         );
         let rendered = child_asset(
-            Some(ChildNavigation::PreviousVersions),
+            Some(ChildNavigation {
+                section: ChildSection::PreviousVersions,
+                techmap: false,
+            }),
             "runs/example/index.html",
             original,
         )
         .unwrap();
         assert_eq!(
             String::from_utf8(rendered).unwrap(),
-            r#"<!doctype html><html><head><link rel="stylesheet" href="../../assets/navigation.css"></head><body><nav class="bvc-navigation" aria-label="Primary navigation"><a class="bvc-navigation-home" href="../../../index.html">Results</a><a href="../../../index.html#latest">Latest</a><a href="../../../index.html#versions">All versions</a><a href="../../../history/progression.html">Progression</a></nav><a href="../../../index.html">Results</a></body></html>"#
+            r#"<!doctype html><html><head><link rel="stylesheet" href="../../assets/navigation.css"></head><body><nav class="bvc-navigation" aria-label="Primary navigation"><a class="bvc-navigation-home" href="../../../index.html">Results</a><a href="../../../corpus/">IR/AIG plots</a><a href="../../../history/progression.html">Release progression</a><a href="../../../index.html#versions">All versions</a></nav><a href="../../../index.html">Results</a></body></html>"#
+        );
+        let rendered = child_asset(
+            Some(ChildNavigation {
+                section: ChildSection::Corpus,
+                techmap: true,
+            }),
+            "index.html",
+            original,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(rendered).unwrap(),
+            r#"<!doctype html><html><head><link rel="stylesheet" href="./assets/navigation.css"></head><body><nav class="bvc-navigation" aria-label="Primary navigation"><a class="bvc-navigation-home" href="./../index.html">Results</a><a href="./../corpus/">IR/AIG plots</a><a href="./../history/progression.html">Release progression</a><a href="./../tech-mapped-asap7/">Tech mapped ASAP7</a><a href="./../index.html#versions">All versions</a></nav><a href="../../">Results</a></body></html>"#
         );
         assert!(
             child_parent_link("runs/example/index.html", "../../../index.html#versions").unwrap()
         );
         assert!(!child_parent_link("runs/example/index.html", "../../../../index.html").unwrap());
         assert!(!child_parent_link("index.html", "https://example.invalid/").unwrap());
+        assert!(child_parent_link("index.html", "./../corpus/").unwrap());
+        assert!(child_parent_link("index.html", "./../tech-mapped-asap7/").unwrap());
+    }
+    #[test]
+    fn aggregation_browser_math() {
+        let output = Command::new("node")
+            .arg("testdata/aggregation_test.js")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     #[test]
     fn dashboard_browser_semantics() {

@@ -528,7 +528,6 @@ def main() -> int:
     archive_dir = runner_root / "archive"
     heartbeat_path = runner_root / "heartbeat.json"
     live_path = runner_root / "live.json"
-    capabilities_path = runner_root / "capabilities.json"
 
     for path in [runner_root, inbox_dir, processing_dir, results_dir, archive_dir]:
         path.mkdir(parents=True, exist_ok=True)
@@ -550,11 +549,6 @@ def main() -> int:
             "hostname": socket.gethostname(),
         },
     )
-    try:
-        write_capabilities(capabilities_path, args.runner_key, args.runner_instance_id, args.image)
-    except subprocess.CalledProcessError as error:
-        # Script requests can still run. The host retries missing capability evidence.
-        print(f"driver capability probe failed: {error}", file=sys.stderr)
     heartbeat.publish()
 
     stop_event = threading.Event()

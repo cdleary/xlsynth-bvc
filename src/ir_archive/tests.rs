@@ -101,6 +101,115 @@ fn archives_are_fixed_deterministic_and_deduplicated() {
 }
 
 #[test]
+fn selected_site_roots_reuse_only_the_requested_exact_identities() {
+    let fixture = Fixture::new();
+    fixture_builder().write(&fixture.site()).unwrap();
+    let selected = root("whole-functions-v1", "structural.ir");
+    let retained = root("mffc-v1", "retained.ir");
+    let mut builder = Builder::default();
+    builder.add(retained.clone(), ir()).unwrap();
+    builder
+        .extend_selected_from_site(&fixture.site(), &[selected.clone()])
+        .unwrap();
+    assert_eq!(
+        builder.roots,
+        BTreeMap::from([
+            (root_key(&retained), retained),
+            (root_key(&selected), selected.clone()),
+        ])
+    );
+    assert_eq!(
+        builder.blobs,
+        BTreeMap::from([(digest(ir()), ir().to_vec())])
+    );
+    builder
+        .extend_selected_from_site(&fixture.site(), &[selected])
+        .unwrap();
+    assert_eq!(builder.roots.len(), 2);
+}
+
+#[test]
+fn selected_site_roots_reject_missing_mismatched_and_duplicate_selections_atomically() {
+    let fixture = Fixture::new();
+    fixture_builder().write(&fixture.site()).unwrap();
+    let selected = root("whole-functions-v1", "structural.ir");
+    let mut wrong_digest = selected.clone();
+    wrong_digest.source_sha256 = vec![0; 32];
+    let mut wrong_top = selected.clone();
+    wrong_top.top_fn_name = "other".into();
+    for bad in [
+        root("mffc-v1", "missing.ir"),
+        wrong_digest,
+        wrong_top,
+        selected.clone(),
+    ] {
+        let mut builder = Builder::default();
+        assert!(
+            builder
+                .extend_selected_from_site(&fixture.site(), &[selected.clone(), bad])
+                .is_err()
+        );
+        assert!(builder.roots.is_empty());
+        assert!(builder.blobs.is_empty());
+    }
+}
+
+#[test]
+fn selected_site_roots_reject_destination_conflicts_before_adding_roots() {
+    let fixture = Fixture::new();
+    fixture_builder().write(&fixture.site()).unwrap();
+    let different_ir = b"package other\ntop fn f(x: bits[1] id=1) -> bits[1] {\n ret not.2: bits[1] = not(x, id=2)\n}\n";
+    let mut conflict = root("whole-functions-v1", "structural.ir");
+    conflict.source_sha256 = digest(different_ir);
+    let mut builder = Builder::default();
+    builder.add(conflict.clone(), different_ir).unwrap();
+    assert!(
+        builder
+            .extend_selected_from_site(
+                &fixture.site(),
+                &[
+                    root("full-corpus", "hash/f.ir"),
+                    root("whole-functions-v1", "structural.ir"),
+                ],
+            )
+            .is_err()
+    );
+    assert_eq!(
+        builder.roots,
+        BTreeMap::from([(root_key(&conflict), conflict)])
+    );
+    assert_eq!(
+        builder.blobs,
+        BTreeMap::from([(digest(different_ir), different_ir.to_vec())])
+    );
+}
+
+#[test]
+fn selected_site_roots_require_a_verified_complete_source_bundle() {
+    let fixture = Fixture::new();
+    fixture_builder().write(&fixture.site()).unwrap();
+    let selected = root("whole-functions-v1", "structural.ir");
+    let unused_bucket = index(&fixture.site())
+        .buckets
+        .into_iter()
+        .find(|bucket| bucket.blobs.is_empty())
+        .unwrap();
+    fs::write(
+        fixture.site().join(archive_path(&unused_bucket.prefix)),
+        b"invalid archive",
+    )
+    .unwrap();
+    let mut builder = Builder::default();
+    assert!(
+        builder
+            .extend_selected_from_site(&fixture.site(), &[selected])
+            .is_err()
+    );
+    assert!(builder.roots.is_empty());
+    assert!(builder.blobs.is_empty());
+}
+
+#[test]
 fn progression_download_roots_must_match_independent_evidence() {
     let fixture = Fixture::new();
     let combined = fixture_builder();
