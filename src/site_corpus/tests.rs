@@ -910,7 +910,7 @@ fn evidence_reuse_rejects_duplicate_releases_mixed_populations_and_overlap() {
 }
 
 #[test]
-fn evidence_reuse_preserves_aliases_or_refreshes_them_from_an_explicit_snapshot() {
+fn evidence_reuse_preserves_frozen_aliases_across_partial_snapshots_and_new_releases() {
     let root = Fixture::new();
     let run = fixture_run(&root.0, "0.74.0", 1);
     let mut options = root.options();
@@ -952,19 +952,32 @@ fn evidence_reuse_preserves_aliases_or_refreshes_them_from_an_explicit_snapshot(
         samples
     );
 
-    // The supplied snapshot lacks this function. Its verified index must replace
-    // the old alias binding rather than silently retaining stale classifications.
+    // A partial current snapshot cannot erase verified frozen-input aliases.
+    // A new release of the same exact input inherits the original PB binding.
     let historical = Fixture::new();
     super::super::tests::build_historical_candidate_site_fixture(&historical.0);
     options.snapshot_dir = historical.0.join("snapshot");
     options.out_dir = root.0.join("refreshed");
-    build(&options, &[], &[], std::slice::from_ref(&source), 100_000).unwrap();
-    samples[0].provenance = None;
+    let newer = fixture_run(&root.0, "0.75.0", 1);
+    let (_, expected_new) = ingest(&newer).unwrap();
+    build(
+        &options,
+        &[],
+        &[newer],
+        std::slice::from_ref(&source),
+        100_000,
+    )
+    .unwrap();
     let refreshed = evidence::Source::open(&options.out_dir).unwrap();
+    assert_eq!(refreshed.site.generations.len(), 2);
     assert_eq!(
         refreshed.samples(&refreshed.site.generations[0]).unwrap(),
         samples
     );
+    let new_samples = refreshed.samples(&refreshed.site.generations[1]).unwrap();
+    let mut expected_new = expected_new;
+    expected_new[0].provenance = samples[0].provenance.clone();
+    assert_eq!(new_samples, expected_new);
 
     // A new snapshot cannot launder an invalid old binding before validation.
     samples[0].provenance = Some(wire::InputProvenance::default());

@@ -8,6 +8,60 @@ use wire::InputKind;
 #[derive(Default)]
 pub(super) struct Index(BTreeMap<Vec<u8>, wire::InputProvenance>);
 
+/// Frozen input metadata is reusable across measured releases, independently
+/// of the current snapshot's historical coverage. Keep each source snapshot
+/// commitment intact rather than relabeling old origins as new observations.
+#[derive(Default)]
+pub(super) struct RetainedIndex(BTreeMap<(Vec<u8>, String), wire::InputProvenance>);
+
+impl RetainedIndex {
+    pub(super) fn preserve_or_enrich(
+        &mut self,
+        sample: &mut wire::Sample,
+        current: &Index,
+    ) -> Result<()> {
+        validate(sample)?;
+        let input = required(&sample.input, "input")?;
+        if input.source_sha256.len() != 32
+            || Sha256::digest(sample.input_ir.as_bytes()).as_slice() != input.source_sha256
+        {
+            bail!("retained corpus metadata input does not match its exact bytes");
+        }
+        let key = (input.source_sha256.clone(), input.top_fn_name.clone());
+        if let Some(provenance) = &sample.provenance {
+            match self.0.get_mut(&key) {
+                Some(previous)
+                    if previous.source_snapshot_sha256 == provenance.source_snapshot_sha256 =>
+                {
+                    if previous.function_sha256 != provenance.function_sha256 {
+                        bail!("conflicting retained corpus function identity");
+                    }
+                    previous
+                        .structural_hashes
+                        .extend(provenance.structural_hashes.clone());
+                    previous.structural_hashes.sort();
+                    previous.structural_hashes.dedup();
+                    previous.origins.extend(provenance.origins.clone());
+                    canonicalize(&mut previous.origins);
+                }
+                Some(_) => {
+                    // Different snapshots are distinct observations. Existing
+                    // public evidence stays authoritative; do not mix bindings.
+                }
+                None => {
+                    self.0.insert(key, provenance.clone());
+                }
+            }
+            return Ok(());
+        }
+        if let Some(provenance) = self.0.get(&key) {
+            sample.provenance = Some(provenance.clone());
+            return validate(sample);
+        }
+        current.enrich(sample)
+    }
+}
+
 fn name_kind(name: &str) -> InputKind {
     if name.starts_with("__mffc_") {
         InputKind::Mffc
@@ -320,6 +374,55 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn retained_origins_require_exact_package_bytes_and_selected_top() {
+        let mut original = sample();
+        original.input_ir.push_str("\nfn other(x: bits[1] id=3) -> bits[1] {\n ret identity.4: bits[1] = identity(x, id=4)\n}\n");
+        original.input.as_mut().unwrap().source_sha256 =
+            Sha256::digest(original.input_ir.as_bytes()).to_vec();
+        let mut binding = evidence(&original);
+        canonicalize(&mut binding.origins);
+        original.provenance = Some(binding);
+        let frozen = original.provenance.clone();
+        let mut retained = RetainedIndex::default();
+        let fresh = Index::default();
+        retained.preserve_or_enrich(&mut original, &fresh).unwrap();
+        let mut replay = original.clone();
+        replay.provenance = None;
+        retained.preserve_or_enrich(&mut replay, &fresh).unwrap();
+        assert_eq!(replay.provenance, frozen);
+
+        let mut other_top = original.clone();
+        other_top.provenance = None;
+        other_top.input.as_mut().unwrap().top_fn_name = "other".into();
+        retained.preserve_or_enrich(&mut other_top, &fresh).unwrap();
+        assert_eq!(other_top.provenance, None);
+
+        let mut changed = original.clone();
+        changed.provenance = None;
+        changed.input_ir = changed.input_ir.replace("not(x,", "identity(x,");
+        assert!(retained.preserve_or_enrich(&mut changed, &fresh).is_err());
+        changed.input.as_mut().unwrap().source_sha256 =
+            Sha256::digest(changed.input_ir.as_bytes()).to_vec();
+        retained.preserve_or_enrich(&mut changed, &fresh).unwrap();
+        assert_eq!(changed.provenance, None);
+
+        let mut other_observation = original.clone();
+        other_observation
+            .provenance
+            .as_mut()
+            .unwrap()
+            .source_snapshot_sha256 = vec![9; 32];
+        let other_binding = other_observation.provenance.clone();
+        retained
+            .preserve_or_enrich(&mut other_observation, &fresh)
+            .unwrap();
+        assert_eq!(other_observation.provenance, other_binding);
+        replay.provenance = None;
+        retained.preserve_or_enrich(&mut replay, &fresh).unwrap();
+        assert_eq!(replay.provenance, frozen);
     }
 
     #[test]

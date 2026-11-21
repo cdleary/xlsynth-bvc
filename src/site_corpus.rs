@@ -642,6 +642,7 @@ pub(super) fn build_in_place(
     target: usize,
 ) -> Result<BuildStaticSiteSummary> {
     let origins = provenance::Index::from_snapshot(&options.snapshot_dir)?;
+    let mut retained_origins = provenance::RetainedIndex::default();
     let mut archives = crate::ir_archive::Builder::default();
     let mut site = wire::CorpusSite {
         record_version: 1,
@@ -650,12 +651,8 @@ pub(super) fn build_in_place(
     };
     let mut append =
         |mut generation: wire::Generation, mut samples: Vec<wire::Sample>| -> Result<()> {
-            if !options.snapshot_dir.as_os_str().is_empty() {
-                for sample in &mut samples {
-                    // Validate the frozen binding before replacing it from an explicit snapshot.
-                    provenance::validate(sample)?;
-                    origins.enrich(sample)?;
-                }
+            for sample in &mut samples {
+                retained_origins.preserve_or_enrich(sample, &origins)?;
             }
             if site
                 .generations
