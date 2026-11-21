@@ -132,8 +132,9 @@ separate stages:
 2. After workers are idle, rerun the exact `run-ir-dir-corpus` command once to refresh the public
    manifest and exported stats. Require the full cohort to be `done` with zero failed, missing, or
    extra samples. Do not merge or hand-edit JSON/JSONL files.
-3. Reconstruct a fresh static snapshot from the canonical artifact store and current checked-in
-   definitions. A prior snapshot is publication output, not the authority for the current release
+3. Reconstruct the structural index with `populate-ir-fn-corpus-structural
+   --recompute-missing-hashes`, then build a fresh static snapshot from the canonical artifact
+   store and current checked-in definitions. A prior snapshot is publication output, not the authority for the current release
    universe. Content-bound canonical store results may be reused for identical action identities;
    rebuild the derived publication indices.
 4. Pass every completed release or Git output directory directly to `build-static-site` with a
@@ -141,9 +142,11 @@ separate stages:
    cohort, complete action graph, and provenance-backed stats, then writes one typed
    `data/progression-runs/<generation-id>/evidence.pb` record per generation. JSON is created only
    as the final browser catalog/projection.
-   Alternatively, pass `--progression-evidence-dir PREVIOUS_SITE/history` to reuse a verified
-   published generation without its original workspace. The source publication must retain its
-   parent IR archive. Reuse validates the manifest-bound protobuf evidence independently of the
+   As an optional rendering shortcut, pass `--progression-evidence-dir PREVIOUS_SITE/history` to
+   reuse a verified published generation without opening its original workspace. Retain the
+   canonical evaluation store separately; the public summary does not restore it. The source
+   publication must retain its parent IR archive. Reuse validates the manifest-bound protobuf
+   evidence independently of the
    source browser assets; the new output receives full current-site verification. Reused and
    newly evaluated generations must be disjoint.
    Git annotations that no longer match the destination snapshot's checked head or latest
@@ -162,6 +165,9 @@ Example publication command:
 
 ```bash
 cargo run --release --bin xlsynth_bvc -- \
+  populate-ir-fn-corpus-structural --recompute-missing-hashes
+
+cargo run --release --bin xlsynth_bvc -- \
   build-static-snapshot \
   --out-dir /path/to/current/snapshot \
   --overwrite
@@ -176,7 +182,14 @@ cargo run --release --bin xlsynth_bvc -- \
 
 ## Reproducing the manifest
 
-Given the verified snapshot site directory, this command reproduces the manifest byte-for-byte:
+For a fresh evaluation of the existing frozen cohort, use its registered manifest and exact IR
+bytes from canonical inputs or the [protobuf-indexed IR archives](ir-archives.md). A previous
+browser dataset is not required to recreate that input directory.
+
+The commands below document how the original whole-function population was selected. They are
+an audit of that historical capture, not the normal input or storage format for new evaluations.
+Given the original verified snapshot site directory, this command reproduces the manifest
+byte-for-byte:
 
 ```bash
 snapshot_site=/path/to/verified-snapshot/site

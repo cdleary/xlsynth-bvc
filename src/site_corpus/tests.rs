@@ -625,13 +625,15 @@ fn dashboard_composes_verifies_and_publishes_all_versions() {
     .unwrap();
     let mut mapped_options = options.clone();
     mapped_options.out_dir = root.0.join("mapped-dashboard");
+    // A composed IR/AIG and technology-mapped site can be built entirely from
+    // native completed runs. Retained publication evidence is optional.
     super::super::site_dashboard::build(
         &mapped_options,
         &[],
         &[],
         &[],
+        &[root.0.join("0.74.0"), root.0.join("0.75.0")],
         &[],
-        &[options.out_dir.join("corpus")],
         100_000,
         &[mapper_run],
         &[],

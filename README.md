@@ -268,7 +268,11 @@ restore portable corpus directories, and seed canonical IR-import cache roots
 without rerunning their original crate-generation pipelines. See
 [portable IR archives](docs/ir-archives.md) for commands and integrity checks.
 
-For later refreshes, reuse the previous dashboard's typed release evidence with
+Build refreshes from completed canonical stores and run directories; a previous website is not
+required. Keep frozen input bytes, pinned tool/recipe definitions, and completed evaluation data
+separately from the rendered site. See the [rebuild contract](docs/complete-corpus-site.md#rebuild-inputs-and-retained-results).
+
+As an optional rendering shortcut, reuse a previous dashboard's typed release evidence with
 `--corpus-evidence-dir ../previous-site/corpus` and pass only newly completed releases via
 `--corpus-run-dir`. This avoids reopening old evaluation stores; it regenerates the web assets
 and still verifies the complete result. Use a separate output directory. See
@@ -278,9 +282,10 @@ contract and standalone-site usage.
 Retain published fixed-cohort generations with
 `--progression-evidence-dir ../previous-site/history` and mapped measurements with
 `--techmap-evidence-dir ../previous-site/tech-mapped-asap7`. These inputs use verified protobuf
-evidence, including mapper-isolation results and archived fixed-cohort IR, so the original
-evaluation workspaces are unnecessary. Supply only new generations through the corresponding
-run-directory options; overlapping generations are rejected.
+evidence, including mapper-isolation results and archived fixed-cohort IR. The original
+evaluation workspaces are unnecessary for rerendering these retained measurements; the bundles
+do not restore their execution stores or missing historical datasets. Supply only new generations
+through the corresponding run-directory options; overlapping generations are rejected.
 
 When release collection used separate canonical stores, `import-store --source-store-dir DIR
 --source-artifacts-via-sled PATH` imports completed actions and terminal campaign records into

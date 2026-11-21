@@ -225,6 +225,13 @@ browser datasets, builds a verified static site, and promotes immutable site
 and catalog objects before updating the small current-site pointers. Static web
 serving requires neither the Rust process nor sled.
 
+Static publications are disposable projections, not the only retention location for historical
+measurements. Exact frozen IR inputs, cohort identities, and pinned tool/recipe definitions
+support recomputation into fresh canonical stores. Completed stores and run records support
+rendering without recomputation or a previous site. Optional retained publication protobufs can
+shorten that rendering path, but do not restore execution records or supply historical datasets
+that were never included. Retain canonical evaluation data independently of deployed sites.
+
 The browser catalog is a deny-unknown typed JSON projection and must use the
 canonical Rust encoding. Verification reconstructs every fixed HTML page,
 compiled CSS/JavaScript asset, catalog, and embedded snapshot manifest from the

@@ -95,7 +95,7 @@ Pass each run directory to a composed dashboard build alongside its existing his
 ```bash
 target/release/xlsynth_bvc build-static-site \
   --snapshot-dir "$SNAPSHOT" --out-dir "$SITE" --base-url / \
-  --corpus-evidence-dir "$PREVIOUS_SITE/corpus" \
+  --corpus-run-dir "$FULL_CORPUS_RUN" \
   --progression-run-dir "$WHOLE_FUNCTION_HISTORY" \
   --progression-run-dir "$MFFC_HISTORY" \
   --techmap-run-dir "$TECHMAP_RUN"
@@ -112,11 +112,13 @@ netlist paths and recomputes sample record digests. It retains an opaque SHA-256
 original execution manifest, while the publication binds the complete public projection. Local
 execution evidence and scientific browser measurements are unchanged.
 
-For later builds, `--techmap-evidence-dir PREVIOUS_SITE/tech-mapped-asap7` reuses the previous
-publication's verified protobuf measurements and mapper-isolation experiments. Add only new
+As an optional rendering shortcut, `--techmap-evidence-dir PREVIOUS_SITE/tech-mapped-asap7` reuses
+the previous publication's verified protobuf measurements and mapper-isolation experiments. Add only new
 release/cohort runs with `--techmap-run-dir`; duplicate measurements or experiments are rejected.
 Reuse consumes manifest-bound protobufs without requiring the source browser projections. The
 new publication regenerates and verifies all projections with the current renderer.
+Keep the independent execution `manifest.pb` and its run artifacts for replay; the public
+protobuf projection omits local netlist locators and cannot restore the execution manifest.
 
 The comparison embeds Plotly's pinned strict bundle so full-corpus WebGL plots work under the
 page's content security policy. Browsers without WebGL show a deterministic overview of up to
@@ -140,7 +142,7 @@ Pass the experiment's canonical protobuf manifest alongside its exact baseline r
 ```bash
 target/release/xlsynth_bvc build-static-site \
   --snapshot-dir "$SNAPSHOT" --out-dir "$SITE" --base-url / \
-  --corpus-evidence-dir "$PREVIOUS_SITE/corpus" \
+  --corpus-run-dir "$FULL_CORPUS_RUN" \
   --techmap-run-dir "$BASELINE_TECHMAP_RUN" \
   --techmap-crossmap-run "$CROSSMAP_MANIFEST"
 ```
