@@ -695,17 +695,11 @@ pub(super) fn build_leaf(
     let mut runs = read_runs(run_dirs)?;
     let mut crossmap = BTreeMap::new();
     for dir in evidence_dirs {
-        verify_static_site(dir).with_context(|| {
-            format!(
-                "verifying technology-mapping evidence site {}",
-                dir.display()
-            )
+        let source = site_evidence::Source::open(dir).with_context(|| {
+            format!("reading technology-mapping evidence site {}", dir.display())
         })?;
-        let manifest = pb::StaticSiteManifest::decode(
-            fs::read(dir.join(STATIC_SITE_MANIFEST_FILENAME))?.as_slice(),
-        )?;
-        runs.extend(load_published_runs(dir, &manifest)?);
-        for (path, bytes) in load_published_crossmap_evidence(dir)? {
+        runs.extend(load_retained_runs(&source)?);
+        for (path, bytes) in load_retained_crossmap_evidence(&source)? {
             if crossmap.insert(path, bytes).is_some() {
                 bail!("duplicate mapper-isolation publication evidence");
             }
@@ -752,11 +746,19 @@ fn load_published_runs(
     out: &Path,
     manifest: &pb::StaticSiteManifest,
 ) -> Result<Vec<PublicTechmapRun>> {
-    let bytes = fs::read(out.join(MANIFEST))?;
+    load_retained_runs(&site_evidence::Source::from_manifest(
+        out,
+        manifest.clone(),
+    )?)
+}
+
+fn load_retained_runs(source: &site_evidence::Source) -> Result<Vec<PublicTechmapRun>> {
+    let bytes = source.read(MANIFEST, site_evidence::MAX_EVIDENCE_BYTES)?;
     let site = site_corpus::wire::TechmapSite::decode(bytes.as_slice())?;
     if ![2, 3].contains(&site.record_version)
         || site.encode_to_vec() != bytes
-        || digest_hex(&manifest.source_snapshot_id, "techmap identity")? != sha256_hex(&bytes)
+        || digest_hex(&source.manifest().source_snapshot_id, "techmap identity")?
+            != sha256_hex(&bytes)
     {
         bail!("invalid technology-mapping site identity");
     }
@@ -772,11 +774,8 @@ fn load_published_runs(
                 .as_ref()
                 .context("missing techmap evidence path")?
                 .value;
-            normalized_relpath(path)?;
-            if record.bytes > SHARD_TARGET as u64 || record != &publication_file(out, path)? {
-                bail!("invalid mapping evidence shard binding");
-            }
-            let shard = decode_public_run(&fs::read(out.join(path))?)?;
+            let bytes = source.read_record(record, SHARD_TARGET as u64)?;
+            let shard = decode_public_run(&bytes)?;
             let measurements = shard
                 .measurements
                 .as_ref()
@@ -807,7 +806,17 @@ fn load_published_runs(
 }
 
 fn load_published_crossmap_evidence(out: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
-    let site = site_corpus::wire::TechmapSite::decode(fs::read(out.join(MANIFEST))?.as_slice())?;
+    load_retained_crossmap_evidence(&site_evidence::Source::open(out)?)
+}
+
+fn load_retained_crossmap_evidence(
+    source: &site_evidence::Source,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let bytes = source.read(MANIFEST, site_evidence::MAX_EVIDENCE_BYTES)?;
+    let site = site_corpus::wire::TechmapSite::decode(bytes.as_slice())?;
+    if site.encode_to_vec() != bytes {
+        bail!("technology-mapping site index is not canonical protobuf");
+    }
     let mut crossmap = BTreeMap::new();
     for record in site.crossmap_runs {
         let path = &record
@@ -818,10 +827,11 @@ fn load_published_crossmap_evidence(out: &Path) -> Result<BTreeMap<String, Vec<u
         normalized_relpath(path)?;
         if !path.starts_with("crossmap/")
             || !path.ends_with(".pb")
-            || record.bytes > SHARD_TARGET as u64
-            || record != publication_file(out, path)?
             || crossmap
-                .insert(path.clone(), fs::read(out.join(path))?)
+                .insert(
+                    path.clone(),
+                    source.read_record(&record, SHARD_TARGET as u64)?,
+                )
                 .is_some()
         {
             bail!("invalid mapper-isolation evidence binding");
@@ -1497,6 +1507,10 @@ pub(super) mod tests {
             .unwrap(),
         )
         .unwrap();
+        fs::write(source.join("index.html"), b"earlier mapping renderer").unwrap();
+        super::super::tests::refresh_site_manifest_entry(&source, "index.html");
+        assert!(verify_static_site(&source).is_err());
+        site_evidence::retain_protobuf_files(&source);
         let out = root.join("combined");
         build_leaf(
             &out,
@@ -1542,12 +1556,28 @@ pub(super) mod tests {
                 &root.join("tampered"),
                 "/tech-mapped-asap7/",
                 &[],
-                &[source],
+                std::slice::from_ref(&source),
                 &[]
             )
             .is_err()
         );
         assert!(!root.join("tampered").exists());
+        let mut invalid = PublicTechmapRun::decode(retained[0].encode_to_vec().as_slice()).unwrap();
+        invalid.measurements.as_mut().unwrap().samples[0].points[0].area = -1.0;
+        fs::write(source.join(path), invalid.encode_to_vec()).unwrap();
+        super::super::tests::refresh_site_manifest_entry(&source, path);
+        // The typed index's own shard binding still disagrees after only the outer checksum changes.
+        assert!(
+            build_leaf(
+                &root.join("rehashed"),
+                "/tech-mapped-asap7/",
+                &[],
+                &[source],
+                &[]
+            )
+            .is_err()
+        );
+        assert!(!root.join("rehashed").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1594,6 +1624,30 @@ pub(super) mod tests {
                 fs::read(out.join(&path)).unwrap()
             );
         }
+        let retained_source = root.join("protobuf-retained");
+        fs::create_dir_all(&retained_source).unwrap();
+        for path in actual_site_relpaths(&out)
+            .unwrap()
+            .into_iter()
+            .chain(std::iter::once(STATIC_SITE_MANIFEST_FILENAME.into()))
+            .filter(|path| path.ends_with(".pb"))
+        {
+            write_file(&retained_source, &path, &fs::read(out.join(&path)).unwrap()).unwrap();
+        }
+        let protobuf_only = root.join("protobuf-reused");
+        build_leaf(
+            &protobuf_only,
+            "/tech-mapped-asap7/",
+            &[],
+            &[retained_source],
+            &[],
+        )
+        .unwrap();
+        verify_static_site(&protobuf_only).unwrap();
+        assert_eq!(
+            load_published_crossmap_evidence(&protobuf_only).unwrap(),
+            load_published_crossmap_evidence(&out).unwrap()
+        );
         let mut browser: serde_json::Value =
             serde_json::from_slice(&fs::read(out.join("crossmap-results.json")).unwrap()).unwrap();
         assert_eq!(browser["runs"][0]["verified_points"], 2);

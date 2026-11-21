@@ -967,6 +967,18 @@ fn published_progression_evidence_reuses_canonical_bytes_and_rejects_duplicates(
     let source_catalog = read_browser_catalog(&source).unwrap();
     let relative = format!("data/progression-runs/{generation_id}/evidence.pb");
     let canonical_bytes = fs::read(source.join(&relative)).unwrap();
+    // Retention consumes protobuf evidence, regardless of the historical web renderer.
+    let mut old_catalog = source_catalog.clone();
+    old_catalog.schema_version = 9;
+    fs::write(
+        source.join("catalog.json"),
+        encode_browser_catalog(&old_catalog).unwrap(),
+    )
+    .unwrap();
+    fs::write(source.join("index.html"), b"previous HTML renderer").unwrap();
+    refresh_site_manifest_entry(&source, "catalog.json");
+    refresh_site_manifest_entry(&source, "index.html");
+    assert!(verify_static_site(&source).is_err());
     let options = BuildStaticSiteOptions {
         snapshot_dir: root.join("snapshot"),
         out_dir: root.join("reused"),
@@ -987,6 +999,25 @@ fn published_progression_evidence_reuses_canonical_bytes_and_rejects_duplicates(
     );
     verify_static_site(&options.out_dir).unwrap();
 
+    // Web projections may be discarded completely once their protobuf evidence is retained.
+    site_evidence::retain_protobuf_files(&source);
+    let mut protobuf_only = options.clone();
+    protobuf_only.out_dir = root.join("protobuf-only");
+    build_static_site_with_progression_runs(
+        &protobuf_only,
+        &[],
+        &[],
+        std::slice::from_ref(&source),
+    )
+    .unwrap();
+    verify_static_site(&protobuf_only.out_dir).unwrap();
+    assert_eq!(
+        read_browser_catalog(&protobuf_only.out_dir)
+            .unwrap()
+            .progression,
+        source_catalog.progression
+    );
+
     let mut duplicates = options.clone();
     duplicates.out_dir = root.join("duplicate-inputs");
     assert!(
@@ -1003,8 +1034,34 @@ fn published_progression_evidence_reuses_canonical_bytes_and_rejects_duplicates(
     fs::write(source.join(&relative), b"tampered evidence").unwrap();
     let mut tampered = options;
     tampered.out_dir = root.join("tampered-source");
-    assert!(build_static_site_with_progression_runs(&tampered, &[], &[], &[source]).is_err());
+    assert!(
+        build_static_site_with_progression_runs(&tampered, &[], &[], std::slice::from_ref(&source))
+            .is_err()
+    );
     assert!(!tampered.out_dir.exists());
+    // Rehashing a malformed canonical message cannot bypass its semantic validators.
+    let mut invalid =
+        pb::FixedCorpusProgressionRunEvidence::decode(canonical_bytes.as_slice()).unwrap();
+    invalid.samples[0].g8r_nodes = -1.0;
+    fs::write(source.join(&relative), invalid.encode_to_vec()).unwrap();
+    refresh_site_manifest_entry(&source, &relative);
+    assert!(read_published_progression_evidence(std::slice::from_ref(&source)).is_err());
+
+    fs::write(source.join(&relative), canonical_bytes).unwrap();
+    refresh_site_manifest_entry(&source, &relative);
+    let wrong_path = "data/progression-runs/wrong-generation/evidence.pb";
+    fs::create_dir_all(source.join(wrong_path).parent().unwrap()).unwrap();
+    fs::rename(source.join(&relative), source.join(wrong_path)).unwrap();
+    let manifest_path = source.join(STATIC_SITE_MANIFEST_FILENAME);
+    let mut manifest =
+        pb::StaticSiteManifest::decode(fs::read(&manifest_path).unwrap().as_slice()).unwrap();
+    *manifest
+        .files
+        .iter_mut()
+        .find(|record| record.logical_key == relative)
+        .unwrap() = publication_file(&source, wrong_path).unwrap();
+    fs::write(manifest_path, manifest.encode_to_vec()).unwrap();
+    assert!(read_published_progression_evidence(&[source]).is_err());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1587,7 +1644,7 @@ fn empty_versions_index_bytes() -> Vec<u8> {
     bytes
 }
 
-fn refresh_site_manifest_entry(site_dir: &Path, relpath: &str) {
+pub(super) fn refresh_site_manifest_entry(site_dir: &Path, relpath: &str) {
     let manifest_path = site_dir.join(STATIC_SITE_MANIFEST_FILENAME);
     let mut manifest = pb::StaticSiteManifest::decode(
         fs::read(&manifest_path)

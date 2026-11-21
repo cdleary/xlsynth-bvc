@@ -23,6 +23,8 @@ pub(crate) mod site_corpus;
 mod site_crossmap;
 #[path = "site_dashboard.rs"]
 pub(crate) mod site_dashboard;
+#[path = "site_evidence.rs"]
+mod site_evidence;
 #[path = "site_shards.rs"]
 mod site_shards;
 #[path = "site_techmap.rs"]
@@ -838,30 +840,17 @@ fn read_published_progression_evidence(
     let mut evidence = Vec::new();
     for dir in dirs {
         let previous_count = evidence.len();
-        verify_static_site(dir)
-            .with_context(|| format!("verifying progression evidence site {}", dir.display()))?;
-        let manifest = pb::StaticSiteManifest::decode(
-            fs::read(dir.join(STATIC_SITE_MANIFEST_FILENAME))?.as_slice(),
-        )?;
-        for record in manifest.files {
-            let path = &record
-                .relpath
-                .context("missing progression evidence path")?
-                .value;
+        let source = site_evidence::Source::open(dir)
+            .with_context(|| format!("reading progression evidence site {}", dir.display()))?;
+        for path in source.paths() {
             if !path.starts_with("data/progression-runs/") || !path.ends_with("/evidence.pb") {
                 continue;
             }
-            normalized_relpath(path)?;
-            let bytes = fs::read(dir.join(path))?;
-            if bytes.len() as u64 != record.bytes
-                || sha256_hex(&bytes) != digest_hex(&record.sha256, "progression evidence digest")?
-            {
-                bail!("reused progression evidence differs from its source manifest");
-            }
+            let bytes = source.read(path, site_evidence::MAX_EVIDENCE_BYTES)?;
             let (cohort_id, generation, runtime_identity) =
                 decode_progression_run_evidence(&bytes)?;
             if path
-                != &format!(
+                != format!(
                     "data/progression-runs/{}/evidence.pb",
                     generation.generation_id
                 )

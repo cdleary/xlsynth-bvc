@@ -115,6 +115,8 @@ execution evidence and scientific browser measurements are unchanged.
 For later builds, `--techmap-evidence-dir PREVIOUS_SITE/tech-mapped-asap7` reuses the previous
 publication's verified protobuf measurements and mapper-isolation experiments. Add only new
 release/cohort runs with `--techmap-run-dir`; duplicate measurements or experiments are rejected.
+Reuse consumes manifest-bound protobufs without requiring the source browser projections. The
+new publication regenerates and verifies all projections with the current renderer.
 
 The comparison embeds Plotly's pinned strict bundle so full-corpus WebGL plots work under the
 page's content security policy. Browsers without WebGL show a deterministic overview of up to

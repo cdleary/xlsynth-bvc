@@ -143,7 +143,9 @@ separate stages:
    as the final browser catalog/projection.
    Alternatively, pass `--progression-evidence-dir PREVIOUS_SITE/history` to reuse a verified
    published generation without its original workspace. The source publication must retain its
-   parent IR archive. Reused and newly evaluated generations must be disjoint.
+   parent IR archive. Reuse validates the manifest-bound protobuf evidence independently of the
+   source browser assets; the new output receives full current-site verification. Reused and
+   newly evaluated generations must be disjoint.
 5. Inspect the progression page with the intended cohort and explicit baseline/current generation
    IDs. Confirm both labels, completeness, summed-product delta, distribution plot, and largest
    per-artifact changes.
