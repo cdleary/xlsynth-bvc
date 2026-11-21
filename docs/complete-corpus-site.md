@@ -122,9 +122,10 @@ cache hit or implicit preference between duplicate releases. Keep evidence input
 directories disjoint, and retain the source until the new build succeeds. This avoids millions of
 small provenance/export reads, but does not skip validation of the resulting website.
 
-Without a snapshot, existing function aliases and their provenance bindings are retained. With
-`--snapshot-dir`, those bindings are validated and then refreshed from the supplied snapshot,
-just as for run-directory inputs. Measurement evidence remains frozen in either case.
+Existing function aliases and their source-snapshot provenance bindings are retained. Verified
+metadata may be reused for another release only when the exact input bytes and selected top
+function match. With `--snapshot-dir`, the supplied snapshot enriches inputs that have no retained
+metadata. Measurement evidence remains frozen in either case.
 
 ## All-versions dashboard
 
