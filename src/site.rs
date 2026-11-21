@@ -727,6 +727,91 @@ struct ProgressionRunEvidenceInput {
     git_identity: Option<ProgressionGitIdentity>,
     sample_sources_by_g8r_stats_action: BTreeMap<String, ProgressionSampleSourceEvidence>,
 }
+/// Labels and IR sizes belong to the frozen input, independently of which
+/// stdlib releases happen to be present in the current evaluation snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProgressionSampleMetadata {
+    fn_key: String,
+    ir_node_count: u64,
+    source_sha256: String,
+}
+
+#[derive(Default)]
+struct ProgressionMetadataLookup {
+    published: BTreeMap<(String, String), ProgressionSampleMetadata>,
+    snapshot: BTreeMap<(String, String), ProgressionSampleMetadata>,
+}
+
+impl ProgressionMetadataLookup {
+    fn from_dataset(dataset: &StdlibG8rVsYosysDataset) -> Result<Self> {
+        let mut lookup = Self::default();
+        for cohort in &PROGRESSION_COHORTS {
+            let artifacts = progression_ir_artifacts(cohort)?;
+            for sample in &dataset.samples {
+                let Some(hash) = normalized_progression_ir_hash(sample) else {
+                    continue;
+                };
+                let Some(source_sha256) = artifacts.get(&hash) else {
+                    continue;
+                };
+                // Preserve the legacy dataset's first-label convention for
+                // inputs that have no canonical progression publication yet.
+                lookup
+                    .snapshot
+                    .entry((cohort.cohort_id.into(), hash))
+                    .or_insert_with(|| ProgressionSampleMetadata {
+                        fn_key: sample.fn_key.clone(),
+                        ir_node_count: sample.ir_node_count,
+                        source_sha256: source_sha256.clone(),
+                    });
+            }
+        }
+        Ok(lookup)
+    }
+
+    fn record_generation(
+        &mut self,
+        cohort_id: &str,
+        generation: &BrowserProgressionGeneration,
+    ) -> Result<()> {
+        let cohort = progression_cohort(cohort_id)?;
+        let artifacts = progression_ir_artifacts(cohort)?;
+        for sample in &generation.run_samples {
+            let expected_source = artifacts
+                .get(&sample.structural_hash)
+                .context("progression metadata is outside its fixed cohort")?;
+            if sample.fn_key.is_empty()
+                || sample.ir_node_count == 0
+                || &sample.source_sha256 != expected_source
+            {
+                bail!("progression metadata does not match its frozen input identity");
+            }
+            let key = (cohort_id.to_string(), sample.structural_hash.clone());
+            let metadata = ProgressionSampleMetadata {
+                fn_key: sample.fn_key.clone(),
+                ir_node_count: sample.ir_node_count,
+                source_sha256: sample.source_sha256.clone(),
+            };
+            if let Some(prior) = self.published.get(&key) {
+                if prior != &metadata {
+                    bail!("progression generations disagree about frozen input metadata");
+                }
+            } else {
+                self.published.insert(key, metadata);
+            }
+        }
+        Ok(())
+    }
+
+    fn get(&self, cohort_id: &str, structural_hash: &str) -> Result<&ProgressionSampleMetadata> {
+        let key = (cohort_id.to_string(), structural_hash.to_string());
+        self.published
+            .get(&key)
+            .or_else(|| self.snapshot.get(&key))
+            .context("release progression sample has no structural metadata")
+    }
+}
+
 /// Canonical publication bytes remain the durable boundary when reusing a site.
 struct PublishedProgressionEvidence {
     cohort_id: String,
@@ -3575,7 +3660,7 @@ fn validate_release_progression_yosys_runtime(runtime: &YosysRuntimeSpec) -> Res
 
 fn load_release_progression_generation_with_evidence(
     run_dir: &Path,
-    dataset: &StdlibG8rVsYosysDataset,
+    metadata_lookup: &ProgressionMetadataLookup,
     releases: &[CrateReleaseStatusView],
 ) -> Result<ProgressionRunEvidenceInput> {
     let manifest = read_release_corpus_manifest(run_dir)?;
@@ -3620,13 +3705,7 @@ fn load_release_progression_generation_with_evidence(
         let expected_source_sha256 = artifacts
             .get(&structural_hash)
             .context("release progression sample is outside the fixed cohort")?;
-        let metadata = dataset
-            .samples
-            .iter()
-            .find(|value| {
-                normalized_progression_ir_hash(value).as_deref() == Some(structural_hash.as_str())
-            })
-            .context("release progression sample has no structural metadata")?;
+        let metadata = metadata_lookup.get(cohort.cohort_id, &structural_hash)?;
         let import_action_id =
             crate::executor::compute_action_id(&ActionSpec::ImportIrPackageFile {
                 source_sha256: sample.source_sha256.clone(),
@@ -3830,7 +3909,7 @@ fn load_release_progression_generation_with_evidence(
 fn validate_release_progression_generation(
     generation: &BrowserProgressionGeneration,
     release_catalog: &BrowserProgressionCatalog,
-    dataset: &StdlibG8rVsYosysDataset,
+    metadata_lookup: &ProgressionMetadataLookup,
     releases: &[CrateReleaseStatusView],
 ) -> Result<()> {
     let cohort = progression_cohort(&release_catalog.cohort_id)?;
@@ -3867,14 +3946,7 @@ fn validate_release_progression_generation(
         let expected_source_sha256 = artifacts
             .get(&sample.structural_hash)
             .context("release progression sample is outside the fixed cohort")?;
-        let metadata = dataset
-            .samples
-            .iter()
-            .find(|value| {
-                normalized_progression_ir_hash(value).as_deref()
-                    == Some(sample.structural_hash.as_str())
-            })
-            .context("release progression sample has no structural metadata")?;
+        let metadata = metadata_lookup.get(cohort.cohort_id, &sample.structural_hash)?;
         let metrics = [
             sample.g8r_nodes,
             sample.g8r_levels,
@@ -3938,6 +4010,7 @@ fn combine_progression_generations(
     mut release_catalog: BrowserProgressionCatalog,
     generations: Vec<BrowserProgressionGeneration>,
     dataset: &StdlibG8rVsYosysDataset,
+    metadata_lookup: &ProgressionMetadataLookup,
     releases: &[CrateReleaseStatusView],
     repository_observation: Option<&RepositoryHeadObservationView>,
 ) -> Result<BrowserProgressionCatalog> {
@@ -3948,7 +4021,7 @@ fn combine_progression_generations(
                 validate_release_progression_generation(
                     &generation,
                     &release_catalog,
-                    dataset,
+                    metadata_lookup,
                     releases,
                 )?;
             }
@@ -4044,10 +4117,17 @@ fn build_browser_progression_catalog_and_progression_evidence_from_site(
         }
     }
     let mut evidence = read_published_progression_evidence(progression_evidence_dirs)?;
+    let mut metadata_lookup = ProgressionMetadataLookup::from_dataset(&dataset)?;
+    for input in &evidence {
+        metadata_lookup.record_generation(&input.cohort_id, &input.generation)?;
+    }
     let mut release_generations = BTreeMap::<String, Vec<BrowserProgressionGeneration>>::new();
     for run_dir in release_dirs {
-        let input = load_release_progression_generation_with_evidence(run_dir, &dataset, releases)
-            .with_context(|| format!("loading release progression run {}", run_dir.display()))?;
+        let input =
+            load_release_progression_generation_with_evidence(run_dir, &metadata_lookup, releases)
+                .with_context(|| {
+                    format!("loading release progression run {}", run_dir.display())
+                })?;
         evidence.push(PublishedProgressionEvidence::from_native(input)?);
     }
     for input in &evidence {
@@ -4071,6 +4151,7 @@ fn build_browser_progression_catalog_and_progression_evidence_from_site(
                 catalog,
                 generations,
                 &dataset,
+                &metadata_lookup,
                 releases,
                 repository_observation,
             )
@@ -4126,6 +4207,7 @@ fn build_browser_progression_catalog_and_progression_evidence_from_site(
                 catalog,
                 generations,
                 &dataset,
+                &metadata_lookup,
                 releases,
                 repository_observation,
             )
@@ -6225,6 +6307,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
                 BTreeMap::<String, Vec<BrowserProgressionGeneration>>::new();
             let mut git_generations = BTreeMap::<String, Vec<BrowserProgressionGeneration>>::new();
             let mut runtime_identities = BTreeMap::new();
+            let mut metadata_lookup = ProgressionMetadataLookup::from_dataset(&dataset)?;
             for evidence_ref in &catalog.progression_evidence {
                 let bytes = fs::read(site_dir.join(&evidence_ref.url)).with_context(|| {
                     format!("reading progression evidence {}", evidence_ref.url)
@@ -6251,6 +6334,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
                     &cohort_id,
                     &runtime_identity,
                 )?;
+                metadata_lookup.record_generation(&cohort_id, &generation)?;
                 let target = match generation.origin {
                     BrowserProgressionOrigin::CrateRelease => &mut release_generations,
                     BrowserProgressionOrigin::GitRevision { .. } => &mut git_generations,
@@ -6268,6 +6352,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
                         release_catalog,
                         generations,
                         &dataset,
+                        &metadata_lookup,
                         &catalog.releases,
                         catalog.repository_head_observation.as_ref(),
                     )
@@ -6286,6 +6371,7 @@ pub(crate) fn verify_static_site(site_dir: &Path) -> Result<VerifyStaticSiteSumm
                         release_catalog,
                         generations,
                         &dataset,
+                        &metadata_lookup,
                         &catalog.releases,
                         catalog.repository_head_observation.as_ref(),
                     )

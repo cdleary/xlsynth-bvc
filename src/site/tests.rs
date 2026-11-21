@@ -903,6 +903,64 @@ fn build_historical_candidate_site_fixture_with_graph_le(
 }
 
 #[test]
+fn frozen_progression_metadata_is_independent_of_current_stdlib_measurements() {
+    let root = temp_root();
+    let (source, generation_id) = build_historical_candidate_site_fixture(&root);
+    let bytes = fs::read(source.join(format!("data/progression-runs/{generation_id}/evidence.pb")))
+        .unwrap();
+    let (cohort_id, generation, _) = decode_progression_run_evidence(&bytes).unwrap();
+    let empty = StdlibG8rVsYosysDataset {
+        fraig: false,
+        samples: Vec::new(),
+        min_ir_nodes: 0,
+        max_ir_nodes: 0,
+        g8r_only_count: 0,
+        yosys_only_count: 0,
+        available_crate_versions: Vec::new(),
+    };
+    let mut lookup = ProgressionMetadataLookup::from_dataset(&empty).unwrap();
+    let sample = &generation.run_samples[0];
+    assert!(lookup.get(&cohort_id, &sample.structural_hash).is_err());
+    lookup.record_generation(&cohort_id, &generation).unwrap();
+    assert_eq!(
+        lookup.get(&cohort_id, &sample.structural_hash).unwrap(),
+        &ProgressionSampleMetadata {
+            fn_key: sample.fn_key.clone(),
+            ir_node_count: sample.ir_node_count,
+            source_sha256: sample.source_sha256.clone(),
+        }
+    );
+    let mut inconsistent = generation.clone();
+    inconsistent.run_samples[0].ir_node_count += 1;
+    assert!(lookup.record_generation(&cohort_id, &inconsistent).is_err());
+    let mut wrong_bytes = generation.clone();
+    wrong_bytes.run_samples[0].source_sha256 = "0".repeat(64);
+    assert!(
+        ProgressionMetadataLookup::default()
+            .record_generation(&cohort_id, &wrong_bytes)
+            .is_err()
+    );
+
+    // A complete release remains independently checkable when that release's
+    // historical stdlib sample rows are absent from the current snapshot.
+    let catalog = read_browser_catalog(&source).unwrap();
+    let mut release = generation.clone();
+    release.origin = BrowserProgressionOrigin::CrateRelease;
+    release.crate_version = Some("0.66.0".into());
+    release.generation_id = progression_generation_id(&cohort_id, "0.66.0", &release.dso_version);
+    release.display_label = "v0.66.0".into();
+    release.baseline_generation_id = None;
+    release.event_time_utc =
+        Some(release_event_time_utc(&catalog.releases, "0.66.0", &release.dso_version).unwrap());
+    let mut lookup = ProgressionMetadataLookup::from_dataset(&empty).unwrap();
+    lookup.record_generation(&cohort_id, &generation).unwrap();
+    let cohort =
+        empty_browser_progression_catalog_for(progression_cohort(&cohort_id).unwrap()).unwrap();
+    validate_release_progression_generation(&release, &cohort, &lookup, &catalog.releases).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn published_progression_evidence_reuses_canonical_bytes_and_rejects_duplicates() {
     let root = temp_root();
     let (source, generation_id) = build_historical_candidate_site_fixture(&root);
