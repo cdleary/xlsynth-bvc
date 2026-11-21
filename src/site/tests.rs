@@ -490,6 +490,54 @@ fn build_historical_candidate_site_fixture_with_graph_le(
     root: &Path,
     graph_le: bool,
 ) -> (PathBuf, String) {
+    build_candidate_site_fixture_with_observation(root, graph_le, None)
+}
+
+fn fixture_repository_observation(
+    root: &Path,
+    mut observation: RepositoryHeadObservationView,
+) -> PathBuf {
+    let repo = root.join("repository");
+    for relative in [
+        crate::DEFAULT_DOCKERFILE,
+        crate::MODERN_DRIVER_DOCKERFILE,
+        crate::DEFAULT_GIT_DOCKERFILE,
+        crate::VENDORED_DOWNLOAD_RELEASE_SCRIPT,
+    ] {
+        let destination = repo.join(relative);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::copy(test_repo_root().join(relative), destination).unwrap();
+    }
+    #[derive(Serialize, Deserialize)]
+    struct CompatEntry {
+        xlsynth_release_version: String,
+        crate_release_datetime: String,
+    }
+    let mut compat: BTreeMap<String, CompatEntry> = serde_json::from_slice(
+        &fs::read(test_repo_root().join(crate::VERSION_COMPAT_PATH)).unwrap(),
+    )
+    .unwrap();
+    compat.retain(|version, _| {
+        !cmp_dotted_numeric_version(version, &observation.latest_crate_version).is_gt()
+    });
+    let bytes = serde_json::to_vec(&compat).unwrap();
+    observation.version_compat_sha256 = sha256_hex(&bytes);
+    let path = repo.join(crate::VERSION_COMPAT_PATH);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+    fs::write(
+        repo.join(crate::XLSYNTH_CRATE_REPOSITORY_OBSERVATION_PATH),
+        serde_json::to_vec(&observation).unwrap(),
+    )
+    .unwrap();
+    repo
+}
+
+fn build_candidate_site_fixture_with_observation(
+    root: &Path,
+    graph_le: bool,
+    observation: Option<RepositoryHeadObservationView>,
+) -> (PathBuf, String) {
     let baseline_version = "0.66.0";
     let dso_version = "v0.54.7";
     let candidate_commit = "8".repeat(40);
@@ -872,11 +920,14 @@ fn build_historical_candidate_site_fixture_with_graph_le(
             .expect("write paired IR shard");
     }
     let snapshot_dir = root.join("snapshot");
-    rebuild_versions_cards_index(&store, &test_repo_root())
+    let repo = observation
+        .map(|observation| fixture_repository_observation(root, observation))
+        .unwrap_or_else(test_repo_root);
+    rebuild_versions_cards_index(&store, &repo)
         .expect("rebuild versions dataset after source artifacts");
     build_static_snapshot(
         &store,
-        &test_repo_root(),
+        &repo,
         &BuildStaticSnapshotOptions {
             out_dir: snapshot_dir.clone(),
             overwrite: false,
@@ -900,6 +951,134 @@ fn build_historical_candidate_site_fixture_with_graph_le(
     )
     .expect("build historical candidate site");
     (site_dir, generation_id)
+}
+
+#[test]
+fn retained_git_evidence_survives_advancing_head_and_latest_release() {
+    let root = temp_root();
+    let mut captured_observation =
+        load_xlsynth_crate_repository_head_observation(&test_repo_root())
+            .unwrap()
+            .unwrap();
+    captured_observation.head_commit = "8".repeat(40);
+    captured_observation.head_committed_at_utc = "2026-08-31T12:00:00Z".into();
+    captured_observation.observed_at_utc = "2026-09-01T12:00:00Z".into();
+    captured_observation.latest_crate_version = "0.66.0".into();
+    captured_observation.latest_release_tag = "v0.66.0".into();
+    captured_observation.latest_release_commit = "7".repeat(40);
+    captured_observation.latest_release_committed_at_utc = "2026-08-30T12:00:00Z".into();
+    captured_observation.comparison_status = "ahead".into();
+    captured_observation.commits_ahead = 1;
+    captured_observation.commits_behind = 0;
+    let (source, generation_id) = build_candidate_site_fixture_with_observation(
+        &root,
+        false,
+        Some(captured_observation.clone()),
+    );
+    verify_static_site(&source).unwrap();
+    let catalog = read_browser_catalog(&source).unwrap();
+    let captured = catalog
+        .progression
+        .cohorts
+        .iter()
+        .flat_map(|cohort| &cohort.generations)
+        .find(|generation| generation.generation_id == generation_id)
+        .unwrap()
+        .clone();
+    let BrowserProgressionOrigin::GitRevision {
+        requested_ref,
+        baseline_release_commit,
+        ..
+    } = &captured.origin
+    else {
+        panic!("Git fixture")
+    };
+    assert_eq!(requested_ref.as_deref(), Some("main"));
+    assert_eq!(
+        baseline_release_commit.as_deref(),
+        Some("7777777777777777777777777777777777777777")
+    );
+    let relative = format!("data/progression-runs/{generation_id}/evidence.pb");
+    let evidence_bytes = fs::read(source.join(&relative)).unwrap();
+    site_evidence::retain_protobuf_files(&source);
+
+    let store = ArtifactStore::new(root.join("store"));
+    for (name, head_advances, release_advances) in [
+        ("head", true, false),
+        ("latest", false, true),
+        ("both", true, true),
+    ] {
+        let mut observation = captured_observation.clone();
+        observation.observed_at_utc = "2026-09-03T12:00:00Z".into();
+        if head_advances {
+            observation.head_commit = "9".repeat(40);
+            observation.head_committed_at_utc = "2026-09-02T12:00:00Z".into();
+        }
+        if release_advances {
+            observation.latest_crate_version = "0.68.0".into();
+            observation.latest_release_tag = "v0.68.0".into();
+            observation.latest_release_commit = "6".repeat(40);
+        }
+        let repo = fixture_repository_observation(&root, observation);
+        rebuild_versions_cards_index(&store, &repo).unwrap();
+        let snapshot = root.join(format!("snapshot-{name}"));
+        build_static_snapshot(
+            &store,
+            &repo,
+            &BuildStaticSnapshotOptions {
+                out_dir: snapshot.clone(),
+                overwrite: false,
+                skip_rebuild_web_indices: true,
+            },
+        )
+        .unwrap();
+        let out = root.join(format!("reused-{name}"));
+        build_static_site_with_progression_runs(
+            &BuildStaticSiteOptions {
+                snapshot_dir: snapshot,
+                out_dir: out.clone(),
+                base_url: "/".into(),
+                overwrite: false,
+            },
+            &[],
+            &[],
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        verify_static_site(&out).unwrap();
+        assert_eq!(fs::read(out.join(&relative)).unwrap(), evidence_bytes);
+        let current = read_browser_catalog(&out).unwrap();
+        let generation = current
+            .progression
+            .cohorts
+            .iter()
+            .flat_map(|cohort| &cohort.generations)
+            .find(|generation| generation.generation_id == generation_id)
+            .unwrap();
+        let mut expected = captured.clone();
+        let BrowserProgressionOrigin::GitRevision {
+            requested_ref,
+            baseline_release_commit,
+            ..
+        } = &mut expected.origin
+        else {
+            unreachable!()
+        };
+        if head_advances {
+            *requested_ref = None;
+            expected.display_label = "git@88888888".into();
+        }
+        if release_advances {
+            *baseline_release_commit = None;
+        }
+        assert_eq!(generation, &expected);
+        // The retained scientific record still carries both original collection-time annotations.
+        let (_, retained, _) =
+            decode_progression_run_evidence(&fs::read(out.join(&relative)).unwrap()).unwrap();
+        assert_eq!(retained, captured);
+    }
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

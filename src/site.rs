@@ -3995,6 +3995,43 @@ fn merge_validated_progression_generation(
     Ok(())
 }
 
+/// Floating-ref and latest-release annotations describe the destination observation.
+/// Project a browser clone; the retained protobuf keeps its collection-time metadata.
+fn project_candidate_progression_observation(
+    generation: &mut BrowserProgressionGeneration,
+    observation: Option<&RepositoryHeadObservationView>,
+) -> Result<()> {
+    let BrowserProgressionOrigin::GitRevision {
+        commit,
+        requested_ref,
+        baseline_crate_version,
+        baseline_release_commit,
+        ..
+    } = &mut generation.origin
+    else {
+        return Ok(());
+    };
+    let observation =
+        observation.context("candidate progression has no checked repository observation")?;
+    if requested_ref.as_ref().is_some_and(|reference| {
+        commit != &observation.head_commit || reference != &observation.head_ref
+    }) {
+        *requested_ref = None;
+        generation.display_label = format!(
+            "git@{}",
+            commit
+                .get(..8)
+                .context("candidate progression commit is too short")?
+        );
+    }
+    if normalize_tag_version(baseline_crate_version)
+        != normalize_tag_version(&observation.latest_crate_version)
+    {
+        *baseline_release_commit = None;
+    }
+    Ok(())
+}
+
 fn combine_progression_generations(
     mut release_catalog: BrowserProgressionCatalog,
     generations: Vec<BrowserProgressionGeneration>,
@@ -4004,7 +4041,7 @@ fn combine_progression_generations(
     repository_observation: Option<&RepositoryHeadObservationView>,
 ) -> Result<BrowserProgressionCatalog> {
     let mut incoming_generation_ids = BTreeSet::new();
-    for generation in generations {
+    for mut generation in generations {
         match generation.origin {
             BrowserProgressionOrigin::CrateRelease => {
                 validate_release_progression_generation(
@@ -4015,6 +4052,7 @@ fn combine_progression_generations(
                 )?;
             }
             BrowserProgressionOrigin::GitRevision { .. } => {
+                project_candidate_progression_observation(&mut generation, repository_observation)?;
                 validate_candidate_progression_generation(
                     &generation,
                     &release_catalog,

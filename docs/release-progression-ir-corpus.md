@@ -146,6 +146,8 @@ separate stages:
    parent IR archive. Reuse validates the manifest-bound protobuf evidence independently of the
    source browser assets; the new output receives full current-site verification. Reused and
    newly evaluated generations must be disjoint.
+   Git annotations that no longer match the destination snapshot's checked head or latest
+   release are rendered as historical references. The original protobuf evidence stays unchanged.
 5. Inspect the progression page with the intended cohort and explicit baseline/current generation
    IDs. Confirm both labels, completeness, summed-product delta, distribution plot, and largest
    per-artifact changes.
