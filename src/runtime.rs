@@ -500,6 +500,25 @@ mod tests {
     }
 
     #[test]
+    fn list_fns_substitutes_through_030_and_preserves_031_source_runtime() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (_, latest) = oldest_and_latest_driver_versions(repo_root);
+        for version in ["0.29.0", "0.30.0"] {
+            let source = source_runtime(repo_root, version);
+            let original = source.clone();
+            let resolved = resolve_driver_runtime_for_dslx_list_fns(repo_root, &source)
+                .expect("substitute legacy list-fns runtime");
+            assert_substitute_runtime_is_self_consistent(repo_root, &source, &resolved, &latest);
+            assert_eq!(source, original);
+        }
+
+        let source = source_runtime(repo_root, "0.31.0");
+        let resolved = resolve_driver_runtime_for_dslx_list_fns(repo_root, &source)
+            .expect("retain supported list-fns runtime");
+        assert_eq!(resolved, source);
+    }
+
+    #[test]
     fn driver_git_commit_requires_full_lowercase_sha() {
         let commit = "0123456789abcdef0123456789abcdef01234567";
         assert_eq!(

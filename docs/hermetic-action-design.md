@@ -204,6 +204,10 @@ Because compatibility is modeled as crate->dso, the DSO label is derivable from 
 but many crate versions may map to the same DSO release; storing both labels keeps provenance and
 queries explicit.
 `download-stdlib` uses that same compatibility map to resolve a runtime for `dslx-list-fns`-based suggestion generation; failures are recorded in provenance details without failing the stdlib extraction artifact.
+Drivers through 0.30.0 use the latest known driver for function discovery because their
+function-listing API can panic on functions without an explicit return type. Discovery provenance
+records both the source and enumeration runtimes. The discovered DSLX-to-IR actions retain the
+source release's runtime and DSO; the substitution only enumerates functions.
 `ir-to-delay-info` uses `delay_info_main --proto_out` and decodes the emitted binary `xls.DelayInfoProto` with `protoc` into canonical textual output (`delay_info.textproto`) using schema files cached during setup from the release's locked `xlsynth/xlsynth` source commit.
 
 Yosys/ABC actions use a dedicated image (`docker/yosys-abc.Dockerfile`) and take a script reference that is captured as `(path, sha256)` in the action spec; rematerialization re-validates that hash. The image also contains a pinned sv-elab/yosys-slang plugin. `ComboVerilogToYosysAbcAig` records either the canonical builtin frontend or `slang` with its exact plugin revision in action identity and provenance. A slang action requires the same commit in its Yosys runtime identity; that commit participates in the runtime fingerprint and is passed to the Docker build.
