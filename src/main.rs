@@ -163,7 +163,8 @@ const OUTPUT_IR_OP_COUNT_DETAILS_KEY: &str = "output_ir_op_count";
 const DEFAULT_K_BOOL_CONE_MAX_IR_OPS: u64 = 16;
 const DEFAULT_MFFC_MIN_INTERNAL_NON_LITERAL: u64 = 4;
 const DELAY_INFO_OUTPUT_FORMAT_TEXTPROTO_V1: &str = "textproto_v1";
-const DSLX_LIST_FNS_LEGACY_SOURCE_DRIVER_MAX: &str = "0.29.0";
+// Older list-fns APIs can panic on functions without an explicit return type.
+const DSLX_LIST_FNS_LEGACY_SOURCE_DRIVER_MAX: &str = "0.30.0";
 const XLSYNTH_SOURCE_ARCHIVE_URL_PREFIX: &str = "https://github.com/xlsynth/xlsynth/archive";
 const MODULE_SUBTREE_ROOT_PATHS: &[&str] = &["xls/modules/add_dual_path"];
 static DOCKER_RUN_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
